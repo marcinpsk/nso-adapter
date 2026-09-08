@@ -126,6 +126,16 @@ class ReadFailure:
         }
 
 
+def http_status_of(exc: BaseException) -> int | None:
+    """Return the numeric status the server answered, or None when the failure carries none.
+
+    The ONE rule for taking a status off a raised read: only :class:`httpx.HTTPStatusError`
+    carries one, and only the number is taken. The exception's message is built from the
+    server's reason phrase and the request URL, so nothing else of it may travel.
+    """
+    return exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+
+
 def read_failure_from_exception(
     exc: BaseException,
     *,
@@ -133,18 +143,13 @@ def read_failure_from_exception(
     device: str,
     family: str,
 ) -> ReadFailure:
-    """Classify a read that RAISED: the type always, plus the numeric status the server answered.
-
-    Only :class:`httpx.HTTPStatusError` carries a server status code, and only the code is
-    taken from it — never the reason phrase, the URL, the redirect location or the body.
-    """
-    status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+    """Classify a read that RAISED: the type always, plus the numeric status the server answered."""
     return ReadFailure(
         operation=operation,
         device=device,
         family=family,
         error_type=type(exc).__name__,
-        http_status=status,
+        http_status=http_status_of(exc),
     )
 
 
