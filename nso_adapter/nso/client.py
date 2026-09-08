@@ -26,6 +26,16 @@ class NsoExportUnavailableError(RuntimeError):
     """
 
 
+class NsoActionFailedError(RuntimeError):
+    """An NSO action answered 200 while its output reports the work did not happen.
+
+    The message names the action and the failure KIND, both ours; the action's own
+    ``info``/``error``/``result`` text is never repeated. Distinct from a bare
+    ``RuntimeError`` so a sink can tell an adapter-authored refusal, whose message is
+    the diagnostic, from a third-party failure, whose message is not ours to print.
+    """
+
+
 class NsoReadContractError(RuntimeError):
     """A ``device-state-read`` action response that the server did not certify (READSEM 1328).
 
@@ -521,7 +531,7 @@ class NsoClient:
                 if result not in ("updated", "unchanged")
                 else "reported a stored key with no fingerprint"
             )
-            raise RuntimeError(f"fetch-host-keys for {device_name!r} {kind}")
+            raise NsoActionFailedError(f"fetch-host-keys for {device_name!r} {kind}")
         return out
 
     async def sync_from(self, device_name: str) -> bool:
