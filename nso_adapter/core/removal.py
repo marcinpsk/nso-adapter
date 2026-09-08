@@ -120,7 +120,18 @@ _NED_DIALECT_SCOPES: frozenset[str] = frozenset({"route_policy"})
 
 # OSPF/BGP/IS-IS have multi-row applies; interface_config is a compound-key (device,interface)
 # list whose removal PUT-replaces/deletes per-interface instances — all bespoke below.
-VALID_REMOVAL_SCOPES: set[str] = set(_SIMPLE_TARGETS) | {"ospf", "bgp", "isis", "interface_config", "snmp"}
+# switchport and lag have NO dispatch handler and no guard: they are here because
+# projection_sections() refuses any difference between this set and _SECTION_TABLES, and
+# C9 deletes this set outright. Admission refuses them (AWAITING_SENDER_SECTIONS).
+VALID_REMOVAL_SCOPES: set[str] = set(_SIMPLE_TARGETS) | {
+    "ospf",
+    "bgp",
+    "isis",
+    "interface_config",
+    "snmp",
+    "switchport",
+    "lag",
+}
 
 
 class RemovalBlockedError(Exception):
@@ -1734,6 +1745,7 @@ def _refuse_force_incompatible(
     static_route_tombstone_ids,
     promotes,
     apply_attempt_id,
+    frozen_fragments,
 ) -> None:
     """Refuse the arguments a reissue cannot honor: it skips the guard and records no plan."""
     if promotes:
@@ -1750,6 +1762,8 @@ def _refuse_force_incompatible(
         )
     if apply_attempt_id is not None:
         raise ValueError(f"a force-removal of {scope!r} carries no Apply attempt; got {apply_attempt_id}")
+    if frozen_fragments:
+        raise ValueError(f"a force-removal of {scope!r} promotes nothing; got frozen fragments to promote")
     if static_route_tombstone_ids:
         raise ValueError(
             f"a force-removal of {scope!r} records no execution plan; got tombstone ids "
@@ -1930,6 +1944,7 @@ async def enqueue_removal(
     document: dict | None = None,
     static_route_tombstone_ids: tuple[int, ...] = (),
     apply_attempt_id: UUID | None = None,
+    frozen_fragments: dict[str, dict] | None = None,
 ):
     """Queue an async ``removal`` job that PUT-replaces *scope*'s service.
 
@@ -1988,8 +2003,8 @@ async def enqueue_removal(
 
     *document* is the composed document the promoted generation deploys, stated by the caller
     that already built it. A reissue composes its own, so *force* refuses it here rather than
-    dropping it silently. The same refusal applies to *apply_attempt_id*, *marking*, and
-    *promotes*.
+    dropping it silently. The same refusal applies to *apply_attempt_id*, *marking*,
+    *promotes* and *frozen_fragments*.
     """
     from nso_adapter.core.generation import (
         create_generation,
@@ -2014,6 +2029,7 @@ async def enqueue_removal(
             static_route_tombstone_ids,
             promotes,
             apply_attempt_id,
+            frozen_fragments,
         )
     store_only = STORE_ONLY.get()
     context: dict = {"scope": scope}
@@ -2093,6 +2109,7 @@ async def enqueue_removal(
             settlement_cohort=settlement_cohort,
             static_route_tombstone_ids=static_route_tombstone_ids,
             apply_attempt_id=apply_attempt_id,
+            frozen_fragments=frozen_fragments,
         )
     job = await create_dedicated_job(db, device_id, JobType.removal, context=context)
     await require_attach_to_job(db, generation, job)

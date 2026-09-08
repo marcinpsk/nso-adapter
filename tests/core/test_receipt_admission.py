@@ -131,7 +131,24 @@ def test_every_intent_stream_promotes_a_real_projection_family():
     known = projection_sections()
     for path, endpoint in INTENT_PUT_ENDPOINTS.items():
         assert endpoint.promotes in known, f"{path} promotes unknown projection section {endpoint.promotes!r}"
-    assert projection_streams() == {endpoint.stream for endpoint in INTENT_PUT_ENDPOINTS.values()}
+    assert projection_streams() == {endpoint.stream for endpoint in INTENT_PUT_ENDPOINTS.values()} | {
+        "switchport",
+        "lag",
+    }
+
+
+def test_the_out_of_protocol_apply_posts_name_live_routes():
+    """The route path is the source, so the derived stream set cannot drift from it."""
+    from nso_adapter.core.intent_protocol import OUT_OF_PROTOCOL_APPLY_POSTS, OUT_OF_PROTOCOL_STREAMS
+    from nso_adapter.main import create_app
+
+    live = {route.path for route in iter_route_contexts(create_app().routes) if "POST" in (route.methods or ())}
+    assert set(OUT_OF_PROTOCOL_APPLY_POSTS) <= live, "an Apply POST entry names a route that no longer exists"
+    assert OUT_OF_PROTOCOL_APPLY_POSTS == {
+        "/api/v1/devices/{device_id}/lag-config/apply": "lag",
+        "/api/v1/devices/{device_id}/switchport/apply": "switchport",
+    }
+    assert OUT_OF_PROTOCOL_STREAMS == frozenset(OUT_OF_PROTOCOL_APPLY_POSTS.values())
 
 
 def test_every_in_protocol_put_injects_the_delivery_dependency():

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from time import perf_counter
 
 import pytest
 from sqlalchemy import text
@@ -123,7 +124,8 @@ _APPLY_BODY = {
                 {"interface_name": "GigabitEthernet0/2", "mode": "active"},
             ],
         }
-    ]
+    ],
+    "deleted_roots": [],
 }
 
 
@@ -133,7 +135,15 @@ async def test_apply_lag_config_stores_full_snapshot(adapter_client):
     resp = await adapter_client.post(f"/api/v1/devices/{device_id}/lag-config/apply", json=_APPLY_BODY, headers=AUTH)
 
     assert resp.status_code == 200
-    assert resp.json() == {"status": "stored", "device_id": device_id, "count": 1, "removed": 0}
+    assert resp.json() == {
+        "status": "prepared",
+        "device_id": device_id,
+        "stream": "lag",
+        "count": 1,
+        "removed": 0,
+        "desired_revision": 1,
+        "selection_revision": 1,
+    }
 
     async with session() as db:
         bundle = (
@@ -174,7 +184,8 @@ async def test_apply_lag_config_stores_full_snapshot(adapter_client):
         ("GigabitEthernet0/1", "active", 200),
         ("GigabitEthernet0/2", "active", None),
     ]
-    assert tuple(side_effect_counts) == (0, 0, 0, 0)
+    # One projection revision and its counter; still no receipt and no device job.
+    assert tuple(side_effect_counts) == (1, 1, 0, 0)
 
 
 @pytest.mark.anyio
@@ -184,21 +195,24 @@ async def test_apply_lag_config_full_replace_reports_removed_roots(adapter_clien
         "bundles": [
             {"name": "Port-channel1", "lag_id": 6},
             {"name": "Port-channel2", "lag_id": 7},
-        ]
+        ],
+        "deleted_roots": [],
     }
     response = await adapter_client.post(
         f"/api/v1/devices/{device_id}/lag-config/apply",
         json=first,
         headers=AUTH,
     )
-    assert response.json() == {"status": "stored", "device_id": device_id, "count": 2, "removed": 0}
+    assert response.json()["count"] == 2
+    assert response.json()["removed"] == 0
 
     response = await adapter_client.post(
         f"/api/v1/devices/{device_id}/lag-config/apply",
-        json={"bundles": [{"name": "Port-channel2", "lag_id": 7}]},
+        json={"bundles": [{"name": "Port-channel2", "lag_id": 7}], "deleted_roots": []},
         headers=AUTH,
     )
-    assert response.json() == {"status": "stored", "device_id": device_id, "count": 1, "removed": 1}
+    assert response.json()["count"] == 1
+    assert response.json()["removed"] == 1
 
     async with session() as db:
         names = (
@@ -232,7 +246,7 @@ async def test_apply_lag_config_requires_explicit_snapshot_without_mutating_stor
     device_id = await seed_device(nso_device_name="lag-required-snapshot", netbox_device_id=None)
     stored = await adapter_client.post(
         f"/api/v1/devices/{device_id}/lag-config/apply",
-        json={"bundles": [{"name": "Port-channel1", "lag_id": 1}]},
+        json={"bundles": [{"name": "Port-channel1", "lag_id": 1}], "deleted_roots": []},
         headers=AUTH,
     )
     assert stored.status_code == 200
@@ -292,7 +306,7 @@ async def test_apply_lag_config_rejects_invalid_graph_without_mutating_store(ada
     device_id = await seed_device(nso_device_name="lag-invalid-request", netbox_device_id=None)
     response = await adapter_client.post(
         f"/api/v1/devices/{device_id}/lag-config/apply",
-        json={"bundles": bundles},
+        json={"bundles": bundles, "deleted_roots": []},
         headers=AUTH,
     )
 
@@ -313,12 +327,12 @@ async def test_apply_lag_config_treats_empty_timer_and_system_id_as_unset(adapte
 
     from sqlalchemy import update
 
-    from nso_adapter.core.generation import lock_device_document
-    from nso_adapter.core.switching_intent import render_switching_sections
+    from nso_adapter.core.projection import hydrate_section, snapshot_stream
+    from nso_adapter.core.switching_intent import encode_lag_section
     from nso_adapter.store.models import LagBundleIntent
 
     device_id = await seed_device(nso_device_name="lag-empty-strings", netbox_device_id=1215)
-    body = {"bundles": [{"name": "Port-channel1", "lag_id": 1}]}
+    body = {"bundles": [{"name": "Port-channel1", "lag_id": 1}], "deleted_roots": []}
     assert (
         await adapter_client.post(f"/api/v1/devices/{device_id}/lag-config/apply", json=body, headers=AUTH)
     ).status_code == 200
@@ -350,30 +364,247 @@ async def test_apply_lag_config_treats_empty_timer_and_system_id_as_unset(adapte
     assert (row.accepted_at, row.last_apply_at) == (evidence_at, evidence_at), "an unchanged row keeps its evidence"
 
     async with session() as db:
-        await lock_device_document(db, device_id)
-        rendered = await render_switching_sections(db, device_id)
+        document = {"lag": await snapshot_stream(db, device_id, "lag")}
         await db.rollback()
-    assert rendered["lag"]["bundle"] == [{"name": "Port-channel1", "lag-id": 1}], "the unset leaves are omitted"
+    context = {"ned_id": "cisco-ios-cli-6.95", "dialect": "identity"}
+    assert encode_lag_section(hydrate_section(document, "lag"), context) == {
+        "bundle": [{"name": "Port-channel1", "lag-id": 1}]
+    }, "the unset leaves are omitted"
+
+
+# ── #1612: the POST prepares, Apply authorizes ────────────────────────────────
+
+_PREPARE_A = {"bundles": [{"name": "Port-channel1", "lag_id": 1}], "deleted_roots": []}
+_PREPARE_B = {"bundles": [{"name": "Port-channel2", "lag_id": 2}], "deleted_roots": []}
+
+
+async def _post_lag(client, device_id: int, body: dict, *, query: str = ""):
+    return await client.post(f"/api/v1/devices/{device_id}/lag-config/apply{query}", json=body, headers=AUTH)
+
+
+async def _stream_row(device_id: int, stream: str = "lag"):
+    from sqlalchemy import select
+
+    from nso_adapter.store.models import DeviceProjectionStream
+
+    async with session() as db:
+        return await db.scalar(
+            select(DeviceProjectionStream).where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == stream,
+            )
+        )
 
 
 @pytest.mark.anyio
-async def test_apply_lag_rejects_duplicate_ids_without_mutation(adapter_client):
-    device_id = await seed_device(nso_device_name="lag-api-duplicate-id", netbox_device_id=None)
-    response = await adapter_client.post(
-        f"/api/v1/devices/{device_id}/lag-config/apply",
-        json={"bundles": [{"name": "Port-channel1", "lag_id": 7}, {"name": "Port-channel2", "lag_id": 7}]},
-        headers=AUTH,
-    )
-    assert response.status_code == 422
+async def test_apply_lag_config_prepares_a_selectable_snapshot(adapter_client):
+    device_id = await seed_device(nso_device_name="lag-prepared", netbox_device_id=1620)
+
+    response = await _post_lag(adapter_client, device_id, _PREPARE_A)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "status": "prepared",
+        "device_id": device_id,
+        "stream": "lag",
+        "count": 1,
+        "removed": 0,
+        "desired_revision": 1,
+        "selection_revision": 1,
+    }
+    row = await _stream_row(device_id)
+    assert (row.desired_revision, row.authorized_revision, row.applied_revision) == (1, 0, 0)
+    assert row.source_push_seq is None
+    assert row.authorized_document is None
+    assert row.prepared_revision == 1
+    assert set(row.prepared_tables) == {"lag_bundle_intent", "lag_member_intent"}
+    assert "_execution" not in row.prepared_tables, "the slot holds tables only; freezing happens at Apply"
+    assert [bundle["name"] for bundle in row.prepared_tables["lag_bundle_intent"]] == ["Port-channel1"]
+    assert row.prepared_deletions == {"delete_origin": {}, "detach": {}, "owned_content": {}}
+
     async with session() as db:
-        assert await db.scalar(text("SELECT count(*) FROM lag_bundle_intent")) == 0
+        counts = (
+            await db.execute(
+                text(
+                    "SELECT "
+                    "(SELECT count(*) FROM intent_push_receipt WHERE device_id = :device_id) AS receipts, "
+                    "(SELECT count(*) FROM jobs WHERE device_id = :device_id) AS jobs, "
+                    "(SELECT count(*) FROM deployment_generation WHERE device_id = :device_id) AS generations"
+                ),
+                {"device_id": device_id},
+            )
+        ).one()
+    assert tuple(counts) == (0, 0, 0)
+
+
+@pytest.mark.anyio
+async def test_apply_lag_config_store_only_bumps_the_revision_and_preserves_the_slot(adapter_client):
+    device_id = await seed_device(nso_device_name="lag-store-only", netbox_device_id=1621)
+    prepared = await _post_lag(adapter_client, device_id, _PREPARE_A)
+    assert prepared.json()["selection_revision"] == 1
+
+    response = await _post_lag(adapter_client, device_id, _PREPARE_B, query="?store_only=true")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "status": "stored",
+        "device_id": device_id,
+        "stream": "lag",
+        "count": 1,
+        "removed": 1,
+        "desired_revision": 2,
+        "selection_revision": None,
+    }
+    row = await _stream_row(device_id)
+    assert row.desired_revision == 2
+    assert row.prepared_revision == 1, "a store-only replacement never replaces the prepared slot"
+    assert [bundle["name"] for bundle in row.prepared_tables["lag_bundle_intent"]] == ["Port-channel1"]
+    async with session() as db:
+        live = (
+            (
+                await db.execute(
+                    text("SELECT name FROM lag_bundle_intent WHERE device_id = :device_id"),
+                    {"device_id": device_id},
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert live == ["Port-channel2"], "the live rows are the store-only replacement"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("query", ["?delete_origin=true", "?backfill_only=true"])
+async def test_apply_lag_config_refuses_the_request_modes_it_does_not_implement(adapter_client, query):
+    device_id = await seed_device(nso_device_name=f"lag-mode{query[1:9]}", netbox_device_id=None)
+
+    response = await _post_lag(adapter_client, device_id, _PREPARE_A, query=query)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    assert await _stream_row(device_id) is None
+    async with session() as db:
+        assert (
+            await db.scalar(
+                text("SELECT count(*) FROM lag_bundle_intent WHERE device_id = :device_id"),
+                {"device_id": device_id},
+            )
+            == 0
+        )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("deleted_roots", "reason"),
+    [
+        pytest.param(["Port-channel2", "Port-channel2"], "repeats", id="duplicate"),
+        pytest.param(["Port-channel1"], "still present", id="still-present"),
+        pytest.param(["Port-channel9"], "not authorized", id="unauthorized"),
+    ],
+)
+async def test_apply_lag_config_refuses_an_invalid_deletion_authority(adapter_client, deleted_roots, reason):
+    device_id = await seed_device(nso_device_name=f"lag-roots-{reason.split()[0]}", netbox_device_id=None)
+    assert (await _post_lag(adapter_client, device_id, _PREPARE_A)).status_code == 200
+
+    response = await _post_lag(
+        adapter_client,
+        device_id,
+        {"bundles": _PREPARE_A["bundles"], "deleted_roots": deleted_roots},
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "validation_error"
+    assert reason in response.json()["error"]["message"]
+    row = await _stream_row(device_id)
+    assert (row.desired_revision, row.prepared_revision) == (1, 1), "a refusal leaves every revision untouched"
+
+
+@pytest.mark.anyio
+async def test_apply_lag_config_store_only_accepts_a_deletion_authority_and_records_none(adapter_client):
+    """A store-only replacement replaces the rows and the revision, and prepares nothing."""
+    from sqlalchemy import update
+
+    from nso_adapter.store.models import DeviceProjectionStream
+
+    device_id = await seed_device(nso_device_name="lag-store-only-roots", netbox_device_id=None)
+    prepared = await _post_lag(adapter_client, device_id, _PREPARE_A)
+    assert prepared.status_code == 200, prepared.text
+    async with session() as db:
+        # The state an Apply promotion leaves behind, so Port-channel1 is AUTHORIZED.
+        authorized = (await _stream_row(device_id)).prepared_tables
+        await db.execute(
+            update(DeviceProjectionStream)
+            .where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == "lag",
+            )
+            .values(authorized_document=authorized, authorized_revision=1)
+        )
+        await db.commit()
+
+    response = await _post_lag(
+        adapter_client,
+        device_id,
+        {"bundles": [], "deleted_roots": ["Port-channel1"]},
+        query="?store_only=true",
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "status": "stored",
+        "device_id": device_id,
+        "stream": "lag",
+        "count": 0,
+        "removed": 1,
+        "desired_revision": 2,
+        "selection_revision": None,
+    }
+    row = await _stream_row(device_id)
+    assert (row.desired_revision, row.authorized_revision, row.prepared_revision) == (2, 1, 1)
+    assert row.authorized_document == authorized, "a store-only replacement authorizes nothing"
+    assert row.prepared_deletions == {"delete_origin": {}, "detach": {}, "owned_content": {}}
+    async with session() as db:
+        assert (
+            await db.scalar(
+                text("SELECT count(*) FROM lag_bundle_intent WHERE device_id = :device_id"),
+                {"device_id": device_id},
+            )
+            == 0
+        )
+
+
+@pytest.mark.anyio
+async def test_apply_lag_config_store_only_still_validates_the_deletion_authority(adapter_client):
+    device_id = await seed_device(nso_device_name="lag-store-only-invalid-roots", netbox_device_id=None)
+
+    response = await _post_lag(
+        adapter_client,
+        device_id,
+        {"bundles": [], "deleted_roots": ["Port-channel1"]},
+        query="?store_only=true",
+    )
+
+    assert response.status_code == 422
+    assert "not authorized" in response.json()["error"]["message"]
+    assert await _stream_row(device_id) is None
+
+
+@pytest.mark.anyio
+async def test_apply_lag_config_requires_an_explicit_deletion_authority(adapter_client):
+    device_id = await seed_device(nso_device_name="lag-roots-required", netbox_device_id=None)
+
+    response = await _post_lag(adapter_client, device_id, {"bundles": []})
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    assert await _stream_row(device_id) is None
 
 
 @pytest.mark.anyio
 async def test_apply_lag_accepts_the_lacp_vocabulary_the_export_emits(adapter_client):
     """A GET body must replay into apply: the export serves the raw NED string, not a fixed set."""
-    from nso_adapter.core.generation import lock_device_document
-    from nso_adapter.core.switching_intent import render_switching_sections
+    from nso_adapter.core.projection import hydrate_section
+    from nso_adapter.core.switching_intent import encode_lag_section
 
     device_id = await seed_device(nso_device_name="lag-export-vocabulary", netbox_device_id=None)
     body = {
@@ -393,11 +624,14 @@ async def test_apply_lag_accepts_the_lacp_vocabulary_the_export_emits(adapter_cl
                     {"interface_name": "GigabitEthernet0/2", "mode": "desirable"},
                 ],
             },
-        ]
+        ],
+        "deleted_roots": [],
     }
-    response = await adapter_client.post(f"/api/v1/devices/{device_id}/lag-config/apply", json=body, headers=AUTH)
-    assert response.status_code == 200, response.text
 
+    response = await _post_lag(adapter_client, device_id, body)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "prepared"
     async with session() as db:
         stored = (
             await db.execute(
@@ -415,24 +649,183 @@ async def test_apply_lag_accepts_the_lacp_vocabulary_the_export_emits(adapter_cl
         ("slow", "TenGigE0/0/0/0", "inherit"),
     ]
 
-    async with session() as db:
-        await lock_device_document(db, device_id)
-        rendered = await render_switching_sections(db, device_id)
-        await db.rollback()
-    assert rendered["lag"]["bundle"] == [
+    context = {"ned_id": "cisco-ios-cli-6.95", "dialect": "identity"}
+    document = {"lag": (await _stream_row(device_id)).prepared_tables}
+    assert encode_lag_section(hydrate_section(document, "lag"), context) == {
+        "bundle": [
+            {
+                "name": "Bundle-Ether2",
+                "lag-id": 2,
+                "timer": "slow",
+                "member": [{"interface-name": "TenGigE0/0/0/0", "mode": "inherit"}],
+            },
+            {
+                "name": "Port-channel1",
+                "lag-id": 1,
+                "timer": "fast",
+                "member": [
+                    {"interface-name": "GigabitEthernet0/1", "mode": "auto"},
+                    {"interface-name": "GigabitEthernet0/2", "mode": "desirable"},
+                ],
+            },
+        ]
+    }
+
+
+@pytest.mark.anyio
+async def test_apply_lag_accepts_an_lacp_leaf_at_the_column_width(adapter_client):
+    """The request bound equals the store column width, so the longest accepted value fits."""
+    from nso_adapter.core.projection import hydrate_section
+    from nso_adapter.core.switching_intent import encode_lag_section
+
+    device_id = await seed_device(nso_device_name="lag-leaf-width", netbox_device_id=None)
+    mode, timer = "m" * 16, "t" * 8
+
+    response = await _post_lag(
+        adapter_client,
+        device_id,
         {
-            "name": "Bundle-Ether2",
-            "lag-id": 2,
-            "timer": "slow",
-            "member": [{"interface-name": "TenGigE0/0/0/0", "mode": "inherit"}],
-        },
-        {
-            "name": "Port-channel1",
-            "lag-id": 1,
-            "timer": "fast",
-            "member": [
-                {"interface-name": "GigabitEthernet0/1", "mode": "auto"},
-                {"interface-name": "GigabitEthernet0/2", "mode": "desirable"},
+            "bundles": [
+                {
+                    "name": "Port-channel1",
+                    "lag_id": 1,
+                    "timer": timer,
+                    "members": [{"interface_name": "Gi0/1", "mode": mode}],
+                }
             ],
+            "deleted_roots": [],
         },
-    ]
+    )
+
+    assert response.status_code == 200, response.text
+    async with session() as db:
+        stored = (
+            await db.execute(
+                text(
+                    "SELECT b.timer, m.mode FROM lag_bundle_intent b "
+                    "JOIN lag_member_intent m ON m.lag_bundle_id = b.id "
+                    "WHERE b.device_id = :device_id"
+                ),
+                {"device_id": device_id},
+            )
+        ).one()
+    assert tuple(stored) == (timer, mode)
+
+    context = {"ned_id": "cisco-ios-cli-6.95", "dialect": "identity"}
+    document = {"lag": (await _stream_row(device_id)).prepared_tables}
+    assert encode_lag_section(hydrate_section(document, "lag"), context) == {
+        "bundle": [
+            {
+                "name": "Port-channel1",
+                "lag-id": 1,
+                "timer": timer,
+                "member": [{"interface-name": "Gi0/1", "mode": mode}],
+            }
+        ]
+    }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("leaf", "value"), [("mode", "m" * 17), ("timer", "t" * 9)])
+async def test_apply_lag_rejects_an_lacp_leaf_past_the_column_width(adapter_client, leaf, value):
+    device_id = await seed_device(nso_device_name=f"lag-leaf-overflow-{leaf}", netbox_device_id=None)
+    bundle = {"name": "Port-channel1", "lag_id": 1}
+    if leaf == "mode":
+        bundle["members"] = [{"interface_name": "Gi0/1", "mode": value}]
+    else:
+        bundle["timer"] = value
+
+    response = await _post_lag(adapter_client, device_id, {"bundles": [bundle], "deleted_roots": []})
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    assert await _stream_row(device_id) is None
+    async with session() as db:
+        assert await db.scalar(text("SELECT count(*) FROM lag_bundle_intent")) == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["", None])
+async def test_apply_lag_treats_an_empty_member_mode_as_unset(adapter_client, mode):
+    from nso_adapter.core.projection import hydrate_section
+    from nso_adapter.core.switching_intent import encode_lag_section
+
+    device_id = await seed_device(nso_device_name="lag-unset-mode", netbox_device_id=None)
+    response = await _post_lag(
+        adapter_client,
+        device_id,
+        {
+            "bundles": [
+                {
+                    "name": "Port-channel1",
+                    "lag_id": 1,
+                    "members": [{"interface_name": "Gi0/1", "mode": mode}],
+                }
+            ],
+            "deleted_roots": [],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "prepared"
+    async with session() as db:
+        assert (
+            await db.scalar(
+                text(
+                    "SELECT m.mode FROM lag_bundle_intent b JOIN lag_member_intent m ON m.lag_bundle_id = b.id "
+                    "WHERE b.device_id = :device_id"
+                ),
+                {"device_id": device_id},
+            )
+        ) is None
+    context = {"ned_id": "cisco-ios-cli-6.95", "dialect": "identity"}
+    document = {"lag": (await _stream_row(device_id)).prepared_tables}
+    assert encode_lag_section(hydrate_section(document, "lag"), context) == {
+        "bundle": [{"name": "Port-channel1", "lag-id": 1, "member": [{"interface-name": "Gi0/1"}]}]
+    }
+
+
+@pytest.mark.anyio
+async def test_apply_lag_rejects_duplicate_ids_without_mutation(adapter_client):
+    device_id = await seed_device(nso_device_name="lag-api-duplicate-id", netbox_device_id=None)
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/lag-config/apply",
+        json={
+            "bundles": [{"name": "Port-channel1", "lag_id": 7}, {"name": "Port-channel2", "lag_id": 7}],
+            "deleted_roots": [],
+        },
+        headers=AUTH,
+    )
+    assert response.status_code == 422
+    assert await _stream_row(device_id) is None
+    async with session() as db:
+        assert await db.scalar(text("SELECT count(*) FROM lag_bundle_intent")) == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("route", "field"), [("lag-config", "bundles"), ("switchport", "interfaces")])
+async def test_switching_apply_refuses_many_duplicate_roots_promptly(adapter_client, route, field):
+    device_id = await seed_device(nso_device_name="switching-large-deletion-list", netbox_device_id=None)
+    body = {field: [], "deleted_roots": ["root-z", "root-a"] * 39_999 + ["root-z", "root-once"]}
+
+    started = perf_counter()
+    response = await adapter_client.post(f"/api/v1/devices/{device_id}/{route}/apply", json=body, headers=AUTH)
+    elapsed = perf_counter() - started
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["message"] == "deleted_roots repeats a root: ['root-a', 'root-z']"
+    assert elapsed < 5.0, f"80,000 deletion entries took {elapsed:.3f}s; expected less than 5s"
+    async with session() as db:
+        counts = (
+            await db.execute(
+                text(
+                    "SELECT "
+                    "(SELECT count(*) FROM lag_bundle_intent) AS bundles, "
+                    "(SELECT count(*) FROM switchport_intent) AS interfaces, "
+                    "(SELECT count(*) FROM device_projection_stream) AS streams, "
+                    "(SELECT count(*) FROM device_generation_counter) AS counters, "
+                    "(SELECT count(*) FROM jobs) AS jobs"
+                )
+            )
+        ).one()
+    assert tuple(counts) == (0, 0, 0, 0, 0)

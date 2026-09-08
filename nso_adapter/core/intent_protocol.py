@@ -76,7 +76,20 @@ OUT_OF_PROTOCOL_PUTS: frozenset[str] = frozenset(
     }
 )
 
-#: Every stream receipt admission accepts.
+#: Apply-POST route path -> the projection stream it prepares (#1612). These two families
+#: are stored by a POST that carries no claim, so they have no receipt lane and no replay:
+#: the POST prepares a snapshot and the manual Apply authorizes it. The route path is THE
+#: source, and the stream set below is derived from it, so the two cannot drift apart.
+OUT_OF_PROTOCOL_APPLY_POSTS: dict[str, str] = {
+    "/api/v1/devices/{device_id}/lag-config/apply": "lag",
+    "/api/v1/devices/{device_id}/switchport/apply": "switchport",
+}
+
+#: The two projection streams no intent PUT delivers to.
+OUT_OF_PROTOCOL_STREAMS: frozenset[str] = frozenset(OUT_OF_PROTOCOL_APPLY_POSTS.values())
+
+#: Every stream receipt admission accepts. Sixteen: the two out-of-protocol streams are
+#: deliberately absent, so ``admit_push`` can never admit them.
 INTENT_STREAMS: frozenset[str] = frozenset(endpoint.stream for endpoint in INTENT_PUT_ENDPOINTS.values())
 
 
@@ -95,7 +108,9 @@ def intent_endpoint(route_path: str) -> IntentEndpoint:
 __all__ = [
     "INTENT_PUT_ENDPOINTS",
     "INTENT_STREAMS",
+    "OUT_OF_PROTOCOL_APPLY_POSTS",
     "OUT_OF_PROTOCOL_PUTS",
+    "OUT_OF_PROTOCOL_STREAMS",
     "IntentEndpoint",
     "intent_endpoint",
 ]
