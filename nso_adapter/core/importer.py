@@ -711,6 +711,7 @@ async def _resolve_ned_id(db: AsyncSession, device: Device, client: NsoClient) -
             # so the classification travels and the exception's own text never does.
             logger.warning(
                 "importer.ned_id.read_failed",
+                nso_instance=device.nso_instance,
                 device=device.nso_device_name,
                 kept=device.ned_id,
                 read_operation="ned_id_get",

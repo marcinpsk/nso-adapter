@@ -2202,9 +2202,55 @@ async def test_ned_id_read_failure_record_names_the_read_and_not_what_the_server
     assert record == {
         "event": "importer.ned_id.read_failed",
         "log_level": "warning",
+        "nso_instance": "nso-dev",
         "device": "sw-nedreason",
         "kept": "cisco-ios-cli-6.95",
         "read_operation": "ned_id_get",
         "error_type": "HTTPStatusError",
         "http_status": 503,
     }
+
+
+async def test_ned_id_read_failure_records_stay_distinct_across_nso_instances(db_session: AsyncSession):
+    """A device name is unique only WITHIN an NSO instance, so the record must name the instance.
+
+    Two instances routinely carry the same device name. Without the instance the two 503s
+    log byte-identical records, and an operator cannot tell which instance to go and look at.
+
+    Drives the real ``_resolve_ned_id`` over ``httpx.MockTransport`` for both instances.
+    """
+    import httpx
+    from structlog.testing import capture_logs
+
+    from nso_adapter.config import NsoInstanceConfig
+    from nso_adapter.core.importer import _resolve_ned_id
+
+    records = []
+    for instance_name in ("nso-east", "nso-west"):
+        device = Device(
+            nso_instance=instance_name,
+            nso_device_name="sw-twins",
+            ned_id="cisco-ios-cli-6.95",
+            netbox_device_id=None,
+        )
+        db_session.add(device)
+        await db_session.commit()
+
+        transport = httpx.MockTransport(lambda request: httpx.Response(503))
+        instance = NsoInstanceConfig(
+            name=instance_name,
+            base_url=f"http://placeholder-{instance_name}.internal:8080",
+            username_ref="NSO_USERNAME",
+            password_ref="NSO_PASSWORD",
+        )
+        client = NsoClient(instance, "admin", "admin")
+        client._client = lambda timeout=None, t=transport, i=instance: httpx.AsyncClient(
+            transport=t, base_url=i.base_url
+        )
+
+        with capture_logs() as logs:
+            await _resolve_ned_id(db_session, device, client)
+        records.append(next(r for r in logs if r["event"] == "importer.ned_id.read_failed"))
+
+    assert records[0] != records[1], "two instances' failures collapsed into one record"
+    assert [r["nso_instance"] for r in records] == ["nso-east", "nso-west"]
