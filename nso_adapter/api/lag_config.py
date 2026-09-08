@@ -226,7 +226,8 @@ async def apply_lag_config(
         refused = api_error(404, "not_found", "Device not found")
     except SwitchingRequestRefused as exc:
         await db.rollback()
-        refused = api_error(422, "validation_error", str(exc))
+        # Authored per reason: the answer names the refusal, never the roots the caller sent.
+        refused = api_error(422, "validation_error", exc.public_message, {"reason": exc.reason.value})
     if refused is not None:
         raise refused
     await db.commit()
