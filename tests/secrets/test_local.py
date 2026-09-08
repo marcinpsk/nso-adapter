@@ -3,8 +3,9 @@
 
 import pytest
 
-from nso_adapter.secrets.base import SecretsProvider
+from nso_adapter.secrets.base import SecretResolutionError, SecretsProvider, resolve_secret
 from nso_adapter.secrets.local import LocalSecretsProvider
+from tests._secret_discipline import assert_chain_free_of
 
 
 def test_local_provider_from_env(monkeypatch):
@@ -29,10 +30,31 @@ def test_local_provider_from_file(tmp_path, monkeypatch):
     assert p.get("MY_TOKEN") == "mytoken"
 
 
-def test_local_provider_missing_raises():
+def test_local_provider_missing_refuses_without_the_reference():
+    """The protocol's refusal: a KeyError quoting the reference met neither half of it.
+
+    ``resolve_secret`` masked it for CONFIGURED lookups, so a direct caller got a KeyError
+    it could not catch as SecretResolutionError, carrying the reference it did not need.
+    """
     p = LocalSecretsProvider()
-    with pytest.raises(KeyError, match="NONEXISTENT_KEY_XYZ"):
-        p.get("NONEXISTENT_KEY_XYZ")
+
+    with pytest.raises(SecretResolutionError) as caught:
+        p.get("PLACEHOLDER_MISSING_REF")
+
+    assert caught.value.reason == "the referenced environment variable is not set"
+    assert caught.value.slot is None, "only the caller knows the configuration slot"
+    assert "PLACEHOLDER_MISSING_REF" not in str(caught.value)
+    assert_chain_free_of(caught.value, ["PLACEHOLDER_MISSING_REF"])
+
+
+def test_resolve_secret_stamps_the_slot_on_the_local_refusal():
+    """The provider classifies, the caller addresses: the slot is the caller's to add."""
+    with pytest.raises(SecretResolutionError) as caught:
+        resolve_secret(LocalSecretsProvider(), "PLACEHOLDER_MISSING_REF", slot="netbox.api_token_ref")
+
+    assert str(caught.value) == "netbox.api_token_ref: the referenced environment variable is not set"
+    assert "PLACEHOLDER_MISSING_REF" not in str(caught.value)
+    assert_chain_free_of(caught.value, ["PLACEHOLDER_MISSING_REF"])
 
 
 def test_local_provider_satisfies_protocol():

@@ -170,6 +170,28 @@ def test_get_reauthenticates_on_forbidden(fake_hvac):
     assert kv.read_paths == ["credentials/svc", "credentials/svc"]
 
 
+def test_the_reauthentication_warning_reaches_the_structlog_pipeline(fake_hvac):
+    """The module logged through stdlib logging, so the app's structlog sink never saw it.
+
+    ``nso_adapter.main.lifespan`` configures structlog, and the 403 re-auth is the one
+    operational event this provider reports; it must land in the same stream as the rest.
+    """
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
+    _state, store, kv = fake_hvac
+    store["credentials/svc"] = {"netbox_token": "placeholder-vault-value"}
+    kv.forbid_once.add("credentials/svc")  # first read 403s, retry succeeds
+
+    with capture_logs() as logs:
+        assert _provider().get("credentials/svc#netbox_token") == "placeholder-vault-value"
+
+    reauth = [record for record in logs if record["event"] == "vault.reauthenticating"]
+    assert reauth == [{"event": "vault.reauthenticating", "cause": "forbidden", "log_level": "warning"}]
+    assert_records_free_of(logs, ["credentials/svc", "netbox_token", "placeholder-vault-value"])
+
+
 def test_namespace_forwarded_to_client(fake_hvac):
     state, store, _ = fake_hvac
     store["credentials/svc"] = {"netbox_token": "s3cr3t"}

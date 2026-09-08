@@ -7,14 +7,14 @@ the configured mount (e.g. ``credentials/svc-netbox-nso#netbox_token``).
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import hvac
+import structlog
 
 from nso_adapter.secrets.base import SecretResolutionError
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class VaultSecretsProvider:
@@ -63,7 +63,7 @@ class VaultSecretsProvider:
         client.token = resp["auth"]["client_token"]
         self._client = client
         self._cache.clear()
-        logger.info("Vault AppRole login succeeded")
+        logger.info("vault.approle_login")
 
     def _fetch_path(self, path: str) -> dict[str, str]:
         assert self._client is not None
@@ -107,7 +107,7 @@ class VaultSecretsProvider:
             try:
                 data = self._fetch_path(path)
             except hvac.exceptions.Forbidden:
-                logger.warning("Vault token expired, re-authenticating")
+                logger.warning("vault.reauthenticating", cause="forbidden")
                 self._authenticate()
                 data = self._fetch_path(path)
         except Exception as exc:  # noqa: BLE001 — every Vault failure is one classified refusal
@@ -133,7 +133,7 @@ class VaultSecretsProvider:
         try:
             return operation()
         except hvac.exceptions.Forbidden:
-            logger.warning("Vault token expired, re-authenticating")
+            logger.warning("vault.reauthenticating", cause="forbidden")
             self._authenticate()
             return operation()
 
