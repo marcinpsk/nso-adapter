@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import text
 
 from tests.conftest import VALID_TOKEN, push_seq, seed_device, seed_switchport, seed_vlan_database, session
 
@@ -67,34 +68,183 @@ async def test_vlan_database_requires_auth(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_apply_switchport_builds_payload(adapter_client):
-    from unittest.mock import AsyncMock, patch
-
+async def test_apply_switchport_stores_full_snapshot(adapter_client):
     device_id = await seed_device(nso_device_name="sw-apply", netbox_device_id=1210)
-    nso_write = AsyncMock()
     body = {
         "interfaces": [
             {"interface_name": "Gi0/1", "mode": "access", "untagged_vlan": 10, "tagged_vlans": []},
             {"interface_name": "Gi0/2", "mode": "trunk", "untagged_vlan": 99, "tagged_vlans": [20, 30]},
         ]
     }
-    with (
-        patch("nso_adapter.api.vlan.get_nso_client", return_value=AsyncMock()),
-        patch("nso_adapter.core.switchport_intent._nso_apply_switchport_config", nso_write),
-    ):
-        resp = await adapter_client.post(f"/api/v1/devices/{device_id}/switchport/apply", json=body, headers=AUTH)
+    resp = await adapter_client.post(f"/api/v1/devices/{device_id}/switchport/apply", json=body, headers=AUTH)
+
     assert resp.status_code == 200
-    assert resp.json()["status"] == "deployed"
-    _c, dev_name, ifaces = nso_write.await_args.args
-    assert dev_name == "sw-apply"
-    by = {i["interface-name"]: i for i in ifaces}
-    assert by["Gi0/2"]["tagged-vlan"] == [20, 30]
+    assert resp.json() == {"status": "stored", "device_id": device_id, "count": 2, "removed": 0}
+
+    async with session() as db:
+        interfaces = (
+            await db.execute(
+                text(
+                    "SELECT id, interface_name, mode, untagged_vlan FROM switchport_intent "
+                    "WHERE device_id = :device_id ORDER BY interface_name"
+                ),
+                {"device_id": device_id},
+            )
+        ).all()
+        tagged_vlans = (
+            await db.execute(
+                text(
+                    "SELECT s.interface_name, t.vlan_id FROM switchport_tagged_vlan_intent t "
+                    "JOIN switchport_intent s ON s.id = t.switchport_id "
+                    "WHERE s.device_id = :device_id ORDER BY s.interface_name, t.vlan_id"
+                ),
+                {"device_id": device_id},
+            )
+        ).all()
+        side_effect_counts = (
+            await db.execute(
+                text(
+                    "SELECT "
+                    "(SELECT count(*) FROM device_projection_stream WHERE device_id = :device_id) AS streams, "
+                    "(SELECT count(*) FROM device_generation_counter WHERE device_id = :device_id) AS counters, "
+                    "(SELECT count(*) FROM intent_push_receipt WHERE device_id = :device_id) AS receipts, "
+                    "(SELECT count(*) FROM jobs WHERE device_id = :device_id) AS jobs"
+                ),
+                {"device_id": device_id},
+            )
+        ).one()
+
+    assert [(row.interface_name, row.mode, row.untagged_vlan) for row in interfaces] == [
+        ("Gi0/1", "access", 10),
+        ("Gi0/2", "trunk", 99),
+    ]
+    assert [tuple(row) for row in tagged_vlans] == [("Gi0/2", 20), ("Gi0/2", 30)]
+    assert tuple(side_effect_counts) == (0, 0, 0, 0)
 
 
 @pytest.mark.anyio
 async def test_apply_switchport_device_not_found(adapter_client):
     resp = await adapter_client.post("/api/v1/devices/999999/switchport/apply", json={"interfaces": []}, headers=AUTH)
     assert resp.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_apply_switchport_requires_explicit_snapshot_without_mutating_store(adapter_client):
+    device_id = await seed_device(nso_device_name="switchport-required-snapshot", netbox_device_id=None)
+    stored = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/switchport/apply",
+        json={"interfaces": [{"interface_name": "Gi0/1", "untagged_vlan": 10}]},
+        headers=AUTH,
+    )
+    assert stored.status_code == 200
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/switchport/apply",
+        json={},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    async with session() as db:
+        names = (
+            (
+                await db.execute(
+                    text("SELECT interface_name FROM switchport_intent WHERE device_id = :device_id"),
+                    {"device_id": device_id},
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert names == ["Gi0/1"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "interfaces",
+    [
+        [{"interface_name": "Gi0/1", "untagged_vlan": True}],
+        [{"interface_name": "Gi0/1", "untagged_vlan": "10"}],
+        [{"interface_name": "Gi0/1", "tagged_vlans": [65536]}],
+        [
+            {"interface_name": "Gi0/1"},
+            {"interface_name": "Gi0/1"},
+        ],
+        [{"interface_name": "Gi0/1", "tagged_vlans": [10, 10]}],
+        # mode is a closed vocabulary: access, trunk, or the empty string for unset.
+        [{"interface_name": "Gi0/1", "mode": "foo"}],
+        [{"interface_name": "Gi0/1", "mode": "ACCESS"}],
+    ],
+)
+async def test_apply_switchport_rejects_invalid_graph_without_mutating_store(adapter_client, interfaces):
+    device_id = await seed_device(nso_device_name="switchport-invalid-request", netbox_device_id=None)
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/switchport/apply",
+        json={"interfaces": interfaces},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    async with session() as db:
+        count = await db.scalar(
+            text("SELECT count(*) FROM switchport_intent WHERE device_id = :device_id"),
+            {"device_id": device_id},
+        )
+    assert count == 0
+
+
+@pytest.mark.anyio
+async def test_apply_switchport_full_replace_reports_removed_roots(adapter_client):
+    device_id = await seed_device(nso_device_name="switchport-full-replace", netbox_device_id=1211)
+    first = {
+        "interfaces": [
+            {"interface_name": "Gi0/1", "untagged_vlan": 10},
+            {"interface_name": "Gi0/2", "tagged_vlans": [20, 30]},
+        ]
+    }
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/switchport/apply",
+        json=first,
+        headers=AUTH,
+    )
+    assert response.json() == {"status": "stored", "device_id": device_id, "count": 2, "removed": 0}
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/switchport/apply",
+        json={"interfaces": [{"interface_name": "Gi0/2", "tagged_vlans": [30]}]},
+        headers=AUTH,
+    )
+    assert response.json() == {"status": "stored", "device_id": device_id, "count": 1, "removed": 1}
+
+    async with session() as db:
+        names = (
+            (
+                await db.execute(
+                    text("SELECT interface_name FROM switchport_intent WHERE device_id = :device_id"),
+                    {"device_id": device_id},
+                )
+            )
+            .scalars()
+            .all()
+        )
+        tags = (
+            (
+                await db.execute(
+                    text(
+                        "SELECT vlan_id FROM switchport_tagged_vlan_intent t "
+                        "JOIN switchport_intent s ON s.id = t.switchport_id "
+                        "WHERE s.device_id = :device_id"
+                    ),
+                    {"device_id": device_id},
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert names == ["Gi0/2"]
+    assert tags == [30]
 
 
 async def _count_vlan_intent(device_id: int) -> int:
@@ -129,3 +279,120 @@ async def test_put_vlan_intent_stores_and_full_replaces(adapter_client):
 async def test_put_vlan_intent_unknown_device_404(adapter_client):
     resp = await adapter_client.put("/api/v1/devices/999999/vlan-intent", json={"vlans": []}, headers=AUTH | push_seq())
     assert resp.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_apply_switchport_accepts_the_trunk_all_mode(adapter_client):
+    """`trunk-all` is live: the plugin sends it for NetBox `tagged-all`, and YANG names it."""
+    from nso_adapter.core.generation import lock_device_document
+    from nso_adapter.core.switching_intent import render_switching_sections
+
+    device_id = await seed_device(nso_device_name="switchport-trunk-all", netbox_device_id=1212)
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/switchport/apply",
+        json={"interfaces": [{"interface_name": "Gi0/1", "mode": "trunk-all", "tagged_vlans": []}]},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 200, response.text
+    async with session() as db:
+        stored = await db.scalar(
+            text("SELECT mode FROM switchport_intent WHERE device_id = :device_id"),
+            {"device_id": device_id},
+        )
+    assert stored == "trunk-all"
+
+    async with session() as db:
+        await lock_device_document(db, device_id)
+        rendered = await render_switching_sections(db, device_id)
+        await db.rollback()
+    assert rendered["switchport"]["interface"] == [{"interface-name": "Gi0/1", "mode": "trunk-all"}]
+
+
+@pytest.mark.anyio
+async def test_apply_switchport_treats_an_empty_mode_as_unset(adapter_client):
+    """`""` and null both mean unset, so re-sending one for the other is not a change."""
+    from datetime import UTC, datetime
+
+    from sqlalchemy import update
+
+    from nso_adapter.store.models import SwitchportIntent
+
+    device_id = await seed_device(nso_device_name="switchport-empty-mode", netbox_device_id=1213)
+    stored = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/switchport/apply",
+        json={"interfaces": [{"interface_name": "Gi0/1", "untagged_vlan": 10}]},
+        headers=AUTH,
+    )
+    assert stored.status_code == 200, stored.text
+
+    evidence_at = datetime(2026, 9, 1, tzinfo=UTC)
+    async with session() as db:
+        await db.execute(
+            update(SwitchportIntent)
+            .where(SwitchportIntent.device_id == device_id)
+            .values(accepted_at=evidence_at, last_apply_at=evidence_at)
+        )
+        await db.commit()
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/switchport/apply",
+        json={"interfaces": [{"interface_name": "Gi0/1", "mode": "", "untagged_vlan": 10}]},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 200, response.text
+    async with session() as db:
+        row = (
+            await db.execute(
+                text("SELECT mode, accepted_at, last_apply_at FROM switchport_intent WHERE device_id = :device_id"),
+                {"device_id": device_id},
+            )
+        ).one()
+    assert row.mode is None, "the empty string is stored as the unset the renderer omits"
+    assert (row.accepted_at, row.last_apply_at) == (evidence_at, evidence_at), "an unchanged row keeps its evidence"
+
+
+@pytest.mark.anyio
+async def test_apply_lag_config_treats_an_empty_member_mode_as_unset(adapter_client):
+    """The LACP member mode carries the same ambiguity as the switchport one."""
+    from datetime import UTC, datetime
+
+    from sqlalchemy import update
+
+    from nso_adapter.store.models import LagBundleIntent
+
+    device_id = await seed_device(nso_device_name="lag-empty-member-mode", netbox_device_id=1214)
+    body = {"bundles": [{"name": "Port-channel1", "lag_id": 1, "members": [{"interface_name": "Gi0/1"}]}]}
+    stored = await adapter_client.post(f"/api/v1/devices/{device_id}/lag-config/apply", json=body, headers=AUTH)
+    assert stored.status_code == 200, stored.text
+
+    evidence_at = datetime(2026, 9, 1, tzinfo=UTC)
+    async with session() as db:
+        await db.execute(
+            update(LagBundleIntent)
+            .where(LagBundleIntent.device_id == device_id)
+            .values(accepted_at=evidence_at, last_apply_at=evidence_at)
+        )
+        await db.commit()
+
+    body["bundles"][0]["members"][0]["mode"] = ""
+    response = await adapter_client.post(f"/api/v1/devices/{device_id}/lag-config/apply", json=body, headers=AUTH)
+
+    assert response.status_code == 200, response.text
+    async with session() as db:
+        bundle = (
+            await db.execute(
+                text("SELECT accepted_at, last_apply_at FROM lag_bundle_intent WHERE device_id = :device_id"),
+                {"device_id": device_id},
+            )
+        ).one()
+        member_mode = await db.scalar(
+            text(
+                "SELECT m.mode FROM lag_member_intent m JOIN lag_bundle_intent b ON b.id = m.lag_bundle_id "
+                "WHERE b.device_id = :device_id"
+            ),
+            {"device_id": device_id},
+        )
+    assert member_mode is None
+    assert (bundle.accepted_at, bundle.last_apply_at) == (evidence_at, evidence_at)

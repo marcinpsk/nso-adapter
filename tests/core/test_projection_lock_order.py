@@ -269,6 +269,124 @@ async def test_projection_writer_commits_before_real_offboard(adapter_client, ri
         assert stored.error["code"] == "device_offboarded"
 
 
+async def test_switching_writer_commits_before_real_offboard(adapter_client, rival_engine):
+    from nso_adapter.core import claim as claim_module
+    from nso_adapter.core.onboarding import offboard_device
+    from nso_adapter.core.switching_intent import LagBundleSnapshot, replace_lag_snapshot
+    from nso_adapter.store.db import get_engine
+    from nso_adapter.store.models import Device, LagBundleIntent
+
+    device_id = await seed_device(nso_device_name="lock-switching-writer-wins", netbox_device_id=9912)
+    rival = async_sessionmaker(rival_engine, expire_on_commit=False)
+
+    async with session() as writer, rival() as offboarding:
+        writer_pid = await _backend_pid(writer)
+        device = await offboarding.get(Device, device_id)
+        offboarding_pid = await _backend_pid(offboarding)
+        claim_acquired = asyncio.Event()
+        continue_offboard = asyncio.Event()
+        acquire_claim = claim_module.acquire_claim_or_refuse
+
+        async def acquire_claim_then_wait(*args, **kwargs):
+            registration = await acquire_claim(*args, **kwargs)
+            claim_acquired.set()
+            await continue_offboard.wait()
+            return registration
+
+        with patch.object(claim_module, "acquire_claim_or_refuse", acquire_claim_then_wait):
+            teardown = asyncio.create_task(offboard_device(offboarding, device))
+            try:
+                await asyncio.wait_for(claim_acquired.wait(), timeout=10)
+                await replace_lag_snapshot(
+                    writer,
+                    device_id,
+                    (LagBundleSnapshot(name="Port-channel1", lag_id=1),),
+                )
+                continue_offboard.set()
+                await _wait_for_blocked_query(
+                    get_engine(),
+                    blocker_pid=writer_pid,
+                    waiter_pid=offboarding_pid,
+                    relation="devices",
+                    fragments=("from devices", "for update"),
+                )
+                await writer.commit()
+                await asyncio.wait_for(teardown, timeout=10)
+            finally:
+                continue_offboard.set()
+                if not teardown.done():
+                    teardown.cancel()
+                    await asyncio.gather(teardown, return_exceptions=True)
+
+    async with session() as db:
+        assert await db.get(Device, device_id) is None
+        assert await db.scalar(sa.select(sa.func.count()).select_from(LagBundleIntent)) == 0
+
+
+async def test_document_snapshot_waits_for_a_switching_replacement(adapter_client, rival_engine):
+    from nso_adapter.core.generation import lock_device_document
+    from nso_adapter.core.switching_intent import (
+        LagBundleSnapshot,
+        LagMemberSnapshot,
+        render_switching_sections,
+        replace_lag_snapshot,
+    )
+    from nso_adapter.store.db import get_engine
+
+    device_id = await seed_device(nso_device_name="lock-switching-snapshot", netbox_device_id=9913)
+    rival = async_sessionmaker(rival_engine, expire_on_commit=False)
+
+    async with session() as writer, rival() as reader:
+        writer_pid = await _backend_pid(writer)
+        reader_pid = await _backend_pid(reader)
+        await replace_lag_snapshot(
+            writer,
+            device_id,
+            (
+                LagBundleSnapshot(
+                    name="Port-channel1",
+                    lag_id=1,
+                    members=(LagMemberSnapshot(interface_name="Gi0/1", mode="active"),),
+                ),
+            ),
+        )
+
+        async def read_document():
+            await lock_device_document(reader, device_id)
+            document = await render_switching_sections(reader, device_id)
+            await reader.rollback()
+            return document
+
+        reading = asyncio.create_task(read_document())
+        try:
+            await _wait_for_blocked_query(
+                get_engine(),
+                blocker_pid=writer_pid,
+                waiter_pid=reader_pid,
+                relation="devices",
+                fragments=("from devices", "for no key update"),
+            )
+            assert not reading.done()
+            await writer.commit()
+            document = await asyncio.wait_for(reading, timeout=10)
+        finally:
+            if not reading.done():
+                reading.cancel()
+                await asyncio.gather(reading, return_exceptions=True)
+
+    assert document == {
+        "lag": {
+            "bundle": [
+                {
+                    "name": "Port-channel1",
+                    "lag-id": 1,
+                    "member": [{"interface-name": "Gi0/1", "mode": "active"}],
+                }
+            ]
+        }
+    }
+
+
 async def _prepare_offboard_loser(kind: str, adapter_client, device_id: int) -> None:
     if kind == "retry_carrier":
         await _seed_retry_head(device_id)
@@ -297,6 +415,18 @@ async def _run_offboard_loser(kind: str, adapter_client, device_id: int):
         return await put_vlans(adapter_client, device_id, [10], seq=1)
     if kind == "removal_put":
         return await put_vlans(adapter_client, device_id, [], seq=2, query="?delete_origin=true")
+    if kind == "lag_store":
+        return await adapter_client.post(
+            f"/api/v1/devices/{device_id}/lag-config/apply",
+            json={"bundles": [{"name": "Port-channel1", "lag_id": 1}]},
+            headers=_AUTH,
+        )
+    if kind == "switchport_store":
+        return await adapter_client.post(
+            f"/api/v1/devices/{device_id}/switchport/apply",
+            json={"interfaces": [{"interface_name": "Gi0/1", "untagged_vlan": 10}]},
+            headers=_AUTH,
+        )
     return await adapter_client.post(
         f"/api/v1/devices/{device_id}/actions/force-removal",
         json={"scope": "vlan"},
@@ -306,7 +436,7 @@ async def _run_offboard_loser(kind: str, adapter_client, device_id: int):
 
 @pytest.mark.parametrize(
     "writer_kind",
-    ("retry_carrier", "auto_apply_put", "removal_put", "force_removal"),
+    ("retry_carrier", "auto_apply_put", "removal_put", "force_removal", "lag_store", "switchport_store"),
 )
 async def test_real_offboard_commits_before_a_waiting_writer(adapter_client, rival_engine, writer_kind):
     from nso_adapter.core.onboarding import offboard_device

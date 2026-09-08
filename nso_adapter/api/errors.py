@@ -102,6 +102,15 @@ class IntentApplyResult(BaseModel):
     replaced: bool
 
 
+class StoredIntentResult(BaseModel):
+    """Truthful result for a claim-less full-snapshot store write."""
+
+    status: Literal["stored"]
+    device_id: int
+    count: int
+    removed: int
+
+
 class ApiError(HTTPException):
     """HTTPException whose detail IS the full response body (no FastAPI wrapping)."""
 
