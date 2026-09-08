@@ -38,15 +38,28 @@ _PACKAGE = Path(__file__).resolve().parents[1] / "nso_adapter"
 _FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 
 
+def _as_invocation(decorator: ast.expr) -> ast.expr:
+    """``@name`` is ``name(fn)`` with the call left implicit; spell it as the call it is.
+
+    ``@name(...)`` is already an ``ast.Call``, and any other decorator expression names no
+    local helper, so both are returned unchanged.
+    """
+    if not isinstance(decorator, ast.Name):
+        return decorator
+    return ast.copy_location(ast.Call(func=decorator, args=[], keywords=[]), decorator)
+
+
 def _definition_time_nodes(node: ast.AST) -> list[ast.AST]:
     """The parts of a function definition the interpreter evaluates where it is WRITTEN.
 
     Decorators and default expressions run at definition time, so one written in a handler
-    runs in the handler. A lambda has defaults but no decorators.
+    runs in the handler. Applying a decorator CALLS it, with or without parentheses.
+    A lambda has defaults but no decorators.
     """
     args = node.args
     defaults = [default for default in (*args.defaults, *args.kw_defaults) if default is not None]
-    return [*getattr(node, "decorator_list", ()), *defaults]
+    decorators = [_as_invocation(decorator) for decorator in getattr(node, "decorator_list", ())]
+    return [*decorators, *defaults]
 
 
 def _executes_in_handler(handler: ast.ExceptHandler) -> Iterator[ast.AST]:
@@ -306,6 +319,25 @@ def test_flags_a_raising_call_in_a_DECORATOR_evaluated_by_the_definition() -> No
     """So does a decorator expression."""
     assert isinstance(_runtime_context(_DECORATOR_CALLS_A_RAISING_HELPER), ValueError)
     assert scan_source(_DECORATOR_CALLS_A_RAISING_HELPER, "t.py") == ["t.py:7"]
+
+
+_BARE_DECORATOR_IS_A_RAISING_HELPER = (
+    "def refuse(fn):\n"
+    "    raise Boom() from None\n"
+    "\n"
+    "try:\n"
+    "    trigger()\n"
+    "except ValueError:\n"
+    "    @refuse\n"
+    "    def later():\n"
+    "        pass\n"
+)
+
+
+def test_flags_a_BARE_decorator_that_is_an_always_raising_helper() -> None:
+    """``@refuse`` with no parentheses still CALLS ``refuse``, and the call runs in the handler."""
+    assert isinstance(_runtime_context(_BARE_DECORATOR_IS_A_RAISING_HELPER), ValueError)
+    assert scan_source(_BARE_DECORATOR_IS_A_RAISING_HELPER, "t.py") == ["t.py:7"]
 
 
 def test_a_returning_helper_called_in_a_handler_stays_legal() -> None:
