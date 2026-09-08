@@ -267,7 +267,7 @@ async def harvest_community(
         raise api_error(
             404,
             "community_not_found",
-            f"no community with the requested fingerprint in the config mirror of "
+            "no community with the requested fingerprint in the config mirror of "
             f"{device.nso_device_name!r} — if the device changed out-of-band, run sync-from and refresh first",
         )
 
