@@ -263,21 +263,21 @@ async def harvest_community(
 
     found = snmp_harvest.find_community(ned_id, payload or {}, body.community_hash)
     if found is None:
-        # The device is the adapter's own row; the fingerprint is the caller's and it holds it.
+        # The adapter's own device id, never the NSO name; the fingerprint is the caller's.
         raise api_error(
             404,
             "community_not_found",
-            "no community with the requested fingerprint in the config mirror of "
-            f"{device.nso_device_name!r} — if the device changed out-of-band, run sync-from and refresh first",
+            f"no community with the requested fingerprint in the config mirror of device {device.id}. "
+            "If the device changed out-of-band, run sync-from and refresh first",
         )
 
     version = await _vault_op(lambda: provider.write_path(ref.mount, ref.path, {ref.key: found.secret}))
     operation_id = _operation_id()
-    # The device is the adapter's own row and the hash is a fingerprint; no part of the ref.
+    # The device is the adapter's own id and the hash is a fingerprint; no part of the ref.
     logger.info(
         "secrets.harvest_community",
         operation_id=operation_id,
-        device=device.nso_device_name,
+        device_id=device.id,
         community_hash=body.community_hash,
         version=version,
     )
