@@ -19,8 +19,9 @@ The rule is about what RUNS while the handler is active, not about what is writt
   an alias, and it attaches exactly the same way.
 * calling a helper that always raises is the same ``raise X`` one frame down: the interpreter
   attaches the caught exception to whatever the helper raised.
-* a function DEFINED in a handler runs nothing at definition time. Called after the handler
-  exits, its raise attaches nothing; called inside it, it is the helper case above.
+* a function DEFINED in a handler runs its decorators and its default expressions THERE,
+  and its body nowhere. Called after the handler exits, its raise attaches nothing; called
+  inside it, it is the helper case above.
 
 Every self-test below is checked against the interpreter first, so the analyzer is measured
 against real ``__context__`` behaviour instead of against a claim about it.
@@ -37,17 +38,30 @@ _PACKAGE = Path(__file__).resolve().parents[1] / "nso_adapter"
 _FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 
 
+def _definition_time_nodes(node: ast.AST) -> list[ast.AST]:
+    """The parts of a function definition the interpreter evaluates where it is WRITTEN.
+
+    Decorators and default expressions run at definition time, so one written in a handler
+    runs in the handler. A lambda has defaults but no decorators.
+    """
+    args = node.args
+    defaults = [default for default in (*args.defaults, *args.kw_defaults) if default is not None]
+    return [*getattr(node, "decorator_list", ()), *defaults]
+
+
 def _executes_in_handler(handler: ast.ExceptHandler) -> Iterator[ast.AST]:
     """Every node that RUNS while *handler* is active.
 
-    A nested function or lambda body does not: defining it executes nothing, and calling it
-    later runs where the interpreter has no exception to attach. Walking into those bodies
-    rejects code that is correct.
+    A nested function or lambda BODY does not: defining it executes nothing there, and
+    calling it later runs where the interpreter has no exception to attach. Walking into
+    those bodies rejects code that is correct. What the definition itself evaluates —
+    decorators and defaults — does run here, so those are walked.
     """
     stack: list[ast.AST] = list(handler.body)
     while stack:
         node = stack.pop()
         if isinstance(node, _FUNCTION_NODES):
+            stack.extend(_definition_time_nodes(node))
             continue
         yield node
         stack.extend(ast.iter_child_nodes(node))
@@ -71,18 +85,20 @@ def _none_aliases(tree: ast.Module) -> set[str]:
     return names
 
 
-def _always_raising_helpers(tree: ast.Module) -> set[str]:
-    """Functions whose CALL always raises: the body ends in a raise and nothing returns.
+def _always_raising_helpers(tree: ast.Module, none_aliases: set[str]) -> set[str]:
+    """Functions whose CALL always raises AND attaches: the body ends in such a raise.
 
     Calling one inside a handler is the same `raise X`, written one frame down. The
-    interpreter attaches the caught exception to it exactly as it would in the handler.
+    interpreter attaches the caught exception to it exactly as it would in the handler,
+    and ``from None`` one frame down suppresses just as little — so the helper's raise is
+    judged by the SAME cause classification as a raise written in the handler.
     """
     found: set[str] = set()
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or not node.body:
             continue
         last = node.body[-1]
-        if not isinstance(last, ast.Raise) or last.exc is None or last.cause is not None:
+        if not isinstance(last, ast.Raise) or not _attaches_context(last, none_aliases):
             continue
         if any(isinstance(child, ast.Return) for child in ast.walk(node)):
             continue
@@ -106,7 +122,7 @@ def scan_source(source: str, path: str) -> list[str]:
     """Every context-attaching site that RUNS inside an except handler, as ``path:line``."""
     tree = ast.parse(source, filename=path)
     none_aliases = _none_aliases(tree)
-    helpers = _always_raising_helpers(tree)
+    helpers = _always_raising_helpers(tree, none_aliases)
     lines: set[int] = set()
     for handler in ast.walk(tree):
         if not isinstance(handler, ast.ExceptHandler):
@@ -246,6 +262,50 @@ def test_flags_a_function_defined_AND_CALLED_inside_the_handler() -> None:
     """The same definition, invoked one line earlier, is the helper case."""
     assert isinstance(_runtime_context(_DEFINED_AND_CALLED_INSIDE), ValueError)
     assert scan_source(_DEFINED_AND_CALLED_INSIDE, "t.py") == ["t.py:6"]
+
+
+_HELPER_RAISING_FROM_NONE = (
+    "def _refuse():\n    raise Boom() from None\n\ntry:\n    trigger()\nexcept ValueError:\n    _refuse()\n"
+)
+_DEFAULT_CALLS_A_RAISING_HELPER = (
+    "def _refuse():\n"
+    "    raise Boom()\n"
+    "\n"
+    "try:\n"
+    "    trigger()\n"
+    "except ValueError:\n"
+    "    def later(x=_refuse()):\n"
+    "        pass\n"
+)
+_DECORATOR_CALLS_A_RAISING_HELPER = (
+    "def _refuse():\n"
+    "    raise Boom()\n"
+    "\n"
+    "try:\n"
+    "    trigger()\n"
+    "except ValueError:\n"
+    "    @_refuse()\n"
+    "    def later():\n"
+    "        pass\n"
+)
+
+
+def test_flags_a_helper_whose_raise_says_FROM_NONE() -> None:
+    """``from None`` inside the helper suppresses nothing: the caught exception still attaches."""
+    assert isinstance(_runtime_context(_HELPER_RAISING_FROM_NONE), ValueError)
+    assert scan_source(_HELPER_RAISING_FROM_NONE, "t.py") == ["t.py:7"]
+
+
+def test_flags_a_raising_call_in_a_DEFAULT_evaluated_by_the_definition() -> None:
+    """A default expression runs where the ``def`` is WRITTEN, so it runs in the handler."""
+    assert isinstance(_runtime_context(_DEFAULT_CALLS_A_RAISING_HELPER), ValueError)
+    assert scan_source(_DEFAULT_CALLS_A_RAISING_HELPER, "t.py") == ["t.py:7"]
+
+
+def test_flags_a_raising_call_in_a_DECORATOR_evaluated_by_the_definition() -> None:
+    """So does a decorator expression."""
+    assert isinstance(_runtime_context(_DECORATOR_CALLS_A_RAISING_HELPER), ValueError)
+    assert scan_source(_DECORATOR_CALLS_A_RAISING_HELPER, "t.py") == ["t.py:7"]
 
 
 def test_a_returning_helper_called_in_a_handler_stays_legal() -> None:

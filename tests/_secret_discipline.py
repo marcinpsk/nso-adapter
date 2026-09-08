@@ -5,14 +5,19 @@
 ``raise ... from None`` only sets ``__suppress_context__``. The suppressed exception stays
 reachable as ``__context__`` and its repr can still hold the secret, so an assertion that
 reads those two flags passes while the material is one attribute away. Every check here
-walks both chains to the end and reads the nodes instead.
+walks the chains to the end and reads the nodes instead.
+
+"Reachable" is what a formatted traceback prints, which is more than the two chains: a note
+added with ``BaseException.add_note`` prints under the exception it is on, and an exception
+group prints its members, which hang off neither ``__cause__`` nor ``__context__``. Any task
+group raises one, so both are walked here.
 """
 
 from __future__ import annotations
 
 
 def exception_chain(exc: BaseException) -> list[BaseException]:
-    """Every exception reachable from *exc* through ``__cause__`` AND ``__context__``."""
+    """Every exception reachable from *exc*: ``__cause__``, ``__context__``, group members."""
     seen: set[int] = set()
     pending: list[BaseException | None] = [exc]
     chain: list[BaseException] = []
@@ -23,13 +28,15 @@ def exception_chain(exc: BaseException) -> list[BaseException]:
         seen.add(id(node))
         chain.append(node)
         pending += [node.__cause__, node.__context__]
+        if isinstance(node, BaseExceptionGroup):
+            pending += list(node.exceptions)
     return chain
 
 
 def assert_chain_free_of(exc: BaseException, secrets) -> None:
-    """Fail when any node of *exc*'s cause/context chain repeats one of *secrets*."""
+    """Fail when any node of *exc*'s chain, its notes included, repeats one of *secrets*."""
     for node in exception_chain(exc):
-        rendered = f"{node!r} {node}"
+        rendered = " ".join((repr(node), str(node), *getattr(node, "__notes__", ())))
         for secret in secrets:
             assert secret not in rendered, f"{type(node).__name__} in the chain repeats secret material"
 
