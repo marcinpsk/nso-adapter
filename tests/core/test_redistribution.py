@@ -744,3 +744,90 @@ async def test_all_components_device_absent_keeps_and_succeeds(adapter_client):
         "kept",
         True,
     )
+
+
+# ── the merged composite keeps the failing component's classification (#1698) ──
+
+
+def _read_failure(family: str):
+    from nso_adapter.nso.read_outcome import ReadFailure, ReadOperation
+
+    return ReadFailure(
+        operation=ReadOperation.section_get,
+        device="rd-failure-carry",
+        family=family,
+        error_type="HTTPStatusError",
+        http_status=503,
+    )
+
+
+@pytest.mark.anyio
+async def test_the_export_down_composite_carries_the_outage_classification(adapter_client, monkeypatch):
+    """The tier-1 abort built a bare Unavailable, dropping what the failing read classified.
+
+    ``failure`` is compare=False, so an equality assertion on the outcome cannot see the
+    loss: the operator's record simply stopped naming the read, the type and the status.
+    """
+    from nso_adapter.core import redistribution
+
+    device_id = await seed_device(nso_device_name="rd-outage-carry", netbox_device_id=7710)
+    recorded = []
+
+    async def _record(db, device, outcome, refresh_source, **kwargs):
+        recorded.append(outcome)
+        return
+
+    monkeypatch.setattr(redistribution, "_record_composite", _record)
+    failure = _read_failure("redistribution.ospf")
+
+    async with _device_session(device_id) as (db, device):
+        await refresh_redistribution_from_outcomes(
+            db,
+            device,
+            {
+                "ospf": Unavailable(UnavailableReason.export_down, failure=failure),
+                "isis": Unavailable(UnavailableReason.unsupported),
+                "bgp": Unavailable(UnavailableReason.unsupported),
+            },
+            refresh_source="test",
+            own_lock=False,
+        )
+
+    assert recorded, "the composite was never recorded"
+    assert recorded[0].reason is UnavailableReason.export_down
+    assert recorded[0].failure is failure, "the composite dropped the outage classification"
+
+
+@pytest.mark.anyio
+async def test_the_merged_outcome_carries_the_worst_components_failure(adapter_client, monkeypatch):
+    """Nothing replaced, one real failure: the merge kept the reason and dropped the failure."""
+    from nso_adapter.store import outcome_store
+
+    device_id = await seed_device(nso_device_name="rd-merge-carry", netbox_device_id=7711)
+    real_record = outcome_store.record_read_outcome
+    merged = []
+
+    async def _spy(db, device_id_, family, outcome, **kwargs):
+        merged.append(outcome)
+        return await real_record(db, device_id_, family, outcome, **kwargs)
+
+    monkeypatch.setattr(outcome_store, "record_read_outcome", _spy)
+    failure = _read_failure("redistribution.bgp")
+
+    async with _device_session(device_id) as (db, device):
+        ok = await refresh_redistribution_from_outcomes(
+            db,
+            device,
+            {
+                "ospf": Unavailable(UnavailableReason.unsupported),
+                "isis": Unavailable(UnavailableReason.unsupported),
+                "bgp": Unavailable(UnavailableReason.read_error, failure=failure),
+            },
+            refresh_source="test",
+            own_lock=False,
+        )
+
+    assert ok is False, "a real failure with nothing replaced is not a success"
+    assert merged, "phase 1 never recorded the merged outcome"
+    assert merged[0].reason is UnavailableReason.read_error, "the worst reason must still win"
+    assert merged[0].failure is failure, "the merge dropped the failing component's classification"

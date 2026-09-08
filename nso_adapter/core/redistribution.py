@@ -12,6 +12,7 @@ Entry points:
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import UTC, datetime
 
 import structlog
@@ -202,12 +203,13 @@ async def refresh_redistribution_from_outcomes(
     now = datetime.now(UTC)
 
     # Tier 1 — any confirmed export outage aborts the whole refresh, rows untouched.
-    if any(isinstance(o, Unavailable) and o.reason is UnavailableReason.export_down for o in outcomes.values()):
+    outage = _first_with_reason(outcomes.values(), UnavailableReason.export_down)
+    if outage is not None:
         logger.warning("redistribution.refresh.degraded", device_id=device_id, device_name=name)
         selected = await _record_composite(
             db,
             device,
-            Unavailable(UnavailableReason.export_down),
+            outage,
             refresh_source,
             result="kept",
             succeeded=False,
@@ -245,13 +247,13 @@ async def refresh_redistribution_from_outcomes(
         composite_ok = not errors
     elif errors:
         # Nothing replaced, at least one real failure → unavailable with the WORST reason.
-        merged = Unavailable(_worst_reason([o for o in outcomes.values() if isinstance(o, Unavailable)]))
+        merged = _worst_unavailable([o for o in outcomes.values() if isinstance(o, Unavailable)])
         terminal_result, terminal_succeeded, composite_ok = "kept", False, False
     else:
         # All components are non-failing keeps (unsupported and/or device-absent
         # not_authoritative): nothing was read — never claim fresh-present/replaced, but this is a
         # KEPT SUCCESS (no partial), carrying the most severe of the keep reasons for telemetry.
-        merged = Unavailable(_worst_reason([o for o in outcomes.values() if isinstance(o, Unavailable)]))
+        merged = _worst_unavailable([o for o in outcomes.values() if isinstance(o, Unavailable)])
         terminal_result, terminal_succeeded, composite_ok = "kept", True, True
     attempt_id = None
     try:
@@ -429,13 +431,23 @@ _REASON_SEVERITY = (
 )
 
 
-def _worst_reason(unavailables: list[Unavailable]) -> UnavailableReason:
-    """Pick the most severe reason among *unavailables* per :data:`_REASON_SEVERITY`."""
-    reasons = {o.reason for o in unavailables}
+def _first_with_reason(outcomes: Iterable[ReadOutcome], reason: UnavailableReason) -> Unavailable | None:
+    """Return the first :class:`Unavailable` carrying *reason*, or None."""
+    return next((o for o in outcomes if isinstance(o, Unavailable) and o.reason is reason), None)
+
+
+def _worst_unavailable(unavailables: list[Unavailable]) -> Unavailable:
+    """Pick the most severe :class:`Unavailable` among *unavailables* per :data:`_REASON_SEVERITY`.
+
+    The OBJECT, not the reason: a read failure carries its :class:`ReadFailure` classification
+    (the operation, the device, the family, the exception type, the numeric status), and the
+    merged outcome is the only place the composite still holds it.
+    """
     for reason in _REASON_SEVERITY:
-        if reason in reasons:
-            return reason
-    return UnavailableReason.read_error  # unreachable with a non-empty input
+        found = _first_with_reason(unavailables, reason)
+        if found is not None:
+            return found
+    return Unavailable(UnavailableReason.read_error)  # unreachable with a non-empty input
 
 
 async def _record_composite(
