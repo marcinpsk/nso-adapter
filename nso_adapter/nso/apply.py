@@ -225,7 +225,14 @@ async def native_dry_run(
 
 
 async def _verify_native_or_raise(
-    client: NsoClient, url: str, payload: str, device_name: str, *, scope: str, method: str = "patch"
+    client: NsoClient,
+    url: str,
+    payload: str,
+    device_name: str,
+    *,
+    scope: str,
+    method: str = "patch",
+    no_networking: bool = False,
 ) -> str:
     """Re-issue *payload* as a native dry-run; raise if NSO would still change the device.
 
@@ -249,7 +256,10 @@ async def _verify_native_or_raise(
 
     # strict=True: a conclusive 4xx on the re-dry-run raises (the apply did not land),
     # rather than being swallowed as an inconclusive false success.
-    delta = await native_dry_run(client, url, payload, device_name, method=method, strict=True)
+    # The verification re-issues the commit, so it must carry the commit's own no-networking.
+    delta = await native_dry_run(
+        client, url, payload, device_name, method=method, strict=True, no_networking=no_networking
+    )
     if delta is None:
         logger.warning("nso.apply.verify_inconclusive_or_unexpected", scope=scope, device=device_name)
         return VERIFY_INCONCLUSIVE
@@ -382,7 +392,9 @@ async def apply_device_intent(
                 detail={"nso_error": err},
             )
     logger.info("nso.apply.device_intent_sent", device=device_name, families=sorted(containers))
-    return await _verify_native_or_raise(client, url, payload, device_name, scope="device-intent", method="put")
+    return await _verify_native_or_raise(
+        client, url, payload, device_name, scope="device-intent", method="put", no_networking=no_networking
+    )
 
 
 # Recognised boolean spellings for the `enabled` interface attribute. The intent value

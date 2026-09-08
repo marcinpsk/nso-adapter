@@ -215,6 +215,18 @@ async def test_no_networking_reaches_the_wire_as_a_commit_param():
     assert "no-networking" in str(transport.requests[0].url)
 
 
+async def test_no_networking_also_reaches_the_post_commit_verification():
+    """A detach commit must be verified the way it was committed: CDB only, no device read."""
+    transport = _RecordingTransport()
+    client = _client_with(transport)
+
+    await apply_device_intent(client, "sw03", {"snmp": {}}, no_networking=True)
+
+    verify = [r for r in transport.requests[1:] if "dry-run=native" in str(r.url)]
+    assert verify, [str(r.url) for r in transport.requests]
+    assert all("no-networking" in str(r.url) for r in verify), [str(r.url) for r in verify]
+
+
 # ── _verify_native_or_raise ────────────────────────────────────────────────────
 
 
