@@ -2149,3 +2149,62 @@ async def test_from_outcomes_lock_discipline(db_session: AsyncSession, monkeypat
     ok = await refresh_redistribution_from_outcomes(db_session, device, outcomes, refresh_source="sync", own_lock=False)
     assert ok is True
     assert acquired == [], "own_lock=False must not touch the lock registry"
+
+
+# ── the kept-NED record carries no server text (#1698) ──────────────────────
+
+
+async def test_ned_id_read_failure_record_names_the_read_and_not_what_the_server_said(
+    db_session: AsyncSession,
+):
+    """A failed ned-id read on a device whose NED is known logged ``repr(exc)``.
+
+    httpx builds an HTTPStatusError message out of the server's REASON PHRASE and the
+    request URL, so a 503 from a proxy put both in ``importer.ned_id.read_failed``. The
+    record must carry the identity we asked for, the read, the exception type and the
+    numeric status, and nothing the server wrote.
+
+    Drives the real NsoClient over a real transport, so the message is the one httpx
+    really builds — a stubbed exception would only repeat the test's own text.
+    """
+    import httpx
+    from structlog.testing import capture_logs
+
+    from nso_adapter.config import NsoInstanceConfig
+    from nso_adapter.core.importer import _resolve_ned_id
+    from tests._secret_discipline import assert_records_free_of
+
+    device = Device(
+        nso_instance="nso-dev", nso_device_name="sw-nedreason", ned_id="cisco-ios-cli-6.95", netbox_device_id=20
+    )
+    db_session.add(device)
+    await db_session.commit()
+
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(503, extensions={"reason_phrase": b"placeholder-proxy-detail"})
+    )
+    instance = NsoInstanceConfig(
+        name="nso-dev",
+        base_url="http://placeholder-nso.internal:8080",
+        username_ref="NSO_USERNAME",
+        password_ref="NSO_PASSWORD",
+    )
+    client = NsoClient(instance, "admin", "admin")
+    client._client = lambda timeout=None: httpx.AsyncClient(transport=transport, base_url=instance.base_url)
+
+    with capture_logs() as logs:
+        await _resolve_ned_id(db_session, device, client)  # must not raise: the NED is known
+
+    await db_session.refresh(device)
+    assert device.ned_id == "cisco-ios-cli-6.95", "a transient read must not clobber the known NED"
+    assert_records_free_of(logs, ["placeholder-proxy-detail", "placeholder-nso.internal"])
+    record = next(r for r in logs if r["event"] == "importer.ned_id.read_failed")
+    assert record == {
+        "event": "importer.ned_id.read_failed",
+        "log_level": "warning",
+        "device": "sw-nedreason",
+        "kept": "cisco-ios-cli-6.95",
+        "read_operation": "ned_id_get",
+        "error_type": "HTTPStatusError",
+        "http_status": 503,
+    }

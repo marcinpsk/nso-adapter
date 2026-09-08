@@ -44,6 +44,7 @@ from nso_adapter.nso.read_outcome import (  # noqa: F401 — Present used below
     Unavailable,
     UnavailableReason,
     classify_envelope_section,
+    http_status_of,
     read_failure_from_exception,
 )
 from nso_adapter.nso.shape import as_list
@@ -706,11 +707,15 @@ async def _resolve_ned_id(db: AsyncSession, device: Device, client: NsoClient) -
         learned = await client.get_device_ned_id(device.nso_device_name)
     except Exception as exc:  # noqa: BLE001 — a read failure must not fail an otherwise-fine sync
         if device.ned_id:
+            # httpx builds its message from the server's reason phrase and the request URL,
+            # so the classification travels and the exception's own text never does.
             logger.warning(
                 "importer.ned_id.read_failed",
                 device=device.nso_device_name,
                 kept=device.ned_id,
-                error=repr(exc),
+                read_operation="ned_id_get",
+                error_type=type(exc).__name__,
+                http_status=http_status_of(exc),
             )
             return  # keep the last-known value and sync on
         learned = ""  # nothing to fall back on → the unmatched path below
