@@ -20,7 +20,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-__all__ = ["VaultRef", "VaultRefError", "parse_vault_ref", "secret_fingerprint"]
+__all__ = [
+    "SECRET_FINGERPRINT_PATTERN",
+    "VaultRef",
+    "VaultRefError",
+    "parse_vault_ref",
+    "secret_fingerprint",
+]
+
+#: How many hex characters of the SHA-256 digest the cross-repo fingerprint keeps.
+_FINGERPRINT_HEX_CHARS = 16
+
+#: Exactly what :func:`secret_fingerprint` produces, for validating one at a request
+#: boundary: a field declared to hold a fingerprint must never accept a plaintext secret.
+SECRET_FINGERPRINT_PATTERN = rf"^[0-9a-f]{{{_FINGERPRINT_HEX_CHARS}}}$"
 
 
 def secret_fingerprint(value: str) -> str:
@@ -32,7 +45,7 @@ def secret_fingerprint(value: str) -> str:
     """
     import hashlib
 
-    return hashlib.sha256(value.encode()).hexdigest()[:16]
+    return hashlib.sha256(value.encode()).hexdigest()[:_FINGERPRINT_HEX_CHARS]
 
 
 class VaultRefError(ValueError):

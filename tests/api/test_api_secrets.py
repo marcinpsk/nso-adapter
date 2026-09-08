@@ -450,6 +450,55 @@ async def test_harvest_community_not_found_404_with_sync_hint(vault_client):
 
 
 @pytest.mark.anyio
+async def test_a_harvest_hash_THAT_IS_NOT_A_FINGERPRINT_is_refused_at_the_boundary(vault_client):
+    """``community_hash`` took any string, and the missing-community 404 echoed it back.
+
+    A caller that pastes the community itself into the field would read its own secret out
+    of the refusal body and out of whatever recorded that answer. The field is a sha256[:16]
+    fingerprint, so the boundary refuses anything else and nothing of the value travels."""
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
+    client, _, _ = vault_client
+    device_id = await _seed_harvest_device("cisco-ios-cli-6.77")
+    _wire_nso_transport(_NsoTransport({"tailf-ned-cisco-ios:community": [{"name": "other", "RO": [None]}]}))
+
+    with capture_logs() as logs:
+        resp = await client.post(
+            f"/api/v1/devices/{device_id}/secrets/harvest-community",
+            json={"community_hash": "placeholder-secret-pasted-here", "vault_ref": "network/p#community"},
+            headers=AUTH,
+        )
+
+    assert resp.status_code == 422, "a value that is not a fingerprint is not a request we can serve"
+    assert "placeholder-secret-pasted-here" not in resp.text, "the refusal repeats the caller's own value"
+    assert_records_free_of(logs, ["placeholder-secret-pasted-here"])
+
+
+@pytest.mark.anyio
+async def test_a_missing_community_404_repeats_no_part_of_the_request(vault_client):
+    """The refusal states WHICH device could not serve it; the caller holds what it sent."""
+    client, _, _ = vault_client
+    device_id = await _seed_harvest_device("cisco-ios-cli-6.77")
+    _wire_nso_transport(_NsoTransport({"tailf-ned-cisco-ios:community": [{"name": "other", "RO": [None]}]}))
+
+    asked = _h("placeholder-absent-community")
+    resp = await client.post(
+        f"/api/v1/devices/{device_id}/secrets/harvest-community",
+        json={"community_hash": asked, "vault_ref": "network/p#community"},
+        headers=AUTH,
+    )
+
+    assert resp.status_code == 404
+    err = resp.json()["error"]
+    assert err["code"] == "community_not_found"
+    assert asked not in resp.text, "the refusal echoes the submitted value"
+    assert "harvest-dev" in err["message"], "the operator must still learn WHICH device could not serve it"
+    assert "sync-from" in err["message"]
+
+
+@pytest.mark.anyio
 async def test_harvest_community_unsupported_ned(vault_client):
     client, _, _ = vault_client
     device_id = await _seed_harvest_device("timos-nc-9.1")
