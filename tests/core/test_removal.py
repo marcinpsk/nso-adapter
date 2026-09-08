@@ -302,9 +302,14 @@ async def test_enqueue_removal_creates_job_for_each_valid_scope(adapter_client):
 # carry an unaccepted row, whatever the fragment serialized.
 
 
-async def _dispatch(device_id: int, scope: str, *, context_extra: dict | None = None, instance=None):
-    """Run one scope's removal dispatch and return the containers it transmitted."""
-    job_id = await _seed_removal_job(device_id, scope, context_extra)
+async def _dispatch(device_id: int, scope: str, *, context_extra: dict | None = None, instance=None, job_id=None):
+    """Run one scope's removal dispatch and return the containers it transmitted.
+
+    *job_id* reuses a generation the caller created earlier, so a test can move device state
+    between the freeze and the execution.
+    """
+    if job_id is None:
+        job_id = await _seed_removal_job(device_id, scope, context_extra)
     client = _guard_client(instance)
     sender = _sender()
     async with session() as db:
@@ -547,24 +552,45 @@ async def test_dispatch_scope_route_policy_encodes_with_the_frozen_dialect(adapt
     """Route-policy members are spelled by the section's FROZEN dialect, never a live read.
 
     The removal used to thread ``device.ned_id`` into the writer at execution, so a NED
-    change between authorization and execution silently changed the wire form. The dialect
-    is frozen with the fragment now, so the body is a function of the document alone.
+    change between authorization and execution silently changed the wire form. The
+    generation freezes the Nokia dialect, the device then moves to a Cisco NED, and the
+    member must still reach the wire in the Nokia spelling: bare colons, no ``large:``
+    keyword. A live read would emit the canonical Cisco form instead.
     """
     device_id = await _seed_device(nso_device_name="ra1")
     async with session() as db:
         device = await db.get(Device, device_id)
+        device.ned_id = "timos-nc-23.10"
+        db.add(
+            RoutePolicyObjectIntent(
+                device_id=device_id,
+                family="community_list",
+                name="RP-COMM",
+                entries=[{"sequence": 1, "action": "permit", "community": "large:64500:1:2"}],
+                accepted_at=_NOW,
+            )
+        )
+        await db.commit()
+    job_id = await _seed_removal_job(device_id, "route_policy")
+    async with session() as db:
+        device = await db.get(Device, device_id)
         device.ned_id = "cisco-iosxr-nc-7.3"
-        db.add(RoutePolicyObjectIntent(device_id=device_id, family="rpl", name="RP-IN", entries=[], accepted_at=_NOW))
         await db.commit()
 
-    containers = await _dispatch(device_id, "route_policy")
+    containers = await _dispatch(device_id, "route_policy", job_id=job_id)
 
     assert containers["route-policy"] == {
         "prefix-list": [],
-        "community-list": [],
+        "community-list": [
+            {
+                "name": "RP-COMM",
+                "invert-match": False,
+                "entry": [{"sequence": 1, "action": "permit", "community": "64500:1:2"}],
+            }
+        ],
         "as-path": [],
         "route-map": [],
-    }, "an unknown family renders nothing, and the container is still asserted whole"
+    }, "the frozen Nokia dialect spells the member, and the container is still asserted whole"
 
 
 async def test_dispatch_scope_unknown_raises(adapter_client):
