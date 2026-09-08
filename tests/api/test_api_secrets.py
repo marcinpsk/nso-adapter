@@ -494,7 +494,8 @@ async def test_a_missing_community_404_repeats_no_part_of_the_request(vault_clie
     err = resp.json()["error"]
     assert err["code"] == "community_not_found"
     assert asked not in resp.text, "the refusal echoes the submitted value"
-    assert "harvest-dev" in err["message"], "the operator must still learn WHICH device could not serve it"
+    assert "harvest-dev" not in resp.text, "the refusal repeats the device's name in NSO"
+    assert f"device {device_id}" in err["message"], "the operator must still learn WHICH device could not serve it"
     assert "sync-from" in err["message"]
 
 
@@ -632,7 +633,8 @@ async def test_a_SUCCESSFUL_harvest_echoes_no_REFERENCE_COMPONENT_anywhere(vault
     assert_records_free_of(logs, _REF_LOCATORS)
     for echoed in _REF_LOCATORS:
         assert echoed not in resp.text, "the answer repeats a component of the caller's reference"
-    assert harvested[0]["device"] == "harvest-dev", "the device is the adapter's own row"
+    assert harvested[0]["device_id"] == device_id, "the adapter's own device id, never the name in NSO"
+    assert_records_free_of(logs, ["harvest-dev"])
     assert harvested[0]["community_hash"] == target_hash
     assert harvested[0]["operation_id"] == resp.json()["operation_id"], "the record must join to the answer"
 

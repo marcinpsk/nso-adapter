@@ -41,6 +41,21 @@ async def test_jobs_list_empty(adapter_client):
     assert resp.json() == []
 
 
+async def test_jobs_list_invalid_status_is_refused_without_the_value(adapter_client):
+    """The 422 quoted the caller's own filter value straight back into the answer."""
+    resp = await adapter_client.get(
+        "/api/v1/jobs",
+        params={"status": "placeholder-status-value"},
+        headers={"Authorization": f"Bearer {VALID_TOKEN}"},
+    )
+
+    assert resp.status_code == 422, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "validation_error"
+    assert error["message"] == "Invalid job status"
+    assert "placeholder-status-value" not in resp.text, "the refusal echoes the submitted value"
+
+
 async def test_job_not_found(adapter_client):
     resp = await adapter_client.get("/api/v1/jobs/9999", headers={"Authorization": f"Bearer {VALID_TOKEN}"})
     assert resp.status_code == 404

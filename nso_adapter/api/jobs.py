@@ -136,7 +136,7 @@ async def list_jobs(
             js = JobStatus(status)
         except ValueError:
             # Built in the handler, raised after it: a raise inside attaches the caught exception.
-            invalid = api_error(422, "validation_error", f"Invalid job status: {status!r}")
+            invalid = api_error(422, "validation_error", "Invalid job status")
         if invalid is not None:
             raise invalid
         query = query.where(Job.status == js)
