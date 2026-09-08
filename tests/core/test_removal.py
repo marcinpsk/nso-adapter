@@ -593,6 +593,23 @@ async def test_dispatch_scope_route_policy_encodes_with_the_frozen_dialect(adapt
     }, "the frozen Nokia dialect spells the member, and the container is still asserted whole"
 
 
+async def test_dispatch_scope_route_policy_renders_nothing_for_an_unknown_family(adapter_client):
+    """A stored family no YANG list holds renders nothing, and every list is still sent."""
+    device_id = await _seed_device(nso_device_name="ra2")
+    async with session() as db:
+        db.add(RoutePolicyObjectIntent(device_id=device_id, family="rpl", name="RP-IN", entries=[], accepted_at=_NOW))
+        await db.commit()
+
+    containers = await _dispatch(device_id, "route_policy")
+
+    assert containers["route-policy"] == {
+        "prefix-list": [],
+        "community-list": [],
+        "as-path": [],
+        "route-map": [],
+    }, "an unknown family renders nothing, and the container is still asserted whole"
+
+
 async def test_dispatch_scope_unknown_raises(adapter_client):
     device_id = await _seed_device()
     async with session() as db:
