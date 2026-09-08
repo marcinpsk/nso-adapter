@@ -118,6 +118,37 @@ def test_db_migrate_rejects_a_non_postgresql_url_before_touching_the_database(tm
     assert "Running upgrade" not in output, f"alembic started the chain before the check:\n{output}"
 
 
+def test_db_migrate_survives_a_percent_in_the_password_and_prints_no_credential():
+    """A ``%`` in the password must not break migrations, and must not reach the output.
+
+    ``Config.set_main_option`` hands the URL to ConfigParser, which interpolates it. An
+    unescaped ``%`` raised ``ValueError: invalid interpolation syntax`` before anything
+    connected, and that message quotes the whole credential-bearing URL. The entrypoint
+    runs before uvicorn, so the traceback is the container log.
+
+    Driven as the real subprocess the entrypoint runs. The refused connection is the proof
+    that configuration finished: the run got all the way to the database.
+    """
+    password = "pw%40placeholder-secret"
+    proc = subprocess.run(
+        [sys.executable, "-m", "nso_adapter.db_migrate"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        # Port 1 refuses instantly, so the connection attempt itself is the observable step.
+        env={
+            "PATH": "/usr/bin:/bin",
+            "DATABASE_URL": f"postgresql+asyncpg://placeholder_user:{password}@127.0.0.1:1/nso_placeholder",
+        },
+    )
+    output = proc.stdout + proc.stderr
+
+    assert "invalid interpolation syntax" not in output, f"the % broke configuration:\n{output}"
+    assert "OperationalError" in output, f"the run never reached the database:\n{output}"
+    for leaked in (password, "pw%%40", "placeholder-secret", "placeholder_user"):
+        assert leaked not in output, f"the entrypoint printed the credential {leaked!r}:\n{output}"
+
+
 def test_db_migrate_and_init_db_share_one_validator():
     """Both entry points must reject identically — two copies would drift."""
     from nso_adapter.store.db import require_postgresql_url
