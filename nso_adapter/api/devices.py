@@ -430,11 +430,15 @@ class DeviceCreate(BaseModel):
     responses={**RESP_401, **RESP_409, **RESP_422_VALIDATION},
 )
 async def onboard_device(body: DeviceCreate, db: AsyncSession = Depends(get_db)):
+    from nso_adapter.core.onboarding import DeviceIdentityRefused
     from nso_adapter.core.onboarding import onboard_device as _onboard
 
     refused = None
     try:
         device = await _onboard(db, body.nso_instance, body.nso_device_name, body.netbox_device_id)
+    except DeviceIdentityRefused as exc:
+        # Authored text: the link that refuses the request is server-side state, and it is logged.
+        refused = api_error(409, "conflict", str(exc), {"reason": exc.reason})
     except LookupError as exc:
         # Built in the handler, raised after it: a raise inside attaches the caught exception.
         refused = api_error(409, "conflict", str(exc))
@@ -751,6 +755,7 @@ class DevicePatch(BaseModel):
     responses={**RESP_401, **RESP_404_DEVICE, **RESP_409, **RESP_422_VALIDATION},
 )
 async def rekey_device(device_id: int, body: DevicePatch, db: AsyncSession = Depends(get_db)):
+    from nso_adapter.core.onboarding import DeviceIdentityRefused
     from nso_adapter.core.onboarding import rekey_device as _rekey
 
     device = await db.get(Device, device_id)
@@ -761,6 +766,9 @@ async def rekey_device(device_id: int, body: DevicePatch, db: AsyncSession = Dep
     refused = None
     try:
         device = await _rekey(db, device, body.nso_instance, body.nso_device_name)
+    except DeviceIdentityRefused as exc:
+        # A patch may name only the instance, so the refused identity is half the stored row.
+        refused = api_error(409, "conflict", str(exc), {"reason": exc.reason})
     except LookupError as exc:
         refused = api_error(409, "conflict", str(exc))
     except ValueError as exc:

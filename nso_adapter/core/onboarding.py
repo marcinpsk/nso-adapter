@@ -51,6 +51,26 @@ from nso_adapter.store.models import (
 
 logger = structlog.get_logger(__name__)
 
+
+class DeviceIdentityRefused(LookupError):
+    """A conflict whose real detail is server-side link state, so the message is authored.
+
+    The caller sent an identity and a NetBox device id; what refuses the request is the link
+    the adapter already holds, which the caller never sent and must not be told. The message
+    repeats none of it, ``reason`` names the refusal for the client, and the full detail goes
+    to the log at the raise site (every caller of onboarding gets it, not just the API).
+    """
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+#: The authored answers. Each states the refusal and interpolates nothing.
+_ONBOARDED_ELSEWHERE = "The NSO device is already onboarded to a different NetBox device"
+_IDENTITY_CLAIMED = "The target NSO identity is already claimed by another device"
+
+
 _READ_MIRROR_ROOTS = (
     "interfaces",
     "lag_interface",
@@ -223,10 +243,15 @@ async def onboard_device(
             return existing
         # Linked to a DIFFERENT NetBox device → genuine conflict; never silently repoint it.
         if existing.netbox_device_id is not None:
-            raise LookupError(
-                f"NSO device {nso_device_name!r} on {nso_instance!r} is already onboarded "
-                f"to NetBox device {existing.netbox_device_id}"
+            logger.warning(
+                "device.onboard_refused",
+                reason="onboarded_elsewhere",
+                nso_instance=nso_instance,
+                nso_device=nso_device_name,
+                linked_netbox_device_id=existing.netbox_device_id,
+                requested_netbox_device_id=netbox_device_id,
             )
+            raise DeviceIdentityRefused(_ONBOARDED_ELSEWHERE, reason="onboarded_elsewhere")
         # Unlinked leftover — provisioned INTO NSO without a NetBox link (netbox_device_id NULL).
         # ADOPT it: fill the mapping in on the same row. Rejecting here left the plugin's onboard
         # POST failing with 409, which it swallowed, so the device never onboarded. The target
@@ -497,9 +522,15 @@ async def _link_existing_under_claim(
     # Linked to a DIFFERENT NetBox device → genuine conflict; never silently repoint it.
     if linked_to is not None:
         await db.rollback()
-        raise LookupError(
-            f"NSO device {nso_device_name!r} on {nso_instance!r} is already onboarded to NetBox device {linked_to}"
+        logger.warning(
+            "device.onboard_refused",
+            reason="onboarded_elsewhere",
+            nso_instance=nso_instance,
+            nso_device=nso_device_name,
+            linked_netbox_device_id=linked_to,
+            requested_netbox_device_id=netbox_device_id,
         )
+        raise DeviceIdentityRefused(_ONBOARDED_ELSEWHERE, reason="onboarded_elsewhere")
     dup_nb = await db.scalar(
         select(Device.id).where(Device.netbox_device_id == netbox_device_id, Device.id != device_id)
     )
@@ -824,7 +855,14 @@ async def rekey_device(
         )
     )
     if dup.scalar_one_or_none():
-        raise LookupError(f"NSO device {target_name!r} on {target_instance!r} is already claimed by another device")
+        logger.warning(
+            "device.rekey_refused",
+            reason="identity_claimed",
+            device_id=device_id,
+            nso_instance=target_instance,
+            nso_device=target_name,
+        )
+        raise DeviceIdentityRefused(_IDENTITY_CLAIMED, reason="identity_claimed")
 
     device.nso_instance = target_instance
     device.nso_device_name = target_name
