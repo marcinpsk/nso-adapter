@@ -13,7 +13,6 @@ import uuid
 from contextlib import suppress
 from typing import Any
 
-import httpx
 import structlog
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -31,11 +30,7 @@ from nso_adapter.core.claim import (
     resolve_claim_by_token,
 )
 from nso_adapter.core.families import ALL_FAMILY_KEYS
-from nso_adapter.nso.client import (
-    NsoActionFailedError,
-    NsoExportUnavailableError,
-    NsoReadContractError,
-)
+from nso_adapter.nso.client import failure_detail
 from nso_adapter.store import outcome_store
 from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import (
@@ -106,27 +101,6 @@ _READ_MIRROR_ROOTS = (
 #: The failures whose message the adapter WROTE: it names the failure and repeats nothing
 #: the server said. Every other exception is classified by its type alone — a decode of a
 #: malformed answer carries the server's bytes, and a store failure carries the statement.
-_AUTHORED_FAILURES = (NsoActionFailedError, NsoExportUnavailableError, NsoReadContractError)
-
-
-def _failure_detail(exc: BaseException) -> str:
-    """Classify a provisioning failure for the step record.
-
-    ``repr()`` on an httpx failure carries the reason phrase, the request URL and, on a
-    redirect, the ``Location`` the server chose; a decode failure quotes the bytes the
-    server sent. The step detail is persisted in the job result and returned by the
-    provisioning API, so only the classification travels. The numeric status stays, because
-    an operator has to tell an auth refusal from an outage, and an authored message stays,
-    because it is ours. Anything else travels as its TYPE: the step name already says which
-    part of the provision failed.
-    """
-    if isinstance(exc, httpx.HTTPStatusError):
-        return f"{type(exc).__name__} (HTTP {exc.response.status_code})"
-    if isinstance(exc, _AUTHORED_FAILURES):
-        return repr(exc)
-    return type(exc).__name__
-
-
 async def _bootstrap_address(client, device_name: str, primary: str, oob_ip: str | None) -> tuple[str, dict | None]:
     """Reachability-aware initial management address.
 
@@ -149,7 +123,7 @@ async def _bootstrap_address(client, device_name: str, primary: str, oob_ip: str
         return ActiveAddress.primary.value, {
             "step": "failover_bootstrap",
             "status": "failed",
-            "detail": _failure_detail(exc),
+            "detail": failure_detail(exc),
         }
     return ActiveAddress.oob.value, {
         "step": "failover_bootstrap",
@@ -622,7 +596,7 @@ async def provision_nso_device(
             await client.create_device(device_name, address, ned_id, authgroup, ned_type=device_type, port=port)
             _step("create", "ok", f"device-type={device_type}")
     except Exception as exc:
-        _step("create", "failed", _failure_detail(exc))
+        _step("create", "failed", failure_detail(exc))
         return _result(False)
 
     # 2. admin-state unlocked — blocking. MUST precede fetch-host-keys: a newly
@@ -632,7 +606,7 @@ async def provision_nso_device(
         await client.set_admin_state(device_name, admin_state)
         _step("admin_state", "ok", admin_state)
     except Exception as exc:
-        _step("admin_state", "failed", _failure_detail(exc))
+        _step("admin_state", "failed", failure_detail(exc))
         return _result(False)
 
     # 2b. reachability-aware address: bootstrap a fresh device over OOB if primary is
@@ -648,7 +622,7 @@ async def provision_nso_device(
         await _once_with_retry(lambda: client.fetch_host_keys(device_name))
         _step("fetch_host_keys", "ok")
     except Exception as exc:
-        _step("fetch_host_keys", "failed", _failure_detail(exc))
+        _step("fetch_host_keys", "failed", failure_detail(exc))
         # If the bootstrap pinned NSO to the OOB address, don't strand the device: map it and
         # seed the failover row so the loop can fail it back to primary once in-band recovers.
         if active_address == ActiveAddress.oob.value:
@@ -675,7 +649,7 @@ async def provision_nso_device(
             sync_ok = bool(await _once_with_retry(lambda: client.sync_from(device_name), ok=bool))
             _step("sync_from", "ok" if sync_ok else "failed")
         except Exception as exc:
-            _step("sync_from", "failed", _failure_detail(exc))
+            _step("sync_from", "failed", failure_detail(exc))
 
     # 5-6. adapter mapping row (so the read pipeline manages it henceforth) + failover row
     #      (IPs + bootstrapped address) so the failover loop can manage it.
@@ -748,7 +722,7 @@ async def _initial_mirror_refresh(
     except Exception as exc:  # noqa: BLE001 — never fail provisioning on a mirror-read hiccup
         await db.rollback()
         # The mirror read is HTTP against NSO, so the same classification applies here.
-        logger.warning("device.onboard_mirror.failed", device_id=device_id, error=_failure_detail(exc))
+        logger.warning("device.onboard_mirror.failed", device_id=device_id, error=failure_detail(exc))
 
 
 async def _map_and_seed_failover(

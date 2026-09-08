@@ -48,6 +48,27 @@ class NsoReadContractError(RuntimeError):
     """
 
 
+#: The failures whose message the adapter authored, so repeating it repeats only our own words.
+AUTHORED_FAILURES = (NsoActionFailedError, NsoExportUnavailableError, NsoReadContractError)
+
+
+def failure_detail(exc: BaseException) -> str:
+    """Classify a failure for a log record, a job step or a response.
+
+    ``repr()`` on an httpx failure carries the reason phrase, the request URL and, on a
+    redirect, the ``Location`` the server chose; a decode failure quotes the bytes the server
+    sent. None of that is ours to print, and every one of these sinks is persisted or served.
+    The numeric status stays, because an operator has to tell an auth refusal from an outage,
+    and an authored message stays, because it is ours. Anything else travels as its TYPE: the
+    caller's own context already says which part of the work failed.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"{type(exc).__name__} (HTTP {exc.response.status_code})"
+    if isinstance(exc, AUTHORED_FAILURES):
+        return repr(exc)
+    return type(exc).__name__
+
+
 # The only statuses a device-state-read action section may carry: the build is a terminal
 # extraction (never the record-served facade's stale/not-ready). See _certify_device_state_output.
 _TERMINAL_SECTION_STATUSES = frozenset({"ok", "unsupported", "error"})
