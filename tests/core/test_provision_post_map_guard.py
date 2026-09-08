@@ -490,11 +490,14 @@ async def test_a_taken_netbox_id_is_refused_and_leaks_no_claim(adapter_client_wi
 async def test_a_pair_mapped_elsewhere_is_reported_and_leaks_no_claim(adapter_client_with_nso):
     """The node is already linked to a DIFFERENT NetBox device: report it, never repoint it.
 
-    The conflict is detected under the claim, after the read transaction ends, so the
-    message must be built from values snapshotted while the instance was still live — an
-    implicit lazy load on an expired one raises MissingGreenlet and turns a clean
+    The conflict is detected under the claim, after the read transaction ends.
+    Diagnostics must use values snapshotted while the instance was still live.
+    An implicit lazy load on an expired instance raises MissingGreenlet and turns a clean
     ``adapter_mapping: exists`` into an internal failure.
+    The step detail contains the authored refusal. The operator log carries the link.
     """
+    from structlog.testing import capture_logs
+
     from nso_adapter.store.models import DeviceClaim
 
     await seed_device(nso_device_name="pg-elsewhere", netbox_device_id=7250, attributes=[])
@@ -504,14 +507,20 @@ async def test_a_pair_mapped_elsewhere_is_reported_and_leaks_no_claim(adapter_cl
     refresh = _BarrierRefresh()
     refresh.release.set()
 
-    async with session() as db:
-        result = await _provision(
-            db, name="pg-elsewhere", netbox_device_id=7251, reg=reg, job_id=job_id, refresh=refresh
-        )
+    with capture_logs() as logs:
+        async with session() as db:
+            result = await _provision(
+                db, name="pg-elsewhere", netbox_device_id=7251, reg=reg, job_id=job_id, refresh=refresh
+            )
 
     mapping = next(step for step in result["steps"] if step["step"] == "adapter_mapping")
     assert mapping["status"] == "exists"
-    assert "7250" in mapping["detail"]
+    assert "The NSO device is already onboarded to a different NetBox device" in mapping["detail"]
+    assert "7250" not in mapping["detail"]
+    record = next(record for record in logs if record["event"] == "device.onboard_refused")
+    assert record["linked_netbox_device_id"] == 7250
+    assert record["requested_netbox_device_id"] == 7251
+    assert record["reason"] == "onboarded_elsewhere"
     assert not reg.registered
     async with session() as db:
         assert (await db.execute(sa.select(DeviceClaim))).first() is None
