@@ -15458,7 +15458,7 @@
     },
     "/api/v1/secrets": {
       "post": {
-        "description": "Merge-write secret fields at the ref's Vault path; return version + fingerprints.",
+        "description": "Merge-write secret fields at the ref's Vault path; return the new KV v2 version.",
         "operationId": "set_secret_api_v1_secrets_post",
         "requestBody": {
           "content": {

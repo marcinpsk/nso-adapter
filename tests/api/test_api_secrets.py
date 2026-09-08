@@ -638,6 +638,30 @@ async def test_a_SUCCESSFUL_harvest_echoes_no_REFERENCE_COMPONENT_anywhere(vault
 
 
 @pytest.mark.anyio
+async def test_the_secrets_write_description_promises_exactly_what_it_answers(vault_client):
+    """The write's description still promised "version + fingerprints".
+
+    SecretWriteOut carries neither field names nor hashes: it answers the operation_id and
+    the KV v2 version. The stale promise reached the live OpenAPI document and the committed
+    snapshot, so a client author reads a contract the adapter does not serve."""
+    from nso_adapter.api.secrets import SecretWriteOut
+
+    client, _, _ = vault_client
+    resp = await client.post(
+        "/api/v1/secrets", json={"vault_ref": _REF, "values": {_REF_KEY: "placeholder-secret"}}, headers=AUTH
+    )
+
+    assert resp.status_code == 200
+    answered = set(resp.json())
+    assert answered == set(SecretWriteOut.model_fields), "the answer must be the declared model"
+
+    description = create_app().openapi()["paths"]["/api/v1/secrets"]["post"]["description"]
+    assert "fingerprint" not in description.lower(), (
+        "the description promises a fingerprint the write does not answer; it answers " + ", ".join(sorted(answered))
+    )
+
+
+@pytest.mark.anyio
 async def test_a_SUCCESSFUL_verify_echoes_no_REFERENCE_COMPONENT_anywhere(vault_client):
     """The verify echoed the submitted ref too; what VAULT holds is not a caller echo."""
     from structlog.testing import capture_logs
