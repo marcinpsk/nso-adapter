@@ -2364,8 +2364,12 @@ Every `PUT /api/v1/devices/{id}/*-intent` endpoint below (and `vlan-intent`,
 - Explicit `actions/apply` can execute the sixteen receipt lanes through the fourteen
   sections in `DOCUMENT_EXECUTED_SECTIONS`. The registry also contains `lag` and `switchport`.
   These two streams remain in `AWAITING_SENDER_SECTIONS` and return
-  `awaiting_aggregate_sender`. Use a new `X-Push-Seq` when resending a stored receipt-lane
-  payload because receipt replay returns the recorded response without new work.
+  `awaiting_aggregate_sender`. Resending a receipt-lane payload has two distinct meanings,
+  and `X-Push-Seq` is what separates them. To recover a lost response, replay the ORIGINAL
+  sequence with the same body and the same request modes: that is a replay, and it returns
+  the recorded response without new work. A different body or mode under that sequence is
+  `409 sequence_reuse`. Use a NEW sequence only to authorize the payload again as fresh
+  work, because a higher sequence is admitted as a new delivery.
 - Where dropping a row from a keyed NSO service list requires it, the adapter
   queues an async removal job (see [Removal propagation](#removal-propagation)).
 - → `200` `{ "device_id": 1, "count": <rows stored>, "removed": <rows dropped> }`.
