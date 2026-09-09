@@ -58,3 +58,22 @@ def test_static_route_reader_refuses_unqualified_authority():
 
     with pytest.raises(ValueError, match="scope-qualified"):
         _removal_keys({"route": [["", "198.18.0.0/24", "198.18.1.1"]]})
+
+
+def test_a_live_row_without_its_list_key_refuses_instead_of_reading_clean():
+    """The orphan walk indexes live rows BY key, so a key-less row cannot be filtered out.
+
+    Skipping it would take it out of the live set the body is subtracted from, and the guard
+    would report a clean bill for a row the PUT retracts with no authority behind it. A key
+    is mandatory in every RESTCONF list entry, so its absence is corrupt data, and the write
+    fails closed on it.
+    """
+    from nso_adapter.core.removal import _document_orphans
+
+    live = {"interface": {"interface": [{"interface-name": "Gi0/1", "ipv4-address": [{"address": "198.18.0.1"}]}]}}
+    body = {"interface": {"interface": [{"interface-name": "Gi0/1", "ipv4-address": []}]}}
+    assert _document_orphans(live, body, {}) == {"interface_config/ipv4-address": [["Gi0/1", "198.18.0.1"]]}
+
+    keyless = {"interface": {"interface": [{"ipv4-address": [{"address": "198.18.0.1"}]}]}}
+    with pytest.raises(KeyError):
+        _document_orphans(keyless, body, {})
