@@ -41,8 +41,13 @@ async def test_generation_refuses_unqualified_authority(adapter_client):
     from nso_adapter.store.models import GenerationMode
 
     device_id = await seed_device(nso_device_name="invalid-authority")
+    # Committed first: with the projection row uncommitted the refusal rolls the row itself
+    # back, and the assertion below would pass without proving anything about the authority.
     async with session() as db:
         await note_write(db, device_id, "vlan")
+        await db.commit()
+
+    async with session() as db:
         with pytest.raises(ValueError, match="scope-qualified"):
             await create_generation(
                 db,
@@ -51,6 +56,22 @@ async def test_generation_refuses_unqualified_authority(adapter_client):
                 mode=GenerationMode.networked,
                 allowed_removal_keys={"vlan": [[100]]},
             )
+
+    # create_generation writes authorized_revision before it validates the authority, in the
+    # caller-owned transaction, so a fresh session is what proves it never committed.
+    async with session() as db:
+        from sqlalchemy import select
+
+        from nso_adapter.store.models import DeviceProjectionStream
+
+        stream = await db.scalar(
+            select(DeviceProjectionStream).where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == "vlan",
+            )
+        )
+    assert stream is not None, "the committed projection row survives the refusal"
+    assert stream.authorized_revision == 0, "a refused generation must leave no authority behind"
 
 
 def test_static_route_reader_refuses_unqualified_authority():
@@ -75,5 +96,5 @@ def test_a_live_row_without_its_list_key_refuses_instead_of_reading_clean():
     assert _document_orphans(live, body, {}) == {"interface_config/ipv4-address": [["Gi0/1", "198.18.0.1"]]}
 
     keyless = {"interface": {"interface": [{"ipv4-address": [{"address": "198.18.0.1"}]}]}}
-    with pytest.raises(KeyError):
+    with pytest.raises(KeyError, match="interface-name"):
         _document_orphans(keyless, body, {})

@@ -148,6 +148,15 @@ async def test_c1_1_the_fence_no_longer_decides_whether_a_replacement_needs_proo
         ],
     )
     assert fence_open([]) is True, "the predicate itself is unchanged"
+    async with session() as db:
+        from nso_adapter.store.models import StaticRouteIntent
+
+        seeded = list(
+            (await db.execute(sa.select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+    assert fence_open(seeded) is False, "the seeded NULL route_id shuts this device's fence"
     plan, _ = await _plan(device_id)
     assert plan.mode == "PUT", "a shut fence cannot make an undelivered identity edit unprovable"
     assert C in plan.allowed, "the body drops the predecessor, so the authority must name it"
