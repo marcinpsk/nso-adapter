@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
-"""#1396 R2 chunk C5 — atomic exclusion and the follow-on PUT.
+"""#1396 R2 chunk C5 — the replacement rides the one document.
 
-Pins C5.1-C5.5 plus the empty-combined-body case C2 handed over.
+C5 existed because atomic mode staged the static-route family as a merge-PATCH (staging
+ignored ``replace``, G4), so a replacement-open device needed its own follow-on PUT after
+the combined commit, outside that transaction. The aggregate sender removed the premise:
+there is one PUT of one document, so the replacement lands WITH its siblings and the
+documented non-transactional loss is gone.
 
-This is A3(iv)'s acceptance criterion: until C5, atomic mode staged the static-route scope
-as a merge-PATCH (staging ignores ``replace``, G4) and no PUT ever followed, so an atomic
-apply on a replacement-open device honestly reported ``unproven`` and closed nothing. Every
-case here drives the REAL ``run_apply`` with ``NSO_ADAPTER_ATOMIC_APPLY=1`` against a real
-PostgreSQL clone; only the RESTCONF boundary is faked, and it records every request in
-order, so the assertions are about the bytes that reached NSO and their sequence.
+What is pinned here is what replaced it: the one commit carries every family, a rejected
+commit leaves every family pending, and the static-route bookkeeping (CAS, per-row
+evidence, reader-compare, capability) still runs off that single verdict. Every case drives
+the REAL ``run_apply`` against a real PostgreSQL clone; only the RESTCONF boundary is faked,
+and it records every request in order, so the assertions are about the bytes that reached
+NSO and their sequence.
 """
 
 from __future__ import annotations
@@ -31,14 +35,10 @@ pytestmark = pytest.mark.anyio
 
 _NOW = datetime(2026, 6, 1, tzinfo=UTC)
 
-_DATA_URL = "http://nso/restconf/data"
-_VLAN_ROOT = "vlan-reconciler:vlan-config"
-
-
-@pytest.fixture(autouse=True)
-def _atomic_on(monkeypatch):
-    """Every case in this module is about the atomic implementation."""
-    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
+#: The one instance every family is written through.
+_DEVICE_URL = "http://nso/restconf/data/device-intent:device-intent=sr-atomic"
+_VLAN_CONTAINER = "vlan"
+_SR_CONTAINER = "static-route"
 
 
 # ── seeding ──────────────────────────────────────────────────────────────────
@@ -79,22 +79,22 @@ async def static_rows(device_id: int) -> list:
 
 
 class _AtomicRecorder(_ProofRecorder):
-    """C3's recorder plus the two failures C5.2/C5.3 need to tell apart.
+    """C3's recorder plus the one failure the cases below need: a rejected COMMIT.
 
-    ``fail_combined`` rejects the combined ``/restconf/data`` commit; ``fail_static_put``
-    rejects the follow-on keyed PUT. Dry-runs are never rejected — the failure has to be the
-    COMMIT, or atomic-failure localisation would attribute it to the wrong place.
+    Dry-runs are never rejected. The failure has to be the commit itself, or failure
+    localisation would attribute it to the wrong family.
     """
 
     def __init__(self, device_name: str, dry_run_status: int = 200):
         super().__init__(device_name, dry_run_status=dry_run_status)
-        self.fail_combined = False
-        self.fail_static_put = False
+        self.fail_commit = False
+        #: The device error the rejection carries. The ratified refusal shape names its own
+        #: family, which is what lets localisation attribute one without a dry-run sweep.
+        self.reject_message = "device rejected the commit"
 
     async def _handle(self, method: str, url: str, content=None, headers=None):
         live = "dry-run=" not in url
-        combined = url.split("?")[0] == _DATA_URL
-        reject = (live and combined and self.fail_combined) or (live and method == "put" and self.fail_static_put)
+        reject = live and self.fail_commit
         if reject:
             self.calls.append(
                 {"method": method, "url": url, "body": json.loads(content) if content else None, "dry_run": False}
@@ -102,14 +102,18 @@ class _AtomicRecorder(_ProofRecorder):
             return httpx.Response(
                 400,
                 request=httpx.Request(method.upper(), url),
-                json={"errors": {"error": [{"error-message": "device rejected the commit"}]}},
+                json={
+                    "ietf-restconf:errors": {"error": [{"error-message": self.reject_message}]},
+                    "errors": {"error": [{"error-message": self.reject_message}]},
+                },
             )
         return await super()._handle(method, url, content, headers)
 
     # ── views ──
     @property
-    def combined_commits(self) -> list[dict]:
-        return [c for c in self.commits if c["url"].split("?")[0] == _DATA_URL]
+    def documents(self) -> list[dict]:
+        """Every device-intent instance this device really committed, in order."""
+        return [c["body"][_SR_ROOT][0] for c in self.commits if _SR_ROOT in (c["body"] or {})]
 
 
 def atomic_client(device_name: str, *, state, section: dict, dry_run_status: int = 200):
@@ -164,16 +168,16 @@ async def seed_replacement(device_id: int, *, last_apply_at=None, last_apply_err
     )
 
 
-# ── C5.1 — the replacement leaves the combined transaction, and a PUT follows ─
+# ── C5.1 — the replacement rides the ONE document, with its siblings ─────────
 
 
-async def test_c5_1_a_put_mode_plan_is_excluded_from_the_combined_patch(adapter_client):
-    """C5.1 — atomic on, replacement open.
+async def test_c5_1_a_replacement_rides_the_one_document_with_its_siblings(adapter_client):
+    """C5.1 — what the exclusion was for is gone: one PUT IS the replace.
 
-    Staging is merge-PATCH only and explicitly ignores ``replace`` (G4). A staged PUT-mode
-    plan therefore adds ``B`` to the combined PATCH and leaves the predecessor ``A`` live
-    while the job reports success — the exact false green R2 exists to prevent. The scope
-    must be absent from ``modules`` and delivered by its own PUT afterwards.
+    Staging used to be merge-PATCH only and ignored ``replace`` (G4), so a replacement had
+    to leave the combined transaction and follow it. The aggregate document is a full
+    replace by construction, so the predecessor is retracted in the SAME commit that carries
+    every other family, and there is no second write to sequence.
     """
     device_id = await seed_device(nso_device_name="sr-atomic", netbox_device_id=7501)
     await seed_replacement(device_id)
@@ -185,57 +189,39 @@ async def test_c5_1_a_put_mode_plan_is_excluded_from_the_combined_patch(adapter_
     job = await run_the_apply(device_id, client)
 
     assert job.status == JobStatus.succeeded, job.error
-    combined = rec.combined_commits
-    assert len(combined) == 1, "the sibling scope still commits atomically"
-    assert _VLAN_ROOT in combined[0]["body"], "the combined transaction must be a REAL one"
-    assert _SR_ROOT not in combined[0]["body"], "a merge-PATCH cannot deliver a replacement"
-
-    puts = rec.sr_commits("put")
-    assert len(puts) == 1, "the replacement is delivered by exactly one follow-on PUT"
-    assert rec.routes(puts[0]) == [wire(B)]
-    assert rec.commits.index(combined[0]) < rec.commits.index(puts[0]), "the follow-on runs AFTER the commit"
-    assert rec.sr_commits("patch") == [], "and nothing merged the static scope on the side"
+    assert len(rec.documents) == 1, "one document, one commit"
+    document = rec.documents[0]
+    assert _VLAN_CONTAINER in document, "the sibling family rides the same transaction"
+    assert document[_SR_CONTAINER]["route"] == [wire(B)], "and the replacement is in it"
+    assert [c["method"] for c in rec.commits] == ["put"], "no follow-on write of any kind"
 
 
-# ── C5.2 — a rolled-back combined commit issues no follow-on ─────────────────
+# ── C5.2 — a rejected commit leaves every family pending ────────────────────
 
 
 async def test_c5_2_a_failed_combined_commit_issues_no_follow_on_put(adapter_client):
-    """C5.2 — the combined commit fails ⇒ no static HTTP at all, rows pending.
-
-    The static rows were excluded from that transaction, so its rollback says nothing about
-    them — but PUTting them anyway would deliver a replacement on top of a device the rest
-    of the apply just failed to change. They are treated exactly as a non-offending scope
-    is: untouched, retried next apply, never stamped failed.
-    """
+    """A rejected commit leaves last_apply_at unset and records failure on each affected row."""
     device_id = await seed_device(nso_device_name="sr-atomic", netbox_device_id=7502)
     await seed_replacement(device_id)
     await seed_vlan(device_id)
     client, rec = atomic_client(
         "sr-atomic", state=present(wire(A), device_name="sr-atomic"), section=dev_state(wire(B))
     )
-    rec.fail_combined = True
+    rec.fail_commit = True
 
     job = await run_the_apply(device_id, client)
 
     assert job.status == JobStatus.failed
-    assert rec.sr_commits() == [], "no static-route write may follow a rolled-back combined commit"
-    assert client.service_instance_state.await_count == 0, "not even the pre-PUT snapshot read"
-    assert await static_rows(device_id) == [(None, None)], "pending, NOT stamped failed"
+    assert len(rec.commits) == 1, "one rejected write, and no retry behind it"
+    ((applied, error),) = await static_rows(device_id)
+    assert applied is None, "nothing landed"
+    assert error["code"] == "nso_put_failed", "the family rode the rejected commit, so it records it"
     assert await deployed_keys(device_id) == {B: list(A)}, "the replacement stays open"
-    assert outcomes(job) == {B: "unproven"}, "nothing was delivered, so nothing is proven"
+    assert outcomes(job) == {B: "apply_failed"}
 
 
-async def test_p0_2_an_untouched_row_does_not_pair_a_previous_error_with_this_result(adapter_client):
-    """#1396 R3 P0 — C5.2's row, but carrying an error an EARLIER apply left on it.
-
-    This is the one path where a row keeps a persisted ``last_apply_error`` while this pass
-    neither delivered nor failed it: the combined commit rolls back in a sibling scope, the
-    static rows are deliberately left untouched, and the outcome is ``unproven``. Reading the
-    column straight into the record would hand a generation-correlated consumer a failure
-    from a superseded generation as though it described this one. The row keeps its error —
-    it is still the store's last known failure — but the record must not claim it.
-    """
+async def test_localized_refusal_replaces_previous_errors_on_other_families(adapter_client):
+    """A refused transaction replaces stale errors on every affected row."""
     device_id = await seed_device(nso_device_name="sr-atomic", netbox_device_id=7504)
     stale = {"code": "internal", "message": "a previous apply failed", "detail": {}}
     await seed_replacement(device_id, last_apply_error=stale)
@@ -243,25 +229,27 @@ async def test_p0_2_an_untouched_row_does_not_pair_a_previous_error_with_this_re
     client, rec = atomic_client(
         "sr-atomic", state=present(wire(A), device_name="sr-atomic"), section=dev_state(wire(B))
     )
-    rec.fail_combined = True
+    rec.fail_commit = True
+    rec.reject_message = "device-intent: refused [family=vlan field=vlan-id]: unsupported"
 
     job = await run_the_apply(device_id, client)
 
     entry = job.result["static_route_results"][0]
-    assert entry["outcome"] == "unproven"
-    assert entry["error"] is None, "this pass produced no verdict for this route"
-    assert await static_rows(device_id) == [(None, stale)], "the row still holds it — only the record is scoped"
+    assert entry["outcome"] == "apply_failed"
+    assert entry["error"] is not None
+    assert "vlan" in entry["error"]["message"]
+    assert await static_rows(device_id) == [(None, entry["error"])]
 
 
-# ── C5.3 — a failed follow-on fails the job, and only the static rows ────────
+# ── C5.3 — a rejected commit fails EVERY family, not just the static rows ────
 
 
-async def test_c5_3_a_failed_follow_on_put_fails_the_job_and_only_its_own_rows(adapter_client):
-    """C5.3 — combined commit succeeds, the follow-on PUT is rejected.
+async def test_c5_3_a_rejected_commit_fails_every_family_together(adapter_client):
+    """C5.3 — the documented non-transactional loss is gone with the follow-on.
 
-    Reporting ``succeeded`` here would settle a replacement the device refused. The
-    documented loss is the other half: the combined commit has already landed, so the
-    sibling scope stays applied — the replacement is NOT transactional with it.
+    A rejected follow-on used to fail the static rows while the sibling stayed applied,
+    because the combined commit had already landed. One transaction removes the seam: the
+    device took nothing, so no family may be stamped as though it had.
     """
     device_id = await seed_device(nso_device_name="sr-atomic", netbox_device_id=7503)
     await seed_replacement(device_id)
@@ -269,30 +257,29 @@ async def test_c5_3_a_failed_follow_on_put_fails_the_job_and_only_its_own_rows(a
     client, rec = atomic_client(
         "sr-atomic", state=present(wire(A), device_name="sr-atomic"), section=dev_state(wire(B))
     )
-    rec.fail_static_put = True
+    rec.fail_commit = True
 
     job = await run_the_apply(device_id, client)
 
     assert job.status == JobStatus.failed
-    assert len(rec.sr_commits("put")) == 1
-    ((sr_applied, sr_error),) = await static_rows(device_id)
-    assert sr_applied is None and sr_error["code"] == "nso_put_failed", sr_error
+    assert len(rec.commits) == 1
     ((vlan_applied, vlan_error),) = await vlan_rows(device_id)
-    assert vlan_applied is not None and vlan_error is None, "only the static rows failed"
-    assert job.result["vlan_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
-    assert job.result["static_route_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
-    assert await deployed_keys(device_id) == {B: list(A)}, "a refused PUT closes nothing"
+    assert vlan_applied is None, "the sibling family landed nothing either"
+    assert vlan_error["code"] == "nso_put_failed", "and it records the same one rejection"
+    assert await deployed_keys(device_id) == {B: list(A)}, "a refused commit closes nothing"
     assert outcomes(job) == {B: "apply_failed"}
 
 
-# ── C5.4 — no replacement open ⇒ the scope is staged as before ───────────────
+# ── C5.4 — an ordinary apply rides the same one document ────────────────────
 
 
-async def test_c5_4_without_a_replacement_the_scope_still_rides_the_combined_patch(adapter_client):
-    """C5.4 — the exclusion is scoped to PUT mode, not to static routes.
+async def test_c5_4_an_apply_with_no_replacement_open_rides_the_same_document(adapter_client):
+    """C5.4 — the exclusion was scoped to PUT mode; there is no mode left to scope it to.
 
-    Excluding the scope unconditionally would drop every ordinary static-route apply out of
-    the one-transaction guarantee for nothing.
+    Excluding the family unconditionally would have dropped every ordinary static-route
+    apply out of the one-transaction guarantee. It rides that guarantee now whether or not a
+    replacement is open, and the retention read runs either way because the document may
+    still owe a carrier's entry.
     """
     device_id = await seed_device(nso_device_name="sr-atomic", netbox_device_id=7504)
     await seed_rows(device_id, [{"triple": B, "route_id": 7, "deployed_key": list(B)}])
@@ -304,11 +291,8 @@ async def test_c5_4_without_a_replacement_the_scope_still_rides_the_combined_pat
     job = await run_the_apply(device_id, client)
 
     assert job.status == JobStatus.succeeded, job.error
-    combined = rec.combined_commits
-    assert len(combined) == 1
-    assert _SR_ROOT in combined[0]["body"], "a PATCH-mode plan is staged exactly as before"
-    assert rec.sr_commits("put") == [], "and no PUT follows"
-    assert client.service_instance_state.await_count == 0, "a merge needs no snapshot"
+    assert len(rec.documents) == 1
+    assert _SR_CONTAINER in rec.documents[0] and _VLAN_CONTAINER in rec.documents[0]
 
 
 # ── C5.5 — the clean end-to-end record ──────────────────────────────────────
@@ -367,18 +351,18 @@ async def test_c5_5b_an_inconclusive_follow_on_verify_closes_nothing_and_still_s
     assert outcomes(job) == {B: "unproven"}
 
 
-# ── C2's hand-off: PUT mode must never produce an empty combined PATCH ───────
+# ── C2's hand-off: a force=False pass with nothing eligible ─────────────────
 
 
-async def test_the_excluded_scope_never_leaves_an_empty_combined_patch(adapter_client):
-    """C2's hand-off, made unreachable rather than merely unreached.
+async def test_a_replacement_is_delivered_even_when_the_eligible_list_is_empty(adapter_client):
+    """C1.4's rule at the sender: ``any_eligible`` comes from the PLAN, not the eligible list.
 
-    ``any_eligible`` comes from ``plan.rows`` (C1.4), so a ``force=False`` apply of a
-    replacement-open row with a clean ``last_apply_at`` admits the atomic branch with an
-    EMPTY eligible list. Once C5 also takes the static scope out of the staging, nothing at
-    all is left to stage — and an empty ``/restconf/data`` PATCH would be a write whose
-    verify verdict belongs to no scope. Unreachable in production only because the worker
-    passes ``force=True``; the structure must not depend on that.
+    ``force=False`` on a replacement-open row with a clean ``last_apply_at`` leaves the
+    eligible list empty while the body still has every accepted row to send and a
+    predecessor to retract. Deriving "anything to do" from the eligible list would take the
+    all-zero early success and leave the predecessor on the device for ever. Unreachable in
+    production only because the worker passes ``force=True``; the structure must not depend
+    on that.
     """
     device_id = await seed_device(nso_device_name="sr-atomic", netbox_device_id=7507)
     await seed_replacement(device_id, last_apply_at=_NOW)
@@ -389,10 +373,10 @@ async def test_the_excluded_scope_never_leaves_an_empty_combined_patch(adapter_c
     job = await run_the_apply(device_id, client, force=False)
 
     assert job.status == JobStatus.succeeded, job.error
-    assert rec.combined_commits == [], "an empty combined body must not be committed"
-    assert rec.routes(rec.sr_commits("put")[0]) == [wire(B)], "the follow-on still delivers the replacement"
-    assert await deployed_keys(device_id) == {B: list(B)}
-    assert outcomes(job) == {B: "in_sync"}
+    assert rec.documents[0][_SR_CONTAINER]["route"] == [wire(B)], "the replacement was delivered"
+    assert job.result["static_route_count_by_outcome"] != {"in_sync": 0, "apply_failed": 0}, (
+        "an all-zero result after a real write is the false no-op C1.4 forbids"
+    )
 
 
 async def test_a_reader_compare_miss_on_the_follow_on_fails_only_the_missing_row(adapter_client):
@@ -450,16 +434,14 @@ async def capability_scopes(device_id: int) -> list[str]:
         return [r.scope for r in rows if r.status in ("unsupported", "skipped")]
 
 
-@pytest.mark.parametrize("put_fails", [False, True], ids=["clean_follow_on", "rejected_follow_on"])
-async def test_a_clean_follow_on_clears_the_stale_capability_the_exclusion_skipped(adapter_client, put_fails):
-    """A scope that leaves the combined body must not leave its capability record behind.
+@pytest.mark.parametrize("put_fails", [False, True], ids=["clean_commit", "rejected_commit"])
+async def test_a_clean_commit_clears_the_stale_capability_for_every_family_it_carried(adapter_client, put_fails):
+    """A clean commit proves every family in the document applies on this ``(ned, sw)``.
 
-    ``_clear_atomic_capability`` only sees the roots that rode the combined commit, so once a
-    PUT-mode pass is excluded from it, a stale apply-sourced ``unsupported`` for static_route
-    would stick forever — a probe cannot downgrade an apply-sourced row, so
-    ``/apply/preflight`` would keep warning about a scope that now applies cleanly. The clear
-    runs AFTER the terminal transaction, because it commits and would otherwise split §4.6's
-    single transaction; a REJECTED follow-on proves nothing and clears nothing.
+    A stale apply-sourced ``unsupported`` for static_route would otherwise stick forever — a
+    probe cannot downgrade an apply-sourced row, so ``/apply/preflight`` would keep warning
+    about a family that now applies cleanly. A REJECTED commit proves nothing and clears
+    nothing.
     """
     device_id = await seed_device(nso_device_name="sr-atomic", netbox_device_id=7509 + int(put_fails))
     await seed_replacement(device_id)
@@ -468,9 +450,73 @@ async def test_a_clean_follow_on_clears_the_stale_capability_the_exclusion_skipp
     client, rec = atomic_client(
         "sr-atomic", state=present(wire(A), device_name="sr-atomic"), section=dev_state(wire(B))
     )
-    rec.fail_static_put = put_fails
+    rec.fail_commit = put_fails
 
     job = await run_the_apply(device_id, client)
 
     assert job.status == (JobStatus.failed if put_fails else JobStatus.succeeded), job.error
     assert await capability_scopes(device_id) == (["static_route"] if put_fails else [])
+
+
+@pytest.mark.parametrize("phase", ["commit", "verify"])
+@pytest.mark.parametrize("shape", ["object", "text", "string"])
+async def test_rejected_commit_redacts_secrets_in_logs_and_stored_errors(adapter_client, shape, phase):
+    from structlog.testing import capture_logs
+
+    from nso_adapter.store.models import OspfInterfaceIntent
+
+    secret = "placeholder-authentication-secret"
+    device_id = await seed_device(nso_device_name="sr-atomic")
+    await seed_vlan(device_id)
+    async with session() as db:
+        db.add(
+            OspfInterfaceIntent(
+                device_id=device_id,
+                interface_name="GigabitEthernet0/1",
+                process_id="1",
+                area_id="0",
+                auth_type="md5",
+                auth_key=secret,
+                accepted_at=_NOW,
+            )
+        )
+        await db.commit()
+    client, rec = atomic_client("sr-atomic", state=present(device_name="sr-atomic"), section=dev_state())
+    original = rec._handle
+
+    async def reject(method, url, content=None, headers=None):
+        if method == "put" and ("dry-run=" in url) == (phase == "verify") and secret in content:
+            message = f"device-intent: refused [family=ospf field=auth-key]: rejected {secret}"
+            if shape == "text":
+                return httpx.Response(400, text=message)
+            if shape == "string":
+                return httpx.Response(400, json=message)
+            return httpx.Response(
+                400,
+                json={
+                    "ietf-restconf:errors": {
+                        "error": [
+                            {
+                                "error-message": message,
+                                "error-info": {"auth-key": secret, "submitted": f"value={secret}"},
+                            }
+                        ]
+                    }
+                },
+            )
+        return await original(method, url, content, headers)
+
+    rec._handle = reject
+    with capture_logs() as logs:
+        job = await run_the_apply(device_id, client)
+    assert job.status == JobStatus.failed
+    async with session() as db:
+        row = await db.scalar(select(OspfInterfaceIntent).where(OspfInterfaceIntent.device_id == device_id))
+        error = row.last_apply_error
+    assert error is not None, json.dumps({"error": job.error, "logs": logs})
+    assert error["code"] == ("nso_put_failed" if phase == "commit" else "dry_run_rejected"), error
+    assert secret not in json.dumps(error)
+    event = "nso.apply.device_intent_failed" if phase == "commit" else "nso.apply.dry_run_non_2xx"
+    failures = [record for record in logs if record["event"] == event]
+    assert failures
+    assert secret not in json.dumps(logs)

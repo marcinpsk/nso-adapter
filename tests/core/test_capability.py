@@ -271,6 +271,38 @@ def test_parse_rejected_construct():
     assert parse_rejected_construct("no command here") == (None, None)
     # A rejection whose command is the LAST line (no trailing newline) must still parse (#20).
     assert parse_rejected_construct("aborted: command: set tag 5") == ("rm-set", "set tag")
+    # Community lists resolve to a FIXED identifier: the redaction allowlist is built from the
+    # same table, so a name derived from the device's own text could never survive it. Each
+    # form keeps its own identifier, because the identifier is what states the member kind.
+    assert parse_rejected_construct("command: ip community-list standard CL permit 65000:1") == (
+        "community",
+        "ip community-list standard",
+    )
+    assert parse_rejected_construct("command: ip community-list expanded CL permit ^65000:") == (
+        "community",
+        "ip community-list expanded",
+    )
+    assert parse_rejected_construct("command: ip large-community-list expanded CL permit .*") == (
+        "community",
+        "ip large-community-list",
+    )
+    # A numbered list names its kind by a NUMBER, which is device text the redaction may not
+    # keep, so it is not attributed at all rather than attributed to a guessed kind.
+    assert parse_rejected_construct("command: ip community-list 100 permit ^65000:") == (None, None)
+
+
+def test_a_community_list_row_indexes_under_the_kind_its_list_carries():
+    """A rejection names a LIST. Kinding it as a member reads every identifier as 'standard'."""
+    from nso_adapter.core.capability import preflight
+
+    for name, condemned, cleared in (
+        ("ip community-list standard", "65000:1", "^65000:"),
+        ("ip community-list expanded", "^65000:", "65000:1"),
+        ("ip large-community-list", "large:65000:1:2", "65000:1"),
+    ):
+        rows = [_row("community", name, "unsupported")]
+        assert preflight(rows, community_members=[condemned])["fully_supported"] is False, name
+        assert preflight(rows, community_members=[cleared])["fully_supported"] is True, name
 
 
 @pytest.mark.asyncio
@@ -535,3 +567,50 @@ async def test_clear_capability_rejections_clears_fine_grained_names_in_scope(ad
         assert cleared == 1
         rows = await get_device_capability(db, _NED, sw)
         assert not any(r.scope == "interface_ip" for r in rows)
+
+
+def test_the_redaction_keeps_every_construct_capability_attribution_can_resolve():
+    """The sanitizer and the attribution parsers must not drift apart.
+
+    Every allowlisted identifier, driven through the real redaction: the operand and the
+    device text go, the scope survives, and the name that survives is one preflight can
+    look up. A new construct added to a table is covered without a new case here.
+    """
+    from itertools import chain
+
+    from nso_adapter.core.capability import (
+        _IFACE_CMD_CONSTRUCTS,
+        _IFACE_PATH_CONSTRUCTS,
+        _MATCH_KEY_CONSTRUCTS,
+        _REJECTION_CONSTRUCTS,
+        _SET_KEY_CONSTRUCTS,
+        _rejection_command_allowlist,
+        parse_rejected_construct,
+        parse_rejected_iface_construct,
+    )
+    from nso_adapter.nso.apply import _diagnostic_message
+
+    secret = "placeholder-resolved-community"
+    resolvable = {name for _scope, name, _token in (*_REJECTION_CONSTRUCTS, *_IFACE_CMD_CONSTRUCTS)}
+    resolvable |= {name for _scope, name, _token in _IFACE_PATH_CONSTRUCTS}
+    resolvable |= set(chain(*_SET_KEY_CONSTRUCTS.values(), *_MATCH_KEY_CONSTRUCTS.values()))
+
+    messages = [
+        f"Aborted: syntax error\ncommand: {name} OPERAND\nconfig: snmp-server community {secret} RO"
+        for name in _rejection_command_allowlist()
+    ]
+    messages += [
+        f"invalid value for: x in /ir:interface-config[name='Gi0/1']{token}[c='{secret}']"
+        for _scope, _name, token in _IFACE_PATH_CONSTRUCTS
+    ]
+    assert len(messages) > len(_IFACE_PATH_CONSTRUCTS), "the allowlist is empty"
+
+    for raw in messages:
+        kept = _diagnostic_message(raw)
+        assert secret not in kept, kept
+        assert "OPERAND" not in kept, kept
+        rp_raw, rp_kept = parse_rejected_construct(raw), parse_rejected_construct(kept)
+        assert rp_kept[0] == rp_raw[0], f"{raw!r} lost its route-policy scope: {rp_kept} != {rp_raw}"
+        if rp_kept[1] is not None:
+            assert rp_kept[1] in resolvable, f"{rp_kept[1]!r} is a name preflight cannot look up"
+        assert parse_rejected_iface_construct(kept) == parse_rejected_iface_construct(raw), raw

@@ -231,7 +231,12 @@ async def _record_projection_deletions(
     response: dict,
 ) -> tuple[dict, frozenset[tuple]]:
     """Add first-seen row deletion markings to the receipt's private promotion data."""
-    from nso_adapter.core.projection import is_intent_deletion, rows_by_intent_identity, snapshot_stream
+    from nso_adapter.core.projection import (
+        fragment_tables,
+        is_intent_deletion,
+        rows_by_intent_identity,
+        snapshot_stream,
+    )
     from nso_adapter.core.request_flags import DELETE_ORIGIN_MARKING, DETACH_MARKING
 
     projection = await db.scalar(
@@ -244,7 +249,7 @@ async def _record_projection_deletions(
         return response, frozenset()
     desired = await snapshot_stream(db, device_id, delivery.stream)
     retired = _restored_deletion_identities(
-        _private_response(receipt.response), projection.authorized_document, desired
+        _private_response(receipt.response), fragment_tables(projection.authorized_document), desired
     )
     explicit = {
         identity: record
@@ -252,9 +257,10 @@ async def _record_projection_deletions(
         if (identity := promotion_deletion_identity(record)) is not None
     }
     marking = DELETE_ORIGIN_MARKING if receipt.delete_origin else DETACH_MARKING
-    for table in projection.authorized_document:
+    authorized_tables = fragment_tables(projection.authorized_document)
+    for table in authorized_tables:
         desired_identities = rows_by_intent_identity(desired, table)
-        for identity, row in rows_by_intent_identity(projection.authorized_document, table).items():
+        for identity, row in rows_by_intent_identity(authorized_tables, table).items():
             row_id = row.get("id")
             if not isinstance(row_id, int) or not is_intent_deletion(table, identity, desired_identities):
                 continue

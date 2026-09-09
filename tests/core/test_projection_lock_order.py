@@ -13,6 +13,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.core.removal_helpers import authorize_static_route, authorize_stream
 from tests.core.test_generation_protocol import put_vlans, seed_settings
 
 pytestmark = pytest.mark.anyio
@@ -100,7 +101,11 @@ async def _seed_tombstone(device_id: int, *, job_id: int | None = None) -> int:
         )
         db.add(row)
         await db.commit()
-        return row.id
+        tombstone_id = row.id
+    # What the deletion push that wrote the carrier promoted: a reissue composes only
+    # AUTHORIZED fragments, and creation refuses an operation with no section to live in.
+    await authorize_static_route(device_id)
+    return tombstone_id
 
 
 async def _seed_succeeded_removal(device_id: int) -> int:
@@ -326,7 +331,7 @@ async def test_switching_writer_commits_before_real_offboard(adapter_client, riv
 
 async def test_document_snapshot_waits_for_a_switching_replacement(adapter_client, rival_engine):
     from nso_adapter.core.generation import lock_device_document
-    from nso_adapter.core.projection import hydrate_section, snapshot_stream
+    from nso_adapter.core.projection import hydrate_section
     from nso_adapter.core.switching_intent import (
         LagBundleSnapshot,
         LagMemberSnapshot,
@@ -334,6 +339,7 @@ async def test_document_snapshot_waits_for_a_switching_replacement(adapter_clien
         replace_lag_snapshot,
     )
     from nso_adapter.store.db import get_engine
+    from tests.core.projection_helpers import freeze_snapshot
 
     device_id = await seed_device(nso_device_name="lock-switching-snapshot", netbox_device_id=9913)
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
@@ -356,7 +362,7 @@ async def test_document_snapshot_waits_for_a_switching_replacement(adapter_clien
 
         async def read_document():
             await lock_device_document(reader, device_id)
-            fragment = await snapshot_stream(reader, device_id, "lag")
+            fragment = await freeze_snapshot(reader, device_id, "lag")
             await reader.rollback()
             return encode_lag_section(
                 hydrate_section({"lag": fragment}, "lag"), {"ned_id": None, "dialect": "identity"}
@@ -489,6 +495,65 @@ async def test_real_offboard_commits_before_a_waiting_writer(adapter_client, riv
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "not_found"
     assert await _job_ids() == jobs_before
+
+
+async def test_removal_admission_locks_the_projection_before_selecting_the_carriers_it_discharges(
+    adapter_client, rival_engine
+):
+    """The discharged carriers are SELECTED under the lock, or the operation cannot name them.
+
+    Admission records the pending-clear ids in the immutable operation plane and then deletes
+    them by STREAM. A clear committing between an unlocked selection and the creation is
+    therefore deleted by an operation that never named it: the obligation is gone with no
+    record that anything discharged it, and no retry can rebuild it.
+    """
+    from nso_adapter.core.generation import lock_projection
+    from nso_adapter.core.removal import enqueue_removal
+    from nso_adapter.store.db import get_engine
+    from nso_adapter.store.models import DeploymentGeneration, StreamPendingClear
+
+    device_id = await seed_device(nso_device_name="lock-clear-select", netbox_device_id=9931)
+    await _seed_counter(device_id)
+    await authorize_stream(device_id, "vlan")
+    rival = async_sessionmaker(rival_engine, expire_on_commit=False)
+
+    async with rival() as gate, rival() as worker:
+        gate_pid = await _backend_pid(gate)
+        await lock_projection(gate, device_id)
+
+        async def _admit():
+            job = await enqueue_removal(
+                worker, device_id, "vlan", marking=None, defer_retract=False, promotes=(), force=True
+            )
+            await worker.commit()
+            return job
+
+        admitting = asyncio.create_task(_admit())
+        try:
+            # The projection lock takes the device row first, so that is where admission parks.
+            await _wait_for_blocked_query(
+                get_engine(),
+                blocker_pid=gate_pid,
+                relation="devices",
+                fragments=("from devices", "for no key update"),
+            )
+            # The rival's store-only clear lands while admission waits for the lock.
+            gate.add(StreamPendingClear(device_id=device_id, stream="vlan", provenance="store_only", revision=1))
+            await gate.commit()
+            await asyncio.wait_for(admitting, timeout=10)
+        finally:
+            if not admitting.done():
+                admitting.cancel()
+                await asyncio.gather(admitting, return_exceptions=True)
+
+    async with session() as db:
+        generation = await db.scalar(sa.select(DeploymentGeneration).where(DeploymentGeneration.device_id == device_id))
+        survivors = (
+            await db.scalars(sa.select(StreamPendingClear).where(StreamPendingClear.device_id == device_id))
+        ).all()
+    named = generation.document["vlan"]["_execution"]["operation"]["pending_clear_ids"]
+    assert named, "the operation plane named no carrier while admission deleted one"
+    assert list(survivors) == [], "the carrier admission named must be the carrier it discharged"
 
 
 @pytest.mark.parametrize("producer", ("sweep", "reclaim"))

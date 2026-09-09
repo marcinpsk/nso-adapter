@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
 from sqlalchemy import select
 
 from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
@@ -274,8 +275,13 @@ async def test_put_ip_intent_removal_enqueues_interface_config_job(adapter_clien
             "scope": "interface_config",
             "interfaces": ["Gi0/3"],
             # #104 phase-3: the removed VALUES ride along so run_removal can do the
-            # value-grain residue check after the per-instance replace/delete.
-            "removed": {"address": [["Gi0/3", "10.0.0.2/24", ""]]},
+            # value-grain residue check after the per-instance replace/delete; the wire
+            # grains beside them are what the device-wide collateral guard compares.
+            "removed": {
+                "address": [["Gi0/3", "10.0.0.2/24", ""]],
+                "ipv4-address": [["Gi0/3", "10.0.0.2"]],
+                "interface": [["Gi0/3"]],
+            },
             "detach": True,
         }
 
@@ -343,7 +349,9 @@ async def test_put_ip_intent_removal_captures_values_per_interface(adapter_clien
         assert len(removals) == 1
         assert removals[0].context["interfaces"] == ["Gi0/5"]
         assert removals[0].context["removed"] == {
-            "address": [["Gi0/5", "10.0.1.1/30", "CUST"], ["Gi0/5", "10.0.2.1/30", ""]]
+            "address": [["Gi0/5", "10.0.1.1/30", "CUST"], ["Gi0/5", "10.0.2.1/30", ""]],
+            "ipv4-address": [["Gi0/5", "10.0.1.1"], ["Gi0/5", "10.0.2.1"]],
+            "interface": [["Gi0/5"]],
         }
 
 
@@ -472,3 +480,74 @@ async def test_put_ip_intent_requires_auth(adapter_client):
     """Missing Authorization header → 401."""
     resp = await adapter_client.put("/api/v1/devices/1/ip-intent", json={"addresses": []})
     assert resp.status_code == 401
+
+
+@pytest.mark.parametrize(
+    "address,family",
+    [
+        ("invalid", "ipv4"),
+        ("192.0.2.1/33", "ipv4"),
+        ("2001:db8::1/129", "ipv6"),
+        ("192.0.2.1/24", "ipv6"),
+        ("2001:db8::1/64", "ipv4"),
+        ("192.0.2.1", "ipv4"),
+        ("192.0.2.1/24", "unknown"),
+    ],
+)
+async def test_ip_intent_rejects_invalid_address_before_storing(adapter_client, address, family):
+    """Invalid IP intent fails admission before it can create rows or removal work."""
+    from nso_adapter.store.models import DbInterface, DeviceProjectionStream, InterfaceIpIntent, Job
+
+    device_id = await seed_device(nso_device_name="invalid-ip-intent", netbox_device_id=886)
+    response = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ip-intent",
+        headers=AUTH | push_seq(),
+        json={"addresses": [{"interface": "GigabitEthernet0/1", "address": address, "family": family}]},
+    )
+    assert response.status_code == 422, response.text
+    async with session() as db:
+        for model in (DbInterface, DeviceProjectionStream, InterfaceIpIntent, Job):
+            assert (await db.execute(select(model))).scalars().all() == []
+
+
+@pytest.mark.parametrize(
+    "before,after,family,label,host",
+    [
+        ("192.0.2.1/24", "192.0.2.2/24", "ipv4", "ipv4-address", "192.0.2.1"),
+        ("2001:db8::1/64", "2001:db8::2/64", "ipv6", "ipv6-address", "2001:db8::1"),
+    ],
+)
+async def test_ip_intent_correction_freezes_predecessor_wire_grains(adapter_client, before, after, family, label, host):
+    """A valid correction keeps the predecessor's value and wire removal identities."""
+    from nso_adapter.store.models import InterfaceIpIntent, Job, JobType
+    from tests.core.test_action_apply_promotion import _apply
+    from tests.core.test_execution_context import _execute
+    from tests.core.test_generation_protocol import generations, seed_settings
+
+    device_id = await seed_device(nso_device_name="corrected-ip-intent", netbox_device_id=887)
+    await seed_settings(device_id, auto_apply=False)
+    interface = "GigabitEthernet0/1"
+    for seq, address in ((1880, before), (1881, after)):
+        response = await adapter_client.put(
+            f"/api/v1/devices/{device_id}/ip-intent?delete_origin=true",
+            headers=AUTH | push_seq(seq),
+            json={"addresses": [{"interface": interface, "address": address, "family": family}]},
+        )
+        assert response.status_code == 200, response.text
+        if seq == 1880:
+            assert (await _apply(adapter_client, device_id, {"ip": seq})).status_code == 202
+            await _execute(device_id, "corrected-ip-intent")
+    generation = (await generations(device_id))[-1]
+    async with session() as db:
+        row = (await db.execute(select(InterfaceIpIntent))).scalar_one()
+        assert row.address == after
+        job = await db.get(Job, generation.job_id)
+        assert job.job_type == JobType.removal
+        assert job.context["removed"] == {
+            "interface": [[interface]],
+            "address": [[interface, before, ""]],
+            label: [[interface, host]],
+        }
+    recorder = await _execute(device_id, "corrected-ip-intent")
+    entry = recorder.documents[-1]["interface"]["interface"][0]
+    assert [item["address"] for item in entry[label]] == [after.split("/")[0]]

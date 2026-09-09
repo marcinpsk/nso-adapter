@@ -434,39 +434,6 @@ async def db_session(store_engine, pg_url, tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def sender_enabled_sections(monkeypatch):
-    """Make ``switchport`` and ``lag`` executable for one test process (#1612).
-
-    The two sections sit in ``AWAITING_SENDER_SECTIONS`` until C9's aggregate sender lands,
-    so production Apply refuses to select them. Authorization is not gated on that sender:
-    everything up to and including settlement is testable now, and only actual device
-    transmission is not. This moves the two into ``DOCUMENT_EXECUTED_SECTIONS`` for the
-    duration of one test and restores both sets afterwards.
-    """
-    from nso_adapter.core import projection
-
-    def clear_caches() -> None:
-        for fn in (
-            projection._stream_tables,
-            projection._stream_section,
-            projection.projection_streams,
-            projection.projection_sections,
-        ):
-            fn.cache_clear()
-
-    executed = projection.DOCUMENT_EXECUTED_SECTIONS | projection.AWAITING_SENDER_SECTIONS
-    # A context, not undo(): undo() on the shared function-scoped instance also reverts
-    # the patches every other fixture of the same test made through it.
-    with monkeypatch.context() as scoped:
-        scoped.setattr(projection, "AWAITING_SENDER_SECTIONS", frozenset())
-        scoped.setattr(projection, "DOCUMENT_EXECUTED_SECTIONS", executed)
-        scoped.setattr(projection, "ACTION_APPLY_EXECUTABLE_SECTIONS", executed)
-        clear_caches()
-        yield
-    clear_caches()
-
-
-@pytest.fixture
 def fake_nso_client():
     """AsyncMock simulating NsoClient.
 

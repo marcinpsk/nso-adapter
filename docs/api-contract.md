@@ -124,8 +124,8 @@ its streams' last-authorized fragments, with the just-promoted stream's fresh sn
 overlaid.
 
 An intent push is the only thing that authorizes. `POST …/actions/force-removal` authorizes
-nothing: it re-issues a deployment of one scope, of state an earlier push already
-authorized, with the collateral guard off — so it promotes no stream and marks none applied.
+nothing: it re-issues a deployment of state an earlier push already authorized, with the
+collateral guard off — so it promotes no stream and marks none applied.
 
 **What identifies a delivery.** The sequence, the body digest AND the request mode:
 
@@ -783,9 +783,21 @@ Run the NSO connectivity test.
 
 ### `POST /api/v1/devices/{id}/actions/force-removal`
 
-Reissue one removal scope with the collateral guard disabled. The request body is
-`{ "scope": "<scope>", "interfaces": ["<name>", ...] | null }`.
-`interface_config` requires a non-empty `interfaces` list.
+Reissue a removal with the collateral guard disabled. The request body is
+`{ "scope": "<scope>", "interfaces": ["<name>", ...] | null }`. Only `scope` is validated:
+a scope outside the removal-scope set is `400 bad_request`, and so is a scope nothing has
+ever authorized on this device, because the composed document then carries no section for
+the flush to act on.
+
+**The guard is disabled for the whole document, not for `scope` alone.** One send is the
+device's entire document, so the write flushes every family's orphaned service rows, not
+only the named scope's. `scope` selects the residue check, the pending clears the job
+discharges, and (for `static_route`) the suppression of entry retention. It does not narrow
+the write. Review the orphans of every family, not just one, before issuing this.
+
+`interfaces` does not constrain the write either. It is recorded in the job context and
+nothing reads it, so an `interface_config` force-removal flushes every interface the
+document does not re-assert, whatever the list holds. No scope requires the field.
 
 Each valid request creates a distinct reissue generation and a distinct removal
 job. A repeated request for the same scope does not reuse or replace an earlier
@@ -869,10 +881,10 @@ retry of the same selection can promote it.
 
 For a prepared stream, `no_prepared_revision` means the selected revision has no matching
 prepared slot. It is terminal for the selected revision. Prepare a new snapshot and select
-its returned revision. `awaiting_aggregate_sender` means the section has no device sender.
-It is retryable after the aggregate sender becomes available. On this branch, `lag` and
-`switchport` always return this reason before the adapter checks their prepared revisions.
-The adapter preserves their prepared slots and creates no generation or job for them.
+its returned revision. `lag` and `switchport` resolve against their prepared slots exactly
+like the receipt lanes resolve against their receipts: a selected revision that matches the
+prepared slot promotes, and every other outcome reports `already_applied`, `superseded`,
+`already_authorized` or `no_prepared_revision`.
 
 `superseded` and `backfill_only` require a new selection. `already_applied` needs no further
 work. `already_authorized` leaves recovery to the owning generation's retry or abandon action.
@@ -956,6 +968,7 @@ and an identical retry replays it. Reasons are stable machine codes:
 
 <!-- apply-unexecutable-reasons:start -->
 - `interface_attribute_eligibility_unresolved`
+- `invalid_stored_address`
 - `mixed_detach_replacement`
 - `no_executable_interface`
 - `outstanding_deletion_provenance`
@@ -965,8 +978,9 @@ and an identical retry replays it. Reasons are stable machine codes:
 The registry contains eighteen streams: sixteen endpoint receipt lanes and the out-of-protocol
 `lag` and `switchport` streams. They compose sixteen document sections. The manual-Apply
 execution boundary is `ACTION_APPLY_EXECUTABLE_SECTIONS`, which equals
-`DOCUMENT_EXECUTED_SECTIONS`. Its fourteen sections cover the sixteen receipt lanes.
-The two switching sections remain in `AWAITING_SENDER_SECTIONS` and are not executable.
+`DOCUMENT_EXECUTED_SECTIONS`. Its sixteen sections are every section of the registry, the two
+switching sections included, and no section reads live intent to decide what a generation
+executes.
 SNMP documents store Vault references verbatim. The SNMP writer reads those references from the
 hydrated rows when it builds the send body. BGP documents store the router, scope,
 address-family, peer, and peer address-family tables. The hydrator rebuilds their relationship
@@ -1003,17 +1017,22 @@ result as keep on this NSO).
 
 ### `GET /api/v1/devices/{id}/actions/apply-diff` → `200 | 404`
 
-Preview the per-scope **native device diff** the next Apply would push (NSO
+Preview the **native device diff** the next Apply would push (NSO
 `?dry-run=native&reconcile=keep-non-service-config`; nothing is committed — the
 reconcile param makes the preview match the real reconcile commit). Synchronous —
-no job. `diffs` maps
-scope → native delta; scopes already in sync yield an empty delta and are
-omitted. LAG and switchport have no preview until the aggregate document writer
-consumes their durable snapshots.
+no job. The preview is bound to the device's executable generation head, never to live
+intent, so it can only show a diff the next commit can produce.
+
+One document is one transaction, so there is ONE delta: `diffs` carries a single
+`device_intent` entry covering every family the document holds, the two switching sections
+included. An empty `diffs` means the device already holds the document. Where no preview can
+be rendered (no generation to deploy, an inconclusive dry-run, a body the adapter could not
+build), that one entry carries a `!! preview unavailable: <reason>` line instead of a delta.
+`outformat=cli` renders NSO's NED-uniform `+`/`-` tree diff instead of device-native config.
 
 ```json
-{ "device_id": 1,
-  "diffs": { "interface": "interface GigabitEthernet0/1\n description uplink\n!" } }
+{ "device_id": 1, "outformat": "native",
+  "diffs": { "device_intent": "interface GigabitEthernet0/1\n description uplink\n!" } }
 ```
 
 ### `POST /api/v1/devices/{id}/sync-notify`
@@ -1540,12 +1559,13 @@ the push is a full replace.
 #### Replacing a route in place: the guarded PUT
 
 Editing a route's identity in place (see *Matching* above) leaves the device carrying the
-**old** `(vrf, prefix, next_hop)` while the store holds the new one. A merge-PATCH only adds,
-so it would leave both live. The adapter records per row what it last proved deployed, and
-when that differs from the row's current triple it delivers the whole scope as a
-**PUT-replace** of the `static-route-config` service instance instead of a merge-PATCH. The
-body is then every *accepted* row of the device, not just the eligible subset — an
-eligible-only replace would retract every accepted-and-clean sibling.
+**old** `(vrf, prefix, next_hop)` while the store holds the new one. The adapter records per
+row what it last proved deployed, and when that differs from the row's current triple the
+generation records that its document **delivers a replacement**. The transport is not the
+variable: every send is one PUT of the device's whole document, so the body is always every
+*accepted* row of the device, not just the eligible subset — an eligible-only body would
+retract every accepted-and-clean sibling. What the record decides is whether the send needs
+proof.
 
 The replace is guarded and gated:
 
@@ -1554,18 +1574,25 @@ The replace is guarded and gated:
   *inconclusive*, and the scope fails with `static_route_snapshot_inconclusive` — a
   destructive body must not be built from a read that may be hiding the entries it was
   supposed to preserve.
-- Service entries no accepted row asserts are **collateral**. The scope refuses with
-  `removal_blocked_collateral`; `error.detail.items[].orphans` names the keys and
-  `…items[].preview` carries the device delta the replace would have pushed, so the operator
-  can accept those routes into intent or flush them deliberately via
+- Service entries no accepted row asserts are **collateral**. The write refuses with
+  `removal_blocked_collateral` and sends nothing. `detail.orphans` names the orphan keys per
+  YANG list: `error.detail.orphans` on a removal job, and each stamped row's
+  `last_apply_error.detail.orphans` on an apply. The refusal carries **no device delta**: native
+  config is opaque text that can hold a resolved community or an auth key, and this payload is
+  persisted on the job and on the rows. Render the delta on demand with
+  `GET /api/v1/devices/{id}/actions/apply-diff`, which dry-runs the identical PUT. The operator
+  can then accept those routes into intent or flush them deliberately via
   `POST /api/v1/devices/{id}/actions/force-removal`.
 - Entries a queued removal still owns ride through **verbatim** — including leaves the intent
   store has no column for — so an apply never drops what a removal is about to remove.
-- The replace runs only while post-apply verification is enabled (`NSO_ADAPTER_VERIFY_APPLY`).
-  With it off the scope stays a merge-PATCH and records nothing as deployed: a destructive
-  replace whose proof is structurally unavailable is refused rather than run blind.
-  A queued generation whose immutable plan already records `PUT` is failed before sync-from
-  or any RESTCONF request if verification is disabled when its worker starts.
+- A recorded replacement is delivered only while post-apply verification is enabled
+  (`NSO_ADAPTER_VERIFY_APPLY`). With it off there is nothing to fall back to, so the job
+  FAILS with `static_route_put_verify_disabled` before sync-from and before any RESTCONF
+  request. A destructive replace whose proof is structurally unavailable is refused rather
+  than run blind: closing the replacement while its predecessor may still be on the device is
+  worse than not running it. The check reads the queued generation's immutable plan, so a
+  generation recorded while verification was on still refuses if it is off when its worker
+  starts.
 - `actions/apply-diff` renders the identical payload as a PUT dry-run, so the preview the
   operator approves is byte-for-byte what the apply sends.
 
@@ -1626,21 +1653,21 @@ state, or by a PUT-mode apply that omits the leaf as part of its own authorized 
 Clearing `name` is a documented no-op: it has no wire leaf, so there is nothing to deliver.
 No job is queued and the route's outcome is unaffected.
 
-#### Static-route removals are live-service-relative
+#### Static-route removals are document-relative, with one live read
 
-Removal propagation for `static_route` diverges from the shared pattern in
-[Removal propagation](#removal-propagation), which rebuilds the PUT body from the remaining
-accepted store rows:
+Removal propagation for `static_route` follows the shared pattern in
+[Removal propagation](#removal-propagation) — the body is the device's authorized document with
+the removed rows omitted — plus one narrowly scoped live read:
 
-- the body is the **live service minus exactly the keys this job is authorized to drop** — the
-  removed route's own triple and whatever it was last proved deployed as. Everything else on
-  the service rides through verbatim, so a removal can neither forward-deploy an unrelated
-  store edit nor flush config no store row describes.
-- because such a body cannot flush collateral, a static-route removal **no longer blocks** on
-  unrelated service-owned entries. It retains them and logs
-  `static_route.removal_retained_orphans`, naming exactly the retained keys no route in the
-  generation document claims. That log is the operator's signal. The apply-side guard above still refuses, which
-  is where a store-assertive body really can flush something.
+- the static-route container additionally carries, **verbatim**, the live service entry for
+  every key the frozen plan RETAINS: `claimed - reasserted - operation_selected`, where
+  `claimed` unions each unconsumed deletion record's own triple and its last proved deployed
+  key. Those entries hold metric, tag and NED-specific leaves the store has no column for, so
+  rebuilding them from a store triple would silently rewrite them. An operation-selected key is
+  never retained, and a **force-removal retains nothing** — the override is a flush.
+- the read is certified. An uncertifiable answer refuses the send
+  (`static_route_snapshot_inconclusive`) rather than building a body from "looks empty";
+  certified absence retains nothing.
 - if the generation-creation snapshot shows that every authorized key is claimed and there is
   no cleared leaf to deliver, the job issues no device write at all and succeeds. A later push
   cannot change that recorded decision.
@@ -1649,15 +1676,12 @@ accepted store rows:
   is retried. Removals get no "succeed while unproven" treatment: a succeeded removal is what
   retires the record, so one that consumed nothing must not report success.
 
-#### Interaction with the atomic apply
+#### One transaction, one commit
 
-With `NSO_ADAPTER_ATOMIC_APPLY` on, every scope normally stages into one combined transaction.
-Staging is merge-PATCH only, so a pass that owes a **PUT-replace** cannot ride it: the
-static-route scope is excluded from the combined body and delivered by its own PUT immediately
-after that transaction commits. The replacement is therefore **not** atomic with the other
-scopes — a rejected follow-on fails the job and stamps only the static-route rows while the rest
-of the apply stays applied. A combined commit that fails issues no follow-on at all, leaving the
-static rows pending and retried, exactly like any other non-offending scope.
+Every family of a device rides ONE `device-intent` instance, so a deployment is a single PUT of
+that instance and a family the body omits is a family the write retracts. A rejected commit
+therefore fails **every** family in the push — nothing landed — and those rows record
+`last_apply_error` naming the family the localisation attributed it to.
 
 ### `GET /api/v1/devices/{id}/interface-ips` → `200 | 404`
 
@@ -1689,28 +1713,30 @@ Field notes:
 - `address`: IP address without prefix length.
 - `prefix_length`: integer subnet mask length.
 
-### `PUT /api/v1/devices/{id}/ip-intent` → `200 | 404`
+### `PUT /api/v1/devices/{id}/ip-intent` → `200 | 404 | 422`
 
-Push (full-replace) the interface IP intent mirror for this device.
+Push the full interface IP intent snapshot for this device. Send `X-Push-Seq` with the request.
 
 ```json
 {
-  "interfaces": [
+  "addresses": [
     {
-      "interface_name": "GigabitEthernet0/1",
-      "vrf": "",
-      "address": "192.0.2.1",
-      "prefix_length": 30,
-      "af": "ipv4"
+      "interface": "GigabitEthernet0/1",
+      "address": "192.0.2.1/30",
+      "family": "ipv4",
+      "secondary": false,
+      "vrf": ""
     }
   ]
 }
 ```
 
-Response: `{ "device_id": 1, "count": 1 }`
+`address` must contain a valid IP address and a numeric prefix length.
+`family` must be `ipv4` or `ipv6` and must agree with the address.
+Invalid input returns 422 before the adapter stores intent or queues removal work.
 
-Full-replace semantics: any `(interface_name, af, address)` triple not present in
-the request body is deleted from the intent mirror.
+The response includes `device_id`, `address_count`, `removed_interfaces`, `replaced`, and `updated_at`.
+The adapter deletes each `(interface, address, vrf)` entry absent from the full snapshot.
 
 ### `GET /api/v1/devices/{id}/isis-interfaces` → `200 | 404`
 
@@ -2361,15 +2387,14 @@ Every `PUT /api/v1/devices/{id}/*-intent` endpoint below (and `vlan-intent`,
 - Storing intent **never touches the device synchronously**. If `auto_apply` is enabled in
   the device settings, an ordinary non-store-only PUT enqueues the scope's apply job.
   Otherwise the intent remains stored in the mirror.
-- Explicit `actions/apply` can execute the sixteen receipt lanes through the fourteen
-  sections in `DOCUMENT_EXECUTED_SECTIONS`. The registry also contains `lag` and `switchport`.
-  These two streams remain in `AWAITING_SENDER_SECTIONS` and return
-  `awaiting_aggregate_sender`. Resending a receipt-lane payload has two distinct meanings,
-  and `X-Push-Seq` is what separates them. To recover a lost response, replay the ORIGINAL
-  sequence with the same body and the same request modes: that is a replay, and it returns
-  the recorded response without new work. A different body or mode under that sequence is
-  `409 sequence_reuse`. Use a NEW sequence only to authorize the payload again as fresh
-  work, because a higher sequence is admitted as a new delivery.
+- Explicit `actions/apply` executes every stream through the sixteen sections in
+  `DOCUMENT_EXECUTED_SECTIONS`, the out-of-protocol `lag` and `switchport` streams included.
+  Resending a receipt-lane payload has two distinct meanings, and `X-Push-Seq` is what
+  separates them. To recover a lost response, replay the ORIGINAL sequence with the same body
+  and the same request modes: that is a replay, and it returns the recorded response without
+  new work. A different body or mode under that sequence is `409 sequence_reuse`. Use a NEW
+  sequence only to authorize the payload again as fresh work, because a higher sequence is
+  admitted as a new delivery.
 - Where dropping a row from a keyed NSO service list requires it, the adapter
   queues an async removal job (see [Removal propagation](#removal-propagation)).
 - → `200` `{ "device_id": 1, "count": <rows stored>, "removed": <rows dropped> }`.
@@ -2379,10 +2404,10 @@ Every `PUT /api/v1/devices/{id}/*-intent` endpoint below (and `vlan-intent`,
 
 ### Removal propagation
 
-A merge-PATCH apply never drops a list entry the payload omits, so deleting a row
-from the intent store would otherwise leave the config orphaned on the device. To
-revert it, the owning `*-reconciler` service instance is **PUT-replaced** with the
-full remaining accepted state, which lets NSO FASTMAP delete the dropped entries.
+Deleting a row from the intent store changes nothing on the device by itself, so the drop
+has to be authorized and then deployed. A removal job composes a generation whose document
+omits the dropped rows and **PUT-replaces** the device's one `device-intent` instance with
+it, which lets NSO FASTMAP delete what the body no longer asserts.
 
 The same rule applies to a device-effective scalar that changes from emitted state to
 omitted state. A clear with no un-own gets a networked removal job, so that admission
@@ -2422,19 +2447,25 @@ The `PUT .../static-route-intent?backfill_only=true` path is also an exception: 
 prunes omitted uncorrelated rows but creates neither a removal job nor a tombstone.
 A worker runs each job in the background. A promoted generation hydrates its exact stored
 document and execution plan, so a retry repeats the same selected operation after a worker
-restart. A reissue generation carries no promoted revisions or stored execution plan and
-executes its one removal context's scope from then-current live state. The sweeper, reclaimer,
-and force-removal paths produce reissues. A removal job with no generation is invalid and is
-refused. Scope is carried in `Job.context.scope` (one of
+restart. A reissue generation promotes nothing: its `stream_revisions` is empty, so it
+settles nothing. It is **not** live-relative either. Its document is composed from the
+authorized fragments when the generation is created and stored with it, alongside a frozen
+removal context, so a store-only edit made after the job is enqueued cannot change what that
+job sends. The one live read at execution is the static-route section, whose body
+additionally carries the live certified entries the frozen plan retains. A `force` reissue of
+`static_route` suppresses even that, so the flush is not preserved by its own write. The
+sweeper, reclaimer, and force-removal paths produce reissues. A removal job with no
+generation is invalid and is refused. Scope is carried in `Job.context.scope` (one of
 `route_policy · bfd · svi · subinterface · static_route · interface_mtu · vlan ·
-logging · l2_sap · ospf · bgp · isis · interface_config · snmp`). Job status is
-observable via `GET …/jobs` like any other job; a failed removal records
+logging · l2_sap · ospf · bgp · isis · interface_config · snmp · lag · switchport`).
+Job status is observable via `GET …/jobs` like any other job; a failed removal records
 `error.code = "removal_failed"`.
 
-`static_route` is the one scope that does **not** rebuild its body from the remaining accepted
-rows — it drops exactly what it is authorized to drop and keeps the rest of the live service
-verbatim. See
-[Static-route removals are live-service-relative](#static-route-removals-are-live-service-relative).
+`static_route` is the one scope whose body is not the document alone: its container also
+carries, **verbatim**, the live service entry for every key the frozen plan retains, so a
+removal neither rewrites a leaf the store has no column for nor drops what it was not
+authorized to drop. See
+[Static-route removals are document-relative, with one live read](#static-route-removals-are-document-relative-with-one-live-read).
 
 ---
 

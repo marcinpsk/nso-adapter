@@ -15,11 +15,12 @@ Apply jobs, so running Apply jobs and other types permit successors.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
-from collections.abc import Awaitable, Callable, Sequence
+import re
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
+from functools import cache
 from typing import Any, NamedTuple
 
 import structlog
@@ -28,89 +29,43 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, JobError, internal_error, terminalize
-from nso_adapter.core.generation import executing_generation, generation_execution_sections, note_write
+from nso_adapter.core.community_dialect import community_dialect_for
+from nso_adapter.core.generation import executing_generation, generation_execution_sections
 from nso_adapter.core.projection import (
+    NoComparison,
+    TableCompare,
     hydrate_interface_execution,
     hydrate_section,
     intent_state,
+    section_context,
     section_models,
+    section_registry,
 )
 from nso_adapter.core.static_route_plan import (
     SrPlan,
-    authorized_clear_fields,
-    build_plan,
     hydrate_static_route_apply_plan,
     recorded_static_route_apply_mode,
 )
 from nso_adapter.nso.apply import NsoApplyError
 from nso_adapter.store.models import (
-    BfdIntent,
-    BgpRouterIntent,
     DbInterface,
     Device,
     DeviceSettings,
     InterfaceAttrState,
     InterfaceIntent,
     InterfaceIpIntent,
-    InterfaceMtuIntent,
-    IsisFlexAlgoIntent,
-    IsisInterfaceIntent,
-    IsisLevelIntent,
-    IsisProcessIntent,
     Job,
     JobStatus,
-    JobType,
-    L2SapIntent,
-    LoggingHostIntent,
-    LoggingLevelsIntent,
-    OspfInstanceIntent,
-    OspfInterfaceIntent,
     RedistributionIntent,
-    RoutePolicyObjectIntent,
-    SnmpCommunityIntent,
-    SnmpHostIntent,
-    SnmpSystemInfoIntent,
-    SnmpV3UserIntent,
     StaticRouteIntent,
-    SubinterfaceIntent,
-    SviIntent,
     SyncState,
-    VlanIntent,
 )
 
 logger = structlog.get_logger(__name__)
 
-
-def _nokia_routed_kind(iface) -> str | None:
-    """Derive the SR OS router context (base|ies|vprn) for a Nokia routed interface.
-
-    The adapter's ``DbInterface.kind`` is the interface *type* (physical/logical/loopback/
-    lag); the router context comes from ``service``/``vrf``:
-      * VPRN — ``service`` set and ``vrf`` == ``service`` (VPRN addrs carry vrf=service-name)
-      * IES  — ``service`` set, global table (vrf empty)
-      * Base — no service
-    Returns None for non-routed interfaces (physical ports, LAGs) and for non-Nokia
-    devices (where ``kind`` is unset) so the IP lands via the normal port/interface path.
-    """
-    if iface.kind not in ("logical", "loopback"):
-        return None
-    if iface.service:
-        return "vprn" if (iface.vrf and iface.vrf == iface.service) else "ies"
-    return "base"
-
-
-def _nokia_attr_kind(iface) -> str | None:
-    """SR OS context for a Nokia interface's description/admin-state write.
-
-    Extends :func:`_nokia_routed_kind` (base|ies|vprn for an L3 routed interface) with ``lag``:
-    a Nokia LAG's description/admin-state live under ``configure lag <lag-N>``, not a port and
-    not a router interface. Physical ports (and non-Nokia interfaces) return ``None`` → the
-    legacy ``configure port`` path. Distinct from ``_nokia_routed_kind`` because a LAG never
-    carries an IP, so the IP path must keep returning ``None`` for it.
-    """
-    if iface.kind == "lag":
-        return "lag"
-    return _nokia_routed_kind(iface)
+#: The apply preview's one key. One document is one transaction, so it renders one delta;
+#: the key names the write, not a family.
+PREVIEW_KEY = "device_intent"
 
 
 async def enqueue_apply(
@@ -121,7 +76,7 @@ async def enqueue_apply(
     stream: str,
     settlement_cohort: int | None = None,
 ) -> Job | None:
-    """Create or join a queued coalescible Apply carrier for a new generation.
+    """Admit a new generation, with a dedicated carrier for a settlement cohort.
 
     *stream* names the endpoint lane this write touched — the promotion protocol's unit
     (#1522 §G2). It is a required keyword, not an optional one: a call site that cannot say
@@ -145,8 +100,7 @@ async def enqueue_apply(
     such a device; #1522 §H4's manual-Apply protocol is what needs the bump at the mutation
     site, and moving it there belongs with that change.
     """
-    from nso_adapter.core.generation import attach_to_job, create_generation
-    from nso_adapter.core.jobs import admit_coalescible_job
+    from nso_adapter.core.generation import admit_apply_generation, create_generation
     from nso_adapter.core.request_flags import STORE_ONLY
     from nso_adapter.store.models import GenerationMode
 
@@ -165,111 +119,7 @@ async def enqueue_apply(
         settlement_cohort=settlement_cohort,
     )
 
-    # Atomic same-type QUEUED dedupe, inside a savepoint. Two properties matter to the
-    # fifteen callers, all of which reach here with intent rows already mutated and
-    # uncommitted: a conflict must not poison their transaction, and on a conflict the
-    # queued winner is row-locked until they commit, so the worker cannot start it against a
-    # snapshot older than the request that admitted it.
-    #
-    # A removal is enqueued BEFORE its apply by design, so rejecting on any active job
-    # dropped the apply outright; and a running apply must not refuse its successor, because
-    # the successor is what carries the newer intent.
-    created, winner = await admit_coalescible_job(db, device_id, JobType.apply)
-    job = created or winner
-    if job is not None:
-        # A refused attachment is not an error: the generation is not contiguous with what
-        # that job already carries, so it waits for a job of its own (advance_device_generations).
-        await attach_to_job(db, generation, job)
-    else:
-        logger.error("apply.generation_unattached", device_id=device_id, seq=generation.seq)
-    if created is None:
-        return None
-    await db.flush()
-    return created
-
-
-async def _diff_interface_attributes(db, nso_apply, client, device_name: str, ifaces: dict, fmt=True) -> str:
-    """Accumulated description/enabled native delta across every accepted interface attr.
-
-    One isolated dry-run per accepted (description|enabled) slice — a failing slice is
-    logged and skipped so it never blocks the others.
-    """
-    attr_delta = ""
-    for iface in ifaces.values():
-        rows = (
-            (await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id == iface.id))).scalars().all()
-        )
-        rk = _nokia_attr_kind(iface)
-        for r in rows:
-            if r.accepted_at is None or r.attribute not in ("description", "enabled"):
-                continue
-            try:
-                delta = await nso_apply.apply_interface_attribute(
-                    client=client,
-                    device_name=device_name,
-                    interface_name=iface.name,
-                    attribute=r.attribute,
-                    value=r.intent_value,
-                    kind=rk,
-                    service=iface.service if rk in ("ies", "vprn") else None,
-                    parent_binding=iface.parent_binding,
-                    encap_tag=iface.encap_tag,
-                    dry_run=fmt,
-                )
-            except Exception as exc:  # noqa: BLE001 — preview must never fail hard
-                logger.warning(
-                    "apply_diff.scope_failed",
-                    scope="interface_attribute",
-                    device=device_name,
-                    interface=iface.name,
-                    error=repr(exc),
-                )
-                continue
-            if delta and delta.strip():
-                attr_delta += delta
-    return attr_delta
-
-
-async def _diff_interface_ips(db, nso_apply, client, device_name: str, ifaces: dict, fmt=True) -> str:
-    """Accumulated native IP delta — one isolated dry-run per interface carrying IP intent."""
-    ip_rows = (
-        (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id.in_(list(ifaces) or [-1]))))
-        .scalars()
-        .all()
-    )
-    by_iface: dict[int, list] = {}
-    for r in ip_rows:
-        if r.accepted_at is None:
-            continue  # gate on accepted_at, like the attribute preview and real apply eligibility
-        by_iface.setdefault(r.interface_id, []).append(r)
-    ip_delta = ""
-    for iface_id, rows in by_iface.items():
-        iface = ifaces[iface_id]
-        rk = _nokia_routed_kind(iface)
-        try:
-            delta = await nso_apply.apply_interface_ips(
-                client=client,
-                device_name=device_name,
-                interface_name=iface.name,
-                ip_intent_rows=rows,
-                kind=rk,
-                service=iface.service if rk in ("ies", "vprn") else None,
-                parent_binding=iface.parent_binding,
-                encap_tag=iface.encap_tag,
-                dry_run=fmt,
-            )
-        except Exception as exc:  # noqa: BLE001 — preview must never fail hard
-            logger.warning(
-                "apply_diff.scope_failed",
-                scope="interface_ip",
-                device=device_name,
-                interface=iface.name,
-                error=repr(exc),
-            )
-            continue
-        if delta and delta.strip():
-            ip_delta += delta
-    return ip_delta
+    return await admit_apply_generation(db, generation)
 
 
 # ── #1396 R2 §4.1/§4.2/§4.8 — the guarded static-route PUT-replace ───────────
@@ -284,186 +134,6 @@ async def _diff_interface_ips(db, nso_apply, client, device_name: str, ifaces: d
 SNAPSHOT_INCONCLUSIVE = "static_route_snapshot_inconclusive"
 
 
-async def _static_route_snapshot(client, device, plan) -> tuple[dict | None, list[dict]]:
-    """Read the live static-route service ONCE and derive the entries the PUT must retain.
-
-    Returns ``(snapshot, retained)``. ``snapshot`` is the live instance body, or ``None``
-    when the service is certifiably absent — nothing to retain and no orphan possible, so
-    the PUT proceeds. Raises :class:`NsoApplyError` on an inconclusive read.
-
-    *retained* are the live entries a tombstone still claims (by its own triple or by its
-    ``deployed_key``) and that no body-rendered row re-asserts, kept **verbatim**: metric,
-    tag and NED-specific leaves live only in the live copy, so reconstructing such an entry
-    from the store triple would silently rewrite it.
-    """
-    from nso_adapter.core.static_route_plan import as_triple, triple_of
-    from nso_adapter.nso.apply import _STATIC_ROUTE_SERVICE_PATH, static_route_entry_key
-
-    state = await client.service_instance_state(_STATIC_ROUTE_SERVICE_PATH, device.nso_device_name)
-    if state.inconclusive:
-        raise NsoApplyError(
-            SNAPSHOT_INCONCLUSIVE,
-            f"static_route: could not certify the live service instance on {device.nso_device_name!r} "
-            "— refusing to build a PUT-replace from an uncertified read",
-            detail={"device": device.nso_device_name},
-        )
-    current = state.entry
-    if not current:
-        return current, []
-
-    claimed: set[tuple[str, str, str]] = set()
-    for tomb in plan.tombstones:
-        claimed.add((tomb.vrf or "", tomb.prefix or "", tomb.next_hop or ""))
-        deployed = as_triple(tomb.deployed_key)
-        if deployed is not None:
-            claimed.add(deployed)
-    reasserted = {triple_of(row) for row in plan.rows}
-    keep = claimed - reasserted  # a key a live row still renders needs no retention
-    retained = [entry for entry in (current.get("route") or []) if static_route_entry_key(entry) in keep]
-    return current, retained
-
-
-async def _put_static_routes(client, device, plan, *, dry_run=False, outbox: dict | None = None):
-    """Send the guarded PUT-replace of the whole static-route service instance (§4.1).
-
-    The guard sees the same snapshot the retained entries came from, and ``plan.allowed``
-    names the keys it may watch disappear — the replacement predecessors this apply is
-    delivering, plus (X4 belt) the tombstone keys the retention already re-asserts.
-    """
-    from nso_adapter.core.removal import _guarded_apply
-    from nso_adapter.core.static_route_plan import triple_of
-    from nso_adapter.nso.apply import apply_static_routes, static_route_entry_key
-
-    current, retained = await _static_route_snapshot(client, device, plan)
-
-    async def _apply(**kwargs):
-        return await apply_static_routes(
-            client=client,
-            device_name=device.nso_device_name,
-            route_intent_rows=plan.rows,
-            extra_entries=retained,
-            **kwargs,
-        )
-
-    if dry_run:
-        # Preview parity (§4.8): the same body, rendered as a native PUT dry-run. No guard
-        # (the delta NSO returns already shows what would be retracted), no writes, nothing
-        # consumed — _send_service_config routes replace+dry_run through native_dry_run
-        # with method="put".
-        return await _apply(replace=True, dry_run=dry_run)
-    context = {"removed": {"route": [list(key) for key in sorted(plan.allowed)]}}
-    verdict = await _guarded_apply(client, device, "static_route", context, _apply, current=current)
-    if outbox is not None:
-        outbox["verify"] = verdict
-        # Exactly what the body carried: the rendered rows plus the tombstone entries kept
-        # verbatim. The residue check subtracts these — a key still on the device because
-        # this very PUT re-asserted it is intent, not a survivor (C3.8).
-        outbox["sent_keys"] = {triple_of(row) for row in plan.rows} | {
-            static_route_entry_key(entry) for entry in retained
-        }
-    return verdict
-
-
-async def _enqueue_pending_clear_retract(db: AsyncSession, device, plan, *, reg=None) -> None:
-    """Queue the networked retract a merge-PATCH apply structurally cannot deliver (§4.11).
-
-    A cleared leaf only leaves the device on a networked PUT. In ``PUT`` mode this apply's
-    own store-rendered body already omits it, so nothing is owed. In ``PATCH`` mode the
-    renderer omits the leaf while the merge leaves it live — and reader-compare only checks
-    the route KEY, so the row would otherwise be certified in sync over a stale value.
-
-    Only the ``authorized`` half is deliverable (A1). A ``store_only`` clear was recorded by
-    a request that may mutate the intent store but must never cause a device write; the
-    apply's separate authorization covers the apply's OWN body, not a deletion job whose
-    only purpose is to remove a leaf observed under ``?store_only=true``. Such an entry
-    parks — the row stays unproven — until a later authorized push re-records the clear.
-
-    Runs AFTER the apply's terminal transaction, so a plain failure here is logged, never
-    raised: a second terminal write flipping a committed ``succeeded`` to ``failed`` would
-    misreport rows the device really did accept. Nothing is lost either way — the carrier is
-    store state, so the next apply re-derives exactly this decision.
-
-    A LOST CLAIM is not that kind of failure and does propagate. The job this queues is a
-    networked PUT; if the claim was revoked and reacquired while this apply was running, the
-    successor may since have un-owned a route, and a stale retract queued behind its back
-    would retract that deliberately detached config from the device. So the insert takes the
-    claim lock first and holds it to COMMIT. An UNREGISTERED registration is the documented
-    claimless lane and ``lock_claim`` no-ops on it — this transaction consumes no carrier and
-    deletes no tombstone, so a claimless caller is not the programming error it would be there.
-    """
-    if plan.mode != "PATCH":
-        return
-    fields = sorted({f for row in plan.rows for f in authorized_clear_fields(row.pending_clear)})
-    if not fields:
-        return
-    from nso_adapter.core.claim import ClaimRegistration, lock_claim
-    from nso_adapter.core.removal import enqueue_removal
-
-    try:
-        await lock_claim(db, reg if reg is not None else ClaimRegistration())
-        # retract=True, no removed/shrank: an un-own would make this a no-networking detach,
-        # which can never deliver a clear. Ordinary admission, ordinary FIFO — no immediate
-        # device write, so auto_apply pacing is untouched.
-        # Recorded as a write of its own: this retract is derived from carrier state during
-        # the run, so no request wrote the revision it promotes (#1522 §G2).
-        await note_write(db, device.id, "static_route")
-        job = await enqueue_removal(
-            db,
-            device_id=device.id,
-            scope="static_route",
-            # A pure clear deletes nothing, so it carries no deletion marking and nothing
-            # of this run's un-owns can defer it: it exists only to network the clear.
-            marking=None,
-            defer_retract=False,
-            promotes=("static_route",),
-            retract=True,
-        )
-        await db.commit()
-    except ClaimLostError:
-        await db.rollback()
-        raise
-    except Exception as exc:  # noqa: BLE001 — the apply is already finalized
-        await db.rollback()
-        logger.warning("static_route.pending_clear_retract_enqueue_failed", device_id=device.id, error=repr(exc))
-        return
-    logger.info(
-        "static_route.pending_clear_retract_enqueued",
-        device_id=device.id,
-        job_id=getattr(job, "id", None),
-        fields=fields,
-    )
-
-
-def _static_route_coro(client, device, plan, *, dry_run=False, outbox: dict | None = None):
-    """Build the static-route scope's coroutine for this plan — PUT-replace or today's merge.
-
-    *outbox* collects what the send learned and the caller's bookkeeping needs: the §4.4
-    proof ``verify`` verdict, and ``sent_keys`` — every route key the body actually carried,
-    rendered rows plus verbatim tombstone retention. The residue check subtracts those: a
-    predecessor key this apply deliberately re-asserted (a sibling row reclaimed it, or a
-    tombstone still owns its entry) is not residue, it is intent (C3.8).
-    """
-    from nso_adapter.core.static_route_plan import triple_of
-    from nso_adapter.nso.apply import apply_static_routes
-
-    async def _run():
-        if plan.mode == "PUT":
-            return await _put_static_routes(client, device, plan, dry_run=dry_run, outbox=outbox)
-        verdict = await apply_static_routes(
-            client=client, device_name=device.nso_device_name, route_intent_rows=plan.rows, dry_run=dry_run
-        )
-        if outbox is not None:
-            outbox["verify"] = verdict
-            outbox["sent_keys"] = {triple_of(row) for row in plan.rows}
-        return verdict
-
-    return _run()
-
-
-# ── #1396 R2 §4.4-§4.6 — proof, residue enforcement, CAS, per-route results ──
-
-#: The scope failure a surviving predecessor key raises. Distinct from the writer-drop code:
-#: the intent DID land, and what failed is the retraction of what it replaced.
 RESIDUE_FOUND_CODE = "static_route_residue_found"
 
 #: Per-route outcomes (§4.5). ``unproven`` is the honest third state R2 adds — the write was
@@ -792,14 +462,9 @@ async def _settle_static_routes(
 ) -> list[dict] | None:
     """Run §4.4's proof and §4.5/§4.6's bookkeeping for the static-route scope.
 
-    Shared by both apply implementations, because the atomic path is a separate early return
-    with its own finalization — wiring this into the per-scope loop alone would leave every
-    atomic apply CASing nothing and reporting no per-route outcome at all.
-
-    *put_delivered* is False on the atomic path even for a ``PUT`` plan: atomic staging is
-    merge-PATCH only and explicitly ignores ``replace`` (G4), so no store-rendered body was
-    ever PUT and nothing may close a replacement or consume a clear. Returns ``None`` when
-    the device has no static-route rows in this pass, so ``job.result`` gains no empty key.
+    *put_delivered* is now simply "the document committed": one PUT IS the replacement, so a
+    clean commit delivered it and a failed one delivered nothing. Returns ``None`` when the
+    device has no static-route rows in this pass, so ``job.result`` gains no empty key.
 
     *send_failed* is the SEND's own verdict, captured before reader-compare folds its
     per-row findings into the same counter. The two are different facts: a failed send means
@@ -862,237 +527,261 @@ def _static_route_consumed_keys(plan, sent_keys) -> set:
     return consumed - set(sent_keys or ())
 
 
-async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = "native") -> dict[str, str]:
-    """Read-only preview: the per-scope native device diff the next Apply would push.
+# ── the aggregate document: rows in, one container body per family out ───────
 
-    For each scope, the accepted owned intent is dry-run against NSO — with
-    ``outformat="native"`` (default) NSO renders the device-native config it *would*
-    push; ``outformat="cli"`` renders the NED-uniform ``+``/``-`` tree diff instead
-    (the apply-preview "diff -u" panel). Nothing is committed either way.
-    Returns ``{scope: native_delta}`` for scopes with a non-empty change (a scope already
-    in sync yields an empty delta and is omitted). Never writes to NSO or the DB.
 
-    Covers every scope ``run_apply`` pushes through the intent store: interface
-    attributes/IPs, OSPF, IS-IS, BGP, route-policy, SNMP, static routes, logging, SVI,
-    subinterfaces, VLANs, BFD, and L2 SAPs. LAG and switchport snapshots are durable but
-    stay outside the current generation writer until the aggregate document cutover, so
-    they have no preview here. Each scope is a
-    best-effort, isolated dry-run — one failing/slow scope never blocks the others.
+def _carried(rows: list) -> list:
+    """Return the rows a body may assert: an intent row must be accepted, a carrier has no such column."""
+    return [row for row in rows if not hasattr(row, "accepted_at") or row.accepted_at is not None]
+
+
+def section_execution(document: dict, section: str, proof: Any = None):
+    """Return the frozen facts *section*'s encoder reads besides its rows (memo A9).
+
+    The NED id and the dialect come from the section's own context and from no device row,
+    so a retry, a reissue and an unrelated force-removal all encode the same bytes.
     """
+    from nso_adapter.core.community_dialect import community_dialect_by_name
+    from nso_adapter.nso.apply import SectionExecution
+
+    context = section_context(document, section)
+    return SectionExecution(context["ned_id"], community_dialect_by_name(context["dialect"]), proof)
+
+
+def _hydrated_proof(document: dict, section: str):
+    """Return the proof *section*'s encoder reads, rebuilt from the document alone."""
+    return hydrate_interface_execution(document) if section == "interface_config" else None
+
+
+def encode_section(document: dict, section: str, *, rows: Mapping[str, list] | None = None, proof: Any = None) -> dict:
+    """Encode ONE section into its YANG container body.
+
+    *rows* lets an executing deployment hand in the rows it already collected (the
+    static-route plan's own rows); everything else is read from the document. Nothing here
+    reads a live intent row or the device row.
+    """
+    from nso_adapter.core.projection import section_rows_by_table
+    from nso_adapter.nso.apply import refuse_gated_local_levels
+
+    entry = section_registry()[section]
+    source = rows if rows is not None else section_rows_by_table(document, section)
+    table_rows = {table: _carried(table_rows) for table, table_rows in source.items()}
+    if section == "logging":
+        # A send-boundary refusal, never the encoder's: one document must encode the same
+        # bytes in every process, and a weaker host-only body would stamp the levels row
+        # in_sync with no severity landing.
+        refuse_gated_local_levels(table_rows)
+    if proof is None:
+        proof = _hydrated_proof(document, section)
+    return entry.encode(table_rows, section_execution(document, section, proof))
+
+
+def overlay_retained_routes(body: dict, retained: list[dict]) -> set:
+    """Add the entries an unconsumed carrier still claims to a static-route body → its keys.
+
+    Kept VERBATIM: metric, tag and NED-specific leaves live only in the live copy, so
+    rebuilding such an entry from a store triple would silently rewrite it. A rendered row
+    always wins on a key collision — the store is the authority for a route it still owns.
+    """
+    from nso_adapter.nso.apply import static_route_entry_key
+
+    routes = body["route"]
+    keys = {static_route_entry_key(entry) for entry in routes}
+    for entry in retained:
+        key = static_route_entry_key(entry)
+        if key in keys:
+            continue
+        keys.add(key)
+        routes.append(entry)
+    return keys
+
+
+def encode_device_document(document: dict) -> dict[str, dict]:
+    """Encode every section the document carries into ``{YANG container: body}``.
+
+    The registry binds each section to its container and its encoder, so this walk is the
+    whole family fan-out: a family the document does not carry is absent from the body and,
+    under a full-document PUT, therefore owns nothing.
+    """
+    registry = section_registry()
+    return {
+        registry[section].container: encode_section(document, section) for section in registry if section in document
+    }
+
+
+class DeviceBody(NamedTuple):
+    """One device's whole PUT body, plus what building it learned.
+
+    *static_route* is the certified verdict the retention read returned, or ``None`` when no
+    certified read happened. The collateral guard takes its snapshot from it, so the retained
+    entries and the guard see ONE read (R2 §4.1).
+    """
+
+    containers: dict[str, dict]
+    sent_route_keys: set | None
+    errors: dict[str, NsoApplyError]
+    static_route: Any = None
+
+    @property
+    def snapshot(self):
+        """The live instance the guard compares against, or the take-your-own sentinel."""
+        from nso_adapter.core.removal import _NO_SNAPSHOT
+
+        return _NO_SNAPSHOT if self.static_route is None else self.static_route.instance
+
+
+def _operation_selected_routes(document: dict) -> frozenset:
+    """Return the static-route keys THIS operation is authorized to remove, from its plane."""
+    from nso_adapter.core.projection import section_operation
+    from nso_adapter.core.static_route_plan import as_triple
+
+    removal = section_operation(document, "static_route").get("removal") or {}
+    return frozenset(key for raw in (removal.get("authorized_removal_keys") or []) if (key := as_triple(raw)))
+
+
+async def _static_route_snapshot(client, device, document: dict, plan) -> tuple[Any, list[dict]]:
+    """Read the live static-route section ONCE and derive the entries the PUT must retain.
+
+    Returns ``(certified, retained)``. Certified ABSENCE retains nothing and sends; an
+    INCONCLUSIVE read raises :class:`NsoApplyError`, because a full-document PUT built on a
+    read that may be hiding entries retracts whatever it could not see (#1683 §4.4).
+
+    *retained* are the live entries a tombstone still claims (by its own triple or by its
+    ``deployed_key``), that no body-rendered row re-asserts and that this operation's own
+    plane does not authorize removing. They are kept VERBATIM: metric, tag and NED-specific
+    leaves live only in the live copy, so rebuilding such an entry from the store triple
+    would silently rewrite it.
+    """
+    from nso_adapter.core.static_route_plan import as_triple, triple_of
+    from nso_adapter.core.static_route_reader import certified_static_route_section
+    from nso_adapter.nso.apply import static_route_entry_key
+
+    certified = await certified_static_route_section(client, device)
+    if certified.inconclusive:
+        raise NsoApplyError(
+            SNAPSHOT_INCONCLUSIVE,
+            f"static_route: could not certify the live service instance on {device.nso_device_name!r}; "
+            "refusing to build a device-intent PUT from an uncertified read",
+            detail={"device": device.nso_device_name},
+        )
+    claimed = {triple_of(tomb) for tomb in plan.tombstones}
+    claimed.update(key for tomb in plan.tombstones if (key := as_triple(tomb.deployed_key)) is not None)
+    keep = claimed - {triple_of(row) for row in plan.rows} - _operation_selected_routes(document)
+    return certified, [entry for entry in certified.routes if static_route_entry_key(entry) in keep]
+
+
+async def build_device_containers(
+    client,
+    device,
+    document: dict,
+    *,
+    rows_by_section: Mapping[str, Mapping[str, list]] | None = None,
+    proof_by_section: Mapping[str, Any] | None = None,
+    static_route_plan: SrPlan | None = None,
+    retain_static_routes: bool = True,
+) -> DeviceBody:
+    """Build one device's whole PUT body → ``({container: body}, route keys sent, build errors)``.
+
+    The ONE body builder every sender uses: apply, removal and the preview all encode the same
+    document the same way, so a preview cannot show a body the commit would not send.
+
+    The static-route section is the ratified exception to encoding from the document alone
+    (#1683): its body additionally carries, verbatim, the live certified entries of the keys
+    the frozen plan retains. An uncertified read refuses the send; certified absence retains
+    nothing.
+
+    ``retain_static_routes=False`` is the operator's FLUSH: a force-selected static-route
+    section emits the document's rows and no retained entries, because a force-removal carries
+    no removal authority and the formula would otherwise preserve every carrier-claimed key —
+    the opposite of what the override promises.
+
+    A family whose body cannot be BUILT (a malformed vault_ref, an unmappable enum, an
+    uncertifiable retention read) is returned in *errors* rather than raised, and the caller
+    decides. It is never silently omitted: under a full-document PUT an omitted family is a
+    RETRACTED family, so a body with a build error is not sendable at all.
+    """
+    registry = section_registry()
+    containers: dict[str, dict] = {}
+    errors: dict[str, NsoApplyError] = {}
+    sent_route_keys: set | None = None
+    certified: Any = None
+    for section, entry in registry.items():
+        if section not in document:
+            continue
+        try:
+            body = encode_section(
+                document,
+                section,
+                rows=(rows_by_section or {}).get(section),
+                proof=(proof_by_section or {}).get(section),
+            )
+            if section == "static_route":
+                retained: list[dict] = []
+                if retain_static_routes:
+                    plan = static_route_plan or hydrate_static_route_apply_plan(document)
+                    certified, retained = await _static_route_snapshot(client, device, document, plan)
+                sent_route_keys = overlay_retained_routes(body, retained)
+        except NsoApplyError as exc:
+            logger.error(
+                "apply.section_build_failed", device=device.nso_device_name, section=section, error=exc.message
+            )
+            errors[section] = exc
+            continue
+        containers[entry.container] = body
+    return DeviceBody(containers, sent_route_keys, errors, certified)
+
+
+async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = "native") -> dict[str, str]:
+    """Read-only preview: the native device delta the device's next deployment would push.
+
+    The preview is bound to the DOCUMENT being committed — the device's executable
+    generation head — never to a live-store estimate: store-only intent never reaches the
+    device, so previewing it would show a diff the commit cannot produce. With
+    ``outformat="native"`` NSO renders the device-native config the PUT would push;
+    ``outformat="cli"`` renders the NED-uniform ``+``/``-`` tree diff (the "diff -u" panel).
+    Nothing is committed either way.
+
+    One document is one transaction, so there is one delta: the per-family split the
+    reconcilers gave for free is not reconstructible from a single dry-run, and inventing one
+    would mean sixteen dry-runs of documents the adapter would never send. An empty delta
+    (the device already holds the document) returns ``{}``; a device with nothing authorized
+    to deploy reports the preview UNAVAILABLE rather than an empty one, which would read as
+    "nothing to do".
+    """
+    from nso_adapter.core.generation import executable_head, executing_generation, execution_policy
     from nso_adapter.core.importer import get_nso_client
-    from nso_adapter.nso import apply as nso_apply
+    from nso_adapter.nso.apply import apply_device_intent
 
     device = await db.get(Device, device_id)
     if not device:
         return {}
-    client = get_nso_client(device.nso_instance)
-    device_name = device.nso_device_name
-    # dry_run is bool|str down the apply stack: True = native, "cli" = tree diff.
-    fmt: bool | str = "cli" if outformat == "cli" else True
-    diffs: dict[str, str] = {}
-
-    async def _accepted(model) -> list:
-        """All rows of *model* for this device that have been accepted (Apply-eligible)."""
-        rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
-        return [r for r in rows if getattr(r, "accepted_at", None) is not None]
-
-    async def _record(scope: str, coro) -> None:
-        """Run one scope's dry-run; store a non-empty delta. Never raise.
-
-        A scope that blows up is reported IN the preview rather than silently omitted: the
-        operator approves the apply from this panel, and an empty entry reads as "nothing to
-        do". A body-builder error (a vault_ref the writer cannot render, an unmappable enum)
-        is exactly what will fail the real apply, so it must be visible here first.
-        """
-        try:
-            delta = await coro
-        except Exception as exc:  # noqa: BLE001 — preview must never fail hard
-            logger.warning("apply_diff.scope_failed", scope=scope, device=device_name, error=repr(exc))
-            reason = getattr(exc, "message", None) or repr(exc)
-            diffs[scope] = f"!! preview unavailable for this scope: {reason}"
-            return
-        if delta and delta.strip():
-            diffs[scope] = delta
-
-    ifaces = {
-        i.id: i
-        for i in (await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))).scalars().all()
-    }
-
-    # ── Interface attributes + IPs (each accumulates across several dry-runs) ─────
-    attr_delta = await _diff_interface_attributes(db, nso_apply, client, device_name, ifaces, fmt)
-    if attr_delta.strip():
-        diffs["interface_attribute"] = attr_delta
-    ip_delta = await _diff_interface_ips(db, nso_apply, client, device_name, ifaces, fmt)
-    if ip_delta.strip():
-        diffs["interface_ip"] = ip_delta
-
-    # ── Redistribution rows split by destination protocol (shared by ospf/isis/bgp) ──
-    redist = await _accepted(RedistributionIntent)
-    redist_ospf = [r for r in redist if r.dest_protocol == "ospf"]
-    redist_isis = [r for r in redist if r.dest_protocol == "isis"]
-    redist_bgp = [r for r in redist if r.dest_protocol == "bgp"]
-
-    # Collect every remaining scope's accepted rows (BGP relationships eager-loaded,
-    # like run_apply, so the dry-run sees scopes/peers/afs).
-    ospf_inst = await _accepted(OspfInstanceIntent)
-    ospf_iface = await _accepted(OspfInterfaceIntent)
-    isis_iface = await _accepted(IsisInterfaceIntent)
-    isis_proc = await _accepted(IsisProcessIntent)
-    isis_flex = await _accepted(IsisFlexAlgoIntent)
-    isis_levels = await _accepted(IsisLevelIntent)
-    bgp = await _accepted(BgpRouterIntent)
-    if bgp:
-        from nso_adapter.core.bgp_load import attach_bgp_relationships
-
-        await attach_bgp_relationships(db, bgp)
-    rp = await _accepted(RoutePolicyObjectIntent)
-    snmp_comm = await _accepted(SnmpCommunityIntent)
-    snmp_user = await _accepted(SnmpV3UserIntent)
-    snmp_host = await _accepted(SnmpHostIntent)
-    snmp_sysinfo_rows = await _accepted(SnmpSystemInfoIntent)
-    snmp_sysinfo = snmp_sysinfo_rows[0] if snmp_sysinfo_rows else None
-    sr = await _accepted(StaticRouteIntent)
-    # The preview has always previewed ACCEPTED rows (the real apply pushes the eligible
-    # subset) — passing them as the eligible list keeps PATCH-mode previews byte-identical
-    # to today's, while PUT mode derives its rows from the store regardless.
-    sr_plan = await build_plan(db, device, eligible_rows=sr)
-    lg = await _accepted(LoggingHostIntent)
-    lgl_rows = await _accepted(LoggingLevelsIntent)
-    lgl = lgl_rows[0] if lgl_rows else None
-    svi = await _accepted(SviIntent)
-    subif = await _accepted(SubinterfaceIntent)
-    vlan = await _accepted(VlanIntent)
-    bfd = await _accepted(BfdIntent)
-    mtu = await _accepted(InterfaceMtuIntent)
-    l2 = await _accepted(L2SapIntent)
-
-    # (scope, trigger row-lists, lazy dry-run coroutine). A scope is previewed only when
-    # at least one trigger list is non-empty; the coroutine is built lazily so skipped
-    # scopes never construct an un-awaited dry-run.
-    scopes = [
-        (
-            "ospf",
-            [ospf_inst, ospf_iface, redist_ospf],
-            lambda: nso_apply.apply_ospf_config(
-                client=client,
-                device_name=device_name,
-                process_intent_rows=ospf_inst,
-                interface_intent_rows=ospf_iface,
-                redistribution_rows=redist_ospf,
-                dry_run=fmt,
-            ),
-        ),
-        (
-            "isis",
-            [isis_iface, isis_proc, redist_isis, isis_flex, isis_levels],
-            lambda: nso_apply.apply_isis_interfaces(
-                client=client,
-                device_name=device_name,
-                isis_intent_rows=isis_iface,
-                isis_process_rows=isis_proc,
-                redistribution_rows=redist_isis,
-                flex_algo_rows=isis_flex,
-                level_rows=isis_levels,
-                dry_run=fmt,
-            ),
-        ),
-        (
-            "bgp",
-            [bgp, redist_bgp],
-            lambda: nso_apply.apply_bgp_config(
-                client=client,
-                device_name=device_name,
-                router_intent_rows=bgp,
-                redistribution_rows=redist_bgp,
-                dry_run=fmt,
-            ),
-        ),
-        (
-            "route_policy",
-            [rp],
-            lambda: nso_apply.apply_route_policy_config(
-                client=client,
-                device_name=device_name,
-                intent_rows=rp,
-                ned_id=device.ned_id,
-                dry_run=fmt,
-            ),
-        ),
-        (
-            "snmp",
-            [snmp_comm, snmp_user, snmp_host, [snmp_sysinfo] if snmp_sysinfo else []],
-            lambda: nso_apply.apply_snmp_config(
-                client=client,
-                device_name=device_name,
-                community_intents=snmp_comm,
-                v3_user_intents=snmp_user,
-                host_intents=snmp_host,
-                system_info_intent=snmp_sysinfo,
-                dry_run=fmt,
-            ),
-        ),
-        (
-            "static_route",
-            [sr],
-            # Preview parity (§4.8): the same classifier, the same rows, the same retained
-            # tombstone entries — so a replacement-open device previews the very PUT the
-            # apply would send. Read-only: build_plan writes nothing and consumes nothing.
-            lambda: _static_route_coro(client, device, sr_plan, dry_run=fmt),
-        ),
-        (
-            "logging",
-            [lg, [lgl] if lgl else []],
-            lambda: nso_apply.apply_logging_config(
-                client=client, device_name=device_name, host_intent_rows=lg, levels_intent_row=lgl, dry_run=fmt
-            ),
-        ),
-        (
-            "svi",
-            [svi],
-            lambda: nso_apply.apply_svi_config(
-                client=client, device_name=device_name, svi_intent_rows=svi, dry_run=fmt
-            ),
-        ),
-        (
-            "subinterface",
-            [subif],
-            lambda: nso_apply.apply_subinterface_config(
-                client=client, device_name=device_name, subif_intent_rows=subif, dry_run=fmt
-            ),
-        ),
-        (
-            "vlan",
-            [vlan],
-            lambda: nso_apply.apply_vlan_config(
-                client=client, device_name=device_name, vlan_intent_rows=vlan, dry_run=fmt
-            ),
-        ),
-        (
-            "bfd",
-            [bfd],
-            lambda: nso_apply.apply_bfd_config(
-                client=client, device_name=device_name, bfd_intent_rows=bfd, dry_run=fmt
-            ),
-        ),
-        (
-            "interface_mtu",
-            [mtu],
-            lambda: nso_apply.apply_mtu_config(
-                client=client, device_name=device_name, mtu_intent_rows=mtu, dry_run=fmt
-            ),
-        ),
-        (
-            "l2_sap",
-            [l2],
-            lambda: nso_apply.apply_l2_saps(client=client, device_name=device_name, sap_intent_rows=l2, dry_run=fmt),
-        ),
-    ]
-    for scope, triggers, make_coro in scopes:
-        if any(triggers):
-            await _record(scope, make_coro())
-
-    return diffs
+    generation = await executable_head(db, device_id)
+    if generation is None:
+        return {PREVIEW_KEY: "!! preview unavailable: this device has no generation to deploy"}
+    try:
+        if generation.job_id is not None:
+            generation = await executing_generation(db, generation.job_id)
+            if generation is None:
+                return {PREVIEW_KEY: "!! preview unavailable: job carries no generation"}
+        client = get_nso_client(device.nso_instance)
+        # dry_run is bool|str down the sender: True = native, "cli" = tree diff.
+        fmt: bool | str = "cli" if outformat == "cli" else True
+        policy = execution_policy(generation)
+        body = await build_device_containers(
+            client, device, generation.document, retain_static_routes=policy.retain_static_routes
+        )
+        if body.errors:
+            raise next(iter(body.errors.values()))
+        delta = await apply_device_intent(
+            client, device.nso_device_name, body.containers, dry_run=fmt, no_networking=policy.no_networking
+        )
+    except Exception as exc:  # noqa: BLE001 — the preview must never fail hard
+        logger.warning("apply_diff.failed", device=device.nso_device_name, error=repr(exc))
+        reason = getattr(exc, "message", None) or repr(exc)
+        return {PREVIEW_KEY: f"!! preview unavailable: {reason}"}
+    if delta is None:
+        return {PREVIEW_KEY: "!! preview unavailable: NSO dry-run was inconclusive"}
+    return {PREVIEW_KEY: delta} if delta.strip() else {}
 
 
 # ── run_apply: shared eligibility + per-scope batch-commit helpers ────────────
@@ -1103,56 +792,6 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
 # and ``run_apply`` just wires the scopes together. Each scope commits as one
 # unit: on success every row gets ``last_apply_at`` and a cleared error; on any
 # failure every row records the error payload and the scope reports one item.
-
-
-# Result-dict keys in the order run_apply has always emitted them (also the order
-# failed items are reported in). Interface attributes + IPs come first and are
-# handled out-of-band (per-item, not per-batch); these are the batch scopes.
-_SCOPE_RESULT_ORDER = (
-    "snmp",
-    "static_route",
-    "logging",
-    "svi",
-    "subinterface",
-    "vlan",
-    "bfd",
-    "interface_mtu",
-    "l2_sap",
-    "isis",
-    "bgp",
-    "route_policy",
-    "ospf",
-)
-
-
-class _Scope(NamedTuple):
-    """One per-scope apply pass: which rows to stamp and how to push them."""
-
-    key: str  # result-dict key + failed-item "type"
-    log_label: str  # structlog event infix ("apply.<label>_failed")
-    rows: list  # every row stamped on success/failure
-    make_coro: Callable[[], Awaitable]  # built lazily, only when the scope sends something
-    on_nso_error: Callable[[NsoApplyError], Awaitable] | None = None
-    #: What the BODY carries, when that is not ``rows``. A document-executed scope pushes
-    #: the generation's hydrated document and stamps the live rows it carried, and those two
-    #: lists differ whenever a successor moved a row (#1522 §G1).
-    push: list | None = None
-    #: Where a finding about a PUSHED row is recorded: ``{row id -> the live row}``. ``None``
-    #: means the pushed rows are already the live rows. A pushed row absent from the map has
-    #: no live counterpart left. It still fails the scope, but has no bookkeeping target.
-    stamp_of: dict | None = None
-
-    @property
-    def sent(self) -> list:
-        """Return the rows this scope's body carries. Equal to ``rows`` when no override exists.
-
-        Whether the scope RUNS is decided by this and never by ``rows``, and so is what the
-        post-apply presence check looks for: an empty stamp list means the deployment records
-        nothing, never that it sent nothing. Verifying ``rows`` let a successor-rewritten
-        scope expect no keys at all, so NSO could drop the pushed ones and the run still
-        settled (#1558 rework 3, finding 2).
-        """
-        return self.rows if self.push is None else self.push
 
 
 def _is_eligible(row, force: bool) -> bool:
@@ -1334,11 +973,29 @@ class _AttributeApply(NamedTuple):
     stamp: InterfaceIntent | None
 
 
-async def _collect_document_interface(
-    db: AsyncSession,
-    source: _Projection,
-    document: dict,
-) -> tuple[dict, list[dict], list[_AttributeApply], list[dict], dict, _Rows]:
+class _InterfaceApply(NamedTuple):
+    """The interface section's execution halves: what the body carries and what it stamps.
+
+    The attribute and address halves keep separate bookkeeping (two result counters, two
+    capability scopes) although they ride ONE keyed interface entry on the wire.
+    """
+
+    execution: Any  # projection.InterfaceExecution — the frozen writer context + eligibility
+    attributes: list  # _AttributeApply, the eligible attribute rows and their live stamps
+    ip_by_iface: dict
+    ip_stamp_of: dict | None
+    intent_snapshot: list
+    ip_snapshot: list
+
+    @property
+    def ip_rows(self) -> list:
+        return [row for rows in self.ip_by_iface.values() for row in rows]
+
+
+_NO_INTERFACE = _InterfaceApply(None, [], {}, None, [], [])
+
+
+async def _collect_document_interface(db: AsyncSession, source: _Projection, document: dict) -> _InterfaceApply:
     """Hydrate interface rows and consume their creation-time execution context."""
     execution = hydrate_interface_execution(document)
     document_attr_rows = source._document_rows("interface_config").get(InterfaceIntent, [])
@@ -1399,201 +1056,7 @@ async def _collect_document_interface(
                 "accepted_at": row.accepted_at.isoformat() if row.accepted_at else None,
             }
         )
-    return execution.interfaces, intent_snapshot, eligible, ip_snapshot, ip_by_iface, ip_rows
-
-
-async def _collect_interface_apply_rows(
-    db: AsyncSession,
-    source: _Projection,
-    generation,
-    execution_sections: frozenset[str],
-) -> tuple[dict, list[dict], list, list[dict], dict, dict | None]:
-    """Select no rows or the recorded interface document."""
-    if "interface_config" not in execution_sections:
-        return {}, [], [], [], {}, None
-    ifaces, intent_snapshot, attrs, ip_snapshot, ips, ip_rows = await _collect_document_interface(
-        db,
-        source,
-        generation.document,
-    )
-    return ifaces, intent_snapshot, attrs, ip_snapshot, ips, ip_rows.stamp_of
-
-
-async def _apply_attributes(eligible, apply_fn, *, client, device_name, job_id, now) -> tuple[int, int, list]:
-    """Commit each (interface, attribute) individually and transition its attr_state.
-
-    Unlike the batch scopes, a per-attribute failure isolates to that one attribute.
-    Returns (in_sync, apply_failed, failures).
-    """
-    ok = 0
-    failed = 0
-    failures: list[dict] = []
-    for item in eligible:
-        attr_state, intent_row, iface, stamp = item
-        routed_kind = _nokia_attr_kind(iface)
-        try:
-            await apply_fn(
-                client=client,
-                device_name=device_name,
-                interface_name=iface.name,
-                attribute=intent_row.attribute,
-                value=intent_row.intent_value,
-                kind=routed_kind,
-                service=iface.service if routed_kind in ("ies", "vprn") else None,
-                parent_binding=iface.parent_binding,
-                encap_tag=iface.encap_tag,
-            )
-        except NsoApplyError as exc:
-            logger.error(
-                "apply.attribute_failed",
-                job_id=job_id,
-                device=device_name,
-                interface=iface.name,
-                attribute=intent_row.attribute,
-                error=exc.message,
-            )
-            if attr_state is not None and stamp is not None:
-                attr_state.sync_state = SyncState.apply_failed
-                stamp.last_apply_error = {"code": exc.code, "message": exc.message, "detail": exc.detail}
-            failed += 1
-            failures.append({"interface": iface.name, "attribute": intent_row.attribute, "error": exc.message})
-        except ClaimLostError:
-            # Revocation is not a per-row failure: continuing the loop would push
-            # further scopes under ownership this run has lost.
-            raise
-        except Exception as exc:
-            logger.exception(
-                "apply.attribute_unexpected_error",
-                job_id=job_id,
-                interface=iface.name,
-                attribute=intent_row.attribute,
-            )
-            if attr_state is not None and stamp is not None:
-                attr_state.sync_state = SyncState.apply_failed
-                stamp.last_apply_error = internal_error(exc)
-            failed += 1
-            failures.append(
-                {"interface": iface.name, "attribute": intent_row.attribute, "error": internal_error(exc)["message"]}
-            )
-        else:
-            if attr_state is not None and stamp is not None:
-                attr_state.sync_state = SyncState.in_sync
-                stamp.last_apply_at = now
-                stamp.last_apply_error = None
-            ok += 1
-    return ok, failed, failures
-
-
-async def _apply_ips(
-    by_iface,
-    ifaces,
-    apply_fn,
-    *,
-    client,
-    device_name,
-    job_id,
-    now,
-    stamp_of: dict | None = None,
-) -> tuple[int, int, list]:
-    """Push IP intent one interface at a time (each interface is one commit unit).
-
-    Returns (in_sync, apply_failed, failures); the counts are per-row, the failures
-    per-interface.
-    """
-    ok = 0
-    failed = 0
-    failures: list[dict] = []
-    for iface_id, ip_rows in by_iface.items():
-        iface = ifaces[iface_id]
-        routed_kind = _nokia_routed_kind(iface)
-        try:
-            await apply_fn(
-                client=client,
-                device_name=device_name,
-                interface_name=iface.name,
-                ip_intent_rows=ip_rows,
-                kind=routed_kind,
-                service=iface.service if routed_kind in ("ies", "vprn") else None,
-                parent_binding=iface.parent_binding,
-                encap_tag=iface.encap_tag,
-            )
-        except NsoApplyError as exc:
-            logger.error("apply.ip_failed", job_id=job_id, device=device_name, interface=iface.name, error=exc.message)
-            for row in ip_rows:
-                stamp = row if stamp_of is None else stamp_of.get(_stamp_key(row))
-                if stamp is not None:
-                    stamp.last_apply_error = {"code": exc.code, "message": exc.message, "detail": exc.detail}
-            failed += len(ip_rows)
-            failures.append({"interface": iface.name, "error": exc.message})
-        except ClaimLostError:
-            # Revocation is not a per-row failure: continuing the loop would push
-            # further scopes under ownership this run has lost.
-            raise
-        except Exception as exc:
-            logger.exception("apply.ip_unexpected_error", job_id=job_id, interface=iface.name)
-            for row in ip_rows:
-                stamp = row if stamp_of is None else stamp_of.get(_stamp_key(row))
-                if stamp is not None:
-                    stamp.last_apply_error = internal_error(exc)
-            failed += len(ip_rows)
-            failures.append({"interface": iface.name, "error": internal_error(exc)["message"]})
-        else:
-            for row in ip_rows:
-                stamp = row if stamp_of is None else stamp_of.get(_stamp_key(row))
-                if stamp is not None:
-                    stamp.last_apply_at = now
-                    stamp.last_apply_error = None
-            ok += len(ip_rows)
-    return ok, failed, failures
-
-
-_IFACE_CONFIG_ROOT = "interface-reconciler:interface-config"
-
-
-def _build_interface_config_entries(attr_eligible, ip_by_iface, ifaces, device_name: str) -> list[dict]:
-    """Merge interface description/enabled + IP intent into one entry per interface.
-
-    Both ride the same ``(device, interface-name)``-keyed interface-reconciler instance, so in
-    a single atomic edit they MUST be one list item — two items with a duplicate key conflict.
-    """
-    from nso_adapter.nso.apply import _coerce_enabled_intent, build_interface_ip_entry
-
-    by_name: dict[str, dict] = {}
-
-    def _entry(name: str) -> dict:
-        return by_name.setdefault(name, {"device": device_name, "interface-name": name})
-
-    for _attr_state, intent_row, iface, _stamp in attr_eligible:
-        entry = _entry(iface.name)
-        if intent_row.attribute == "description":
-            entry["description"] = intent_row.intent_value if intent_row.intent_value is not None else ""
-        elif intent_row.attribute == "enabled":
-            # Shared strict coercion (raises on garbage) — same as the per-scope path, so a
-            # corrupt value never silently disables the interface in the atomic body either.
-            entry["enabled"] = _coerce_enabled_intent(intent_row.intent_value)
-
-    for iface_id, rows in ip_by_iface.items():
-        iface = ifaces[iface_id]
-        routed_kind = _nokia_routed_kind(iface)
-        ip_entry = build_interface_ip_entry(
-            device_name,
-            iface.name,
-            rows,
-            kind=routed_kind,
-            service=iface.service if routed_kind in ("ies", "vprn") else None,
-            parent_binding=iface.parent_binding,
-            encap_tag=iface.encap_tag,
-        )
-        entry = _entry(iface.name)
-        for key, value in ip_entry.items():
-            if key not in ("device", "interface-name"):
-                entry[key] = value
-
-    return list(by_name.values())
-
-
-_RP_ROOT = "route-policy-reconciler:route-policy-config"
-_SR_ROOT = "static-route-reconciler:static-route-config"
+    return _InterfaceApply(execution, eligible, ip_by_iface, ip_rows.stamp_of, intent_snapshot, ip_snapshot)
 
 
 def _device_error_message(exc) -> str | None:
@@ -1613,86 +1076,112 @@ def _device_error_message(exc) -> str | None:
     return None
 
 
-async def _localize_atomic_failure(client, device_name, modules, device_err) -> tuple[dict[str, str], tuple]:
-    """Localise a failed atomic commit → ({offender root-key: its rejection message}, rp).
+#: The container the route-policy family writes under. Its rejections are the one class the
+#: device names in the COMMIT error while every dry-run renders clean.
+_RP_CONTAINER = section_registry()["route_policy"].container
 
-    ``rp`` is the route-policy ``(scope, name)`` construct parse. Two complementary signals: (1) a per-scope dry-run — a module the NED cannot compile re-runs
-    to an inconclusive (``None``) delta in isolation; (2) the route-policy device-parser rejection,
-    which renders clean in dry-run but is named in the *device* error (``device_err``). Each
-    offender carries ITS OWN dry-run rejection message (H2): the combined-commit ``device_err``
-    may describe a different module's failure, so per-construct attribution must read the
-    message of the module that actually rejected. No recording here — the caller decides
-    attribution (including the fall-back to all staged scopes) and whether it is a real device
-    rejection before recording capability.
+#: The family a refusal from the aggregate names for itself, from the ratified refusal shape
+#: ``device-intent: refused [family=<container> field=<field_id>]: <reason>``.
+_REFUSED_FAMILY = re.compile(r"device-intent:\s*refused\s*\[\s*family=([A-Za-z0-9._-]+)")
+
+
+@cache
+def _section_by_container() -> dict[str, str]:
+    """YANG container -> the document section that owns it, off the registry."""
+    return {entry.container: section for section, entry in section_registry().items()}
+
+
+def _refused_family(message: str | None, containers) -> str | None:
+    """Return the container a refusal names itself, when the document carries it."""
+    match = _REFUSED_FAMILY.search(message or "")
+    family = match.group(1) if match else None
+    return family if family in containers else None
+
+
+async def _localize_document_failure(client, device_name, containers, device_err) -> tuple[dict[str, str], tuple]:
+    """Localise a failed document commit → ({offender container: its rejection message}, rp).
+
+    ``rp`` is the route-policy ``(scope, name)`` construct parse. Three signals, cheapest
+    first: (1) the aggregate's own refusal names its family in the message; (2) the
+    empty-one-family dry-run — the family whose REMOVAL lets the document pass is the one the
+    device rejected; (3) the route-policy device-parser rejection, which renders clean in
+    dry-run and is only named in the *device* error. A dry-run that stays rejected, or comes
+    back inconclusive, accuses nobody: a transient blip must never brand a family a false
+    ``unsupported`` that a later probe cannot downgrade.
+
+    The loop runs ONLY when the whole document's own dry-run reproduces the failure. A
+    commit that fails for a reason dry-run cannot see — a transport blip, or a device-side
+    misconfiguration that renders clean — lets EVERY trial pass, and every family would be
+    named an offender: sixteen false ``unsupported`` verdicts per ``(ned, sw)`` from one
+    timeout. Not reproducible means not attributable.
+
+    No recording here — the caller decides attribution (including the fall-back to every
+    family in the document) and whether this was a real device rejection.
     """
     from nso_adapter.core.capability import parse_rejected_construct
-    from nso_adapter.nso.apply import NsoApplyError, apply_combined
-
-    offenders: dict[str, str] = {}
-    for root_key, bodies in modules.items():
-        try:
-            # strict=True: only a CONCLUSIVE 4xx rejection in isolation flags this scope as an
-            # offender. A transient/transport error (or 5xx) returns None / raises a non-NsoApplyError
-            # — inconclusive, NOT an offender, so it never brands the scope a false 'unsupported'
-            # that a later probe can't downgrade.
-            await apply_combined(client, device_name, {root_key: bodies}, dry_run=True, strict=True)
-        except NsoApplyError as exc:
-            offenders[root_key] = str(exc.message or "")
-        except Exception:  # noqa: BLE001 — transient/transport during localisation → inconclusive
-            logger.debug("apply.localize.inconclusive", device=device_name, root_key=root_key)
+    from nso_adapter.nso.apply import NsoApplyError, apply_device_intent
 
     rp = parse_rejected_construct(device_err or "")
-    if rp[1] and _RP_ROOT in modules:
-        offenders.setdefault(_RP_ROOT, device_err or "")
+    named = _refused_family(device_err, containers)
+    if named is not None:
+        return {named: device_err or ""}, rp
+
+    def _unattributable():
+        logger.info("apply.localize.not_reproducible", device=device_name)
+        return ({_RP_CONTAINER: device_err or ""} if rp[1] and _RP_CONTAINER in containers else {}), rp
+
+    try:
+        await apply_device_intent(client, device_name, containers, dry_run=True, strict=True)
+    except NsoApplyError:
+        pass  # the document is conclusively rejected as it stands: the loop can attribute it
+    except Exception:  # noqa: BLE001 — a transport blip reproduces nothing, and must not escape
+        logger.debug("apply.localize.inconclusive", device=device_name)
+        return _unattributable()
+    else:
+        return _unattributable()
+
+    offenders: dict[str, str] = {}
+    for container in containers:
+        trial = {name: body for name, body in containers.items() if name != container}
+        try:
+            delta = await apply_device_intent(client, device_name, trial, dry_run=True, strict=True)
+        except NsoApplyError:
+            continue  # still rejected without this family — not the offender
+        except Exception:  # noqa: BLE001 — transient/transport during localisation → inconclusive
+            logger.debug("apply.localize.inconclusive", device=device_name, family=container)
+            continue
+        if delta is None:  # inconclusive, not a clean pass
+            continue
+        offenders[container] = device_err or ""
+
+    if rp[1] and _RP_CONTAINER in containers:
+        offenders.setdefault(_RP_CONTAINER, device_err or "")
     return offenders, rp
 
 
-# Maps a staged module root-key → its result/scope key. interface-config is handled
-# separately (it carries the attribute + IP scopes, which the result model splits out).
-_ATOMIC_SCOPE_ROOTS: dict[str, str] = {
-    "subinterface-reconciler:subif-config": "subinterface",
-    "snmp-reconciler:snmp-config": "snmp",
-    _SR_ROOT: "static_route",
-    "logging-reconciler:logging-config": "logging",
-    "svi-reconciler:svi-config": "svi",
-    "vlan-reconciler:vlan-config": "vlan",
-    "bfd-reconciler:bfd-config": "bfd",
-    "mtu-reconciler:mtu-config": "interface_mtu",
-    "l2-sap-reconciler:l2-sap-config": "l2_sap",
-    "isis-reconciler:isis-config": "isis",
-    "bgp-reconciler:bgp-config": "bgp",
-    "route-policy-reconciler:route-policy-config": "route_policy",
-    "ospf-reconciler:ospf-config": "ospf",
-}
+def _capability_scopes_for(container: str) -> list[str]:
+    """Capability-matrix scope name(s) for a YANG container ([] if not tracked).
 
-
-def _capability_scopes_for(root_key: str) -> list[str]:
-    """Capability-matrix scope name(s) for a staged module root-key ([] if not tracked).
-
-    The merged interface-config module carries BOTH the interface_attribute and interface_ip
-    scopes (collect_apply_diff / preflight treat them separately), so a rejection of it must
-    record capability under both — else a preflight for interface_attribute sees a false
-    'fully supported'.
+    Off the registry's ``capability_scopes``: the merged interface container carries BOTH the
+    interface_attribute and interface_ip scopes (collect_apply_diff / preflight treat them
+    separately), so a rejection of it records capability under both — else a preflight for
+    interface_attribute sees a false "fully supported".
     """
-    if root_key == _IFACE_CONFIG_ROOT:
-        return ["interface_attribute", "interface_ip"]
-    scope = _ATOMIC_SCOPE_ROOTS.get(root_key)
-    return [scope] if scope else []
+    section = _section_by_container().get(container)
+    return list(section_registry()[section].capability_scopes) if section else []
 
 
 async def _record_atomic_capability(db, client, device, device_name, offenders, exc, rp, device_err) -> None:
-    """Record a capability rejection for the attributed offender scopes.
+    """Record a capability rejection for the attributed offender families.
 
-    A per-scope dry-run rejection means the NED cannot compile that scope's intent on this
+    A family whose REMOVAL lets the document compile is one the NED cannot compile on this
     ``(ned, sw)``; a device-parser rejection (``device_err``) means the device itself refused
     the commit — both are real, reactive capability gaps, recorded at scope granularity (or
-    fine-grained for route-policy when ``rp = (scope, name)`` parses). H2: the merged
-    interface-config module carries TWO scopes — when its OWN rejection message names a
-    construct, only the offending half is recorded (construct-named); an unattributable
-    message falls back to the coarse both-scopes record. Detail prefers each offender's own
-    localisation message over the combined ``device_err`` (which may describe a different
-    module). The ``(ned, sw)`` key is read from the device row, learned + persisted via the
-    capability probe only when not already known.
+    fine-grained for route-policy when ``rp = (scope, name)`` parses). H2: the interface
+    container carries TWO scopes — when the rejection message names a construct, only the
+    offending half is recorded (construct-named); an unattributable message falls back to the
+    coarse both-scopes record. The ``(ned, sw)`` key is read from the device row, learned +
+    persisted via the capability probe only when not already known.
     """
     from nso_adapter.core.capability import (
         _clean_capability_key,
@@ -1713,28 +1202,30 @@ async def _record_atomic_capability(db, client, device, device_name, offenders, 
         return
 
     rp_scope, rp_name = rp
-    for root_key in offenders:
-        own_msg = offenders.get(root_key, "") if isinstance(offenders, dict) else ""
+    iface_container = section_registry()["interface_config"].container
+    for container in offenders:
+        own_msg = offenders.get(container, "") if isinstance(offenders, dict) else ""
         detail = (own_msg or device_err or exc.message or "")[:256]
-        if root_key == _RP_ROOT and rp_name:
+        if container == _RP_CONTAINER and rp_name:
             await record_capability_rejection(db, ned_id, sw, rp_scope, rp_name, detail)
             continue
-        if root_key == _IFACE_CONFIG_ROOT:
+        if container == iface_container:
             scope, name = parse_rejected_iface_construct(own_msg or device_err or exc.message or "")
             if scope:
                 await record_capability_rejection(db, ned_id, sw, scope, name, detail)
                 continue
-        for scope in _capability_scopes_for(root_key):
+        for scope in _capability_scopes_for(container):
             await record_capability_rejection(db, ned_id, sw, scope, scope, detail)
 
 
-async def _clear_atomic_capability(db, device, modules) -> None:
-    """Clear stale reactive capability rejections after a clean atomic commit.
+async def _clear_atomic_capability(db, device, containers) -> None:
+    """Clear stale reactive capability rejections after a clean document commit.
 
-    A successful commit proves every staged scope applies on this ``(ned, sw)`` — the strongest
-    positive signal — so drop any coarse ``apply``-sourced ``unsupported`` recorded by an earlier
-    failed apply. Without this the gap would stick forever (a probe cannot downgrade an
-    apply-rejection). Best-effort; the ``(ned, sw)`` key is read from the device row (no probe).
+    A successful commit proves every family in the document applies on this ``(ned, sw)`` —
+    the strongest positive signal — so drop any coarse ``apply``-sourced ``unsupported``
+    recorded by an earlier failed apply. Without this the gap would stick forever (a probe
+    cannot downgrade an apply-rejection). Best-effort; the ``(ned, sw)`` key is read from the
+    device row (no probe).
     """
     from nso_adapter.core.capability import _clean_capability_key, clear_capability_rejections
 
@@ -1743,165 +1234,9 @@ async def _clear_atomic_capability(db, device, modules) -> None:
         return
     sw = _clean_capability_key(device.sw_version)
     scopes: set[str] = set()
-    for root_key in modules:
-        scopes.update(_capability_scopes_for(root_key))
+    for container in containers:
+        scopes.update(_capability_scopes_for(container))
     await clear_capability_rejections(db, ned_id, sw, scopes)
-
-
-class _AtomicRows(NamedTuple):
-    """The atomic path's three per-scope collections (#1558 rework 3, finding 2).
-
-    *sent* is what each staged scope's body carried, *stamp* the live rows that record its
-    outcome, *stamp_of* the ``{scope: {sent row id -> live row}}`` join. Replacing the staged
-    rows with the stamp rows made a successor-rewritten scope verify an empty key set, so a
-    dropped push settled.
-    """
-
-    sent: dict[str, list]
-    stamp: dict[str, list]
-    stamp_of: dict[str, dict]
-
-
-async def _stage_atomic_modules(
-    elig, client, device, device_name, *, sr_plan=None
-) -> tuple[dict, list, _AtomicRows, dict]:
-    """Build the combined ``/restconf/data`` body across every scope.
-
-    Returns ``(modules, iface_entries, rows, stage_errors)``. Each scope stages its
-    body via ``stage=modules`` (reusing its own body-builder, no HTTP); the interface-config
-    module merges attribute + IP intent per interface.
-
-    A scope whose body cannot be BUILT (a malformed vault_ref, an unmappable enum) is
-    isolated into *stage_errors* rather than raising: the fault is deterministic and local
-    to that scope, so the rest of the apply still commits.
-
-    R2 §4.9: a ``PUT``-mode static-route plan is EXCLUDED from the combined body — staging
-    is merge-PATCH only and explicitly ignores ``replace`` (G4), so staging it would send
-    the new triple and leave the predecessor live while reporting success. The scope leaves
-    ``scope_rows`` too, so nothing downstream stamps or reader-compares rows this
-    transaction never carried; a follow-on PUT delivers them after the commit.
-
-    ``scope_rows`` is the STAMP half and is not always the staged half (#1522 §G1): a
-    document-executed scope stages the generation's hydrated document and stamps the LIVE
-    rows it carried, which ``elig["stamp"]`` supplies per scope. Whether a scope is staged at
-    all is still decided by what it PUSHES — an empty stamp list means this deployment
-    records nothing, never that it sends nothing.
-    """
-    from nso_adapter.nso.apply import (
-        apply_bfd_config,
-        apply_bgp_config,
-        apply_isis_interfaces,
-        apply_l2_saps,
-        apply_logging_config,
-        apply_mtu_config,
-        apply_ospf_config,
-        apply_route_policy_config,
-        apply_snmp_config,
-        apply_static_routes,
-        apply_subinterface_config,
-        apply_svi_config,
-        apply_vlan_config,
-    )
-
-    modules: dict[str, list] = {}
-    iface_entries = _build_interface_config_entries(elig["attr"], elig["ip_by_iface"], elig["ifaces"], device_name)
-    if iface_entries:
-        modules[_IFACE_CONFIG_ROOT] = iface_entries
-
-    stagers: list[tuple[str, list, Callable[[], Awaitable[Any]]]] = [
-        (
-            "subinterface",
-            elig["subif"],
-            lambda: apply_subinterface_config(client, device_name, elig["subif"], stage=modules),
-        ),
-        (
-            "snmp",
-            elig["snmp_rows"],
-            lambda: apply_snmp_config(
-                client,
-                device_name,
-                elig["snmp_comm"],
-                elig["snmp_user"],
-                elig["snmp_host"],
-                elig["snmp_sysinfo"],
-                stage=modules,
-            ),
-        ),
-        (
-            "static_route",
-            elig["static_route"],
-            lambda: apply_static_routes(client, device_name, elig["static_route"], stage=modules),
-        ),
-        (
-            "logging",
-            [*elig["logging"], *([elig["logging_levels"]] if elig["logging_levels"] else [])],
-            lambda: apply_logging_config(
-                client, device_name, elig["logging"], levels_intent_row=elig["logging_levels"], stage=modules
-            ),
-        ),
-        ("svi", elig["svi"], lambda: apply_svi_config(client, device_name, elig["svi"], stage=modules)),
-        ("vlan", elig["vlan"], lambda: apply_vlan_config(client, device_name, elig["vlan"], stage=modules)),
-        ("bfd", elig["bfd"], lambda: apply_bfd_config(client, device_name, elig["bfd"], stage=modules)),
-        ("interface_mtu", elig["mtu"], lambda: apply_mtu_config(client, device_name, elig["mtu"], stage=modules)),
-        ("l2_sap", elig["l2_sap"], lambda: apply_l2_saps(client, device_name, elig["l2_sap"], stage=modules)),
-        (
-            "isis",
-            [*elig["isis_iface"], *elig["isis_proc"], *elig["redist_isis"], *elig["isis_flex"], *elig["isis_levels"]],
-            lambda: apply_isis_interfaces(
-                client,
-                device_name,
-                elig["isis_iface"],
-                elig["isis_proc"],
-                elig["redist_isis"],
-                elig["isis_flex"],
-                elig["isis_levels"],
-                stage=modules,
-            ),
-        ),
-        (
-            "bgp",
-            [*elig["bgp"], *elig["redist_bgp"]],
-            lambda: apply_bgp_config(client, device_name, elig["bgp"], elig["redist_bgp"], stage=modules),
-        ),
-        (
-            "route_policy",
-            elig["rp"],
-            lambda: apply_route_policy_config(client, device_name, elig["rp"], ned_id=device.ned_id, stage=modules),
-        ),
-        (
-            "ospf",
-            [*elig["ospf_inst"], *elig["ospf_iface"], *elig["redist_ospf"]],
-            lambda: apply_ospf_config(
-                client, device_name, elig["ospf_inst"], elig["ospf_iface"], elig["redist_ospf"], stage=modules
-            ),
-        ),
-    ]
-    if sr_plan is not None and sr_plan.mode == "PUT":
-        stagers = [entry for entry in stagers if entry[0] != "static_route"]
-    # Three collections, not two: what the body carried (``sent_rows``, what the presence
-    # check must look for), what records the outcome (``scope_rows``) and how one maps onto
-    # the other (``stamp_of``). Keyed access, not a default: ``elig`` has ONE producer, and a
-    # missing key here would silently stamp the hydrated rows again.
-    stamp_rows = elig["stamp"]
-    stamp_of = elig["stamp_of"]
-    sent_rows = {key: rows for key, rows, _fn in stagers}
-    scope_rows = {key: stamp_rows.get(key, rows) for key, rows, _fn in stagers}
-    stage_errors: dict[str, NsoApplyError] = {}
-    for key, rows, stage_fn in stagers:
-        if not rows:
-            continue
-        try:
-            await stage_fn()
-        except NsoApplyError as exc:
-            # This scope's BODY could not be built — a vault_ref that predates the
-            # mount/path#key contract, an enum spelling the writer cannot map. Deterministic
-            # and local to the scope: nothing was staged into `modules` (each builder
-            # assembles its entry locally and only stages it at the very end), so drop the
-            # offender and let the healthy scopes commit. Letting the raise escape failed the
-            # ENTIRE job — interfaces, IPs, BGP, IS-IS — for one bad SNMP row.
-            logger.error("apply.atomic_stage_failed", device=device_name, scope=key, error=exc.message)
-            stage_errors[key] = exc
-    return modules, iface_entries, _AtomicRows(sent_rows, scope_rows, stamp_of), stage_errors
 
 
 def _stamp_attr_atomic(attr_eligible, commit_error, iface_failed, err, msg, now, snapshot) -> tuple[int, int, list]:
@@ -1948,60 +1283,62 @@ def _stamp_ip_atomic(ip_rows_flat, commit_error, iface_failed, err, msg, now, st
     return 0, 0, []
 
 
-async def _atomic_reader_compare(
-    client, device, sent_rows, scope_outcomes, scope_failures, *, job_id, device_name, stamp_of=None
+async def _document_reader_compare(
+    client, device, sections, outcomes, failures, *, job_id, device_name
 ) -> tuple[dict[str, str], dict[str, list[str]], dict[str, dict[int, str]]]:
-    """#108 presence check per staged scope after a clean atomic commit.
+    """#108 presence check per family after a clean commit.
 
-    *sent_rows* is what each staged scope's BODY carried and *stamp_of* maps those rows onto
-    the live rows a finding is recorded on — the stamp rows are not the check's input, or a
-    successor-rewritten scope would be checked for no keys at all.
+    Each family's expected keys come from what its body CARRIED and from the section's own
+    frozen context, and ``stamp_of`` maps those rows onto the live rows a finding is recorded
+    on — the stamp rows are not the check's input, or a successor-rewritten family would be
+    checked for no keys at all.
 
-    Every scope committed in ONE transaction → ONE post-commit point → ONE batched
-    device-state action for all checkable wire_names (r1-m3: no per-scope enlargement on
-    the atomic path). Prepares each eligible scope (expected + Vault translation), fetches
-    the sections whose translated set is non-empty in a single action, then classifies each
-    scope independently. A batched-action raise → every checkable scope records ``error``
-    (non-fatal). Mutates scope_outcomes/scope_failures for scopes with silently-dropped keys
-    and returns ``(reader_compare, reader_compare_unverifiable, evidence_by_scope)`` — the
-    last being R2 §4.4's per-row map, which the static-route bookkeeping reads instead of the
-    aggregate.
+    One document is one transaction is ONE post-commit point, so every checkable family is
+    read in a single batched device-state action. A batched-action raise → every checkable
+    family records ``error`` (non-fatal). Mutates *outcomes* / *failures* for families with
+    silently-dropped keys and returns ``(reader_compare, reader_compare_unverifiable,
+    evidence_by_section)`` — the last being R2 §4.4's per-row map, which the static-route
+    bookkeeping reads instead of the aggregate.
     """
     from nso_adapter.core.removal import _VERIFY_BATCH_TIMEOUT, _live_family_sections
 
-    ned_id = getattr(device, "ned_id", None)
-    preps: dict[str, Any] = {}  # scope → prep tuple | None (uncheckable) | "error" (translate raised)
-    for key, rows in sent_rows.items():
-        s_ok, s_failed = scope_outcomes.get(key, (0, 0))
-        if not rows or s_failed:
+    registry = section_registry()
+    preps: dict[str, Any] = {}  # section → prep tuple | None (uncheckable) | "error" (translate raised)
+    for section, apply_rows in sections.items():
+        key = registry[section].result_keys[0]
+        _ok, failed = outcomes.get(key, (0, 0))
+        if not apply_rows.sent or failed:
             continue
         try:
-            preps[key] = await _reader_compare_prepare(key, rows, ned_id)
-        except Exception as exc:  # noqa: BLE001 — a scope's translation must never fail the apply
-            logger.warning("apply.reader_compare_error", job_id=job_id, device=device_name, scope=key, error=repr(exc))
-            preps[key] = "error"
+            preps[section] = await _reader_compare_prepare(section, apply_rows.sent, apply_rows.ned_id)
+        except Exception as exc:  # noqa: BLE001 — a family's translation must never fail the apply
+            logger.warning(
+                "apply.reader_compare_error", job_id=job_id, device=device_name, scope=section, error=repr(exc)
+            )
+            preps[section] = "error"
 
     wires = sorted({prep[3] for prep in preps.values() if isinstance(prep, tuple) and prep[0]})
-    sections: dict[str, dict] = {}
+    fetched: dict[str, dict] = {}
     action_error: Exception | None = None
     if wires:
         try:
-            sections = await _live_family_sections(client, device.nso_device_name, wires, timeout=_VERIFY_BATCH_TIMEOUT)
-        except Exception as exc:  # noqa: BLE001 — a batched read failure fails no scope's apply
+            fetched = await _live_family_sections(client, device.nso_device_name, wires, timeout=_VERIFY_BATCH_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 — a batched read failure fails no family's apply
             action_error = exc
             logger.warning("apply.reader_compare_error", job_id=job_id, device=device_name, error=repr(exc))
 
     reader_compare: dict[str, str] = {}
     reader_compare_unverifiable: dict[str, list[str]] = {}
-    evidence_by_scope: dict[str, dict[int, str]] = {}
-    for key, prep in preps.items():
-        s_ok, _s_failed = scope_outcomes.get(key, (0, 0))
+    evidence_by_section: dict[str, dict[int, str]] = {}
+    for section, prep in preps.items():
+        key = registry[section].result_keys[0]
+        s_ok, _s_failed = outcomes.get(key, (0, 0))
         if prep is None:
             continue  # structurally uncheckable → no entry
         if prep == "error":
-            reader_compare[key] = "error"
+            reader_compare[section] = "error"
             continue
-        translated, unverifiable, spec, wire = prep
+        translated, unverifiable, lists, wire = prep
         evidence: dict[int, str] = {}
         fails: list[Any]
         if not translated:  # every key Vault-unverifiable → nothing to look for
@@ -2011,210 +1348,286 @@ async def _atomic_reader_compare(
         else:
             try:
                 # guarded (codex P2): a malformed 'ok' section must not let the walker's exception
-                # escape and fail the whole atomic job — classify "error" for just this scope.
+                # escape and fail the whole job — classify "error" for just this family.
                 n_ok, n_failed, fails, status, evidence = _classify_fetched_section(
-                    key,
+                    section,
                     translated,
                     unverifiable,
-                    spec,
-                    sections[wire],
+                    lists,
+                    fetched[wire],
                     s_ok,
                     job_id=job_id,
                     device_name=device_name,
-                    stamp_of=(stamp_of or {}).get(key),
+                    stamp_of=sections[section].stamp_of,
                 )
             except Exception as exc:  # noqa: BLE001 — a read-side glitch never fails a good commit
                 logger.warning(
-                    "apply.reader_compare_error", job_id=job_id, device=device_name, scope=key, error=repr(exc)
+                    "apply.reader_compare_error", job_id=job_id, device=device_name, scope=section, error=repr(exc)
                 )
                 n_ok, n_failed, fails, status, evidence = s_ok, 0, [], "error", {}
-        reader_compare[key] = status
-        evidence_by_scope[key] = evidence
+        reader_compare[section] = status
+        evidence_by_section[section] = evidence
         if unverifiable:
-            reader_compare_unverifiable[key] = unverifiable
+            reader_compare_unverifiable[section] = unverifiable
         if n_failed:
-            scope_outcomes[key] = (n_ok, n_failed)
-            scope_failures.setdefault(key, []).extend(fails)
-    return reader_compare, reader_compare_unverifiable, evidence_by_scope
+            outcomes[key] = (n_ok, n_failed)
+            failures.setdefault(key, []).extend(fails)
+    return reader_compare, reader_compare_unverifiable, evidence_by_section
 
 
-async def _atomic_commit(
-    db, client, device, device_name, modules, *, job_id: int
-) -> tuple[NsoApplyError | None, str | None, dict, dict | None, str]:
-    """Commit the combined transaction and localise its failure → the stamping inputs.
+class _SectionApply(NamedTuple):
+    """One document section as the sender needs it and as its bookkeeping records it.
 
-    Returns ``(commit_error, combined_verify, offenders, err, msg)``. *combined_verify* is
-    the commit's §4.4 proof verdict, shared by every scope staged into it (G39).
+    *rows* is what the encoder reads (table name -> rows), *sent* every row the body carries,
+    *stamp* the LIVE rows this deployment records its outcome on, and *stamp_of* the join
+    between them. The two lists differ whenever a successor rewrote a row this document
+    carried (#1522 §G1), and a section the job does not EXECUTE stamps nothing at all while
+    its rows still ride the body — under a full-document PUT, omitting them would retract them.
     """
-    from nso_adapter.nso.apply import apply_combined
 
+    rows: dict[str, list]
+    sent: list
+    stamp: list
+    stamp_of: dict
+    #: The NED id this section was FROZEN with. Every comparison that is NED-conditioned
+    #: reads it here, never from the live device row.
+    ned_id: str | None
+
+
+class _ApplyPlan(NamedTuple):
+    """Everything one deployment sends and stamps, resolved before the first device call."""
+
+    device_id: int
+    document: dict
+    sections: dict[str, _SectionApply]
+    interface: _InterfaceApply
+    static_route: SrPlan | None
+    #: The keys this deployment may drop, per section and guarded list — the guard's authority.
+    allowed: dict
+    any_eligible: bool
+
+
+@cache
+def _result_keys() -> tuple[str, ...]:
+    """Every job-result counter name, in registry order (memo A8)."""
+    return tuple(key for entry in section_registry().values() for key in entry.result_keys)
+
+
+def _stampable(spec) -> bool:
+    """Whether a section's table is one an apply stamps and counts on its own.
+
+    A child table records through its parent and a lifecycle carrier is settlement state, not
+    intent: neither is device-scoped, so neither is collected or counted here.
+    """
+    return spec.parent is None and not spec.lifecycle
+
+
+async def _collect_sections(
+    db: AsyncSession,
+    source: _Projection,
+    document: dict,
+    *,
+    static_route_plan: SrPlan | None,
+) -> dict[str, _SectionApply]:
+    """Collect every section the document carries: the body's rows and their live stamps.
+
+    The registry is the walk. A section the job does not execute contributes its rows and no
+    bookkeeping; ``_Projection`` decides that, so the two halves cannot drift apart.
+    """
+    from nso_adapter.core.projection import section_rows_by_table
+    from nso_adapter.store.models import StaticRouteTombstone
+
+    sections: dict[str, _SectionApply] = {}
+    for section, entry in section_registry().items():
+        if section not in document:
+            continue
+        rows = section_rows_by_table(document, section)
+        if section == "static_route" and static_route_plan is not None:
+            # The frozen plan owns which rows and which carriers this document executes.
+            rows = {
+                **rows,
+                StaticRouteIntent.__tablename__: list(static_route_plan.rows),
+                StaticRouteTombstone.__tablename__: list(static_route_plan.tombstones),
+            }
+        sent: list = []
+        stamp: list = []
+        stamp_of: dict = {}
+        if section != "interface_config":  # the interface halves keep their own bookkeeping
+            for spec in entry.tables:
+                if not _stampable(spec):
+                    continue
+                collected = await source.collect(spec.model, section=section)
+                sent.extend(collected.push)
+                stamp.extend(collected.stamp)
+                stamp_of.update(collected.stamp_of or {})
+        if section == "static_route" and static_route_plan is not None:
+            # The SAME objects the body carried and the settlement reads. Two hydrations of
+            # one document produce equal rows that are not the same objects, so a send error
+            # stamped on one is invisible to the per-route record built from the other.
+            sent = list(static_route_plan.rows)
+        sections[section] = _SectionApply(rows, sent, stamp, stamp_of, section_context(document, section)["ned_id"])
+    return sections
+
+
+def _revert_deploying(snapshot: dict) -> None:
+    """Put the attribute states this run marked ``deploying`` back where they were."""
+    for attr_state, state in snapshot.items():
+        attr_state.sync_state = state
+
+
+async def _finalize_unsent(db, plan: _ApplyPlan, build_errors: dict, *, job_id: int, reg) -> None:
+    """Fail the families whose body could not be built. Nothing reached the device."""
+    registry = section_registry()
+    outcomes: dict[str, tuple[int, int]] = dict.fromkeys(_result_keys(), (0, 0))
+    failures: dict[str, list] = {}
+    for section, exc in build_errors.items():
+        error = {"code": exc.code, "message": exc.message, "detail": exc.detail}
+        if section == "interface_config":
+            for item in plan.interface.attributes:
+                if item.stamp is not None:
+                    item.stamp.last_apply_error = error
+            for row in (plan.interface.ip_stamp_of or {}).values():
+                row.last_apply_error = error
+            outcomes["attribute"] = (0, len(plan.interface.attributes))
+            outcomes["ip"] = (0, len(plan.interface.ip_rows))
+            failures["attribute"] = [{"error": exc.message}]
+            continue
+        apply_rows = plan.sections[section]
+        _reject_transient_stamps(section, apply_rows.stamp)
+        for row in apply_rows.sent:
+            row.last_apply_error = error
+        for row in apply_rows.stamp:
+            row.last_apply_error = error
+        key = registry[section].result_keys[0]
+        # Counted against what the body WOULD have carried: a family whose live rows a
+        # successor rewrote stamps none of them, and a (0, 0) outcome is a silent success.
+        outcomes[key] = (0, len(apply_rows.sent))
+        failures[key] = [{"error": exc.message}]
+    await _finalize_job(db, job_id, plan.device_id, True, outcomes, failures, reg=reg, document_failed=True)
+
+
+async def _commit_document(
+    db, client, device, device_name, body, *, allowed: dict, job_id: int
+) -> tuple[NsoApplyError | None, str | None, dict, dict | None, str]:
+    """PUT the device's document behind the guard and localise its failure → stamping inputs.
+
+    Returns ``(commit_error, verify, offenders, err, msg)``. *verify* is the commit's §4.4
+    proof verdict, shared by every family in the document because they landed in ONE
+    transaction (G39).
+
+    The collateral guard runs HERE too, not only on a removal: one PUT makes every omission a
+    retraction, so an apply can flush an orphaned service row exactly as a removal can. A
+    blocked write sent nothing, so it fails the job without accusing any single family.
+    """
+    from nso_adapter.core.removal import RemovalBlockedError, guarded_device_write
+
+    containers = body.containers
     commit_error: NsoApplyError | None = None
-    combined_verify: str | None = None
-    if modules:
-        try:
-            combined_verify = await apply_combined(client, device_name, modules)
-        except NsoApplyError as exc:
-            commit_error = exc
-        except Exception as exc:  # noqa: BLE001 — surface as a job-level failure
-            commit_error = NsoApplyError("internal", repr(exc))
-    else:
-        # Nothing reached the combined body: every eligible scope either failed to stage or
-        # left the transaction (a PUT-mode static-route plan, §4.9). An empty PATCH is a
-        # pointless round trip whose verify verdict would then be attributed to a scope the
-        # transaction never carried. C2 handed this case over: with atomic on, PUT mode and
-        # force=False, `any_eligible` comes from plan.rows and the eligible list can be
-        # empty — unreachable while the worker passes force=True, and it must stay so.
-        logger.info("apply.atomic_nothing_staged", job_id=job_id, device=device_name)
+    verify: str | None = None
+    blocked = False
+    try:
+        verify = await guarded_device_write(client, device, containers, allowed=allowed, current=body.snapshot)
+    except RemovalBlockedError as exc:
+        logger.error("apply.blocked_collateral", job_id=job_id, device=device_name, orphans=exc.orphans)
+        commit_error = NsoApplyError("removal_blocked_collateral", str(exc), detail={"orphans": exc.orphans})
+        blocked = True
+    except NsoApplyError as exc:
+        commit_error = exc
+    except Exception as exc:  # noqa: BLE001 — surface as a job-level failure
+        # The TYPE only: exception text can carry credentials (a RESTCONF error echoes the
+        # request, an httpx error its headers) and this payload is persisted on every row.
+        logger.error("apply.commit_internal_error", job_id=job_id, device=device_name, error=repr(exc))
+        internal = internal_error(exc)
+        commit_error = NsoApplyError("internal", internal["message"], detail=internal["detail"])
 
     if commit_error is None:
         # Positive signal (I2): a clean commit clears any stale reactive 'unsupported' for the
-        # applied scopes — a probe cannot downgrade an apply-rejection, so without this the gap
-        # would stick forever even after the device is fixed / upgraded and the intent lands.
+        # families in the document — a probe cannot downgrade an apply-rejection, so without
+        # this the gap would stick forever even after the device is fixed and the intent lands.
         try:
-            await _clear_atomic_capability(db, device, modules)
+            await _clear_atomic_capability(db, device, containers)
         except Exception:  # noqa: BLE001 — capability bookkeeping is best-effort
             logger.debug("apply.atomic.capability_clear_skipped", job_id=job_id)
-        return None, combined_verify, {}, None, ""
+        return None, verify, {}, None, ""
 
     logger.error("apply.atomic_failed", job_id=job_id, device=device_name, error=commit_error.message)
     device_err = _device_error_message(commit_error)
-    offenders, rp = await _localize_atomic_failure(client, device_name, modules, device_err)
-    # Capability (I2): record ONLY reliably-localised offenders — a per-scope dry-run the NED
-    # cannot compile, or a parse_rejected_construct match (a known-unsupported construct named
-    # in the device error). A generic device rejection is NOT a capability signal: it may be a
-    # MISCONFIGURATION (e.g. a route-map referencing a prefix-list not included in the push),
-    # not a NED limit — recording it would be a false "unsupported" verdict. Such failures
-    # still fail the job + stamp last_apply_error (the operator sees the real device error).
+    # A guard refusal never reached the device, so there is nothing to localise and no
+    # capability verdict to draw: the whole unsent document is the failure.
+    offenders, rp = (
+        ({}, (None, None)) if blocked else await _localize_document_failure(client, device_name, containers, device_err)
+    )
+    # Capability (I2): record ONLY reliably-localised offenders — a family whose removal lets
+    # the document compile, a refusal that names its own family, or a parse_rejected_construct
+    # match. A generic device rejection is NOT a capability signal: it may be a MISCONFIGURATION
+    # (a route-map referencing a prefix-list the push does not carry), not a NED limit, and
+    # recording it would be a false "unsupported" verdict. Such failures still fail the job and
+    # stamp last_apply_error, so the operator sees the real device error.
     if offenders:
         try:
             await _record_atomic_capability(db, client, device, device_name, offenders, commit_error, rp, device_err)
         except Exception:  # noqa: BLE001 — capability recording is best-effort
             logger.debug("apply.atomic.capability_record_skipped", job_id=job_id)
-    if not offenders:  # could not localise → the whole rolled-back commit is the failure
-        offenders = dict.fromkeys(modules.keys(), "")
-    err = {"code": commit_error.code, "message": commit_error.message, "detail": commit_error.detail}
-    return commit_error, combined_verify, offenders, err, commit_error.message
+    message = commit_error.message
+    if offenders:
+        message = f"{message}; blocked by {', '.join(sorted(offenders))} refusal: {device_err or message}"
+    else:
+        offenders = dict.fromkeys(containers, "")
+    err = {"code": commit_error.code, "message": message, "detail": commit_error.detail}
+    return commit_error, verify, offenders, err, message
 
 
-async def _static_route_followon_put(
-    client,
-    device,
-    device_name,
-    plan,
-    *,
-    job_id: int,
-    now,
-    outbox: dict,
-    scope_outcomes: dict,
-    scope_failures: dict,
-    reader_compare: dict,
-    reader_compare_unverifiable: dict,
-    stamp_rows: list,
-    stamp_of: dict | None,
-) -> tuple[bool, dict[int, str]]:
-    """Deliver the ``PUT``-mode replacement the combined transaction cannot (§4.9).
+def _stamp_batch_sections(sections, offenders, commit_error, err, msg, now) -> tuple[dict, dict]:
+    """Stamp every batch family from the single commit outcome → (outcomes, failures).
 
-    Runs only after ``apply_combined`` committed cleanly, and is the whole reason a
-    ``PUT``-mode plan is excluded from that commit: staging ignores ``replace`` (G4), so
-    without this the atomic path would merge the new triple, leave the predecessor on the
-    device and close nothing — an honest ``unproven`` at best, a false green at worst.
-
-    The scope's outcome, failures, reader-compare status and per-row evidence are produced
-    exactly as the per-scope loop produces them, so the bookkeeping that follows cannot tell
-    the two implementations apart. Returns ``(send_failed, evidence)`` — the send's OWN
-    verdict, captured before reader-compare folds its per-row findings into the same counter.
-
-    **Documented loss**: the replacement is NOT transactional with the other scopes. The
-    combined commit has already landed when this PUT runs, so a failure here fails the job
-    and stamps the static rows while every other scope stays applied.
+    Keyed by result key, in registry order. Every transmitted family fails when the
+    transaction rolls back. Localization identifies the culprit only.
     """
-    from nso_adapter.core.removal import _VERIFY_PER_CALL_TIMEOUT
-
-    scope_ok, scope_failed, fails = await _run_scope(
-        "static_route",
-        _static_route_coro(client, device, plan, outbox=outbox),
-        stamp_rows,
-        sent_rows=plan.rows,
-        job_id=job_id,
-        device_name=device_name,
-        now=now,
-    )
-    send_failed = scope_failed != 0
-    evidence: dict[int, str] = {}
-    if not send_failed:
-        scope_ok, scope_failed, fails, status, unverifiable, evidence = await _reader_compare_scope(
-            client,
-            device,
-            "static_route",
-            plan.rows,
-            ok=scope_ok,
-            job_id=job_id,
-            device_name=device_name,
-            timeout=_VERIFY_PER_CALL_TIMEOUT,
-            stamp_of=stamp_of,
-        )
-        if status is not None:
-            reader_compare["static_route"] = status
-        if unverifiable:
-            reader_compare_unverifiable["static_route"] = unverifiable
-    scope_outcomes["static_route"] = (scope_ok, scope_failed)
-    if fails:
-        scope_failures.setdefault("static_route", []).extend(fails)
-    return send_failed, evidence
-
-
-def _stamp_batch_scopes_atomic(sent_rows, stamp_rows, offenders, commit_error, err, msg, now) -> tuple[dict, dict]:
-    """Stamp every batch scope from the single atomic outcome → (scope_outcomes, scope_failures).
-
-    Offending scopes fail; non-offending scopes are pending (rows untouched, retried next apply).
-    """
-    scope_outcomes: dict[str, tuple[int, int]] = {key: (0, 0) for key in _SCOPE_RESULT_ORDER}
-    scope_failures: dict[str, list] = {}
-    for root_key, scope_key in _ATOMIC_SCOPE_ROOTS.items():
-        sent = sent_rows.get(scope_key) or []
-        if not sent:
+    registry = section_registry()
+    outcomes: dict[str, tuple[int, int]] = {}
+    failures: dict[str, list] = {}
+    for section, apply_rows in sections.items():
+        if section == "interface_config":
+            continue  # its two counters come from the per-attribute and per-address halves
+        key = registry[section].result_keys[0]
+        outcomes.setdefault(key, (0, 0))
+        if not apply_rows.sent:
             continue
-        stamps = stamp_rows.get(scope_key) or []
-        _reject_transient_stamps(scope_key, stamps)
+        _reject_transient_stamps(section, apply_rows.stamp)
         if commit_error is None:
-            for row in stamps:
+            for row in apply_rows.stamp:
                 row.last_apply_at = now
                 row.last_apply_error = None
-            scope_outcomes[scope_key] = (len(sent), 0)
-        elif root_key in offenders:
-            for row in sent:
+            outcomes[key] = (len(apply_rows.sent), 0)
+        else:
+            for row in apply_rows.sent:
                 row.last_apply_error = err
-            for row in stamps:
+            for row in apply_rows.stamp:
                 row.last_apply_error = err
-            scope_outcomes[scope_key] = (0, len(sent))
-            scope_failures[scope_key] = [{"error": msg}]
-    return scope_outcomes, scope_failures
+            outcomes[key] = (0, len(apply_rows.sent))
+            failures[key] = [{"error": msg}]
+    return outcomes, failures
 
 
-async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, elig, *, sr_plan=None, reg=None) -> None:
-    """I3b atomic apply: stage every scope into one transaction and commit once.
+async def _run_document_apply(db, device, client, device_name, job, job_id, now, plan, *, reg=None) -> None:
+    """Deploy one device's document: encode every family, PUT once, stamp the one outcome.
 
-    On success, stamp every row in_sync; on failure the whole transaction rolled back —
-    localise the offending scope(s), fail those rows (+ record capability), and leave
-    non-offending scopes pending (untouched → retried next apply).
+    On success every row the body carried is stamped in_sync; on failure the whole
+    transaction rolled back. Fail every transmitted row and localize only for attribution
+    and capability recording.
 
-    R2 §4.4: the combined commit's verify verdict is threaded out of ``apply_combined``
-    rather than discarded, and the static-route bookkeeping runs here too. Staging is
-    merge-PATCH only and ignores ``replace`` (G4), so a ``PATCH``-mode plan delivers no
-    replacement and no clear — ``put_delivered=False``, which is what keeps such an apply
-    from closing a replacement the device never received.
-
-    R2 §4.9: a ``PUT``-mode plan is instead excluded from the combined transaction and
-    delivered by a follow-on PUT once that transaction has committed. The replacement is
-    therefore NOT atomic with the other scopes — a deliberate, tested loss.
+    §4.4: the commit's verify verdict is threaded out of the sender rather than discarded and
+    is shared by every family. §4.9's PATCH-versus-PUT split is gone with the per-family
+    services: one PUT IS the replacement, so a static-route replacement is delivered in the
+    same transaction as everything else instead of after it.
     """
-    attr_eligible = elig["attr"]
-    ip_rows_flat = [r for rows in elig["ip_by_iface"].values() for r in rows]
+    attr_eligible = plan.interface.attributes
+    ip_rows_flat = [row for rows in plan.interface.ip_by_iface.values() for row in rows]
 
-    # Snapshot attr states, then mark deploying (parity with the per-scope path); a pending
-    # (rolled-back, non-offender) attr is reverted to its snapshot rather than left deploying.
+    # Snapshot attr states, then mark deploying; a pending (rolled-back, non-offender) attr is
+    # reverted to its snapshot rather than left deploying.
     attr_stamps = [item.stamp for item in attr_eligible if item.stamp is not None]
-    ip_stamps = list((elig.get("ip_stamp_of") or {}).values())
+    ip_stamps = list((plan.interface.ip_stamp_of or {}).values())
     _reject_transient_stamps("interface_config", [*attr_stamps, *ip_stamps])
     snapshot = {
         item.state: item.state.sync_state for item in attr_eligible if item.state is not None and item.stamp is not None
@@ -2223,188 +1636,105 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
         attr_state.sync_state = SyncState.deploying
     await db.commit()
 
-    sr_put_mode = sr_plan is not None and sr_plan.mode == "PUT"
-
     try:
-        modules, iface_entries, rows, stage_errors = await _stage_atomic_modules(
-            elig, client, device, device_name, sr_plan=sr_plan
+        body = await build_device_containers(
+            client,
+            device,
+            plan.document,
+            rows_by_section={section: rows.rows for section, rows in plan.sections.items()},
+            proof_by_section={"interface_config": plan.interface.execution},
+            static_route_plan=plan.static_route,
         )
     except Exception:
-        # An UNEXPECTED error while building the combined body (before any commit) — a real
-        # bug, not a scope's own bad intent, which _stage_atomic_modules isolates. Revert the
-        # attrs we just marked 'deploying' so they aren't stuck forever, then re-raise so
-        # run_apply fails the job with the real error.
-        for attr_state, state in snapshot.items():
-            attr_state.sync_state = state
+        # An UNEXPECTED error while building the body (before any commit) — a real bug, not a
+        # family's own bad intent, which the builder isolates. Revert the attrs just marked
+        # 'deploying' so they are not stuck forever, then re-raise so run_apply fails the job
+        # with the real error.
+        _revert_deploying(snapshot)
         await db.commit()
         raise
 
-    # Scopes whose body could not be built never entered the transaction; the rest still
-    # commit. Keep them out of every stage that assumes a scope was pushed.
-    staged_stamp = {k: v for k, v in rows.stamp.items() if k not in stage_errors}
-    staged_sent = {k: v for k, v in rows.sent.items() if k not in stage_errors}
+    if body.errors:
+        # NOTHING was sent: an omitted family is a retracted family under a full-document PUT,
+        # so a body that could not be built whole is not sendable at all. Fail exactly the
+        # families that could not be built and leave every other row pending.
+        _revert_deploying(snapshot)
+        await _finalize_unsent(db, plan, body.errors, job_id=job_id, reg=reg)
+        return
 
-    commit_error, combined_verify, offenders, err, msg = await _atomic_commit(
-        db, client, device, device_name, modules, job_id=job_id
+    commit_error, verify, offenders, err, msg = await _commit_document(
+        db, client, device, device_name, body, allowed=plan.allowed, job_id=job_id
     )
 
-    iface_failed = (_IFACE_CONFIG_ROOT in offenders) if iface_entries else False
+    iface_container = section_registry()["interface_config"].container
+    iface_failed = commit_error is not None and iface_container in body.containers
     attr_outcome = _stamp_attr_atomic(attr_eligible, commit_error, iface_failed, err, msg, now, snapshot)
     ip_outcome = _stamp_ip_atomic(
-        ip_rows_flat,
-        commit_error,
-        iface_failed,
-        err,
-        msg,
-        now,
-        stamp_of=elig.get("ip_stamp_of"),
+        ip_rows_flat, commit_error, iface_failed, err, msg, now, stamp_of=plan.interface.ip_stamp_of
     )
-    scope_outcomes, scope_failures = _stamp_batch_scopes_atomic(
-        staged_sent, staged_stamp, offenders, commit_error, err, msg, now
-    )
+    outcomes, failures = _stamp_batch_sections(plan.sections, offenders, commit_error, err, msg, now)
+    outcomes["attribute"] = attr_outcome[:2]
+    outcomes["ip"] = ip_outcome[:2]
+    if attr_outcome[2]:
+        failures["attribute"] = list(attr_outcome[2])
+    if ip_outcome[2]:
+        failures["ip"] = list(ip_outcome[2])
 
-    # A scope whose body could not be built failed on its own terms — it never reached the
-    # device, so the commit outcome says nothing about it. Fail exactly its rows.
-    for scope_key, stage_exc in stage_errors.items():
-        stamped = rows.stamp.get(scope_key) or []
-        _reject_transient_stamps(scope_key, stamped)
-        stage_err = {"code": stage_exc.code, "message": stage_exc.message, "detail": stage_exc.detail}
-        for row in rows.sent.get(scope_key) or []:
-            row.last_apply_error = stage_err
-        for row in stamped:
-            row.last_apply_error = stage_err
-        # Counted against what the body WOULD have carried: a scope whose live rows a
-        # successor rewrote stamps none of them, and a (0, 0) outcome is a silent success.
-        scope_outcomes[scope_key] = (0, len(rows.sent.get(scope_key) or []))
-        scope_failures[scope_key] = [{"error": stage_exc.message}]
+    # The SEND's own verdict, before reader-compare folds per-row findings into the same
+    # counter: "nothing landed" and "one row of several is missing" are different facts, and
+    # reading the merged counter would make one dropped route block its proven sibling's CAS.
+    sr_key = section_registry()["static_route"].result_keys[0]
+    sr_send_failed = bool(outcomes.get(sr_key, (0, 0))[1])
 
-    # #108: a clean atomic commit rides the same FASTMAP writers — run the post-apply
-    # presence check per staged scope and re-flag any silently-dropped keys. Unstaged
-    # scopes are excluded: they were never pushed, so "not on the device" is not a drop.
+    # #108: the document rides the same FASTMAP writers — run the post-apply presence check
+    # per family and re-flag any silently-dropped keys. A family the body could not carry is
+    # excluded: it was never pushed, so "not on the device" is not a drop.
     reader_compare: dict[str, str] = {}
     reader_compare_unverifiable: dict[str, list[str]] = {}
-    evidence_by_scope: dict[str, dict[int, str]] = {}
-    # Captured BEFORE reader-compare folds its per-row findings into the same counter.
-    sr_send_failed = bool(scope_outcomes.get("static_route", (0, 0))[1])
+    evidence_by_section: dict[str, dict[int, str]] = {}
     if commit_error is None:
-        reader_compare, reader_compare_unverifiable, evidence_by_scope = await _atomic_reader_compare(
+        reader_compare, reader_compare_unverifiable, evidence_by_section = await _document_reader_compare(
             client,
             device,
-            staged_sent,
-            scope_outcomes,
-            scope_failures,
+            plan.sections,
+            outcomes,
+            failures,
             job_id=job_id,
             device_name=device_name,
-            stamp_of=rows.stamp_of,
         )
-
-    # §4.9's follow-on: the PUT-mode replacement the combined transaction could not carry.
-    # Only after a CLEAN commit — a rolled-back transaction leaves every non-offending scope
-    # pending, and the static rows are no different for having been excluded from it.
-    sr_outbox: dict = {"verify": combined_verify, "sent_keys": None}
-    sr_evidence = evidence_by_scope.get("static_route", {})
-    sr_put_delivered = False
-    if sr_put_mode and commit_error is None:
-        sr_outbox = {}
-        sr_send_failed, sr_evidence = await _static_route_followon_put(
-            client,
-            device,
-            device_name,
-            sr_plan,
-            job_id=job_id,
-            now=now,
-            outbox=sr_outbox,
-            scope_outcomes=scope_outcomes,
-            scope_failures=scope_failures,
-            reader_compare=reader_compare,
-            reader_compare_unverifiable=reader_compare_unverifiable,
-            stamp_rows=elig["stamp"].get("static_route") or [],
-            stamp_of=rows.stamp_of.get("static_route"),
-        )
-        sr_put_delivered = True
 
     sr_results = None
-    if sr_plan is not None:
+    if plan.static_route is not None:
         sr_results = await _settle_static_routes(
             db,
             device,
             client,
-            sr_plan,
+            plan.static_route,
             job_id=job_id,
-            outbox=sr_outbox,
-            evidence=sr_evidence,
-            put_delivered=sr_put_delivered,
+            outbox={"verify": verify, "sent_keys": body.sent_route_keys},
+            evidence=evidence_by_section.get("static_route", {}),
+            # One PUT is the replacement: the document either landed or nothing did.
+            put_delivered=commit_error is None,
             send_failed=sr_send_failed,
-            scope_outcomes=scope_outcomes,
-            scope_failures=scope_failures,
+            scope_outcomes=outcomes,
+            scope_failures=failures,
             reg=reg,
-            stamp_of=rows.stamp_of.get("static_route"),
+            stamp_of=plan.sections["static_route"].stamp_of if "static_route" in plan.sections else None,
         )
 
     await _finalize_job(
         db,
         job_id,
         device.id,
-        True,
-        attr_outcome,
-        ip_outcome,
-        scope_outcomes,
-        scope_failures,
+        plan.any_eligible,
+        outcomes,
+        failures,
         reader_compare=reader_compare,
         reader_compare_unverifiable=reader_compare_unverifiable,
         static_route_results=sr_results,
         reg=reg,
+        document_failed=commit_error is not None,
     )
-
-    if sr_put_delivered and not sr_send_failed:
-        # The scope that LEFT the combined body still owes its capability bookkeeping:
-        # `_clear_atomic_capability` only sees the roots that rode the commit, so without this
-        # a stale apply-sourced `unsupported` for static_route would stick forever (a probe
-        # cannot downgrade one) and /apply/preflight would keep warning about a scope that now
-        # applies cleanly. Deferred past the terminal transaction because the clear COMMITS —
-        # inline it would split the one transaction §4.6 requires.
-        try:
-            await _clear_atomic_capability(db, device, [_SR_ROOT])
-        except Exception:  # noqa: BLE001 — capability bookkeeping is best-effort
-            logger.debug("apply.atomic.capability_clear_skipped", job_id=job_id)
-
-
-# Scope → (store model name, residue YANG-list label, row → key tuple), guard grain.
-# Key tuples are the store keys verbatim — the same store↔YANG key equivalence the
-# removal path already relies on. bgp and route_policy have bespoke expansion below.
-_READER_COMPARE_SPECS: dict[str, list] = {
-    "static_route": [("StaticRouteIntent", "route", lambda r: (r.vrf, r.prefix, r.next_hop))],
-    "vlan": [("VlanIntent", "vlan", lambda r: (r.vlan_id,))],
-    "svi": [("SviIntent", "interface", lambda r: (r.interface_name,))],
-    "subinterface": [("SubinterfaceIntent", "interface", lambda r: (r.interface_name,))],
-    "bfd": [("BfdIntent", "interface", lambda r: (r.interface_name,))],
-    "interface_mtu": [("InterfaceMtuIntent", "interface", lambda r: (r.interface_name,))],
-    "logging": [("LoggingHostIntent", "host", lambda r: (r.address,))],
-    "l2_sap": [("L2SapIntent", "sap", lambda r: (r.service_name, r.sap_id))],
-    "isis": [
-        ("IsisInterfaceIntent", "interface-config", lambda r: (r.interface_name, r.af)),
-        ("IsisProcessIntent", "process-config", lambda r: (r.process_tag,)),
-    ],
-    "ospf": [
-        ("OspfInstanceIntent", "process-config", lambda r: (r.process_id,)),
-        ("OspfInterfaceIntent", "interface-config", lambda r: (r.interface_name,)),
-    ],
-    "snmp": [
-        # SnmpCommunityIntent's intent key is the human-readable label, while the export keys a
-        # community by sha256(community-string)[:16] — a digest of a secret the adapter never sees
-        # (it pushes a Vault triple; NSO resolves it). Demanding the LABEL be present would stamp
-        # reader_compare_missing on every successful SNMP apply, so the row used to be left out of
-        # the check entirely — leaving the one scope where a silent drop is a missing CREDENTIAL as
-        # the only scope the drop-detector did not cover.
-        #
-        # CR-A17: the adapter holds the vault_ref, so it can resolve the secret and compute that
-        # same digest. The key is emitted as the label here and TRANSLATED in _translate_expected
-        # (which drops the row when Vault cannot answer — unverifiable, never "missing").
-        ("SnmpCommunityIntent", "community", lambda r: (r.label,)),
-        ("SnmpV3UserIntent", "v3-user", lambda r: (r.username,)),
-        ("SnmpHostIntent", "host", lambda r: (r.address,)),
-    ],
-}
 
 
 def _unrenderable_community_list(row, ned_id: str | None) -> bool:
@@ -2419,8 +1749,6 @@ def _unrenderable_community_list(row, ned_id: str | None) -> bool:
     Deterministic — a pure function of member + dialect, the same verdict the apply path
     acts on — so no device read is needed to decide it.
     """
-    from nso_adapter.core.community_dialect import community_dialect_for
-
     if row.family != "community_list":
         return False
     members = {e.get("community") for e in (row.entries or []) if isinstance(e, dict) and e.get("community")}
@@ -2429,18 +1757,29 @@ def _unrenderable_community_list(row, ned_id: str | None) -> bool:
     return len(community_dialect_for(ned_id).unrepresentable_members(sorted(members))) == len(members)
 
 
-def _reader_compare_expected(scope: str, rows, ned_id: str | None = None) -> list[tuple[Any, str, tuple]]:
+def _reader_compare_expected(section: str, rows, ned_id: str | None = None) -> list[tuple[Any, str, tuple]]:
     """(intent row, YANG-list label, key tuple) for every checkable intended object (#108).
 
-    Rows without a keyed reader presence are skipped: redistribution / flex-algo /
-    level rows (nested non-keyed content, guard-grain parity), the snmp system-info
-    scalar, and community-lists the NED cannot render at all
-    (:func:`_unrenderable_community_list`).
+    Dispatches on the section's registry ``verify`` disposition (memo A8): a table comparison
+    reads the registry's own entries, the two bespoke expansions keep their key expansion, and
+    a section with no post-apply comparison expects nothing.
+
+    Rows without a keyed reader presence are skipped: redistribution / flex-algo / level rows
+    (nested non-keyed content, guard-grain parity), the snmp system-info scalar, and
+    community-lists the NED cannot render at all (:func:`_unrenderable_community_list`).
     """
     from nso_adapter.core.removal import _ROUTE_POLICY_FAMILY_LISTS
     from nso_adapter.store import models as m
 
-    if scope == "route_policy":
+    verify = section_registry()[section].verify
+    if isinstance(verify, NoComparison):
+        return []
+    if isinstance(verify, TableCompare):
+        out: list[tuple[Any, str, tuple]] = []
+        for model, label, keyfn in verify.entries:
+            out.extend((r, label, keyfn(r)) for r in rows if isinstance(r, model))
+        return out
+    if section == "route_policy":
         return [
             (r, _ROUTE_POLICY_FAMILY_LISTS[r.family], (r.name,))
             for r in rows
@@ -2448,21 +1787,17 @@ def _reader_compare_expected(scope: str, rows, ned_id: str | None = None) -> lis
             and r.family in _ROUTE_POLICY_FAMILY_LISTS
             and not _unrenderable_community_list(r, ned_id)
         ]
-    if scope == "bgp":
-        out: list[tuple[Any, str, tuple]] = []
+    if section == "bgp":
+        expanded: list[tuple[Any, str, tuple]] = []
         for r in rows:
             if not isinstance(r, m.BgpRouterIntent):
                 continue
-            out.append((r, "router", (r.asn,)))
-            for sc in r.scopes:  # eagerly loaded by attach_bgp_relationships
+            expanded.append((r, "router", (r.asn,)))
+            for sc in r.scopes:  # the document hydrates the whole router tree
                 for p in sc.peers:
-                    out.append((r, "peer", (p.peer_address,)))
-        return out
-    out = []
-    for model_name, label, keyfn in _READER_COMPARE_SPECS.get(scope, []):
-        model = getattr(m, model_name)
-        out.extend((r, label, keyfn(r)) for r in rows if isinstance(r, model))
-    return out
+                    expanded.append((r, "peer", (p.peer_address,)))
+        return expanded
+    raise RuntimeError(f"section {section!r} declares a bespoke expansion that has no implementation")
 
 
 async def _translate_expected(scope: str, expected: list[tuple[Any, str, tuple]]) -> tuple[list, list[str]]:
@@ -2501,45 +1836,28 @@ async def _translate_expected(scope: str, expected: list[tuple[Any, str, tuple]]
     return out, sorted(unverifiable)
 
 
-def _reader_compare_checkable(scope, rows, ned_id) -> bool:
-    """Whether *scope* has any keyed grain the post-apply presence check could verify.
-
-    A cheap, Vault-free predicate (used to decide whether a budget-SKIPPED scope records
-    ``unknown`` vs stays absent): a scope with no expected keyed grain — only nested
-    non-keyed rows (redistribution / flex-algo / level) — is structurally uncheckable and
-    keeps NO reader_compare entry, exactly as before (r3-M3).
-    """
-    from nso_adapter.core.removal import _RESIDUE_WIRE_NAMES, _guard_specs
-
-    return bool(
-        _reader_compare_expected(scope, rows, ned_id)
-        and scope in _RESIDUE_WIRE_NAMES
-        and _guard_specs().get(scope) is not None
-    )
-
-
 async def _reader_compare_prepare(scope, rows, ned_id):
-    """Compute the translatable expected set for *scope* → ``(translated, unverifiable, spec, wire)``.
+    """Compute the translatable expected set for *scope* → ``(translated, unverifiable, lists, wire)``.
 
-    Returns ``None`` when the scope is structurally uncheckable (no expected keyed grain / no
-    envelope wire / no guard spec) — the caller records no reader_compare entry. Otherwise
+    Returns ``None`` when the section is structurally uncheckable (no expected keyed grain, no
+    envelope wire, no guarded list) — the caller records no reader_compare entry. Otherwise
     ``translated`` is the export-namespace expected set (may be empty when EVERY key is
     Vault-unverifiable → the caller records ``unknown`` and runs NO action, r2-m3), and
     ``unverifiable`` names the keys that could not be re-keyed (persisted symmetrically with
     the residue path's ``residue_unverifiable``). Runs the Vault translation (may block).
     """
-    from nso_adapter.core.removal import _RESIDUE_WIRE_NAMES, _guard_specs
+    from nso_adapter.core.removal import residue_wire_name, section_guard_lists
 
     expected = _reader_compare_expected(scope, rows, ned_id)
-    spec = _guard_specs().get(scope)
-    wire = _RESIDUE_WIRE_NAMES.get(scope)
-    if not expected or spec is None or wire is None:
+    lists = section_guard_lists(scope)
+    wire = residue_wire_name(scope)
+    if not expected or not lists or wire is None:
         return None
     translated, unverifiable = await _translate_expected(scope, expected)
     if unverifiable:
         # Named, never folded into "ok" silently: these keys were not checked at all.
         logger.warning("apply.reader_compare_unverifiable", scope=scope, keys=unverifiable)
-    return translated, unverifiable, spec, wire
+    return translated, unverifiable, lists, wire
 
 
 def _reader_compare_walk(
@@ -2547,7 +1865,7 @@ def _reader_compare_walk(
     translated: Any,
     unverifiable: Any,
     section: Any,
-    spec: Any,
+    lists: Any,
     ok: Any,
     *,
     job_id: Any,
@@ -2575,7 +1893,7 @@ def _reader_compare_walk(
     """
     from nso_adapter.core.removal import _norm_key, _reader_keys
 
-    present = {gl.label: _reader_keys(scope, section, gl) for gl in spec.lists}
+    present = {gl.label: _reader_keys(scope, section, gl) for gl in lists}
     row_by_id: dict[int, Any] = {}
     missing: dict[int, list[str]] = {}
     evidence: dict[int, str] = {}
@@ -2621,7 +1939,7 @@ def _reader_compare_walk(
 
 
 def _classify_fetched_section(
-    scope, translated, unverifiable, spec, section, ok, *, job_id, device_name, stamp_of=None
+    scope, translated, unverifiable, lists, section, ok, *, job_id, device_name, stamp_of=None
 ):
     """Classify a CERTIFIED device-state *section* → (ok, failed, fails, status, evidence).
 
@@ -2643,194 +1961,8 @@ def _classify_fetched_section(
         logger.info("apply.reader_compare_unknown", job_id=job_id, device=device_name, scope=scope)
         return ok, 0, [], "unknown", {}
     return _reader_compare_walk(
-        scope, translated, unverifiable, section, spec, ok, job_id=job_id, device_name=device_name, stamp_of=stamp_of
+        scope, translated, unverifiable, section, lists, ok, job_id=job_id, device_name=device_name, stamp_of=stamp_of
     )
-
-
-async def _reader_compare_scope(
-    client: Any,
-    device: Any,
-    scope: Any,
-    rows: Any,
-    *,
-    ok: Any,
-    job_id: Any,
-    device_name: Any,
-    timeout: Any,
-    stamp_of: Any = None,
-) -> tuple[Any, Any, Any, Any, Any, Any]:
-    """Post-apply presence check (#108) → (ok, failed, fails, status, unverifiable, evidence).
-
-    ``_verify_native_or_raise`` re-diffs the committed payload against the CDB SERVICE
-    tree — both sides sit behind the same FASTMAP writer, so a writer that silently
-    drops an object is invisible (proven live on rg03, #26). This check reads the far
-    side of the writer instead: the scope's device-state ``ACTION`` section — a fresh
-    post-commit CDB extraction inside a whole-build txid bracket, read as soon as
-    possible after the commit (the record-served facade is stale post-commit; the legacy
-    subscriber-cache-backed getters can lag it). Every intended key must be present; a
-    missing key stamps its rows ``reader_compare_missing`` (retryable — last_apply_error
-    keeps them eligible) and fails the scope, so the plugin settles deploying→apply_failed
-    on the immediate post-apply reconcile instead of waiting out stuck_deploying_grace_minutes.
-    Status: "ok" / "partial" (checked keys present, some grain unverifiable) / "missing" /
-    "unknown" (the NED has no export surface, or every key is Vault-unverifiable — absence
-    proves nothing) / "error" (never fails a good apply on read trouble) / None (nothing
-    checkable — e.g. only nested non-keyed rows in the batch). ``unverifiable`` names the keys
-    that could not be re-keyed (recorded whenever non-empty, symmetric with residue).
-    The ONE-family action runs inside the caller's wall-clock budget (*timeout*); an all-
-    unverifiable scope returns "unknown" WITHOUT running it. NOT covered: NED/device-side
-    divergence (needs check-sync) and redistribution rows (nested non-keyed, guard parity).
-    """
-    from nso_adapter.core.removal import _live_family_sections
-
-    unverifiable: list[str] = []  # hoisted so the except still reports it (codex P3)
-    try:
-        prep = await _reader_compare_prepare(scope, rows, getattr(device, "ned_id", None))
-        if prep is None:
-            return ok, 0, [], None, [], {}
-        translated, unverifiable, spec, wire = prep
-        if not translated:  # every key Vault-unverifiable → nothing to look for, run NO action
-            return ok, 0, [], "unknown", unverifiable, {}
-        section = (await _live_family_sections(client, device.nso_device_name, [wire], timeout=timeout))[wire]
-        # The walk stays INSIDE the try (codex P2): a malformed 'ok' section (a non-dict where a
-        # keyed entry belongs) makes _reader_keys raise — that must classify "error", never escape
-        # and turn a successful commit into an internal job failure.
-        n_ok, n_failed, fails, status, evidence = _classify_fetched_section(
-            scope,
-            translated,
-            unverifiable,
-            spec,
-            section,
-            ok,
-            job_id=job_id,
-            device_name=device_name,
-            stamp_of=stamp_of,
-        )
-        return n_ok, n_failed, fails, status, unverifiable, evidence
-    except Exception as exc:  # noqa: BLE001 — the check must never fail a good apply
-        logger.warning("apply.reader_compare_error", job_id=job_id, device=device_name, scope=scope, error=repr(exc))
-        return ok, 0, [], "error", unverifiable, {}
-
-
-async def _reader_compare_default_path(client, device, sc, scope_ok, *, remaining, ned_id, job_id, device_name):
-    """Default-path per-scope verify under the HARD budget → (ok, failed, fails, status, unverifiable, evidence).
-
-    ``remaining`` is the VERIFY budget still unspent (``_VERIFY_TOTAL_BUDGET`` minus the time already
-    spent verifying earlier scopes — device COMMIT latency deliberately does NOT count, codex P1, so
-    a slow early commit cannot starve later scopes of silent-drop detection). Budget spent → the scope
-    is SKIPPED without running the action: a checkable scope records ``unknown`` (never silently
-    absent), a structurally-uncheckable one keeps no entry. Otherwise the whole per-scope verify —
-    translation + semaphore acquire + HTTP — runs inside a single ``asyncio.wait_for`` clipped to the
-    remaining budget (so semaphore contention cannot push total default-path verify time past the
-    budget), with the action's own timeout clipped to ``min(_VERIFY_PER_CALL_TIMEOUT, remaining)``. A
-    cut verify → ``unknown``.
-    """
-    from nso_adapter.core.removal import _VERIFY_PER_CALL_TIMEOUT
-
-    if remaining <= 0:
-        status = "unknown" if _reader_compare_checkable(sc.key, sc.sent, ned_id) else None
-        return scope_ok, 0, [], status, [], {}
-    try:
-        return await asyncio.wait_for(
-            _reader_compare_scope(
-                client,
-                device,
-                sc.key,
-                # What was SENT, never what will be stamped: a successor-rewritten scope
-                # stamps nothing and would otherwise be checked for nothing (finding 2).
-                sc.sent,
-                ok=scope_ok,
-                job_id=job_id,
-                device_name=device_name,
-                timeout=min(_VERIFY_PER_CALL_TIMEOUT, remaining),
-                stamp_of=sc.stamp_of,
-            ),
-            timeout=remaining,
-        )
-    except TimeoutError:  # asyncio.TimeoutError is TimeoutError on 3.11+
-        # The whole per-scope verify (translate + semaphore + HTTP) blew the budget; only a
-        # checkable scope ever reaches the action, so a cut verify is always "unknown".
-        return scope_ok, 0, [], "unknown", [], {}
-
-
-async def _run_scope(
-    log_label, coro, rows, *, sent_rows=None, job_id, device_name, now, on_nso_error=None
-) -> tuple[int, int, list]:
-    """Push one scope's batch coroutine and stamp the outcome onto every row in *rows*.
-
-    Returns (in_sync, apply_failed, failures), counted from *sent_rows*. Success stamps
-    last_apply_at and clears the error on every row; an NsoApplyError or any other
-    exception records the error payload on every row and reports a single failure.
-    ``on_nso_error`` is a best-effort side-effect (route-policy uses it to record a
-    device-parser capability rejection).
-
-    A collateral block (the static-route PUT-replace, §4.1) gets its own clause ahead of
-    the broad one: it is a REFUSAL with a machine-readable orphan report and a preview of
-    the would-be device delta, and ``repr(exc)`` under ``code: "internal"`` would throw
-    both away.
-    """
-    from nso_adapter.core.removal import RemovalBlockedError
-
-    _reject_transient_stamps(log_label, rows)
-    accounted_rows = rows if sent_rows is None else sent_rows
-
-    def _record_current_error(err: dict) -> None:
-        # ``rows`` are the live stamps. ``accounted_rows`` are what the body sent and can
-        # be immutable document rows with no live counterpart. The result needs the latter
-        # even when there is deliberately nothing safe to persist.
-        for row in rows:
-            row.last_apply_error = err
-        for row in accounted_rows:
-            row.last_apply_error = err
-
-    try:
-        await coro
-    except NsoApplyError as exc:
-        logger.error(f"apply.{log_label}_failed", job_id=job_id, device=device_name, error=exc.message)
-        err = {"code": exc.code, "message": exc.message, "detail": exc.detail}
-        _record_current_error(err)
-        if on_nso_error is not None:
-            await on_nso_error(exc)
-        return 0, len(accounted_rows), [{"error": exc.message}]
-    except ClaimLostError:
-        # Revocation is not a runner error: recovery already owns the disposition.
-        raise
-    except RemovalBlockedError as exc:
-        logger.error(f"apply.{log_label}_blocked_collateral", job_id=job_id, device=device_name, orphans=exc.orphans)
-        err = {
-            "code": "removal_blocked_collateral",
-            "message": str(exc),
-            "detail": {"orphans": exc.orphans, "preview": exc.preview},
-        }
-        _record_current_error(err)
-        # The preview rides the JOB failure too, not just the rows: it is the would-be device
-        # delta the operator has to review before deciding to force the replacement, and
-        # GET /jobs/{id} is where they read it (the removal path already reports it there).
-        return (
-            0,
-            len(accounted_rows),
-            [
-                {
-                    "error": str(exc),
-                    "code": "removal_blocked_collateral",
-                    "orphans": exc.orphans,
-                    "preview": exc.preview,
-                    "hint": (
-                        "These service rows are not in the accepted intent this apply would "
-                        "PUT-replace. Accept them into intent to keep them, or flush them "
-                        "deliberately via POST /devices/{id}/actions/force-removal."
-                    ),
-                }
-            ],
-        )
-    except Exception as exc:
-        logger.exception(f"apply.{log_label}_unexpected_error", job_id=job_id)
-        err = internal_error(exc)
-        _record_current_error(err)
-        return 0, len(accounted_rows), [{"error": internal_error(exc)["message"]}]
-    for row in rows:
-        row.last_apply_at = now
-        row.last_apply_error = None
-    return len(accounted_rows), 0, []
 
 
 async def _record_rp_capability_now(db, client, device, device_name, errors, *, job_id: int) -> None:
@@ -2912,22 +2044,25 @@ async def _finalize_job(
     job_id: int,
     device_id: int,
     any_eligible: bool,
-    attr_outcome: tuple[int, int, list],
-    ip_outcome: tuple[int, int, list],
-    scope_outcomes: dict,
-    scope_failures: dict,
+    outcomes: dict[str, tuple[int, int]],
+    failures: dict[str, list],
     reader_compare: dict | None = None,
     reader_compare_unverifiable: dict | None = None,
     static_route_results: list | None = None,
     reg=None,
+    document_failed: bool = False,
 ) -> None:
-    """Assemble job.result/status from the pass outcomes and commit.
+    """Assemble job.result/status from the deployment's outcomes and commit.
 
-    With nothing eligible the job succeeds with an all-zero result and returns early.
-    Otherwise the per-scope counts are emitted (plus the per-scope post-apply
-    reader_compare statuses, #108, and any reader_compare_unverifiable labels — the keys a
-    scope's presence check could not verify, mirroring the residue path); any failure flips
-    the job to failed and collects the per-item errors.
+    The counters are the registry's ``result_keys``, in registry order (memo A8): one
+    ``<key>_count_by_outcome`` each, names unchanged, so a new family gets its counter from
+    the registry instead of a hand-kept list. With nothing eligible the job succeeds with an
+    all-zero result and returns early.
+
+    Also emitted: the per-family post-apply ``reader_compare`` statuses (#108) and any
+    ``reader_compare_unverifiable`` labels — the keys a family's presence check could not
+    verify, mirroring the residue path. Any failure flips the job to failed and collects the
+    per-item errors.
 
     *static_route_results* is R2 §4.5's per-route record. It rides here rather than in a
     commit of its own because this IS the terminal transaction: the CAS, the row stamps, the
@@ -2939,38 +2074,19 @@ async def _finalize_job(
     prevent: a consumed carrier or a closed replacement under a failed job. So an unknown
     outcome raises :class:`BookkeepingOutcomeUnknown` instead, and recovery decides.
     """
-    if not any_eligible:
+    keys = _result_keys()
+    if not any_eligible and not document_failed:
         logger.info("apply.nothing_eligible", job_id=job_id, device_id=device_id)
-        empty_result = {
-            "attribute_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "ip_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "snmp_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "static_route_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "subinterface_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "vlan_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "bfd_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "interface_mtu_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "l2_sap_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "isis_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "bgp_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "route_policy_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "ospf_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-        }
+        empty_result = {f"{key}_count_by_outcome": {"in_sync": 0, "apply_failed": 0} for key in keys}
         if not await _write_terminal(db, job_id, JobStatus.succeeded, empty_result, None, reg):
             return
         await _commit_terminal(db, job_id)
         return
 
-    attr_ok, attr_failed, attr_failures = attr_outcome
-    ip_ok, ip_failed, ip_failures = ip_outcome
-
-    result: dict[str, Any] = {
-        "attribute_count_by_outcome": {"in_sync": attr_ok, "apply_failed": attr_failed},
-        "ip_count_by_outcome": {"in_sync": ip_ok, "apply_failed": ip_failed},
-    }
-    for key in _SCOPE_RESULT_ORDER:
-        scope_ok, scope_failed = scope_outcomes[key]
-        result[f"{key}_count_by_outcome"] = {"in_sync": scope_ok, "apply_failed": scope_failed}
+    result: dict[str, Any] = {}
+    for key in keys:
+        key_ok, key_failed = outcomes.get(key, (0, 0))
+        result[f"{key}_count_by_outcome"] = {"in_sync": key_ok, "apply_failed": key_failed}
     if reader_compare:
         result["reader_compare"] = reader_compare
     if reader_compare_unverifiable:
@@ -2978,18 +2094,18 @@ async def _finalize_job(
     if static_route_results is not None:
         result["static_route_results"] = static_route_results
 
-    total_failed = attr_failed + ip_failed + sum(failed for _ok, failed in scope_outcomes.values())
+    total_failed = sum(failed for _ok, failed in outcomes.values())
     error = None
-    if total_failed == 0:
+    if total_failed == 0 and not document_failed:
         status = JobStatus.succeeded
     else:
         status = JobStatus.failed
-        all_failed = [{"type": "attribute", **a} for a in attr_failures] + [{"type": "ip", **a} for a in ip_failures]
-        for key in _SCOPE_RESULT_ORDER:
-            all_failed.extend({"type": key, **a} for a in scope_failures.get(key, []))
+        all_failed = [{"type": key, **item} for key in keys for item in failures.get(key, [])]
         error = {
             "code": "nso_commit_failed",
-            "message": f"{total_failed} item(s) failed to apply",
+            "message": "Device document failed to apply"
+            if document_failed
+            else f"{total_failed} item(s) failed to apply",
             "detail": {"items": all_failed},
         }
     if not await _write_terminal(db, job_id, status, result, error, reg):
@@ -2998,35 +2114,28 @@ async def _finalize_job(
     logger.info(
         "apply.done",
         job_id=job_id,
-        in_sync=attr_ok,
-        apply_failed=attr_failed,
-        ip_in_sync=ip_ok,
-        ip_failed=ip_failed,
-        snmp_in_sync=scope_outcomes["snmp"][0],
-        snmp_failed=scope_outcomes["snmp"][1],
-        sr_in_sync=scope_outcomes["static_route"][0],
-        sr_failed=scope_outcomes["static_route"][1],
-        l2_in_sync=scope_outcomes["l2_sap"][0],
-        l2_failed=scope_outcomes["l2_sap"][1],
-        isis_in_sync=scope_outcomes["isis"][0],
-        isis_failed=scope_outcomes["isis"][1],
-        bgp_in_sync=scope_outcomes["bgp"][0],
-        bgp_failed=scope_outcomes["bgp"][1],
-        rp_in_sync=scope_outcomes["route_policy"][0],
-        rp_failed=scope_outcomes["route_policy"][1],
+        device_id=device_id,
+        failed=total_failed,
+        counts={key: outcomes.get(key, (0, 0)) for key in keys if outcomes.get(key, (0, 0)) != (0, 0)},
     )
 
 
-def _refuse_unverifiable_recorded_put(generation, execution_sections) -> None:
-    """Refuse a recorded destructive PUT when verification is disabled at execution."""
+def _refuse_unverifiable_recorded_put(generation) -> None:
+    """Refuse a recorded destructive replacement when verification is disabled at execution.
+
+    ``mode`` no longer picks a transport — every send is the whole document — so what it
+    records is whether this document DELIVERS a replacement: a predecessor key it drops and
+    then CASes closed. Sending one with no proof channel would close the replacement while
+    the predecessor may still be on the device, so the job refuses instead (§4.4).
+    """
+    from nso_adapter.core.static_route_plan import PUT_REFUSED_EVENT
     from nso_adapter.nso import apply as nso_apply
 
-    if "static_route" not in execution_sections:
-        return
     if recorded_static_route_apply_mode(generation.document) == "PUT" and not nso_apply.VERIFY_AFTER_APPLY:
+        logger.warning(PUT_REFUSED_EVENT, device_id=generation.device_id)
         raise JobError(
             "static_route_put_verify_disabled",
-            "Static-route PUT verification is disabled at worker execution. "
+            "Static-route replacement verification is disabled at worker execution. "
             "The recorded destructive replace was not sent.",
         )
 
@@ -3046,31 +2155,15 @@ async def _required_apply_generation(db: AsyncSession, job_id: int):
 
 
 async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int, force: bool, *, reg=None) -> None:
-    """Run the apply body: sync-from, snapshot intent, push each scope, finalize the job.
+    """Run the apply body: sync-from, collect the document, PUT it once, finalize the job.
 
-    Raises on a missing device / NSO-client error so ``run_apply``'s outer handler can
-    mark the job failed with an ``internal`` error.
+    Raises on a missing device / NSO-client error so ``run_apply``'s outer handler can mark
+    the job failed with an ``internal`` error.
 
     *reg* is the live claim registration, threaded down for the transactions R2 adds here.
     """
     from nso_adapter.core.importer import get_nso_client
-    from nso_adapter.nso.apply import (
-        apply_bfd_config,
-        apply_bgp_config,
-        apply_interface_attribute,
-        apply_interface_ips,
-        apply_isis_interfaces,
-        apply_l2_saps,
-        apply_logging_config,
-        apply_mtu_config,
-        apply_ospf_config,
-        apply_route_policy_config,
-        apply_snmp_config,
-        apply_subinterface_config,
-        apply_svi_config,
-        apply_vlan_config,
-        atomic_apply_enabled,
-    )
+    from nso_adapter.core.removal import guard_allowed
 
     device = await db.get(Device, device_id)
     if not device:
@@ -3081,7 +2174,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     # successor push can commit; without the stored document it would be deployed here, under
     # this generation's identity and settled as this generation's revision.
     generation, execution_sections = await _required_apply_generation(db, job_id)
-    _refuse_unverifiable_recorded_put(generation, execution_sections)
+    _refuse_unverifiable_recorded_put(generation)
 
     client = get_nso_client(device.nso_instance)
     device_name = device.nso_device_name
@@ -3089,497 +2182,47 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     # ── Step 0: sync-from before apply (best-effort) ──
     await _maybe_sync_from(db, client, device_name, device_id)
 
-    source = _Projection(
-        db,
-        device_id,
-        force,
-        generation.document,
-        execution_sections,
+    document = generation.document
+    source = _Projection(db, device_id, force, document, execution_sections)
+
+    # ── Step 1: the document's own rows, plus the live rows this run may stamp ──
+    interface = (
+        await _collect_document_interface(db, source, document) if "interface_config" in document else _NO_INTERFACE
     )
+    # Hydrated whenever the document CARRIES the section, executed or not: the body asserts
+    # every family of the device, so a section this job does not settle still rides it.
+    sr_plan = hydrate_static_route_apply_plan(document) if "static_route" in document else None
+    sections = await _collect_sections(db, source, document, static_route_plan=sr_plan)
 
-    # ── Step 1: snapshot intent + collect every scope this job is allowed to execute ──
-    (
-        ifaces,
-        intent_snapshot,
-        attr_eligible,
-        ip_snapshot,
-        ip_eligible_by_iface,
-        interface_ip_stamp_of,
-    ) = await _collect_interface_apply_rows(
-        db,
-        source,
-        generation,
-        execution_sections,
-    )
-
-    snmp_comm_rows = await source.collect(SnmpCommunityIntent, section="snmp")
-    snmp_user_rows = await source.collect(SnmpV3UserIntent, section="snmp")
-    snmp_host_rows = await source.collect(SnmpHostIntent, section="snmp")
-    snmp_sysinfo_rows = await source.collect(SnmpSystemInfoIntent, section="snmp")
-    snmp_rows = _combine_rows(snmp_comm_rows, snmp_user_rows, snmp_host_rows, snmp_sysinfo_rows)
-    snmp_comm = snmp_comm_rows.push
-    snmp_user = snmp_user_rows.push
-    snmp_host = snmp_host_rows.push
-    snmp_sysinfo = snmp_sysinfo_rows.push[0] if snmp_sysinfo_rows.push else None
-
-    sr_eligible_rows = await source.collect(StaticRouteIntent, section="static_route")
-    sr_eligible = sr_eligible_rows.push
-    if "static_route" in execution_sections:
-        sr_all_rows = await source.collect(StaticRouteIntent, section="static_route", force=True)
-        sr_plan = hydrate_static_route_apply_plan(generation.document, eligible_rows=sr_eligible)
-        sr_stamp_of = sr_all_rows.stamp_of
-        sr_stamp_rows = [
-            stamp for row in sr_plan.rows if (stamp := (sr_stamp_of or {}).get(_stamp_key(row))) is not None
-        ]
-    else:
-        sr_plan = SrPlan("PATCH", [], set(), [], [], 0)
-        sr_stamp_rows = []
-        sr_stamp_of = {}
-    # What the static-route send learned, for §4.4's proof: the verify verdict and the exact
-    # route keys the body carried. Filled by the scope coroutine, read after it returns.
-    sr_outbox: dict = {}
-    logging_host_rows = await source.collect(LoggingHostIntent, section="logging")
-    logging_level_rows = await source.collect(LoggingLevelsIntent, section="logging")
-    logging_rows = _combine_rows(logging_host_rows, logging_level_rows)
-    logging_eligible = logging_host_rows.push
-    logging_levels = logging_level_rows.push[0] if logging_level_rows.push else None
-    svi_rows = await source.collect(SviIntent, section="svi")
-    subif_rows = await source.collect(SubinterfaceIntent, section="subinterface")
-    vlan_rows = await source.collect(VlanIntent, section="vlan")
-    bfd_rows = await source.collect(BfdIntent, section="bfd")
-    mtu_rows = await source.collect(InterfaceMtuIntent, section="interface_mtu")
-    l2_rows = await source.collect(L2SapIntent, section="l2_sap")
-    isis_iface_rows = await source.collect(IsisInterfaceIntent, section="isis")
-    isis_process_rows = await source.collect(IsisProcessIntent, section="isis")
-    isis_flex_rows = await source.collect(IsisFlexAlgoIntent, section="isis")
-    isis_level_rows = await source.collect(IsisLevelIntent, section="isis")
-    redist_isis_rows = await source.collect(RedistributionIntent, section="isis")
-    isis_rows = _combine_rows(
-        isis_iface_rows,
-        isis_process_rows,
-        redist_isis_rows,
-        isis_flex_rows,
-        isis_level_rows,
-    )
-    bgp_router_rows = await source.collect(BgpRouterIntent, section="bgp")
-    if bgp_router_rows.push and not sa_inspect(bgp_router_rows.push[0]).transient:
-        # Live BGP rows still need their relationship collections loaded.
-        from nso_adapter.core.bgp_load import attach_bgp_relationships
-
-        await attach_bgp_relationships(db, bgp_router_rows.push)
-    redist_bgp_rows = await source.collect(RedistributionIntent, section="bgp")
-    bgp_rows = _combine_rows(bgp_router_rows, redist_bgp_rows)
-    bgp_eligible = bgp_router_rows.push
-    redist_bgp = redist_bgp_rows.push
-    rp_rows = await source.collect(RoutePolicyObjectIntent, section="route_policy")
-    ospf_instance_rows = await source.collect(OspfInstanceIntent, section="ospf")
-    ospf_iface_rows = await source.collect(OspfInterfaceIntent, section="ospf")
-    redist_ospf_rows = await source.collect(RedistributionIntent, section="ospf")
-    ospf_rows = _combine_rows(ospf_instance_rows, ospf_iface_rows, redist_ospf_rows)
-
-    svi_eligible = svi_rows.push
-    subif_eligible = subif_rows.push
-    bfd_eligible = bfd_rows.push
-    mtu_eligible = mtu_rows.push
-    l2_eligible = l2_rows.push
-    isis_eligible = isis_iface_rows.push
-    isis_process_eligible = isis_process_rows.push
-    isis_flex_eligible = isis_flex_rows.push
-    isis_level_eligible = isis_level_rows.push
-    redist_isis = redist_isis_rows.push
-    rp_eligible = rp_rows.push
-    ospf_instance_eligible = ospf_instance_rows.push
-    ospf_iface_eligible = ospf_iface_rows.push
-    redist_ospf = redist_ospf_rows.push
-
-    job.context = {"force": force, "intent_snapshot": intent_snapshot, "ip_snapshot": ip_snapshot}
+    job.context = {
+        "force": force,
+        "intent_snapshot": interface.intent_snapshot,
+        "ip_snapshot": interface.ip_snapshot,
+    }
     now = datetime.now(UTC)
 
-    # EVERY collection the scope table below can push must be listed here. The IS-IS
-    # sub-collections are eligible on their own (a per-level knob accepted on a device
-    # whose interfaces are already in sync): when they were missing, the isis scope still
-    # pushed — its _Scope rows list includes them — while _finalize_job took the "nothing
-    # eligible" early-return and reported an all-zero SUCCESS for a commit the device had
-    # rejected, which the plugin then settled deploying -> in_sync.
-    any_eligible = any(
-        [
-            attr_eligible,
-            ip_eligible_by_iface,
-            snmp_rows.push,
-            # From the PLAN, never the eligible list: in PUT mode a force=False apply can
-            # have an empty eligible list and a non-empty body, and _finalize_job's
-            # all-zero early success would then report a clean no-op AFTER a real PUT.
-            sr_plan.rows,
-            logging_rows.push,
-            svi_eligible,
-            subif_eligible,
-            vlan_rows.push,
-            bfd_eligible,
-            mtu_eligible,
-            l2_eligible,
-            isis_eligible,
-            isis_process_eligible,
-            isis_flex_eligible,
-            isis_level_eligible,
-            bgp_eligible,
-            rp_eligible,
-            ospf_instance_eligible,
-            ospf_iface_eligible,
-            redist_ospf,
-            redist_isis,
-            redist_bgp,
-        ]
+    # Whether this job has anything to DO, never what the body carries: a job whose executed
+    # sections carry no eligible row records nothing and touches no device. From the static
+    # route PLAN, never an eligible list — in a replacement the body is every accepted row.
+    any_eligible = bool(
+        interface.attributes
+        or interface.ip_by_iface
+        or any(rows.sent for section, rows in sections.items() if section in execution_sections)
     )
 
-    # Atomic apply (I3b): stage EVERY scope's accepted intent into ONE NSO transaction and
-    # commit once. Self-contained (stages, commits, stamps, finalises). When off, the
-    # per-scope commit path below runs (per-item attr/IP + one batch commit per scope).
-    if atomic_apply_enabled() and any_eligible:
-        elig = {
-            "ifaces": ifaces,
-            "attr": attr_eligible,
-            "ip_by_iface": ip_eligible_by_iface,
-            "ip_stamp_of": interface_ip_stamp_of,
-            "subif": subif_eligible,
-            "snmp_rows": snmp_rows.push,
-            "snmp_comm": snmp_comm,
-            "snmp_user": snmp_user,
-            "snmp_host": snmp_host,
-            "snmp_sysinfo": snmp_sysinfo,
-            "static_route": sr_plan.rows,
-            "logging": logging_eligible,
-            "logging_levels": logging_levels,
-            "svi": svi_eligible,
-            "vlan": vlan_rows.push,
-            "bfd": bfd_eligible,
-            "mtu": mtu_eligible,
-            "l2_sap": l2_eligible,
-            "isis_iface": isis_eligible,
-            "isis_proc": isis_process_eligible,
-            "isis_flex": isis_flex_eligible,
-            "isis_levels": isis_level_eligible,
-            "bgp": bgp_eligible,
-            "rp": rp_eligible,
-            "ospf_inst": ospf_instance_eligible,
-            "ospf_iface": ospf_iface_eligible,
-            "redist_ospf": redist_ospf,
-            "redist_isis": redist_isis,
-            "redist_bgp": redist_bgp,
-            # The body uses the document rows. Bookkeeping uses matching live rows.
-            "stamp": {
-                "snmp": snmp_rows.stamp,
-                "static_route": sr_stamp_rows,
-                "logging": logging_rows.stamp,
-                "svi": svi_rows.stamp,
-                "subinterface": subif_rows.stamp,
-                "vlan": vlan_rows.stamp,
-                "bfd": bfd_rows.stamp,
-                "interface_mtu": mtu_rows.stamp,
-                "l2_sap": l2_rows.stamp,
-                "isis": isis_rows.stamp,
-                "bgp": bgp_rows.stamp,
-                "route_policy": rp_rows.stamp,
-                "ospf": ospf_rows.stamp,
-            },
-            "stamp_of": {
-                "snmp": snmp_rows.stamp_of,
-                "static_route": sr_stamp_of,
-                "logging": logging_rows.stamp_of,
-                "svi": svi_rows.stamp_of,
-                "subinterface": subif_rows.stamp_of,
-                "vlan": vlan_rows.stamp_of,
-                "bfd": bfd_rows.stamp_of,
-                "interface_mtu": mtu_rows.stamp_of,
-                "l2_sap": l2_rows.stamp_of,
-                "isis": isis_rows.stamp_of,
-                "bgp": bgp_rows.stamp_of,
-                "route_policy": rp_rows.stamp_of,
-                "ospf": ospf_rows.stamp_of,
-            },
-        }
-        await _run_atomic_apply(db, device, client, device_name, job, job_id, now, elig, sr_plan=sr_plan, reg=reg)
-        # §4.11 retry path, on BOTH apply implementations: the atomic path is a separate
-        # early return with its own finalization, so wiring this only into the per-scope
-        # loop below would leave atomic-mode applies enqueueing nothing.
-        await _enqueue_pending_clear_retract(db, device, sr_plan, reg=reg)
+    plan = _ApplyPlan(
+        device_id=device_id,
+        document=document,
+        sections=sections,
+        interface=interface,
+        static_route=sr_plan if "static_route" in execution_sections else None,
+        allowed=guard_allowed(generation, route_keys=sr_plan.allowed if sr_plan is not None else None),
+        any_eligible=any_eligible,
+    )
+    if not any_eligible:
+        await _finalize_job(db, job_id, device_id, False, {}, {}, reg=reg)
         return
-
-    # ── Step 2: mark attribute states deploying ──
-    attr_stamps = [item.stamp for item in attr_eligible if item.stamp is not None]
-    ip_stamps = list((interface_ip_stamp_of or {}).values())
-    _reject_transient_stamps("interface_config", [*attr_stamps, *ip_stamps])
-    for item in attr_eligible:
-        if item.state is not None and item.stamp is not None:
-            item.state.sync_state = SyncState.deploying
-    await db.commit()
-
-    # ── Step 3–6: per-item attribute + IP passes ──
-    attr_outcome = await _apply_attributes(
-        attr_eligible, apply_interface_attribute, client=client, device_name=device_name, job_id=job_id, now=now
-    )
-    ip_outcome = await _apply_ips(
-        ip_eligible_by_iface,
-        ifaces,
-        apply_interface_ips,
-        client=client,
-        device_name=device_name,
-        job_id=job_id,
-        now=now,
-        stamp_of=interface_ip_stamp_of,
-    )
-
-    deferred_rp_capability: list[NsoApplyError] = []
-
-    async def _record_rp_capability(exc: NsoApplyError) -> None:
-        # DEFERRED past the terminal transaction, not skipped. Capability recording commits
-        # on THIS session, and route-policy runs after static routes — so a commit here would
-        # land an earlier scope's row stamps without the CAS, per-route results and status
-        # that §4.6 requires to be one transaction. It records a (ned, sw) fact, not this
-        # job's outcome, so its timing is free.
-        deferred_rp_capability.append(exc)
-
-    # ── Step 6b–6g: one batch commit per remaining scope ──
-    scopes = [
-        _Scope(
-            "snmp",
-            "snmp",
-            snmp_rows.stamp,
-            lambda: apply_snmp_config(
-                client=client,
-                device_name=device_name,
-                community_intents=snmp_comm,
-                v3_user_intents=snmp_user,
-                host_intents=snmp_host,
-                system_info_intent=snmp_sysinfo,
-            ),
-            push=snmp_rows.push,
-            stamp_of=snmp_rows.stamp_of,
-        ),
-        _Scope(
-            "static_route",
-            "static_route",
-            # plan.rows, not the eligible list: in PUT mode the body is every ACCEPTED row
-            # (an eligible-only body retracts every accepted-and-clean route). Only matching
-            # live rows receive bookkeeping for the recorded body.
-            sr_stamp_rows,
-            lambda: _static_route_coro(client, device, sr_plan, outbox=sr_outbox),
-            push=sr_plan.rows,
-            stamp_of=sr_stamp_of,
-        ),
-        _Scope(
-            "logging",
-            "logging",
-            logging_rows.stamp,
-            lambda: apply_logging_config(
-                client=client,
-                device_name=device_name,
-                host_intent_rows=logging_eligible,
-                levels_intent_row=logging_levels,
-            ),
-            push=logging_rows.push,
-            stamp_of=logging_rows.stamp_of,
-        ),
-        _Scope(
-            "svi",
-            "svi",
-            svi_rows.stamp,
-            lambda: apply_svi_config(client=client, device_name=device_name, svi_intent_rows=svi_eligible),
-            push=svi_rows.push,
-            stamp_of=svi_rows.stamp_of,
-        ),
-        _Scope(
-            "subinterface",
-            "subif",
-            subif_rows.stamp,
-            lambda: apply_subinterface_config(client=client, device_name=device_name, subif_intent_rows=subif_eligible),
-            push=subif_rows.push,
-            stamp_of=subif_rows.stamp_of,
-        ),
-        _Scope(
-            "vlan",
-            "vlan",
-            # push ≠ stamp here: the body is the executing generation's document, the stamps
-            # go on the live rows that document carried (#1522 §G1).
-            vlan_rows.stamp,
-            lambda: apply_vlan_config(client=client, device_name=device_name, vlan_intent_rows=vlan_rows.push),
-            push=vlan_rows.push,
-            stamp_of=vlan_rows.stamp_of,
-        ),
-        _Scope(
-            "bfd",
-            "bfd",
-            bfd_rows.stamp,
-            lambda: apply_bfd_config(client=client, device_name=device_name, bfd_intent_rows=bfd_eligible),
-            push=bfd_rows.push,
-            stamp_of=bfd_rows.stamp_of,
-        ),
-        _Scope(
-            "interface_mtu",
-            "interface_mtu",
-            mtu_rows.stamp,
-            lambda: apply_mtu_config(client=client, device_name=device_name, mtu_intent_rows=mtu_eligible),
-            push=mtu_rows.push,
-            stamp_of=mtu_rows.stamp_of,
-        ),
-        _Scope(
-            "l2_sap",
-            "l2_sap",
-            l2_rows.stamp,
-            lambda: apply_l2_saps(client=client, device_name=device_name, sap_intent_rows=l2_eligible),
-            push=l2_rows.push,
-            stamp_of=l2_rows.stamp_of,
-        ),
-        _Scope(
-            "isis",
-            "isis",
-            isis_rows.stamp,
-            lambda: apply_isis_interfaces(
-                client=client,
-                device_name=device_name,
-                isis_intent_rows=isis_eligible,
-                isis_process_rows=isis_process_eligible,
-                redistribution_rows=redist_isis,
-                flex_algo_rows=isis_flex_eligible,
-                level_rows=isis_level_eligible,
-            ),
-            push=isis_rows.push,
-            stamp_of=isis_rows.stamp_of,
-        ),
-        _Scope(
-            "bgp",
-            "bgp",
-            bgp_rows.stamp,
-            lambda: apply_bgp_config(
-                client=client,
-                device_name=device_name,
-                router_intent_rows=bgp_eligible,
-                redistribution_rows=redist_bgp,
-            ),
-            push=bgp_rows.push,
-            stamp_of=bgp_rows.stamp_of,
-        ),
-        _Scope(
-            "route_policy",
-            "route_policy",
-            rp_rows.stamp,
-            lambda: apply_route_policy_config(
-                client=client, device_name=device_name, intent_rows=rp_eligible, ned_id=device.ned_id
-            ),
-            on_nso_error=_record_rp_capability,
-            push=rp_rows.push,
-            stamp_of=rp_rows.stamp_of,
-        ),
-        _Scope(
-            "ospf",
-            "ospf",
-            ospf_rows.stamp,
-            lambda: apply_ospf_config(
-                client=client,
-                device_name=device_name,
-                process_intent_rows=ospf_instance_eligible,
-                interface_intent_rows=ospf_iface_eligible,
-                redistribution_rows=redist_ospf,
-            ),
-            push=ospf_rows.push,
-            stamp_of=ospf_rows.stamp_of,
-        ),
-    ]
-
-    # #108/1328: each scope commits then verifies immediately (default path, atomic-apply OFF)
-    # — the per-scope action reads the far side of the FASTMAP writer as soon as possible after
-    # ITS OWN commit (preserving the legacy immediate-per-scope timing, r2-M2). The action is
-    # HEAVY (a live CDB build, not the cache-backed legacy GET), so a HARD budget bounds the total
-    # default-path VERIFY time: once spent, remaining scopes skip to "unknown" rather than
-    # serialising 60s each behind the shared 4-slot action semaphore (r3-M3/r4-M1). Only verify
-    # time is charged — device COMMIT latency is excluded (codex P1), so a slow early commit can
-    # never starve later scopes of silent-drop detection.
-    from nso_adapter.core.removal import _VERIFY_TOTAL_BUDGET
-
-    loop = asyncio.get_running_loop()
-    verify_spent = 0.0
-    device_ned_id = getattr(device, "ned_id", None)
-
-    scope_outcomes: dict[str, tuple[int, int]] = {}
-    scope_failures: dict[str, list] = {}
-    reader_compare: dict[str, str] = {}
-    reader_compare_unverifiable: dict[str, list[str]] = {}
-    evidence_by_scope: dict[str, dict[int, str]] = {}
-    send_failed_by_scope: dict[str, bool] = {}
-    for sc in scopes:
-        if not sc.sent:
-            scope_outcomes[sc.key] = (0, 0)
-            continue
-        scope_ok, scope_failed, fails = await _run_scope(
-            sc.log_label,
-            sc.make_coro(),
-            sc.rows,
-            sent_rows=sc.sent,
-            job_id=job_id,
-            device_name=device_name,
-            now=now,
-            on_nso_error=sc.on_nso_error,
-        )
-        # The SEND's own verdict, before reader-compare folds per-row findings into the same
-        # counter: "nothing landed" and "one row of several is missing" are different facts.
-        send_failed_by_scope[sc.key] = scope_failed != 0
-        if scope_failed == 0:
-            # #108: the commit reported success — require every intended key to be
-            # present in the scope's device-state section (the #26 silent-drop class).
-            verify_started = loop.time()
-            scope_ok, scope_failed, fails, rc_status, rc_unver, rc_evidence = await _reader_compare_default_path(
-                client,
-                device,
-                sc,
-                scope_ok,
-                remaining=_VERIFY_TOTAL_BUDGET - verify_spent,
-                ned_id=device_ned_id,
-                job_id=job_id,
-                device_name=device_name,
-            )
-            verify_spent += loop.time() - verify_started  # charge only verify time, not the commit
-            if rc_status is not None:
-                reader_compare[sc.key] = rc_status
-            if rc_unver:
-                reader_compare_unverifiable[sc.key] = rc_unver
-            evidence_by_scope[sc.key] = rc_evidence
-        scope_outcomes[sc.key] = (scope_ok, scope_failed)
-        if fails:
-            scope_failures[sc.key] = fails
-
-    # ── Step 6h: R2 §4.4-§4.6 — prove, CAS, consume, record (per-scope path) ──
-    sr_results = await _settle_static_routes(
-        db,
-        device,
-        client,
-        sr_plan,
-        job_id=job_id,
-        outbox=sr_outbox,
-        evidence=evidence_by_scope.get("static_route", {}),
-        put_delivered=sr_plan.mode == "PUT",
-        send_failed=send_failed_by_scope.get("static_route", False),
-        scope_outcomes=scope_outcomes,
-        scope_failures=scope_failures,
-        reg=reg,
-        stamp_of=sr_stamp_of,
-    )
-
-    # ── Step 7: finalize ── (any_eligible computed up front, before the atomic branch)
-    await _finalize_job(
-        db,
-        job_id,
-        device_id,
-        any_eligible,
-        attr_outcome,
-        ip_outcome,
-        scope_outcomes,
-        scope_failures,
-        reader_compare=reader_compare,
-        reader_compare_unverifiable=reader_compare_unverifiable,
-        static_route_results=sr_results,
-        reg=reg,
-    )
-    await _enqueue_pending_clear_retract(db, device, sr_plan, reg=reg)
-    await _record_rp_capability_now(db, client, device, device_name, deferred_rp_capability, job_id=job_id)
+    await _run_document_apply(db, device, client, device_name, job, job_id, now, plan, reg=reg)
 
 
 async def _post_apply_refresh_and_notify(db: AsyncSession, device_id: int) -> None:

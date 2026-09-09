@@ -23,6 +23,7 @@ import pytest
 from sqlalchemy import select
 
 from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
+from tests.core.removal_helpers import authorize_stream
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -298,6 +299,8 @@ async def test_force_removal_action_exempt_from_store_only(adapter_client):
     from nso_adapter.store.models import JobType
 
     device_id = await seed_device(nso_device_name="so-force-dev", netbox_device_id=986)
+    # A flush re-deploys AUTHORIZED state, so the family must have some for it to act on.
+    await authorize_stream(device_id, "logging")
     resp = await adapter_client.post(
         f"/api/v1/devices/{device_id}/actions/force-removal?store_only=true",
         json={"scope": "logging"},

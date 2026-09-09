@@ -36,8 +36,9 @@ B = ("", "10.0.1.0/24", "192.0.2.2")
 C = ("", "10.0.2.0/24", "192.0.2.3")
 D = ("", "10.0.3.0/24", "192.0.2.4")
 
-_SR_ROOT = "static-route-reconciler:static-route-config"
-_SR_PATH = "/restconf/data/static-route-reconciler:static-route-config"
+#: The ONE service every family writes, and the container the static-route family occupies.
+_SR_ROOT = "device-intent:device-intent"
+_SR_CONTAINER = "static-route"
 
 
 def wire(triple, **extra) -> dict:
@@ -110,6 +111,18 @@ async def seed_apply_job(device_id: int) -> int:
         job_id = job.id
     await attach_apply_generation(job_id, device_id)
     return job_id
+
+
+async def _first_row_error(device_id: int):
+    from nso_adapter.store.models import StaticRouteIntent
+
+    async with session() as db:
+        row = (
+            (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
+            .scalars()
+            .first()
+        )
+        return row.last_apply_error
 
 
 async def read_job(job_id: int) -> Job:
@@ -194,14 +207,20 @@ class _Recorder:
         return [c for c in self.calls if not c["dry_run"]]
 
     def sr_commits(self, method: str | None = None) -> list[dict]:
-        out = [c for c in self.commits if _SR_ROOT in (c["body"] or {})]
+        """Every committed document that CARRIED the static-route family."""
+        out = [c for c in self.commits if _SR_CONTAINER in (self.instance(c) or {})]
         return [c for c in out if method is None or c["method"] == method]
 
     def sr_payloads(self, *, dry_run: bool) -> list[dict]:
-        return [c["body"] for c in self.calls if c["dry_run"] is dry_run and _SR_ROOT in (c["body"] or {})]
+        return [c["body"] for c in self.calls if c["dry_run"] is dry_run and _SR_CONTAINER in (self.instance(c) or {})]
+
+    @staticmethod
+    def instance(call: dict) -> dict | None:
+        entries = (call.get("body") or {}).get(_SR_ROOT)
+        return entries[0] if isinstance(entries, list) and entries else None
 
     def routes(self, call: dict) -> list[dict]:
-        return call["body"][_SR_ROOT][0]["route"]
+        return (self.instance(call) or {})[_SR_CONTAINER]["route"]
 
 
 def sr_client(device_name: str, *, state, service_config=None, dry_run_delta: str = ""):
@@ -240,7 +259,7 @@ def sr_client(device_name: str, *, state, service_config=None, dry_run_delta: st
 def present(*entries, device_name="sr-put"):
     from nso_adapter.nso.client import ServiceInstanceState
 
-    return ServiceInstanceState("present", {"device": device_name, "route": list(entries)})
+    return ServiceInstanceState("present", {"device": device_name, _SR_CONTAINER: {"route": list(entries)}})
 
 
 def absent():
@@ -285,7 +304,7 @@ async def test_c2_1_a_replacement_open_row_is_delivered_by_a_put_replace(adapter
     assert job.status == JobStatus.succeeded, job.error
     assert [c["method"] for c in rec.sr_commits()] == ["put"], "the replacement must not ride a merge-PATCH"
     put = rec.sr_commits("put")[0]
-    assert f"{_SR_PATH}=sr-put" in put["url"]
+    assert f"/restconf/data/{_SR_ROOT}=sr-put" in put["url"]
     assert rec.routes(put) == [wire(B)], "the PUT body is the store's full desired state"
     # the one-snapshot contract: the guard never issued its own second read
     client.get_service_config.assert_not_awaited()
@@ -309,15 +328,15 @@ async def test_c2_2_a_service_owned_sibling_blocks_the_replace(adapter_client):
     assert job.status == JobStatus.failed
     assert rec.sr_commits() == [], "nothing may be committed once the guard refuses"
     item = next(i for i in job.error["detail"]["items"] if i["type"] == "static_route")
-    assert item["code"] == "removal_blocked_collateral"
-    assert item["orphans"] == {"route": [["", C[1], C[2]]]}, "the orphan report must NAME the sibling"
+    # Scope-qualified: the guard is device-wide, and two families both have a `host` list.
+    assert "static_route/route" in item["error"], "the report must NAME the sibling"
 
     async with session() as db:
         from nso_adapter.store.models import StaticRouteIntent
 
         row = (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id))).scalar_one()
         assert row.last_apply_error["code"] == "removal_blocked_collateral"
-        assert row.last_apply_error["detail"]["orphans"] == {"route": [["", C[1], C[2]]]}
+        assert row.last_apply_error["detail"]["orphans"] == {"static_route/route": [["", C[1], C[2]]]}
 
 
 # ── C2.3 / C2.4 — unconsumed tombstone entries survive VERBATIM ──────────────
@@ -383,20 +402,25 @@ async def test_c2_3c_a_tombstone_authorizes_its_deployed_key_too(adapter_client)
 # ── C2.5 — no replacement open ⇒ nothing changes ─────────────────────────────
 
 
-async def test_c2_5_without_a_replacement_the_apply_is_still_a_merge_patch(adapter_client):
-    """C2.5 — a tombstone alone never triggers the destructive path."""
+async def test_c2_5_a_tombstone_alone_consumes_nothing_and_keeps_its_entry(adapter_client):
+    """C2.5 — a tombstone alone authorizes no deletion; the apply retains its entry.
+
+    There is one transport now, so "destructive path" is not a choice the apply makes. What
+    stays true is the ownership rule: the apply neither drops the carrier's live entry nor
+    consumes the carrier, because the removal job is what authorizes that.
+    """
     device_id = await seed_device(nso_device_name="sr-put", netbox_device_id=7206)
     await seed_rows(device_id, [{"triple": B, "route_id": 7, "deployed_key": list(B)}])
     tombs = [await seed_tombstone(device_id, D, marking="delete_origin")]
-    client, rec = sr_client("sr-put", state=present(wire(D), device_name="sr-put"))
+    live_d = wire(D)
+    client, rec = sr_client("sr-put", state=present(live_d, device_name="sr-put"))
 
     job = await run_the_apply(device_id, client)
 
     assert job.status == JobStatus.succeeded, job.error
-    assert [c["method"] for c in rec.sr_commits()] == ["patch"]
-    assert rec.routes(rec.sr_commits("patch")[0]) == [wire(B)]
+    assert [c["method"] for c in rec.sr_commits()] == ["put"]
+    assert rec.routes(rec.sr_commits("put")[0]) == [wire(B), live_d], "the carrier's entry is retained"
     assert await tombstone_ids(device_id) == tombs
-    assert not client.service_instance_state.await_count, "a merge-PATCH needs no snapshot"
 
 
 # ── C2.6 — preview parity ────────────────────────────────────────────────────
@@ -426,6 +450,10 @@ async def test_c2_6_the_preview_payload_is_byte_identical_to_the_applied_one(ada
 
     before_keys, before_tombs = await deployed_keys(device_id), await tombstone_ids(device_id)
 
+    # The preview is a dry-run OF THE DOCUMENT BEING COMMITTED, so the device needs the
+    # generation the apply will execute before there is anything to preview.
+    job_id = await seed_apply_job(device_id)
+
     preview_client, preview_rec = sr_client("sr-put", state=state)
     with patch("nso_adapter.core.importer.get_nso_client", return_value=preview_client):
         async with session() as db:
@@ -436,28 +464,36 @@ async def test_c2_6_the_preview_payload_is_byte_identical_to_the_applied_one(ada
     assert preview_rec.commits == [], "preview must commit nothing"
 
     apply_client, apply_rec = sr_client("sr-put", state=state)
-    job = await run_the_apply(device_id, apply_client)
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=apply_client),
+        patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=AsyncMock()),
+    ):
+        from nso_adapter.core.apply import run_apply
+
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+    job = await read_job(job_id)
     assert job.status == JobStatus.succeeded, job.error
 
     previewed = preview_rec.sr_payloads(dry_run=True)
     applied = apply_rec.sr_payloads(dry_run=False)
-    assert previewed, "the replacement-open device must produce a static-route preview"
+    assert previewed, "the device must produce a preview of the document it is about to commit"
     assert applied[0] == previewed[0]
     assert json.dumps(applied[0], sort_keys=True) == json.dumps(previewed[0], sort_keys=True)
-    assert applied[0][_SR_ROOT][0]["route"] == [wire(B), wire(C), live_d]
-    # and it was previewed as a PUT dry-run, not a merge dry-run
-    assert [c["method"] for c in preview_rec.calls if c["dry_run"] and _SR_ROOT in (c["body"] or {})] == ["put"]
+    assert applied[0][_SR_ROOT][0][_SR_CONTAINER]["route"] == [wire(B), wire(C), live_d]
+    # and it was previewed as a PUT dry-run: there is one transport, and it is the document
+    assert [c["method"] for c in preview_rec.calls if c["dry_run"]] == ["put"]
 
 
 # ── C2.7 — verification off refuses the replace, and closes nothing ──────────
 
 
-async def test_c2_7_put_is_refused_when_verification_is_disabled_and_nothing_is_closed(adapter_client):
+async def test_c2_7_the_replacement_is_refused_when_verification_is_disabled(adapter_client):
     """C2.7 — a destructive replace whose proof is structurally unavailable must not run.
 
-    The forbidden pair is subtler than the PUT: the merge-PATCH that runs instead must
-    ALSO not record ``deployed_key := B``. That would close the replacement while ``A`` is
-    still on the device, and no later apply would ever reopen it.
+    Every send is the whole document now, so there is no weaker mode to fall back to: the
+    worker refuses the job before any HTTP. What must still hold is the pair — nothing is
+    sent AND ``deployed_key := B`` is not recorded, which would close the replacement while
+    ``A`` is still on the device with no later apply able to reopen it.
     """
     device_id = await seed_device(nso_device_name="sr-put", netbox_device_id=7208)
     await seed_rows(device_id, [{"triple": B, "route_id": 7, "deployed_key": list(A)}])
@@ -466,8 +502,9 @@ async def test_c2_7_put_is_refused_when_verification_is_disabled_and_nothing_is_
     with patch("nso_adapter.nso.apply.VERIFY_AFTER_APPLY", False):
         job = await run_the_apply(device_id, client)
 
-    assert job.status == JobStatus.succeeded, job.error
-    assert [c["method"] for c in rec.sr_commits()] == ["patch"]
+    assert job.status == JobStatus.failed
+    assert job.error["code"] == "static_route_put_verify_disabled"
+    assert rec.sr_commits() == [], "nothing may be sent without a proof channel"
     assert await deployed_keys(device_id) == {B: list(A)}, "the replacement stays OPEN"
 
 
@@ -558,82 +595,30 @@ async def test_c2_9b_the_preview_refuses_an_inconclusive_read_too(adapter_client
 
     device_id = await seed_device(nso_device_name="sr-put", netbox_device_id=7212)
     await seed_rows(device_id, [{"triple": B, "route_id": 7, "deployed_key": list(A)}])
+    await seed_apply_job(device_id)  # the preview is a dry-run of the document being committed
     client, rec = sr_client("sr-put", state=inconclusive())
 
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
         async with session() as db:
             diffs = await collect_apply_diff(db, device_id)
 
+    from nso_adapter.core.apply import PREVIEW_KEY
+
     assert rec.calls == []
     # visible in the panel the operator approves from, not silently omitted
-    assert "refusing to build a PUT-replace" in diffs["static_route"], diffs["static_route"]
+    assert "preview unavailable" in diffs[PREVIEW_KEY], diffs[PREVIEW_KEY]
+    assert "uncertified read" in diffs[PREVIEW_KEY]
 
 
 # ── C2.10 (enqueue half) + the A1 amendment ──────────────────────────────────
 
 
-def _atomic(on: bool):
-    return patch.dict("os.environ", {"NSO_ADAPTER_ATOMIC_APPLY": "1" if on else "0"})
-
-
-@pytest.mark.parametrize("atomic", [False, True], ids=["per_scope_loop", "atomic_path"])
-async def test_c2_10_a_patch_apply_queues_the_retract_it_cannot_deliver(adapter_client, atomic):
-    """C2.10 — a merge-PATCH apply structurally cannot remove a cleared leaf.
-
-    The renderer omits the leaf and the merge keeps it live, while reader-compare only
-    checks the route KEY — so without this the row is certified over a stale value. The
-    atomic path is a separate early return with its own finalization: wiring the follow-on
-    only into the per-scope loop passes a single-path pin while atomic applies queue
-    nothing.
-    """
-    device_id = await seed_device(nso_device_name="sr-put", netbox_device_id=7213 + int(atomic))
-    await seed_rows(
-        device_id,
-        [{"triple": B, "route_id": 7, "deployed_key": list(B), "pending_clear": {"authorized": ["metric"]}}],
-    )
-    client, _rec = sr_client("sr-put", state=present(wire(B), device_name="sr-put"))
-
-    with _atomic(atomic):
-        job = await run_the_apply(device_id, client)
-
-    assert job.status == JobStatus.succeeded, job.error
-    contexts = await removal_contexts(device_id)
-    assert len(contexts) == 1, contexts
-    ctx = contexts[0]
-    assert ctx["scope"] == "static_route"
-    assert not ctx.get("detach"), "a no-networking detach can never deliver a clear"
-    assert not ctx.get("force")
-
-
-@pytest.mark.parametrize("atomic", [False, True], ids=["per_scope_loop", "atomic_path"])
-async def test_a1_a_store_only_clear_never_becomes_a_deletion_job(adapter_client, atomic):
-    """A1 — promotion is by DELIVERY, and a merge-PATCH delivers nothing.
-
-    r8's premise ("an apply only runs because something else authorized a device write")
-    covers the apply's own body. It does not cover enqueueing §4.11's networked retract,
-    whose only purpose would be to delete a leaf recorded from a ``?store_only=true``
-    observation — the exact hazard r8 closed at the removal, moved one hop downstream.
-    """
-    device_id = await seed_device(nso_device_name="sr-put", netbox_device_id=7215 + int(atomic))
-    await seed_rows(
-        device_id,
-        [{"triple": B, "route_id": 7, "deployed_key": list(B), "pending_clear": {"store_only": ["metric"]}}],
-    )
-    client, _rec = sr_client("sr-put", state=present(wire(B), device_name="sr-put"))
-
-    with _atomic(atomic):
-        job = await run_the_apply(device_id, client)
-
-    assert job.status == JobStatus.succeeded, job.error
-    assert await removal_contexts(device_id) == [], "a store-only observation is not deletion authority"
-
-
 async def test_a1_discriminator_a_later_authorized_push_releases_the_parked_clear(adapter_client):
     """A1's discriminating half, driven through the REAL intent endpoint.
 
-    The parked entry stays parked across as many PATCH-mode applies as you like; the thing
-    that releases it is a later AUTHORIZED push re-observing the cleared state, which the
-    endpoint's per-push detection does naturally.
+    A store-only clear stays parked in its own half of the carrier; the thing that releases
+    it is a later AUTHORIZED push re-observing the cleared state, which the endpoint's
+    per-push detection does naturally.
     """
     device_id = await seed_device(nso_device_name="sr-put", netbox_device_id=7217)
 
@@ -670,12 +655,14 @@ async def test_a1_discriminator_a_later_authorized_push_releases_the_parked_clea
         row = (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id))).scalar_one()
         assert "metric" in row.pending_clear["authorized"]
 
-    before = len(await removal_contexts(device_id))
+    # The release is the carrier moving from the store-only half to the authorized one, and
+    # the ENDPOINT queues the networked retract for it. The apply adds none of its own: its
+    # document already omits the leaf, so nothing is owed downstream of it.
+    queued = await removal_contexts(device_id)
+    assert [c["scope"] for c in queued] == ["static_route"]
     client, _rec = sr_client("sr-put", state=present(wire(B), device_name="sr-put"))
     await run_the_apply(device_id, client)
-    after = await removal_contexts(device_id)
-    assert len(after) == before + 1
-    assert after[-1]["scope"] == "static_route" and not after[-1].get("detach")
+    assert await removal_contexts(device_id) == queued, "the apply queues no retract of its own"
 
 
 async def test_c2_10b_a_put_mode_apply_queues_nothing(adapter_client):
@@ -705,105 +692,13 @@ async def test_c2_10c_a_clean_device_queues_nothing(adapter_client):
     assert await removal_contexts(device_id) == []
 
 
-async def test_the_follow_on_enqueue_never_rewrites_the_finalized_apply(adapter_client):
-    """The retract enqueue runs AFTER the apply's terminal transaction.
+async def test_a_blocked_replace_reports_the_orphan_it_refused_over(adapter_client):
+    """The orphan keys are what the operator acts on: re-accept those rows, or force.
 
-    Letting it raise would make ``run_apply``'s outer handler write ``failed`` over an
-    already-committed ``succeeded`` — reporting rows the device really did accept as
-    failures. The carrier is store state, so the next apply re-derives the same decision.
-    """
-    device_id = await seed_device(nso_device_name="sr-put", netbox_device_id=7220)
-    await seed_rows(
-        device_id,
-        [{"triple": B, "route_id": 7, "deployed_key": list(B), "pending_clear": {"authorized": ["metric"]}}],
-    )
-    client, _rec = sr_client("sr-put", state=present(wire(B), device_name="sr-put"))
-
-    with patch("nso_adapter.core.removal.enqueue_removal", side_effect=RuntimeError("db down")):
-        job = await run_the_apply(device_id, client)
-
-    assert job.status == JobStatus.succeeded, job.error
-    assert job.result["static_route_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
-    assert await removal_contexts(device_id) == []
-
-
-# ── codex chunk review — the three accepted findings ─────────────────────────
-
-
-async def test_the_follow_on_enqueue_takes_the_claim_lock(adapter_client):
-    """A revoked claim must not let a stale apply queue a networked retract.
-
-    The job this queues is a device write. If the claim was revoked and reacquired while
-    the apply ran, the successor may have un-owned a route since — and a retract queued
-    behind its back would strip that deliberately detached config off the device. The
-    insert therefore takes the claim lock first; a lost claim propagates, and recovery
-    already owns the disposition (the apply's own terminal commit already landed).
-    """
-    import sqlalchemy as sa
-
-    from nso_adapter.core.claim import ClaimLostError, acquire_claim
-    from nso_adapter.store.models import DeviceClaim
-
-    device_id = await seed_device(nso_device_name="sr-put", netbox_device_id=7221)
-    await seed_rows(
-        device_id,
-        [{"triple": B, "route_id": 7, "deployed_key": list(B), "pending_clear": {"authorized": ["metric"]}}],
-    )
-    reg = await acquire_claim(device_id, "job")
-    assert reg.registered
-
-    client, _rec = sr_client("sr-put", state=present(wire(B), device_name="sr-put"))
-    job_id = await seed_apply_job(device_id)
-
-    from nso_adapter.core import apply as apply_mod
-
-    real_finalize = apply_mod._finalize_job
-
-    async def _finalize_then_revoke(*args, **kwargs):
-        # the apply's own terminal commit LANDS; the claim is lost only afterwards
-        await real_finalize(*args, **kwargs)
-        async with session() as db:
-            await db.execute(sa.delete(DeviceClaim).where(DeviceClaim.device_id == device_id))
-            await db.commit()
-
-    with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=client),
-        patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=AsyncMock()),
-        patch.object(apply_mod, "_finalize_job", _finalize_then_revoke),
-        pytest.raises(ClaimLostError),
-    ):
-        await apply_mod.run_apply(job_id=job_id, device_id=device_id, force=True, reg=reg)
-
-    assert await removal_contexts(device_id) == [], "nothing may be queued under a lost claim"
-    # the apply itself is untouched: its terminal commit already landed, and recovery owns
-    # an already-terminal job (it deletes the stale claim and leaves the job alone)
-    assert (await read_job(job_id)).status == JobStatus.succeeded
-
-
-async def test_a_claimless_caller_still_queues_the_retract(adapter_client):
-    """The discriminating half: an UNREGISTERED registration is the claimless lane.
-
-    This transaction consumes no carrier and deletes no tombstone, so refusing here would
-    only break direct callers without buying any ownership guarantee.
-    """
-    device_id = await seed_device(nso_device_name="sr-put", netbox_device_id=7222)
-    await seed_rows(
-        device_id,
-        [{"triple": B, "route_id": 7, "deployed_key": list(B), "pending_clear": {"authorized": ["metric"]}}],
-    )
-    client, _rec = sr_client("sr-put", state=present(wire(B), device_name="sr-put"))
-
-    job = await run_the_apply(device_id, client)  # run_apply(reg=None)
-
-    assert job.status == JobStatus.succeeded, job.error
-    assert len(await removal_contexts(device_id)) == 1
-
-
-async def test_a_blocked_replace_reports_the_preview_on_the_job(adapter_client):
-    """The native delta is what the operator reviews before forcing the replacement.
-
-    Reporting the orphan keys alone tells them WHICH rows would go, not WHAT would be
-    pushed — and GET /jobs/{id} is where they read it.
+    The refusal carries no native delta. Device config is opaque text that holds resolved
+    communities and auth keys, and this payload is persisted on the job and on every sent
+    row. An operator who wants the delta reads GET /devices/{id}/apply-preview, which
+    previews the same document without storing it.
     """
     device_id = await seed_device(nso_device_name="sr-put", netbox_device_id=7223)
     await seed_rows(device_id, [{"triple": B, "route_id": 7, "deployed_key": list(A)}])
@@ -814,5 +709,8 @@ async def test_a_blocked_replace_reports_the_preview_on_the_job(adapter_client):
 
     assert job.status == JobStatus.failed
     item = next(i for i in job.error["detail"]["items"] if i["type"] == "static_route")
-    assert item["preview"] == delta, "the would-be device delta, not just the orphan keys"
-    assert "force-removal" in item["hint"]
+    assert "static_route/route" in item["error"], "the job names the orphan it refused over"
+    row_error = await _first_row_error(device_id)
+    assert row_error["code"] == "removal_blocked_collateral"
+    assert row_error["detail"]["orphans"] == {"static_route/route": [list(C)]}
+    assert delta not in json.dumps(row_error), "the would-be device delta may not be persisted"

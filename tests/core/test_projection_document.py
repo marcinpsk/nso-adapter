@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 import pytest
 
 from tests.conftest import seed_device, session
+from tests.core.projection_helpers import freeze_snapshot
 
 pytestmark = pytest.mark.anyio
 
@@ -31,26 +32,29 @@ _INCREMENT_FOUR_SECTIONS = frozenset({"interface_config"})
 _INCREMENT_FIVE_SECTIONS = frozenset({"static_route"})
 
 
-def test_every_section_is_either_document_executed_awaiting_a_sender_or_names_its_blocker():
-    """Three states, no fourth. Manual selection and execution stay equal but distinct."""
+def test_every_section_executes_from_its_document_or_names_its_blocker():
+    """Two states, no third. Manual selection and execution stay equal but distinct.
+
+    The aggregate sender closed the completion pin: switchport and lag joined the executed
+    set, ``AWAITING_SENDER_SECTIONS`` is gone, and every section of the registry now has a
+    device writer.
+    """
     from nso_adapter.core.projection import (
         ACTION_APPLY_EXECUTABLE_SECTIONS,
-        AWAITING_SENDER_SECTIONS,
+        CLAIM_LESS_SECTIONS,
         DOCUMENT_EXECUTED_SECTIONS,
         LIVE_READ_SECTIONS,
         projection_sections,
     )
 
-    partition = DOCUMENT_EXECUTED_SECTIONS | set(LIVE_READ_SECTIONS) | AWAITING_SENDER_SECTIONS
+    partition = DOCUMENT_EXECUTED_SECTIONS | set(LIVE_READ_SECTIONS)
     assert partition == projection_sections(), (
         f"sections with no disposition: {sorted(projection_sections() - partition)}; "
         f"unknown sections named: {sorted(partition - projection_sections())}"
     )
     assert not (DOCUMENT_EXECUTED_SECTIONS & set(LIVE_READ_SECTIONS)), "a section cannot be both"
-    assert not (DOCUMENT_EXECUTED_SECTIONS & AWAITING_SENDER_SECTIONS), "a section cannot be both"
-    assert not (set(LIVE_READ_SECTIONS) & AWAITING_SENDER_SECTIONS), "a section cannot be both"
-    assert AWAITING_SENDER_SECTIONS == {"switchport", "lag"}, (
-        "the completion pin C9 deletes names exactly the two sections with no device writer"
+    assert CLAIM_LESS_SECTIONS <= DOCUMENT_EXECUTED_SECTIONS, (
+        "the two out-of-protocol sections execute from their documents like every other one"
     )
     assert all(reason for reason in LIVE_READ_SECTIONS.values()), "every live-read section must state why"
     assert ACTION_APPLY_EXECUTABLE_SECTIONS == DOCUMENT_EXECUTED_SECTIONS, (
@@ -66,8 +70,9 @@ def test_every_section_is_either_document_executed_awaiting_a_sender_or_names_it
         | _INCREMENT_FOUR_SECTIONS
         | _INCREMENT_FIVE_SECTIONS
     )
-    assert incremented | {"vlan"} == DOCUMENT_EXECUTED_SECTIONS, (
-        "vlan is intentionally document-executed without an incremental rollout step"
+    assert incremented | {"vlan"} | CLAIM_LESS_SECTIONS == DOCUMENT_EXECUTED_SECTIONS, (
+        "vlan is intentionally document-executed without an incremental rollout step, and the "
+        "two claim-less sections arrived with the aggregate sender"
     )
 
 
@@ -78,11 +83,11 @@ def test_every_projection_column_has_a_supported_json_round_trip():
     from sqlalchemy import JSON, BigInteger, Boolean, DateTime, Integer, String, Text
     from sqlalchemy.dialects.postgresql import JSONB
 
-    from nso_adapter.core.projection import _SECTION_TABLES
+    from nso_adapter.core.projection import section_registry
 
     supported_types = {BigInteger, Boolean, DateTime, Integer, JSON, JSONB, String, Text}
     supported_python_types = {bool, bytes, date, datetime, Decimal, dict, int, str}
-    models = {spec.model for specs in _SECTION_TABLES.values() for spec in specs}
+    models = {spec.model for entry in section_registry().values() for spec in entry.tables}
     unsupported = []
     for model in sorted(models, key=lambda candidate: candidate.__name__):
         for column in model.__table__.columns:
@@ -108,13 +113,25 @@ def test_hydrate_section_refuses_an_absent_section():
 def test_hydrate_section_accepts_an_explicitly_empty_section():
     from nso_adapter.core.projection import hydrate_section
 
-    assert hydrate_section({"vlan": {}}, "vlan") == {}
+    assert hydrate_section({"vlan": {"_execution": {"context": {"ned_id": None, "dialect": "identity"}}}}, "vlan") == {}
 
 
 def test_composing_an_empty_promoted_stream_preserves_its_section():
     from nso_adapter.core.generation import _compose_document
+    from nso_adapter.core.projection import EXECUTION_KEY
 
-    assert _compose_document({"vlan": {}}) == {"vlan": {}}
+    context = {"ned_id": "cisco-ios-cli-3.8", "dialect": "identity"}
+    assert _compose_document({"vlan": {EXECUTION_KEY: {"context": context}}}) == {
+        "vlan": {EXECUTION_KEY: {"context": context}}
+    }
+
+
+def test_composing_an_unfrozen_fragment_is_refused():
+    """Every fragment a document composes was produced by a fragment producer."""
+    from nso_adapter.core.generation import _compose_document
+
+    with pytest.raises(ValueError, match="contributes an unfrozen fragment"):
+        _compose_document({"vlan": {"vlan_intent": []}})
 
 
 def test_increment_one_sections_are_document_executed():
@@ -148,7 +165,6 @@ def test_increment_four_sections_are_document_executed():
 def test_increment_five_completes_document_execution():
     from nso_adapter.core.projection import (
         ACTION_APPLY_EXECUTABLE_SECTIONS,
-        AWAITING_SENDER_SECTIONS,
         DOCUMENT_EXECUTED_SECTIONS,
         LIVE_READ_SECTIONS,
         projection_sections,
@@ -159,12 +175,12 @@ def test_increment_five_completes_document_execution():
     assert _INCREMENT_FIVE_SECTIONS <= DOCUMENT_EXECUTED_SECTIONS
     assert LIVE_READ_SECTIONS == {}
     assert ACTION_APPLY_EXECUTABLE_SECTIONS is DOCUMENT_EXECUTED_SECTIONS
-    assert DOCUMENT_EXECUTED_SECTIONS | AWAITING_SENDER_SECTIONS == projection_sections()
+    assert DOCUMENT_EXECUTED_SECTIONS == projection_sections()
     assert len(projection_sections()) == 16
     assert len(projection_streams()) == 18
     assert {
         stream for stream in projection_streams() if stream_section(stream) not in ACTION_APPLY_EXECUTABLE_SECTIONS
-    } == {"switchport", "lag"}
+    } == set(), "every stream's section is selectable now that the aggregate sender writes them all"
 
 
 @pytest.mark.parametrize(
@@ -258,7 +274,6 @@ async def test_increment_one_apply_rows_come_from_the_generation_document(
     from sqlalchemy import inspect as sa_inspect
 
     from nso_adapter.core.apply import _Projection
-    from nso_adapter.core.projection import snapshot_stream
     from nso_adapter.store import models
 
     device_id = await seed_device(nso_device_name=f"document-{section}")
@@ -269,7 +284,7 @@ async def test_increment_one_apply_rows_come_from_the_generation_document(
         db.add(row)
         await db.flush()
         original_value = getattr(row, changed_field)
-        document = {section: await snapshot_stream(db, device_id, section)}
+        document = {section: await freeze_snapshot(db, device_id, section)}
         setattr(row, changed_field, successor_value)
         await db.commit()
 
@@ -287,7 +302,6 @@ async def test_snmp_apply_rows_and_vault_refs_come_from_the_generation_document(
     from sqlalchemy import inspect as sa_inspect
 
     from nso_adapter.core.apply import _Projection
-    from nso_adapter.core.projection import snapshot_stream
     from nso_adapter.store.models import SnmpCommunityIntent
 
     device_id = await seed_device(nso_device_name="document-snmp", netbox_device_id=9824)
@@ -302,7 +316,7 @@ async def test_snmp_apply_rows_and_vault_refs_come_from_the_generation_document(
         )
         db.add(row)
         await db.flush()
-        document = {"snmp": await snapshot_stream(db, device_id, "snmp")}
+        document = {"snmp": await freeze_snapshot(db, device_id, "snmp")}
         row.vault_ref = "network/snmp/communities/successor#community"
         await db.commit()
 
@@ -320,7 +334,6 @@ async def test_logging_apply_rows_come_from_the_generation_document(adapter_clie
     from sqlalchemy import inspect as sa_inspect
 
     from nso_adapter.core.apply import _Projection
-    from nso_adapter.core.projection import snapshot_stream
     from nso_adapter.store.models import LoggingHostIntent
 
     device_id = await seed_device(nso_device_name="document-logging", netbox_device_id=9825)
@@ -334,7 +347,7 @@ async def test_logging_apply_rows_come_from_the_generation_document(adapter_clie
         )
         db.add(row)
         await db.flush()
-        document = {"logging": await snapshot_stream(db, device_id, "logging")}
+        document = {"logging": await freeze_snapshot(db, device_id, "logging")}
         row.severity = "WARNING"
         await db.commit()
 
@@ -349,7 +362,7 @@ async def test_logging_apply_rows_come_from_the_generation_document(adapter_clie
 
 async def test_a_snapshot_hydrates_back_into_the_rows_it_was_taken_from(adapter_client):
     """Round-trip fidelity, including the types JSON cannot hold natively."""
-    from nso_adapter.core.projection import hydrate_section, snapshot_stream
+    from nso_adapter.core.projection import hydrate_section
     from nso_adapter.store.models import VlanIntent
 
     device_id = await seed_device(nso_device_name="projection-roundtrip", netbox_device_id=9820)
@@ -360,7 +373,7 @@ async def test_a_snapshot_hydrates_back_into_the_rows_it_was_taken_from(adapter_
         await db.commit()
 
     async with session() as db:
-        document = {"vlan": await snapshot_stream(db, device_id, "vlan")}
+        document = {"vlan": await freeze_snapshot(db, device_id, "vlan")}
 
     rows = hydrate_section(document, "vlan")[VlanIntent]
     assert [(r.vlan_id, r.name) for r in rows] == [(10, "MGMT"), (20, None)]
@@ -370,8 +383,8 @@ async def test_a_snapshot_hydrates_back_into_the_rows_it_was_taken_from(adapter_
 
 async def test_bgp_snapshot_hydrates_the_relationship_graph_for_the_writer(adapter_client):
     """Durable parent identities rebuild the complete BGP writer graph."""
-    from nso_adapter.core.projection import hydrate_section, rows_by_intent_identity, snapshot_stream
-    from nso_adapter.nso.apply import apply_bgp_config
+    from nso_adapter.core.projection import hydrate_section, rows_by_intent_identity
+    from nso_adapter.nso.apply import _CONTEXT_FREE_EXECUTION, encode_bgp
     from nso_adapter.store.models import (
         BgpAfIntent,
         BgpPeerAfIntent,
@@ -407,14 +420,15 @@ async def test_bgp_snapshot_hydrates_the_relationship_graph_for_the_writer(adapt
         await db.commit()
 
     async with session() as db:
-        fragment = await snapshot_stream(db, device_id, "bgp")
+        fragment = await freeze_snapshot(db, device_id, "bgp")
 
     assert set(rows_by_intent_identity(fragment, "bgp_peer_af_intent")) == {("64512", "", "192.0.2.1", "ipv4-unicast")}
     rows = hydrate_section({"bgp": fragment}, "bgp")
-    stage: dict[str, list] = {}
-    await apply_bgp_config(None, "projection-bgp-graph", rows[BgpRouterIntent], stage=stage)
+    body = encode_bgp(
+        {"bgp_router_intent": rows[BgpRouterIntent], "redistribution_intent": []}, _CONTEXT_FREE_EXECUTION
+    )
 
-    router = stage["bgp-reconciler:bgp-config"][0]["router"][0]
+    router = body["router"][0]
     assert router == {
         "asn": 64512,
         "router-id": "192.0.2.254",
@@ -462,6 +476,7 @@ def test_bgp_hydration_resolves_parents_in_linear_work():
         ]
     )
     fragment = {
+        "_execution": {"context": {"ned_id": None, "dialect": "identity"}},
         "bgp_router_intent": [{"id": 1, "device_id": 1, "asn": "64512"}],
         "bgp_scope_intent": [{"id": 2, "router_id": 1, "vrf": ""}],
         "bgp_af_intent": [],
@@ -593,9 +608,19 @@ def test_hydrating_an_unknown_table_or_column_is_refused():
     from nso_adapter.core.projection import hydrate_section
 
     with pytest.raises(ValueError, match="unknown table"):
-        hydrate_section({"vlan": {"not_a_table": []}}, "vlan")
+        hydrate_section(
+            {"vlan": {"_execution": {"context": {"ned_id": None, "dialect": "identity"}}, "not_a_table": []}}, "vlan"
+        )
     with pytest.raises(ValueError, match="unknown column"):
-        hydrate_section({"vlan": {"vlan_intent": [{"nope": 1}]}}, "vlan")
+        hydrate_section(
+            {
+                "vlan": {
+                    "_execution": {"context": {"ned_id": None, "dialect": "identity"}},
+                    "vlan_intent": [{"nope": 1}],
+                }
+            },
+            "vlan",
+        )
 
 
 def test_hydrating_a_row_without_its_primary_key_is_refused():
@@ -603,9 +628,25 @@ def test_hydrating_a_row_without_its_primary_key_is_refused():
     from nso_adapter.core.projection import hydrate_section
 
     with pytest.raises(ValueError, match="primary key"):
-        hydrate_section({"vlan": {"vlan_intent": [{"device_id": 1, "vlan_id": 10}]}}, "vlan")
+        hydrate_section(
+            {
+                "vlan": {
+                    "_execution": {"context": {"ned_id": None, "dialect": "identity"}},
+                    "vlan_intent": [{"device_id": 1, "vlan_id": 10}],
+                }
+            },
+            "vlan",
+        )
     with pytest.raises(ValueError, match="primary key"):
-        hydrate_section({"vlan": {"vlan_intent": [{"id": None, "device_id": 1, "vlan_id": 10}]}}, "vlan")
+        hydrate_section(
+            {
+                "vlan": {
+                    "_execution": {"context": {"ned_id": None, "dialect": "identity"}},
+                    "vlan_intent": [{"id": None, "device_id": 1, "vlan_id": 10}],
+                }
+            },
+            "vlan",
+        )
 
 
 def test_hydrating_a_known_table_under_the_wrong_section_is_refused():
@@ -613,7 +654,9 @@ def test_hydrating_a_known_table_under_the_wrong_section_is_refused():
     from nso_adapter.core.projection import hydrate_section
 
     with pytest.raises(ValueError, match="does not belong"):
-        hydrate_section({"svi": {"vlan_intent": []}}, "svi")
+        hydrate_section(
+            {"svi": {"_execution": {"context": {"ned_id": None, "dialect": "identity"}}, "vlan_intent": []}}, "svi"
+        )
 
 
 def test_interface_execution_context_hydrates_beside_intent_tables():
@@ -633,18 +676,21 @@ def test_interface_execution_context_hydrates_beside_intent_tables():
             ],
             "interface_ip_intent": [],
             EXECUTION_KEY: {
-                "interfaces": [
-                    {
-                        "id": 7,
-                        "name": "GigabitEthernet0/1",
-                        "kind": None,
-                        "parent_binding": None,
-                        "encap_tag": None,
-                        "vrf": None,
-                        "service": None,
-                    }
-                ],
-                "eligible_interface_attributes": [{"interface_id": 7, "attribute": "description"}],
+                "context": {"ned_id": "cisco-ios-cli-3.8", "dialect": "identity"},
+                "proof": {
+                    "interfaces": {
+                        "7": {
+                            "id": 7,
+                            "name": "GigabitEthernet0/1",
+                            "kind": None,
+                            "parent_binding": None,
+                            "encap_tag": None,
+                            "vrf": None,
+                            "service": None,
+                        }
+                    },
+                    "attribute_eligibility": {"7/description": True},
+                },
             },
         }
     }
@@ -664,10 +710,10 @@ def test_every_parented_table_has_a_local_durable_identity():
     referencing a missing parent. :func:`_attach_hydrated_relationships` refuses it; this
     fails first, on the schema itself.
     """
-    from nso_adapter.core.projection import _SECTION_TABLES, _SPEC_BY_MODEL, _identity_fields
+    from nso_adapter.core.projection import _SPEC_BY_MODEL, _identity_fields, section_registry
 
-    for specs in _SECTION_TABLES.values():
-        for spec in specs:
+    for entry in section_registry().values():
+        for spec in entry.tables:
             if spec.parent in _SPEC_BY_MODEL:
                 assert _identity_fields(spec), f"{spec.model.__tablename__} has no local durable identity"
 
@@ -728,12 +774,12 @@ def test_the_two_out_of_protocol_streams_are_the_only_streams_without_an_endpoin
 
 def test_the_switching_identities_use_the_durable_root_and_child_keys():
     """The LAG name stays the document key when its numeric ID is also unique."""
-    from nso_adapter.core.projection import _SECTION_TABLES, _identity_fields
+    from nso_adapter.core.projection import _identity_fields, section_registry
 
     identities = {
         spec.model.__tablename__: _identity_fields(spec)
         for section in ("switchport", "lag")
-        for spec in _SECTION_TABLES[section]
+        for spec in section_registry()[section].tables
     }
     assert identities == {
         "switchport_intent": ("interface_name",),
@@ -744,15 +790,15 @@ def test_the_switching_identities_use_the_durable_root_and_child_keys():
     assert all(
         spec.discriminator is None and not spec.lifecycle
         for section in ("switchport", "lag")
-        for spec in _SECTION_TABLES[section]
+        for spec in section_registry()[section].tables
     )
 
 
 def test_the_switching_sections_are_registered_before_interface_config():
     """Registry iteration still ends at interface_config (the #1522 amendment requires it)."""
-    from nso_adapter.core.projection import _SECTION_TABLES
+    from nso_adapter.core.projection import section_registry
 
-    names = list(_SECTION_TABLES)
+    names = list(section_registry())
     assert names[-1] == "interface_config"
     assert names[-3:-1] == ["switchport", "lag"]
 
@@ -826,7 +872,10 @@ def test_a_split_that_leaves_a_table_unowned_is_refused(monkeypatch):
         monkeypatch.setitem(
             projection._SPLIT_SECTION_STREAMS,
             "isis",
-            {"isis": (IsisProcessIntent,), "isis_flex_algo": (IsisFlexAlgoIntent,)},
+            projection._SplitSection(
+                context_owner="isis",
+                streams={"isis": (IsisProcessIntent,), "isis_flex_algo": (IsisFlexAlgoIntent,)},
+            ),
         )
         with pytest.raises(RuntimeError, match="does not partition its tables"):
             projection._stream_tables()

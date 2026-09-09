@@ -33,7 +33,7 @@ def _now():
     return datetime.now(UTC)
 
 
-def _parse_vlan_string(raw) -> list[int]:
+def parse_vlan_string(raw) -> list[int]:
     """Expand the NSO 'tagged-vlans' string ('805,1518-1519,3629') into a sorted int list.
 
     Also tolerates a list (legacy/test) — returns it as ints.
@@ -171,7 +171,7 @@ async def _upsert_switchports(
         await db.flush()
         # rebuild tagged-vlan join rows
         await db.execute(delete(DeviceSwitchportTaggedVlan).where(DeviceSwitchportTaggedVlan.switchport_id == row.id))
-        for tv in _parse_vlan_string(item.get("tagged-vlans") or item.get("tagged_vlans")):
+        for tv in parse_vlan_string(item.get("tagged-vlans") or item.get("tagged_vlans")):
             vlan = vlan_by_vid.get(tv)
             if vlan is not None:
                 db.add(DeviceSwitchportTaggedVlan(switchport_id=row.id, vlan_id=vlan.id))
