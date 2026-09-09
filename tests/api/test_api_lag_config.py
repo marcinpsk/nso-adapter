@@ -613,6 +613,8 @@ async def test_apply_lag_accepts_the_lacp_vocabulary_the_export_emits(adapter_cl
                 "name": "Bundle-Ether2",
                 "lag_id": 2,
                 "timer": "slow",
+                # junos exports `lacp system-id` as a raw str(), so an apply-group token reaches us.
+                "system_id": "<*>",
                 "members": [{"interface_name": "TenGigE0/0/0/0", "mode": "inherit"}],
             },
             {
@@ -636,7 +638,7 @@ async def test_apply_lag_accepts_the_lacp_vocabulary_the_export_emits(adapter_cl
         stored = (
             await db.execute(
                 text(
-                    "SELECT b.timer, m.interface_name, m.mode FROM lag_bundle_intent b "
+                    "SELECT b.timer, b.system_id, m.interface_name, m.mode FROM lag_bundle_intent b "
                     "JOIN lag_member_intent m ON m.lag_bundle_id = b.id "
                     "WHERE b.device_id = :device_id ORDER BY m.interface_name"
                 ),
@@ -644,9 +646,9 @@ async def test_apply_lag_accepts_the_lacp_vocabulary_the_export_emits(adapter_cl
             )
         ).all()
     assert [tuple(row) for row in stored] == [
-        ("fast", "GigabitEthernet0/1", "auto"),
-        ("fast", "GigabitEthernet0/2", "desirable"),
-        ("slow", "TenGigE0/0/0/0", "inherit"),
+        ("fast", None, "GigabitEthernet0/1", "auto"),
+        ("fast", None, "GigabitEthernet0/2", "desirable"),
+        ("slow", "<*>", "TenGigE0/0/0/0", "inherit"),
     ]
 
     context = {"ned_id": "cisco-ios-cli-6.95", "dialect": "identity"}
@@ -657,6 +659,7 @@ async def test_apply_lag_accepts_the_lacp_vocabulary_the_export_emits(adapter_cl
                 "name": "Bundle-Ether2",
                 "lag-id": 2,
                 "timer": "slow",
+                "system-id": "<*>",
                 "member": [{"interface-name": "TenGigE0/0/0/0", "mode": "inherit"}],
             },
             {
