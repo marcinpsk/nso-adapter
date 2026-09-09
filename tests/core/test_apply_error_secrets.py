@@ -44,6 +44,34 @@ async def _run(device_id, client, monkeypatch, job_id=None):
         return await db.get(Job, job_id)
 
 
+def _log_surface(logs) -> str:
+    """Every attribute of every captured record, not ``LogRecord.__repr__``.
+
+    ``__repr__`` renders only name, level, path, line and ``msg``, so it misses a secret in
+    ``args`` (%-style logging) or in the cached ``exc_text`` of a traceback, which is exactly
+    where this module's redaction failures would land.
+    """
+    return repr([record.__dict__ for record in logs.records])
+
+
+def test_the_log_surface_sees_what_logrecord_repr_hides(caplog):
+    """Pins why the surface reads every attribute: two leaks `repr(records)` cannot show."""
+    caplog.set_level(logging.INFO)
+    logger = logging.getLogger("surface-contract")
+    logger.error("community=%s", "ARGS-ONLY-SECRET")
+    try:
+        raise ValueError("EXC-ONLY-SECRET")
+    except ValueError:
+        logger.exception("apply failed")
+    logging.Formatter().format(caplog.records[-1])  # caches exc_text, as a real handler does
+
+    weak = repr(caplog.records)
+    surface = _log_surface(caplog)
+    for secret in ("ARGS-ONLY-SECRET", "EXC-ONLY-SECRET"):
+        assert secret not in weak, "LogRecord.__repr__ renders only msg"
+        assert secret in surface, "the surface must expose args and exc_text"
+
+
 def _assert_safe(exc, job, row_error, logs, secrets):
     assert job.status == JobStatus.failed
     assert row_error is not None
@@ -54,7 +82,7 @@ def _assert_safe(exc, job, row_error, logs, secrets):
         "".join(traceback.format_exception(exc)),
         json.dumps(job.error),
         json.dumps(row_error),
-        repr([record.__dict__ for record in logs.records]),
+        _log_surface(logs),
     ]
     for surface in surfaces:
         for secret in secrets:
@@ -253,7 +281,7 @@ async def test_a_blocked_apply_keeps_the_device_delta_out_of_the_job_and_row_err
     assert job.status == JobStatus.failed
     assert stored.last_apply_error["code"] == "removal_blocked_collateral"
     assert stored.last_apply_error["detail"]["orphans"] == {"snmp/community": [["legacy"]]}
-    for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error), repr(recorded_logs.records)):
+    for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error), _log_surface(recorded_logs)):
         assert _SECRET not in surface
 
 
@@ -275,7 +303,7 @@ async def test_a_blocked_removal_keeps_the_device_delta_out_of_the_job_error(ada
     assert job.error["code"] == "removal_blocked_collateral"
     assert job.error["detail"]["orphans"] == {"snmp/community": [["legacy"]]}
     assert _SECRET not in json.dumps(job.error)
-    assert _SECRET not in repr(recorded_logs.records)
+    assert _SECRET not in _log_surface(recorded_logs)
 
 
 # ── a device rejection: the construct is attributed, the device text is not kept ──
@@ -360,7 +388,7 @@ async def test_a_device_rejection_attributes_its_construct_and_keeps_no_device_t
     surfaces = [
         json.dumps(job.error),
         json.dumps(stored.last_apply_error),
-        repr([record.__dict__ for record in recorded_logs.records]),
+        _log_surface(recorded_logs),
         *(f"{r.detail} {r.name}" for r in recorded.values()),
     ]
     for surface in surfaces:
