@@ -1944,6 +1944,12 @@ async def _promotion_interface_context(
         if row.get("interface_id") in names_by_id
     ]
     # A REPLACEMENT interface keeps rows and so keeps its entry; only a removal may empty one.
+    replaced = {
+        names_by_id[row["interface_id"]]
+        for rows in replacement_rows.values()
+        for row in rows
+        if row.get("interface_id") in names_by_id
+    }
     emptied = sorted(
         {
             names_by_id[row["interface_id"]]
@@ -1951,6 +1957,7 @@ async def _promotion_interface_context(
             for row in rows
             if row.get("interface_id") in names_by_id
         }
+        - replaced
     )
     attribute_keys = [
         (names_by_id[row["interface_id"]], row["attribute"])

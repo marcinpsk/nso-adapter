@@ -2136,6 +2136,46 @@ async def test_interface_promotion_refuses_an_unresolved_interface_id(adapter_cl
             )
 
 
+async def test_interface_promotion_keeps_an_interface_a_replacement_retains(adapter_client):
+    """Only a removal may empty an interface: a replacement keeps rows, so it keeps its entry.
+
+    ``interface`` in the authority is the ROOT key, so authorizing it lets the guard bless
+    the whole entry disappearing, together with the configuration the replacement retains.
+    """
+    from nso_adapter.core.removal import promotion_removal_context
+    from nso_adapter.store.models import DbInterface
+
+    device_id = await seed_device(nso_device_name="apply-replaced-interface", netbox_device_id=None)
+    seeded = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ip-intent?store_only=true",
+        json={
+            "addresses": [
+                {"interface": "Gi0/1", "address": "198.18.11.1/30", "family": "ipv4"},
+                {"interface": "Gi0/2", "address": "198.18.11.5/30", "family": "ipv4"},
+            ]
+        },
+        headers=AUTH | {"X-Push-Seq": "4911"},
+    )
+    assert seeded.status_code == 200, seeded.text
+
+    async with session() as db:
+        rows = await db.execute(sa.select(DbInterface.name, DbInterface.id).where(DbInterface.device_id == device_id))
+        ids = dict(rows.tuples().all())
+        removed = {"interface_ip_intent": [{"interface_id": ids["Gi0/1"], "address": "198.18.11.1/30", "vrf": ""}]}
+        retained = await promotion_removal_context(
+            db,
+            device_id,
+            "interface_config",
+            removed,
+            replacement_rows={"interface_intent": [{"interface_id": ids["Gi0/1"], "attribute": "description"}]},
+        )
+        emptied = await promotion_removal_context(db, device_id, "interface_config", removed)
+
+    assert "interface" not in retained.removed, "the replacement keeps Gi0/1, so its root key stays unauthorized"
+    assert retained.removed["address"] == [["Gi0/1", "198.18.11.1/30", ""]], "the address it does drop is authorized"
+    assert emptied.removed["interface"] == [["Gi0/1"]], "with nothing retained the same drop empties the entry"
+
+
 async def test_action_apply_accepts_ip_stream_that_executes_from_interface_document(adapter_client):
     """The IP lane is executable because its containing interface section moved to the document."""
     device_id = await seed_device(nso_device_name="apply-interface-list", netbox_device_id=9969)
