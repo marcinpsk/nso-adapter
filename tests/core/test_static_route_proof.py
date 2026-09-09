@@ -79,7 +79,7 @@ class _ProofRecorder(_Recorder):
                 200,
                 request=httpx.Request(method.upper(), url),
                 json={
-                    "route-policy-reconciler:output": {
+                    "route-policy-capability:output": {
                         "ned-id": "vendor-cli-1.0",
                         "sw-version": "1.0.0",
                         "element": [],
