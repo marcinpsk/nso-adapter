@@ -451,7 +451,7 @@ _REJECTION_CONSTRUCTS = (
 #     the same format parse_rejected_construct greps for route-policy.
 # Path tokens map a model node → scope; command prefixes map a CLI line → scope. vrf/kind/
 # service/parent-binding/encap-tag ride the IP half of the merged module (see
-# build_interface_ip_entry), so they attribute to interface_ip.
+# build_interface_ip_body), so they attribute to interface_ip.
 _IFACE_PATH_CONSTRUCTS: tuple[tuple[str, str, str], ...] = (
     ("interface_ip", "ipv4-address", "ipv4-address"),
     ("interface_ip", "ipv6-address", "ipv6-address"),

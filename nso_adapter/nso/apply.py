@@ -477,34 +477,6 @@ def nokia_routed_kind(iface) -> str | None:
     return "base"
 
 
-def build_interface_ip_entry(
-    device_name: str,
-    interface_name: str,
-    ip_intent_rows: list,
-    *,
-    kind: str | None = None,
-    service: str | None = None,
-    parent_binding: str | None = None,
-    encap_tag: str | None = None,
-) -> dict:
-    """Shape one interface-reconciler service-instance body from a device's IP rows.
-
-    The aggregate encoder uses this body. ``kind``/``service``/``parent_binding``/
-    ``encap_tag`` carry the Nokia routed-interface context (ignored by IOS/Junos).
-    """
-    return {
-        "device": device_name,
-        **build_interface_ip_body(
-            interface_name,
-            ip_intent_rows,
-            kind=kind,
-            service=service,
-            parent_binding=parent_binding,
-            encap_tag=encap_tag,
-        ),
-    }
-
-
 def build_interface_ip_body(
     interface_name: str,
     ip_intent_rows: list,

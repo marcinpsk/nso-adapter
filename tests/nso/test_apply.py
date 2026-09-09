@@ -26,7 +26,6 @@ from nso_adapter.nso.apply import (
     _verify_native_or_raise,
     apply_device_intent,
     build_interface_ip_body,
-    build_interface_ip_entry,
     build_isis_process_payload,
     encode_bgp,
     encode_interface_config,
@@ -788,26 +787,26 @@ def test_bgp_invalid_asn_raises_a_clean_error():
         _bgp_body([BgpRouterIntent(asn="not-an-asn")])
 
 
-def test_build_interface_ip_entry_rejects_address_without_prefix():
+def test_build_interface_ip_body_rejects_address_without_prefix():
     """An address missing '/prefix' raises a descriptive NsoApplyError (surfaced), not a
     bare ValueError that would abort the whole atomic apply opaquely."""
     row = SimpleNamespace(address="10.0.0.1", family="ipv4", vrf=None, secondary=False)
     with pytest.raises(NsoApplyError, match="prefix"):
-        build_interface_ip_entry("d", "Gi0/0", [row])
+        build_interface_ip_body("Gi0/0", [row])
 
 
-def test_build_interface_ip_entry_rejects_unknown_family():
+def test_build_interface_ip_body_rejects_unknown_family():
     """A row whose family is neither ipv4 nor ipv6 is NOT silently dropped — it raises so
     the address can never be reported in_sync while never emitted."""
     row = SimpleNamespace(address="10.0.0.1/24", family="inet", vrf=None, secondary=False)
     with pytest.raises(NsoApplyError, match="family"):
-        build_interface_ip_entry("d", "Gi0/0", [row])
+        build_interface_ip_body("Gi0/0", [row])
 
 
-def test_build_interface_ip_entry_secondary_none_is_boolean_not_null():
+def test_build_interface_ip_body_secondary_none_is_boolean_not_null():
     """A None `secondary` becomes JSON false, never null (a boolean YANG leaf rejects null)."""
     row = SimpleNamespace(address="10.0.0.1/24", family="ipv4", vrf=None, secondary=None)
-    entry = build_interface_ip_entry("d", "Gi0/0", [row])
+    entry = build_interface_ip_body("Gi0/0", [row])
     assert entry["ipv4-address"][0]["secondary"] is False
 
 
@@ -1322,9 +1321,9 @@ def test_build_subif_interfaces_shapes_rows():
     ]
 
 
-def test_build_interface_ip_entry_ipv4():
+def test_build_interface_ip_body_ipv4():
     rows = [_make_ip_row("198.18.1.1/24", family="ipv4")]
-    entry = apply_mod.build_interface_ip_entry("sw01", "ae99.999", rows)
+    entry = apply_mod.build_interface_ip_body("ae99.999", rows)
     assert entry["interface-name"] == "ae99.999"
     assert entry["ipv4-address"] == [{"address": "198.18.1.1", "prefix-length": 24, "secondary": False}]
 
