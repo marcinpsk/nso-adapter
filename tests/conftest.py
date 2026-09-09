@@ -455,12 +455,14 @@ def sender_enabled_sections(monkeypatch):
             fn.cache_clear()
 
     executed = projection.DOCUMENT_EXECUTED_SECTIONS | projection.AWAITING_SENDER_SECTIONS
-    monkeypatch.setattr(projection, "AWAITING_SENDER_SECTIONS", frozenset())
-    monkeypatch.setattr(projection, "DOCUMENT_EXECUTED_SECTIONS", executed)
-    monkeypatch.setattr(projection, "ACTION_APPLY_EXECUTABLE_SECTIONS", executed)
-    clear_caches()
-    yield
-    monkeypatch.undo()
+    # A context, not undo(): undo() on the shared function-scoped instance also reverts
+    # the patches every other fixture of the same test made through it.
+    with monkeypatch.context() as scoped:
+        scoped.setattr(projection, "AWAITING_SENDER_SECTIONS", frozenset())
+        scoped.setattr(projection, "DOCUMENT_EXECUTED_SECTIONS", executed)
+        scoped.setattr(projection, "ACTION_APPLY_EXECUTABLE_SECTIONS", executed)
+        clear_caches()
+        yield
     clear_caches()
 
 
