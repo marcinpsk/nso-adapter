@@ -21,6 +21,7 @@ from uuid import uuid4
 import pytest
 import sqlalchemy as sa
 
+from nso_adapter.nso.client import DEVICE_INTENT_ROOT
 from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 from tests.core.removal_helpers import authorize_stream
 
@@ -30,7 +31,7 @@ AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 #: The ONE service every family writes: ``list device-intent[device]``. A body carries one
 #: entry whose keys are the YANG containers the document asserts.
-_DI_ROOT = "device-intent:device-intent"
+_DI_ROOT = DEVICE_INTENT_ROOT
 #: The containers the cases below reach for by name.
 _VLAN_CONTAINER = "vlan"
 _SNMP_CONTAINER = "snmp"
@@ -548,6 +549,7 @@ async def test_f8_e_a_force_removal_authorizes_nothing_outside_the_interfaces_it
     # transmitted, not out of a per-interface instance URL.
     (document,) = rec.documents
     sent = [entry["interface-name"] for entry in document.get("interface", {}).get("interface", [])]
+    assert "Gi0/1" in sent, "the flush did not carry the interface it was scoped to"
     assert "Gi0/2" not in sent, "the flush sent the store-only repair it never authorized"
 
     sibling = await stream_row(device_id, "ip")
