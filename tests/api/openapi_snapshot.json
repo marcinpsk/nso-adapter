@@ -63,7 +63,7 @@
       },
       "ActionApplyIn": {
         "additionalProperties": false,
-        "description": "The exact push sequences this manual Apply is allowed to promote.",
+        "description": "The exact per-stream selections this manual Apply is allowed to promote.\n\nA selection value carries one of two identities. For an in-protocol stream it is a\npush sequence, resolved against that stream's delivery receipt. For the two\nout-of-protocol streams, ``lag`` and ``switchport``, it is the ``selection_revision``\nthe preparation returned, resolved against the stored prepared revision, because\nneither stream carries a receipt.",
         "properties": {
           "apply_attempt_id": {
             "format": "uuid",

@@ -59,7 +59,14 @@ class ApplyDiffOut(BaseModel):
 
 
 class ActionApplyIn(BaseModel):
-    """The exact push sequences this manual Apply is allowed to promote."""
+    """The exact per-stream selections this manual Apply is allowed to promote.
+
+    A selection value carries one of two identities. For an in-protocol stream it is a
+    push sequence, resolved against that stream's delivery receipt. For the two
+    out-of-protocol streams, ``lag`` and ``switchport``, it is the ``selection_revision``
+    the preparation returned, resolved against the stored prepared revision, because
+    neither stream carries a receipt.
+    """
 
     model_config = ConfigDict(extra="forbid")
 

@@ -120,6 +120,19 @@ def test_action_apply_requires_an_attempt_id(openapi_schema):
     }
 
 
+def test_action_apply_documents_both_selection_identities(openapi_schema):
+    """A selection is a push sequence or a prepared revision; the schema must name both."""
+    from nso_adapter.core.intent_protocol import OUT_OF_PROTOCOL_STREAMS
+
+    description = " ".join(openapi_schema["components"]["schemas"]["ActionApplyIn"]["description"].split())
+
+    assert "push sequence" in description
+    assert "selection_revision" in description
+    # Derived from the constant, so a third out-of-protocol stream fails until it is documented.
+    for stream in sorted(OUT_OF_PROTOCOL_STREAMS):
+        assert f"``{stream}``" in description, f"{stream} is out-of-protocol but undocumented"
+
+
 def test_api_contract_documents_the_generation_action_cas():
     contract = (SNAPSHOT_PATH.parents[2] / "docs" / "api-contract.md").read_text()
     actions_table = contract.split("### Execution and admission", maxsplit=1)[1].split(
