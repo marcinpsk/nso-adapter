@@ -1127,12 +1127,21 @@ async def create_action_apply(
     return ActionApplyResult(result.generations, {**skipped, **result.skipped}, skipped_detail)
 
 
+#: Selection reasons an automatic delivery legitimately meets: the push is already carried,
+#: or it authorizes no device work. Every other reason breaks an invariant of this call
+#: site, which wrote the very receipt the selection reads.
+_BENIGN_AUTOMATIC_SKIPS = frozenset({"already_applied", "already_authorized", "backfill_only", "superseded"})
+
+
 async def create_automatic_apply(db: AsyncSession, device_id: int, stream: str, push_seq: int) -> None:
     """Plan an admitted automatic delivery through the shared promotion chain."""
     await lock_projection(db, device_id)
     selected_rows, skipped, _ = await _selected_promotions(db, device_id, {stream: push_seq})
-    if skipped:
-        raise RuntimeError(f"automatic delivery for device {device_id} could not promote: {skipped}")
+    unexpected = {name: reason for name, reason in skipped.items() if reason not in _BENIGN_AUTOMATIC_SKIPS}
+    if unexpected:
+        raise RuntimeError(f"automatic delivery for device {device_id} could not promote: {unexpected}")
+    if not selected_rows:
+        return
     await _create_apply_chain(db, device_id, selected_rows, None)
 
 

@@ -2068,6 +2068,33 @@ async def test_automatic_apply_refuses_store_only_removal(adapter_client):
             STORE_ONLY.reset(token)
 
 
+async def test_a_repeated_automatic_delivery_does_not_refuse_the_second_push(adapter_client):
+    """The second delivery of one push has nothing left to promote, which is not a refusal.
+
+    ``_selected_promotions`` reports it as ``already_authorized``. Raising on every skipped
+    selection turned that into a RuntimeError out of the intent PUT, so the delivery that
+    met an already-promoted push could never commit its own store write.
+    """
+    from nso_adapter.core.generation import create_automatic_apply
+
+    device_id = await seed_device(nso_device_name="automatic-retry", netbox_device_id=19969)
+    await seed_settings(device_id, auto_apply=True)
+    assert (await _put_vlans(adapter_client, device_id, [10, 20], seq=1)).status_code == 200
+    async with session() as db:
+        await create_automatic_apply(db, device_id, "vlan", 1)
+        await db.commit()
+    promoted = [generation.id for generation in await _generations(device_id)]
+    assert len(promoted) == 1
+
+    async with session() as db:
+        await create_automatic_apply(db, device_id, "vlan", 1)
+        await db.commit()
+
+    assert [generation.id for generation in await _generations(device_id)] == promoted, (
+        "the repeat promoted nothing a second time"
+    )
+
+
 async def test_apply_non_static_removal_carries_guarded_keys(adapter_client):
     """Composed non-static removals retain collateral-guard authority."""
     from nso_adapter.store.models import GenerationStatus
