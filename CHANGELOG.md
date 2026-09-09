@@ -2,6 +2,22 @@
 
 <!-- version list -->
 
+## v1.3.0 (2026-09-09)
+
+### Chores
+
+- **ci**: Bump python-semantic-release/python-semantic-release
+  ([`d9eb462`](https://github.com/marcinpsk/nso-adapter/commit/d9eb4626a7390fdcaa18569fd07a5343805bc83a))
+
+- **deps**: Bump ruff in the python-minor-patch group
+  ([`204ac4f`](https://github.com/marcinpsk/nso-adapter/commit/204ac4f8f1f6564f3a820b717d1754c6f92b24c3))
+
+### Testing
+
+- **api**: Prove a non-MAC LACP system-id replays through apply
+  ([`43c2c96`](https://github.com/marcinpsk/nso-adapter/commit/43c2c96dd8a5d55cd9dba30ab974d45e296a10da))
+
+
 ## v1.2.1 (2026-09-01)
 
 ### Bug Fixes
