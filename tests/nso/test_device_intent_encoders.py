@@ -14,6 +14,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -226,9 +227,62 @@ def test_every_read_family_resolves_to_the_residue_wire_name():
 # ── the purity rule the amendment states: encode(rows, frozen context) ───────────────
 
 
+def _apply_module() -> ast.Module:
+    """Parse ``nso/apply.py`` once; the encoder graph and its import bindings both read it."""
+    return ast.parse(Path(inspect.getfile(nso_apply)).read_text())
+
+
+def _import_bindings(module: ast.Module) -> dict[str, str]:
+    """Map every imported local name to the dotted path it binds.
+
+    ``import datetime`` binds ``datetime`` to ``datetime``; ``from datetime import datetime``
+    binds it to ``datetime.datetime``; ``from time import monotonic`` binds ``monotonic`` to
+    ``time.monotonic``. Function-local imports count, so a helper cannot hide one.
+    """
+    bindings: dict[str, str] = {}
+    for node in ast.walk(module):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                bindings[alias.asname or root] = alias.name if alias.asname else root
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            for alias in node.names:
+                bindings[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    return bindings
+
+
+def _dotted(node: ast.AST, bindings: dict[str, str]) -> str | None:
+    """Resolve a name/attribute chain to the imported dotted path it names, else ``None``.
+
+    The root must be an imported binding, so a field or local such as ``row.time`` or ``now``
+    resolves to nothing and is never flagged.
+    """
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    root = bindings.get(node.id)
+    if root is None:
+        return None
+    return ".".join([root, *reversed(parts)])
+
+
+def _impure_reads(node: ast.AST, bindings: dict[str, str]) -> list[str]:
+    """Return every impure API the body resolves to, in source order."""
+    found: list[str] = []
+    for child in ast.walk(node):
+        if isinstance(child, (ast.Name, ast.Attribute)):
+            resolved = _dotted(child, bindings)
+            if resolved in _IMPURE_APIS:
+                found.append(resolved)
+    return found
+
+
 def _encoder_call_graph() -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
     """Every module-level function in ``nso/apply.py`` an encoder can reach."""
-    module = ast.parse(Path(inspect.getfile(nso_apply)).read_text())
+    module = _apply_module()
     defined = {node.name: node for node in module.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
     reached: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
     pending = [entry.encode.__name__ for entry in section_registry().values()]
@@ -247,15 +301,18 @@ def _encoder_call_graph() -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
 
 
 #: Reading any of these makes a body a function of the process rather than of the document.
-_IMPURE_READS = {
-    ("os", "environ"),
-    ("os", "getenv"),
-    ("datetime", "now"),
-    ("datetime", "utcnow"),
-    ("date", "today"),
-    ("time", "time"),
-    ("time", "monotonic"),
-}
+#: Fully qualified, because the check resolves import bindings rather than trailing names.
+_IMPURE_APIS = frozenset(
+    {
+        "os.environ",
+        "os.getenv",
+        "datetime.datetime.now",
+        "datetime.datetime.utcnow",
+        "datetime.date.today",
+        "time.time",
+        "time.monotonic",
+    }
+)
 
 
 def test_no_encoder_reads_the_environment_the_clock_or_the_network():
@@ -265,6 +322,7 @@ def test_no_encoder_reads_the_environment_the_clock_or_the_network():
     would let two adapters encode one document differently, and a retry of a frozen
     generation send different bytes than the attempt it retries.
     """
+    bindings = _import_bindings(_apply_module())
     graph = _encoder_call_graph()
     assert {entry.encode.__name__ for entry in section_registry().values()} <= set(graph)
     impure: list[str] = []
@@ -274,13 +332,35 @@ def test_no_encoder_reads_the_environment_the_clock_or_the_network():
         for child in ast.walk(node):
             if isinstance(child, ast.Await):
                 impure.append(f"{name}: awaits, so it can reach the network")
-            if (
-                isinstance(child, ast.Attribute)
-                and isinstance(child.value, ast.Name)
-                and (child.value.id, child.attr) in _IMPURE_READS
-            ):
-                impure.append(f"{name}: reads {child.value.id}.{child.attr}")
+        impure.extend(f"{name}: reads {api}" for api in _impure_reads(node, bindings))
     assert not impure, impure
+
+
+def test_the_purity_check_resolves_import_bindings():
+    """A trailing-name match missed both of these forms and could flag ordinary fields."""
+    source = textwrap.dedent(
+        """
+        import datetime
+        from time import monotonic
+
+        def nested_clock():
+            return datetime.datetime.now()
+
+        def bare_binding():
+            return monotonic()
+
+        def innocent(row):
+            now = row.time
+            return now
+        """
+    )
+    module = ast.parse(source)
+    bindings = _import_bindings(module)
+    functions = {node.name: node for node in module.body if isinstance(node, ast.FunctionDef)}
+
+    assert _impure_reads(functions["nested_clock"], bindings) == ["datetime.datetime.now"]
+    assert _impure_reads(functions["bare_binding"], bindings) == ["time.monotonic"]
+    assert _impure_reads(functions["innocent"], bindings) == []
 
 
 def test_static_route_legacy_body_paths_are_deleted():
