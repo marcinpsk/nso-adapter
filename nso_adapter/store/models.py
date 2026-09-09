@@ -217,6 +217,12 @@ class Device(Base):
     switchports: Mapped[list[DeviceSwitchport]] = relationship(
         "DeviceSwitchport", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
+    lag_bundle_intents: Mapped[list[LagBundleIntent]] = relationship(
+        "LagBundleIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
+    )
+    switchport_intents: Mapped[list[SwitchportIntent]] = relationship(
+        "SwitchportIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
+    )
     static_route_intents: Mapped[list[StaticRouteIntent]] = relationship(
         "StaticRouteIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
@@ -543,7 +549,18 @@ class DeviceProjectionStream(Base):
     """
 
     __tablename__ = "device_projection_stream"
-    __table_args__ = (UniqueConstraint("device_id", "stream", name="uq_projection_stream"),)
+    __table_args__ = (
+        UniqueConstraint("device_id", "stream", name="uq_projection_stream"),
+        CheckConstraint(
+            "(prepared_revision IS NULL AND prepared_tables IS NULL AND prepared_deletions IS NULL) OR "
+            "(prepared_revision IS NOT NULL AND prepared_tables IS NOT NULL AND prepared_deletions IS NOT NULL)",
+            name="ck_projection_stream_prepared_slot",
+        ),
+        CheckConstraint(
+            "prepared_revision IS NULL OR (prepared_revision > 0 AND prepared_revision <= desired_revision)",
+            name="ck_projection_stream_prepared_revision",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     device_id: Mapped[int] = mapped_column(
@@ -561,6 +578,15 @@ class DeviceProjectionStream(Base):
     #: NULL until the stream is promoted once — an unpromoted lane has nothing on the device
     #: the adapter authorized, so it contributes nothing.
     authorized_document: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    #: The PREPARED SLOT of an out-of-protocol stream (#1612): the snapshot one Apply POST
+    #: stored, the revision that selects it, and the deletion provenance resolved against the
+    #: authorized roots at that moment. The three are null together or present together, and a
+    #: present revision is one this device really reached, so a slot can never name a state no
+    #: write stands behind. Tables ONLY, with no execution metadata: the fragment is frozen at
+    #: authorization, inside the Apply that promotes it.
+    prepared_revision: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    prepared_tables: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    prepared_deletions: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
 
@@ -965,6 +991,77 @@ class LagMemberConfig(Base):
     bundle: Mapped[LagBundleConfig] = relationship("LagBundleConfig", back_populates="members")
 
 
+class LagBundleIntent(Base):
+    """Write-owned desired state for one LAG bundle."""
+
+    __tablename__ = "lag_bundle_intent"
+    __table_args__ = (
+        UniqueConstraint("device_id", "name", name="uq_lag_bundle_intent_identity"),
+        UniqueConstraint(
+            "device_id", "lag_id", name="uq_lag_bundle_intent_device_lag", deferrable=True, initially="DEFERRED"
+        ),
+        CheckConstraint(
+            "lag_id IS NULL OR lag_id BETWEEN 0 AND 4294967295",
+            name="ck_lag_bundle_intent_lag_id_uint32",
+        ),
+        CheckConstraint(
+            "min_links IS NULL OR min_links BETWEEN 0 AND 65535",
+            name="ck_lag_bundle_intent_min_links_uint16",
+        ),
+        CheckConstraint(
+            "system_priority IS NULL OR system_priority BETWEEN 0 AND 65535",
+            name="ck_lag_bundle_intent_system_priority_uint16",
+        ),
+        CheckConstraint(
+            "admin_key IS NULL OR admin_key BETWEEN 0 AND 65535",
+            name="ck_lag_bundle_intent_admin_key_uint16",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    lag_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    min_links: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    system_priority: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    system_id: Mapped[str | None] = mapped_column(String(17), nullable=True)
+    timer: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    admin_key: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    accepted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_error: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+
+    device: Mapped[Device] = relationship("Device", back_populates="lag_bundle_intents")
+    members: Mapped[list[LagMemberIntent]] = relationship(
+        "LagMemberIntent", back_populates="bundle", cascade="all, delete-orphan", lazy="raise"
+    )
+
+
+class LagMemberIntent(Base):
+    """Write-owned desired state for one member of a LAG bundle."""
+
+    __tablename__ = "lag_member_intent"
+    __table_args__ = (
+        UniqueConstraint("lag_bundle_id", "interface_name", name="uq_lag_member_intent_identity"),
+        CheckConstraint(
+            "port_priority IS NULL OR port_priority BETWEEN 0 AND 65535",
+            name="ck_lag_member_intent_port_priority_uint16",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    lag_bundle_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("lag_bundle_intent.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    interface_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    port_priority: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    bundle: Mapped[LagBundleIntent] = relationship("LagBundleIntent", back_populates="members")
+
+
 class DeviceVlan(Base):
     """Read mirror of a device's VLAN database. Full-replace per refresh."""
 
@@ -999,6 +1096,59 @@ class VlanIntent(Base):
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     device: Mapped[Device] = relationship("Device", back_populates="vlan_intents")
+
+
+class SwitchportIntent(Base):
+    """Write-owned desired state for one L2 switchport."""
+
+    __tablename__ = "switchport_intent"
+    __table_args__ = (
+        UniqueConstraint("device_id", "interface_name", name="uq_switchport_intent_identity"),
+        CheckConstraint(
+            "untagged_vlan IS NULL OR untagged_vlan BETWEEN 0 AND 65535",
+            name="ck_switchport_intent_untagged_vlan_uint16",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    interface_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    untagged_vlan: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    accepted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_error: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+
+    device: Mapped[Device] = relationship("Device", back_populates="switchport_intents")
+    tagged_vlans: Mapped[list[SwitchportTaggedVlanIntent]] = relationship(
+        "SwitchportTaggedVlanIntent",
+        back_populates="switchport",
+        cascade="all, delete-orphan",
+        lazy="raise",
+    )
+
+
+class SwitchportTaggedVlanIntent(Base):
+    """One tagged VLAN leaf-list value owned by a switchport intent."""
+
+    __tablename__ = "switchport_tagged_vlan_intent"
+    __table_args__ = (
+        UniqueConstraint("switchport_id", "vlan_id", name="uq_switchport_tagged_vlan_intent_identity"),
+        CheckConstraint(
+            "vlan_id BETWEEN 0 AND 65535",
+            name="ck_switchport_tagged_vlan_intent_vlan_id_uint16",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    switchport_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("switchport_intent.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    vlan_id: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    switchport: Mapped[SwitchportIntent] = relationship("SwitchportIntent", back_populates="tagged_vlans")
 
 
 class DeviceSwitchport(Base):

@@ -28,6 +28,10 @@
   `adapter_token` on **both** sides (plugin env `NSO_ADAPTER_TOKEN` →
   `PLUGINS_CONFIG["netbox_nso_plugin"]["adapter_token"]`; adapter config
   `api.adapter_token_ref`). Missing/invalid → `401`.
+- **API documentation:** `/docs`, `/redoc` and `/openapi.json` are off by default
+  and answer `404`; the `ENABLE_API_DOCS=1` env setting registers them and then
+  serves the schema and the two UI pages without authentication, because a browser
+  cannot send a bearer header.
 - Timestamps: ISO-8601 UTC.
 - Async operations return a **job**; the consumer polls `GET /jobs/{id}`.
 - **`X-Store-Incarnation`** is set on every `200` from `GET /api/v1/jobs`. It carries the
@@ -818,9 +822,9 @@ do not otherwise refuse these barrier actions.
 
 ### `POST /api/v1/devices/{id}/actions/apply` (A3)
 
-Atomically promote the exact intent pushes selected by the caller and enqueue their
-immutable deployment-generation chain. The selector maps the adapter's receipt stream name
-to the `X-Push-Seq` that the plugin drained:
+Atomically promote the exact intent selected by the caller and enqueue its immutable
+deployment-generation chain. For the sixteen receipt lanes, the selector maps the stream
+name to the `X-Push-Seq` that the plugin drained:
 
 ```json
 {
@@ -847,12 +851,13 @@ creates no generation or job. Reusing the UUID with a different device or select
 `409 conflict`; `error.detail.mismatch` is `device_id` or `selected`. The conflict changes
 nothing.
 
-The selector uses push sequences, not current revisions, because the plugin already owns
-these values in its drain bookkeeping and the adapter receipts use the same identity. A
-selected sequence is a strict integer in the receipt domain `1..2^63-1`. A value outside
-that domain returns `422 validation_error`.
+The receipt lanes use push sequences because the plugin owns these values in its drain
+bookkeeping. The out-of-protocol `lag` and `switchport` streams use the `selection_revision`
+returned by their preparation POST. A store-only POST returns no selection revision.
+Each selected value is a strict integer in `1..2^63-1`. A value outside that domain
+returns `422 validation_error`.
 
-A stream is promotable only when its latest durable receipt and projection row both match the
+A receipt lane is promotable only when its latest durable receipt and projection row both match the
 selected sequence. A later push never rides an earlier selection. Every stale selection is
 reported under `skipped`: `superseded` for an older sequence, `already_applied` when its
 revision settled, `already_authorized` when its generation is still unsettled or was
@@ -861,6 +866,21 @@ matching receipt was admitted in backfill-only mode, and `revision_mismatch` whe
 receipt matches but the projection row does not. `backfill_only` is terminal for that
 sequence: the receipt exists and holds it, but a backfill repairs correlation only, so no
 retry of the same selection can promote it.
+
+For a prepared stream, `no_prepared_revision` means the selected revision has no matching
+prepared slot. It is terminal for the selected revision. Prepare a new snapshot and select
+its returned revision. `awaiting_aggregate_sender` means the section has no device sender.
+It is retryable after the aggregate sender becomes available. On this branch, `lag` and
+`switchport` always return this reason before the adapter checks their prepared revisions.
+The adapter preserves their prepared slots and creates no generation or job for them.
+
+`superseded` and `backfill_only` require a new selection. `already_applied` needs no further
+work. `already_authorized` leaves recovery to the owning generation's retry or abandon action.
+`no_receipt` can be retried after the matching receipt arrives. `revision_mismatch` requires
+the receipt and projection state to match before a retry can promote it.
+Use a new `apply_attempt_id` to re-evaluate a retryable skip. The same UUID replays the stored
+response, even after the sender or stored state changes.
+
 `skipped_detail` is keyed by stream; only its CONTENT is conditional — the key itself is
 always present. It identifies the generation for
 each `already_authorized` skip whose owning generation can be identified. Each member has
@@ -942,9 +962,12 @@ and an identical retry replays it. Reasons are stable machine codes:
 - `unresolved_interface_identity`
 <!-- apply-unexecutable-reasons:end -->
 
-The manual-Apply boundary is exactly `DOCUMENT_EXECUTED_SECTIONS`. It contains every section,
-so all sixteen streams are executable through `ACTION_APPLY_EXECUTABLE_SECTIONS`. SNMP
-documents store Vault references verbatim. The SNMP writer reads those references from the
+The registry contains eighteen streams: sixteen endpoint receipt lanes and the out-of-protocol
+`lag` and `switchport` streams. They compose sixteen document sections. The manual-Apply
+execution boundary is `ACTION_APPLY_EXECUTABLE_SECTIONS`, which equals
+`DOCUMENT_EXECUTED_SECTIONS`. Its fourteen sections cover the sixteen receipt lanes.
+The two switching sections remain in `AWAITING_SENDER_SECTIONS` and are not executable.
+SNMP documents store Vault references verbatim. The SNMP writer reads those references from the
 hydrated rows when it builds the send body. BGP documents store the router, scope,
 address-family, peer, and peer address-family tables. The hydrator rebuilds their relationship
 graph from durable parent identities before the writer walks it. Static-route documents also
@@ -985,8 +1008,8 @@ Preview the per-scope **native device diff** the next Apply would push (NSO
 reconcile param makes the preview match the real reconcile commit). Synchronous —
 no job. `diffs` maps
 scope → native delta; scopes already in sync yield an empty delta and are
-omitted. LAG/switchport have no preview (pushed out-of-band by the plugin,
-not from the intent store).
+omitted. LAG and switchport have no preview until the aggregate document writer
+consumes their durable snapshots.
 
 ```json
 { "device_id": 1,
@@ -2338,10 +2361,15 @@ Every `PUT /api/v1/devices/{id}/*-intent` endpoint below (and `vlan-intent`,
 - Storing intent **never touches the device synchronously**. If `auto_apply` is enabled in
   the device settings, an ordinary non-store-only PUT enqueues the scope's apply job.
   Otherwise the intent remains stored in the mirror.
-- Explicit `actions/apply` promotes every section through `DOCUMENT_EXECUTED_SECTIONS`, so
-  all sixteen streams are executable from their stored generation documents. Use a new
-  `X-Push-Seq` when resending a stored payload because receipt replay returns the recorded
-  response without new work.
+- Explicit `actions/apply` can execute the sixteen receipt lanes through the fourteen
+  sections in `DOCUMENT_EXECUTED_SECTIONS`. The registry also contains `lag` and `switchport`.
+  These two streams remain in `AWAITING_SENDER_SECTIONS` and return
+  `awaiting_aggregate_sender`. Resending a receipt-lane payload has two distinct meanings,
+  and `X-Push-Seq` is what separates them. To recover a lost response, replay the ORIGINAL
+  sequence with the same body and the same request modes: that is a replay, and it returns
+  the recorded response without new work. A different body or mode under that sequence is
+  `409 sequence_reuse`. Use a NEW sequence only to authorize the payload again as fresh
+  work, because a higher sequence is admitted as a new delivery.
 - Where dropping a row from a keyed NSO service list requires it, the adapter
   queues an async removal job (see [Removal propagation](#removal-propagation)).
 - → `200` `{ "device_id": 1, "count": <rows stored>, "removed": <rows dropped> }`.
@@ -2438,18 +2466,51 @@ member `mode`/`port_priority`.
   ] }
 ```
 
-### `POST /api/v1/devices/{id}/lag-config/apply` → `200 | 404`
+### `POST /api/v1/devices/{id}/lag-config/apply` → `200 | 404 | 422`
 
-Synchronous direct apply (NOT the intent-mirror pattern — LAG is owned in
-NetBox and applied via the `lag-reconciler` service immediately). Body =
-the GET `bundles` shape.
+Claim-less full-snapshot PREPARATION of desired LAG state. Body = the GET
+`bundles` shape, excluding read-only `vpc_sensitive`, plus a required
+`deleted_roots`. `lag_id` stays required and is a strict `uint32`; optional LAG
+integer leaves are strict `uint16`. Bundle names, LAG IDs, and member interface
+names must be unique within the request.
 
 ```json
-{ "status": "deployed", "device": "lab01c-ra1", "bundle_count": 1 }
+{ "bundles": [ { "name": "lag-2", "lag_id": 2 } ], "deleted_roots": ["lag-1"] }
 ```
 
-`status: "error"` (with `error`/`message`/`detail`) on NSO failure — the
-HTTP status stays 200; callers check `status`.
+```json
+{ "status": "prepared", "device_id": 1, "stream": "lag", "count": 1,
+  "removed": 1, "desired_revision": 4, "selection_revision": 4 }
+```
+
+The POST prepares; the manual Apply authorizes. It stores the snapshot
+atomically, does not contact NSO, does not accept `X-Push-Seq`, and creates no
+receipt, generation or job. It DOES record one projection revision, and a normal
+request additionally records the prepared snapshot an Apply can select:
+`selection_revision` is that selection identity, and it is the integer to pass
+in the Apply's `selected` map. A `?store_only=true` request answers `stored`
+with `"selection_revision": null` and preserves the previously prepared
+snapshot, so an Apply selecting that revision still promotes what was prepared.
+
+`deleted_roots` names the bundle roots this preparation authorizes RETRACTING
+from the device; every other authorized root the snapshot omits detaches
+instead. It is required, an explicit empty list included, and it is validated
+against the AUTHORIZED roots: a repeated root, a root the snapshot still
+carries, and a root this device has not authorized are each a 422 that leaves
+the store and every revision untouched. `?delete_origin=true` and
+`?backfill_only=true` are a 422 here. A store-only request validates
+`deleted_roots` the same way and then records no provenance at all, because it
+authorizes nothing.
+
+The required `deleted_roots` field and the response fields beside it ship with
+the plugin's switching-delivery change, in the same version: the three
+repositories of this integration move together at 1.0, so there is no
+partial-rollout window and no older client to keep working. A request that omits
+the field is a coding error, and the 422 says so.
+
+`count` is the number of bundle roots now stored. `removed` is the number of
+previous bundle roots omitted by the replacement. Non-2xx responses use the
+standard error envelope.
 
 ---
 
@@ -2464,8 +2525,8 @@ HTTP status stays 200; callers check `status`.
 
 ### `GET /api/v1/devices/{id}/switchport` → `200 | 404`
 
-L2 switchport read-mirror. `mode` ∈ `access` · `trunk` · `""` (unset);
-`untagged_vlan` nullable int; `tagged_vlans` sorted list of ints.
+L2 switchport read-mirror. `mode` ∈ `access` · `trunk` · `trunk-all` · `""`
+(unset); `untagged_vlan` nullable int; `tagged_vlans` sorted list of ints.
 
 ```json
 { "device_id": 1,
@@ -2475,15 +2536,26 @@ L2 switchport read-mirror. `mode` ∈ `access` · `trunk` · `""` (unset);
   ] }
 ```
 
-### `POST /api/v1/devices/{id}/switchport/apply` → `200 | 404`
+### `POST /api/v1/devices/{id}/switchport/apply` → `200 | 404 | 422`
 
-Synchronous direct apply (like `lag-config/apply` — switchport is owned in
-NetBox, not mirrored as adapter intent). Body = `{ "interfaces": [...] }`
-with the GET row shape minus `source`.
+Claim-less full-snapshot PREPARATION of desired switchport state. Body =
+`{ "interfaces": [...], "deleted_roots": [...] }` with the GET row shape minus
+`source`. `mode` is the closed vocabulary `access` · `trunk` · `trunk-all` · `""`,
+where `trunk-all` is NetBox's `tagged-all`. VLAN values are strict `uint16`; interface names and each interface's
+tagged VLAN values must be unique within the request.
 
 ```json
-{ "status": "deployed", "device": "sw03", "interface_count": 2 }
+{ "status": "prepared", "device_id": 1, "stream": "switchport", "count": 2,
+  "removed": 0, "desired_revision": 1, "selection_revision": 1 }
 ```
+
+The POST prepares and the manual Apply authorizes, with the same response
+fields, the same `deleted_roots` rules, the same store-only behaviour and the
+same version coupling as `POST .../lag-config/apply` above; `deleted_roots`
+names switchport interface roots. The endpoint stores scalar VLAN values independently of the
+refresh-owned VLAN mirror and does not contact NSO. It creates no receipt,
+generation or job. `count` and `removed` describe top-level switchport roots.
+Non-2xx responses use the standard error envelope.
 
 ### `PUT /api/v1/devices/{id}/vlan-intent` → `200 | 404`
 

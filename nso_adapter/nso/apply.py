@@ -902,10 +902,6 @@ _MTU_SERVICE_PATH = "/restconf/data/mtu-reconciler:mtu-config"
 # RESTCONF path to the l2-sap-reconciler service list
 _L2_SAP_SERVICE_PATH = "/restconf/data/l2-sap-reconciler:l2-sap-config"
 
-_LAG_SERVICE_PATH = "/restconf/data/lag-reconciler:lag-config"
-
-_SWITCHPORT_SERVICE_PATH = "/restconf/data/switchport-reconciler:switchport-config"
-
 # RESTCONF path to the isis-reconciler service list
 _ISIS_SERVICE_PATH = "/restconf/data/isis-reconciler:isis-config"
 
@@ -1417,70 +1413,6 @@ async def apply_l2_saps(
         device_name,
         {"device": device_name, "sap": saps},
         scope="l2_sap",
-        replace=replace,
-        dry_run=dry_run,
-        stage=stage,
-    )
-
-
-async def apply_lag_config(
-    client: NsoClient,
-    device_name: str,
-    bundles: list[dict],
-    *,
-    replace: bool = False,
-    dry_run: bool | str = False,
-    stage: dict[str, list] | None = None,
-) -> str | None:
-    """Write LACP/LAG bundle intent for a single device to NSO.
-
-    Builds a full lag-reconciler body from the supplied bundle dicts and commits in
-    reconcile mode so pre-existing LAGs are adopted. ``replace=True`` PUT-replaces the
-    keyed instance so removed bundles are reverted (the plugin force-pushes the full
-    owned snapshot, so the input is already the full desired state).
-
-    Each bundle dict uses YANG-style keys: ``name`` (key), ``lag-id``,
-    optional ``min-links``/``system-priority``/``system-id``/``timer``/
-    ``admin-key``, and ``member`` (list of ``interface-name`` + optional
-    ``mode``/``port-priority``).
-    """
-    return await _send_service_config(
-        client,
-        _LAG_SERVICE_PATH,
-        "lag-reconciler:lag-config",
-        device_name,
-        {"device": device_name, "bundle": bundles},
-        scope="lag",
-        replace=replace,
-        dry_run=dry_run,
-        stage=stage,
-    )
-
-
-async def apply_switchport_config(
-    client: NsoClient,
-    device_name: str,
-    interfaces: list[dict],
-    *,
-    replace: bool = False,
-    dry_run: bool | str = False,
-    stage: dict[str, list] | None = None,
-) -> str | None:
-    """Write L2 switchport intent for a single device to NSO.
-
-    Builds a full switchport-reconciler body and commits in reconcile mode. Each
-    interface dict uses YANG-style keys: ``interface-name`` (key), optional ``mode``
-    (access|trunk|trunk-all), ``untagged-vlan``, and ``tagged-vlan`` (list of ids).
-    ``replace=True`` PUT-replaces the keyed instance so removed switchports are
-    reverted (the plugin force-pushes the full owned snapshot).
-    """
-    return await _send_service_config(
-        client,
-        _SWITCHPORT_SERVICE_PATH,
-        "switchport-reconciler:switchport-config",
-        device_name,
-        {"device": device_name, "interface": interfaces},
-        scope="switchport",
         replace=replace,
         dry_run=dry_run,
         stage=stage,

@@ -134,7 +134,9 @@
                 "already_authorized",
                 "no_receipt",
                 "backfill_only",
-                "revision_mismatch"
+                "revision_mismatch",
+                "no_prepared_revision",
+                "awaiting_aggregate_sender"
               ],
               "type": "string"
             },
@@ -5398,10 +5400,13 @@
         "type": "object"
       },
       "LagBundleApply": {
+        "additionalProperties": false,
         "properties": {
           "admin_key": {
             "anyOf": [
               {
+                "maximum": 65535.0,
+                "minimum": 0.0,
                 "type": "integer"
               },
               {
@@ -5411,11 +5416,12 @@
             "title": "Admin Key"
           },
           "lag_id": {
+            "maximum": 4294967295.0,
+            "minimum": 0.0,
             "title": "Lag Id",
             "type": "integer"
           },
           "members": {
-            "default": [],
             "items": {
               "$ref": "#/components/schemas/LagMemberApply"
             },
@@ -5425,6 +5431,8 @@
           "min_links": {
             "anyOf": [
               {
+                "maximum": 65535.0,
+                "minimum": 0.0,
                 "type": "integer"
               },
               {
@@ -5434,12 +5442,15 @@
             "title": "Min Links"
           },
           "name": {
+            "maxLength": 128,
+            "minLength": 1,
             "title": "Name",
             "type": "string"
           },
           "system_id": {
             "anyOf": [
               {
+                "maxLength": 17,
                 "type": "string"
               },
               {
@@ -5451,6 +5462,8 @@
           "system_priority": {
             "anyOf": [
               {
+                "maximum": 65535.0,
+                "minimum": 0.0,
                 "type": "integer"
               },
               {
@@ -5462,6 +5475,7 @@
           "timer": {
             "anyOf": [
               {
+                "maxLength": 8,
                 "type": "string"
               },
               {
@@ -5564,77 +5578,30 @@
         "title": "LagBundleOut",
         "type": "object"
       },
-      "LagConfigApplyDeployed": {
-        "properties": {
-          "bundle_count": {
-            "title": "Bundle Count",
-            "type": "integer"
-          },
-          "device": {
-            "title": "Device",
-            "type": "string"
-          },
-          "status": {
-            "const": "deployed",
-            "title": "Status",
-            "type": "string"
-          }
-        },
-        "required": [
-          "status",
-          "device",
-          "bundle_count"
-        ],
-        "title": "LagConfigApplyDeployed",
-        "type": "object"
-      },
-      "LagConfigApplyError": {
-        "properties": {
-          "detail": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Detail"
-          },
-          "error": {
-            "title": "Error",
-            "type": "string"
-          },
-          "message": {
-            "title": "Message",
-            "type": "string"
-          },
-          "status": {
-            "const": "error",
-            "title": "Status",
-            "type": "string"
-          }
-        },
-        "required": [
-          "status",
-          "error",
-          "message"
-        ],
-        "title": "LagConfigApplyError",
-        "type": "object"
-      },
       "LagConfigApplyRequest": {
+        "additionalProperties": false,
         "properties": {
           "bundles": {
-            "default": [],
             "items": {
               "$ref": "#/components/schemas/LagBundleApply"
             },
             "title": "Bundles",
             "type": "array"
+          },
+          "deleted_roots": {
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Deleted Roots",
+            "type": "array"
           }
         },
+        "required": [
+          "bundles",
+          "deleted_roots"
+        ],
         "title": "LagConfigApplyRequest",
         "type": "object"
       },
@@ -5680,14 +5647,18 @@
         "type": "object"
       },
       "LagMemberApply": {
+        "additionalProperties": false,
         "properties": {
           "interface_name": {
+            "maxLength": 128,
+            "minLength": 1,
             "title": "Interface Name",
             "type": "string"
           },
           "mode": {
             "anyOf": [
               {
+                "maxLength": 16,
                 "type": "string"
               },
               {
@@ -5699,6 +5670,8 @@
           "port_priority": {
             "anyOf": [
               {
+                "maximum": 65535.0,
+                "minimum": 0.0,
                 "type": "integer"
               },
               {
@@ -8611,6 +8584,61 @@
         "title": "StaticRoutesOut",
         "type": "object"
       },
+      "StoredIntentResult": {
+        "description": "Truthful result for a claim-less full-snapshot store write (#1612).\n\n``prepared`` says the snapshot is stored and SELECTABLE by a manual Apply; ``stored``\nsays a store-only replacement landed and prepared nothing. Neither word claims\nauthorization: only Apply authorizes, and only Apply reports deployment.\n``selection_revision`` is the whole selection identity, and it is null for ``stored``.",
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "desired_revision": {
+            "title": "Desired Revision",
+            "type": "integer"
+          },
+          "device_id": {
+            "title": "Device Id",
+            "type": "integer"
+          },
+          "removed": {
+            "title": "Removed",
+            "type": "integer"
+          },
+          "selection_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selection Revision"
+          },
+          "status": {
+            "enum": [
+              "prepared",
+              "stored"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "stream": {
+            "title": "Stream",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "device_id",
+          "stream",
+          "count",
+          "removed",
+          "desired_revision",
+          "selection_revision"
+        ],
+        "title": "StoredIntentResult",
+        "type": "object"
+      },
       "SubinterfaceEntry": {
         "properties": {
           "accepted_at": {
@@ -8870,14 +8898,23 @@
         "type": "object"
       },
       "SwitchportApply": {
+        "additionalProperties": false,
         "properties": {
           "interface_name": {
+            "maxLength": 128,
+            "minLength": 1,
             "title": "Interface Name",
             "type": "string"
           },
           "mode": {
             "anyOf": [
               {
+                "enum": [
+                  "access",
+                  "trunk",
+                  "trunk-all",
+                  ""
+                ],
                 "type": "string"
               },
               {
@@ -8887,8 +8924,9 @@
             "title": "Mode"
           },
           "tagged_vlans": {
-            "default": [],
             "items": {
+              "maximum": 65535.0,
+              "minimum": 0.0,
               "type": "integer"
             },
             "title": "Tagged Vlans",
@@ -8897,6 +8935,8 @@
           "untagged_vlan": {
             "anyOf": [
               {
+                "maximum": 65535.0,
+                "minimum": 0.0,
                 "type": "integer"
               },
               {
@@ -8912,70 +8952,19 @@
         "title": "SwitchportApply",
         "type": "object"
       },
-      "SwitchportApplyDeployed": {
-        "properties": {
-          "device": {
-            "title": "Device",
-            "type": "string"
-          },
-          "interface_count": {
-            "title": "Interface Count",
-            "type": "integer"
-          },
-          "status": {
-            "const": "deployed",
-            "title": "Status",
-            "type": "string"
-          }
-        },
-        "required": [
-          "status",
-          "device",
-          "interface_count"
-        ],
-        "title": "SwitchportApplyDeployed",
-        "type": "object"
-      },
-      "SwitchportApplyError": {
-        "properties": {
-          "detail": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Detail"
-          },
-          "error": {
-            "title": "Error",
-            "type": "string"
-          },
-          "message": {
-            "title": "Message",
-            "type": "string"
-          },
-          "status": {
-            "const": "error",
-            "title": "Status",
-            "type": "string"
-          }
-        },
-        "required": [
-          "status",
-          "error",
-          "message"
-        ],
-        "title": "SwitchportApplyError",
-        "type": "object"
-      },
       "SwitchportApplyRequest": {
+        "additionalProperties": false,
         "properties": {
+          "deleted_roots": {
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Deleted Roots",
+            "type": "array"
+          },
           "interfaces": {
-            "default": [],
             "items": {
               "$ref": "#/components/schemas/SwitchportApply"
             },
@@ -8983,6 +8972,10 @@
             "type": "array"
           }
         },
+        "required": [
+          "interfaces",
+          "deleted_roots"
+        ],
         "title": "SwitchportApplyRequest",
         "type": "object"
       },
@@ -12630,19 +12623,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/LagConfigApplyDeployed"
-                    },
-                    {
-                      "$ref": "#/components/schemas/LagConfigApplyError"
-                    }
-                  ],
-                  "title": "Response 200 Apply Lag Config Api V1 Devices  Device Id  Lag Config Apply Post"
+                  "$ref": "#/components/schemas/StoredIntentResult"
                 }
               }
             },
-            "description": "Apply result envelope (deployed | error)"
+            "description": "Successful Response"
           },
           "401": {
             "content": {
@@ -14710,19 +14695,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/SwitchportApplyDeployed"
-                    },
-                    {
-                      "$ref": "#/components/schemas/SwitchportApplyError"
-                    }
-                  ],
-                  "title": "Response 200 Apply Switchport Api V1 Devices  Device Id  Switchport Apply Post"
+                  "$ref": "#/components/schemas/StoredIntentResult"
                 }
               }
             },
-            "description": "Apply result envelope (deployed | error)"
+            "description": "Successful Response"
           },
           "401": {
             "content": {
@@ -15685,11 +15662,17 @@
             "description": "Successful Response"
           }
         },
+        "security": [],
         "summary": "Healthz",
         "tags": [
           "health"
         ]
       }
     }
-  }
+  },
+  "security": [
+    {
+      "_OptionalBearer": []
+    }
+  ]
 }

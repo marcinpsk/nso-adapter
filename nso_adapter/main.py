@@ -57,6 +57,7 @@ from nso_adapter.api.vlan import router as vlan_router
 from nso_adapter.config import get_config, get_env_settings
 from nso_adapter.core.generation import ApplyUnexecutable, DeviceProjectionGone
 from nso_adapter.core.importer import register_nso_client, set_netbox_client
+from nso_adapter.core.projection import projection_streams
 from nso_adapter.core.receipt import PromotionProvenanceUnexecutable
 from nso_adapter.core.request_flags import (
     BACKFILL_ONLY,
@@ -75,6 +76,60 @@ from nso_adapter.secrets import make_provider
 from nso_adapter.store.db import get_engine, init_db, session
 
 logger = structlog.get_logger(__name__)
+
+
+def _unauthenticated_paths(app: FastAPI) -> frozenset[str]:
+    """Return the route paths that reach their handler without the bearer dependency.
+
+    Derived from the routes rather than listed, so an endpoint that forgets
+    :func:`api.deps.verify_token` changes this set instead of quietly inheriting a
+    requirement the runtime does not enforce.
+    """
+    from fastapi.routing import iter_route_contexts
+
+    from nso_adapter.api.deps import verify_token
+
+    def dependencies(dependant):
+        for dependency in dependant.dependencies:
+            yield dependency.call
+            yield from dependencies(dependency)
+
+    # iter_route_contexts flattens the included routers; app.routes holds their wrappers.
+    exempt: set[str] = set()
+    for route in iter_route_contexts(app.routes):
+        dependant = getattr(route, "dependant", None)
+        if dependant is None or route.path is None:
+            continue
+        if verify_token not in set(dependencies(dependant)):
+            exempt.add(route.path)
+    return frozenset(exempt)
+
+
+def _declare_bearer_requirement(app: FastAPI) -> None:
+    """State in the DOCUMENT what the app enforces at runtime.
+
+    FastAPI declares the scheme per operation, but a generated client reading only the
+    document root sends no ``Authorization`` header and gets a 401 the schema never
+    explained. The global requirement says it once; the endpoints that genuinely take no
+    token opt out with an empty one.
+    """
+    generated_openapi = app.openapi
+
+    def openapi():
+        schema = generated_openapi()
+        if "security" in schema:
+            return schema
+        schemes = schema.get("components", {}).get("securitySchemes", {})
+        if not schemes:  # pragma: no cover - the bearer dependency always registers one
+            return schema
+        schema["security"] = [{name: [] for name in schemes}]
+        for path in _unauthenticated_paths(app):
+            for operation in schema["paths"].get(path, {}).values():
+                if isinstance(operation, dict):
+                    operation["security"] = []
+        return schema
+
+    app.openapi = openapi  # type: ignore[method-assign]
 
 
 def _preserve_exact_openapi_integer_bounds(app: FastAPI) -> None:
@@ -364,6 +419,9 @@ async def lifespan(app: FastAPI):
     )
 
     provider = _init_secrets(app, cfg, env)
+    # Fail the boot, not the first write: a stream with no tables or an endpoint with no
+    # stream is a wiring bug, and this validates the whole projection registry once.
+    projection_streams()
     await _init_database(cfg)
 
     nso_clients = _build_nso_clients(cfg, provider)
@@ -394,7 +452,17 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="NSO Adapter", version=__version__, lifespan=lifespan)
+    # A browser cannot send a bearer header, so the documentation routes are opt-in and
+    # serve everybody once ENABLE_API_DOCS turns them on.
+    api_docs = get_env_settings().enable_api_docs
+    app = FastAPI(
+        title="NSO Adapter",
+        version=__version__,
+        lifespan=lifespan,
+        docs_url="/docs" if api_docs else None,
+        redoc_url="/redoc" if api_docs else None,
+        openapi_url="/openapi.json" if api_docs else None,
+    )
     app.add_exception_handler(ApiError, api_error_handler)
     app.add_exception_handler(StarletteHTTPException, framework_http_error_handler)
     app.add_exception_handler(RequestValidationError, validation_error_handler)
@@ -485,6 +553,7 @@ def create_app() -> FastAPI:
     app.include_router(jobs_router)
     app.include_router(config_router)
     _preserve_exact_openapi_integer_bounds(app)
+    _declare_bearer_requirement(app)
     return app
 
 

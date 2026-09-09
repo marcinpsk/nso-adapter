@@ -305,51 +305,6 @@ async def test_apply_l2_saps_nso_error_raises():
     assert exc_info.value.code == "nso_patch_failed"
 
 
-@pytest.mark.asyncio
-async def test_apply_lag_config_builds_patch_body():
-    """apply_lag_config PATCHes the lag-reconciler service with the bundle list."""
-    import json
-
-    from nso_adapter.nso.apply import apply_lag_config
-
-    client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(204))
-
-    bundles = [
-        {
-            "name": "Port-channel1",
-            "lag-id": 1,
-            "min-links": 2,
-            "member": [
-                {"interface-name": "GigabitEthernet0/1", "mode": "active", "port-priority": 200},
-            ],
-        }
-    ]
-    await apply_lag_config(client=client, device_name="sw03", bundles=bundles)
-
-    mock_http = client._client.return_value.__aenter__.return_value
-    (url,) = mock_http.patch.call_args[0]
-    assert "lag-reconciler" in url
-    payload = json.loads(mock_http.patch.call_args[1]["content"])
-    cfg = payload["lag-reconciler:lag-config"]
-    assert cfg[0]["device"] == "sw03"
-    assert cfg[0]["bundle"][0]["name"] == "Port-channel1"
-    assert cfg[0]["bundle"][0]["member"][0]["port-priority"] == 200
-
-
-@pytest.mark.asyncio
-async def test_apply_lag_config_nso_error_raises():
-    """Non-2xx NSO response from the LAG PATCH raises NsoApplyError."""
-    from nso_adapter.nso.apply import apply_lag_config
-
-    client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(409, json_data={"error": {}}))
-
-    with pytest.raises(NsoApplyError) as exc_info:
-        await apply_lag_config(client=client, device_name="sw03", bundles=[{"name": "Port-channel1", "lag-id": 1}])
-    assert exc_info.value.code == "nso_patch_failed"
-
-
 def test_nso_apply_error_str():
     """NsoApplyError carries code, message, and optional detail."""
     err = NsoApplyError("test_code", "test message", {"k": "v"})
@@ -491,42 +446,6 @@ async def test_apply_interface_ips_nso_error_raises():
 
     assert exc_info.value.code == "nso_patch_failed"
     assert "500" in exc_info.value.message
-
-
-@pytest.mark.asyncio
-async def test_apply_switchport_config_builds_patch_body():
-    """apply_switchport_config PATCHes switchport-reconciler with the interface list."""
-    import json
-
-    from nso_adapter.nso.apply import apply_switchport_config
-
-    client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(204))
-    ifaces = [
-        {"interface-name": "GigabitEthernet0/1", "mode": "access", "untagged-vlan": 10},
-        {"interface-name": "GigabitEthernet0/2", "mode": "trunk", "untagged-vlan": 99, "tagged-vlan": [20, 30]},
-    ]
-    await apply_switchport_config(client=client, device_name="sw03", interfaces=ifaces)
-
-    mock_http = client._client.return_value.__aenter__.return_value
-    (url,) = mock_http.patch.call_args[0]
-    assert "switchport-reconciler" in url
-    cfg = json.loads(mock_http.patch.call_args[1]["content"])["switchport-reconciler:switchport-config"]
-    assert cfg[0]["device"] == "sw03"
-    by = {i["interface-name"]: i for i in cfg[0]["interface"]}
-    assert by["GigabitEthernet0/1"]["mode"] == "access"
-    assert by["GigabitEthernet0/2"]["tagged-vlan"] == [20, 30]
-
-
-@pytest.mark.asyncio
-async def test_apply_switchport_config_nso_error_raises():
-    from nso_adapter.nso.apply import apply_switchport_config
-
-    client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(409, json_data={"error": {}}))
-    with pytest.raises(NsoApplyError) as exc_info:
-        await apply_switchport_config(client=client, device_name="sw03", interfaces=[{"interface-name": "Gi0/1"}])
-    assert exc_info.value.code == "nso_patch_failed"
 
 
 # ── Post-apply native dry-run verification (false-success guard) ────────────────
