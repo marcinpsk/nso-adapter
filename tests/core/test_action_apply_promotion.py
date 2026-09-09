@@ -2862,6 +2862,7 @@ _SHAPE = {
         "child_field": "interface_name",
         "child": lambda n: f"Gi0/{n}",
         "scalar": 7,
+        "scalar_field": "admin_key",
     },
     "switchport": {
         "path": "switchport/apply",
@@ -2872,6 +2873,7 @@ _SHAPE = {
         "child_field": "vlan_id",
         "child": lambda n: n,
         "scalar": "trunk",
+        "scalar_field": "mode",
     },
 }
 
@@ -3251,7 +3253,7 @@ async def test_a_retained_root_clear_beside_a_detach_is_not_refused(adapter_clie
         cleared = next(
             item for item in generation.document[stream][shape["root_table"]] if item[shape["root_field"]] == "A"
         )
-        assert cleared["admin_key" if stream == "lag" else "mode"] is None
+        assert cleared[shape["scalar_field"]] is None
 
 
 @pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
