@@ -200,15 +200,19 @@ def _resolve_deletions(
     authorized_children = rows_by_intent_identity(authorized, child_table)
     retained = _root_names(desired, root_table)
     desired_children = rows_by_intent_identity(desired, child_table)
+    # Indexed once: this runs under the projection lock, and a rescan per dropped root
+    # holds that lock for the product of the two request lists rather than their sum.
+    children_by_root: dict[str, list[dict]] = {}
+    for child_identity, child in authorized_children.items():
+        children_by_root.setdefault(child_identity[0], []).append(child)
     for identity, row in authorized_roots.items():
         root = identity[0]
         if root in retained:
             continue
         group = "delete_origin" if root in marked else "detach"
         groups[group].setdefault(root_table, []).append(deepcopy(row))
-        for child_identity, child in authorized_children.items():
-            if child_identity[0] == root:
-                groups[group].setdefault(child_table, []).append(deepcopy(child))
+        for child in children_by_root.get(root, ()):
+            groups[group].setdefault(child_table, []).append(deepcopy(child))
     for child_identity, child in authorized_children.items():
         if child_identity[0] in retained and child_identity not in desired_children:
             groups["owned_content"].setdefault(child_table, []).append(deepcopy(child))
