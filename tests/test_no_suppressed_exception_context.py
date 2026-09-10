@@ -99,6 +99,19 @@ def _none_aliases(tree: ast.Module) -> set[str]:
     return names
 
 
+def _terminal_call_name(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+    """The name a function's body ENDS in calling, when its last statement is that call."""
+    last = node.body[-1]
+    if not isinstance(last, ast.Expr):
+        return None
+    call = last.value
+    if isinstance(call, ast.Await):
+        call = call.value
+    if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
+        return call.func.id
+    return None
+
+
 def _always_raising_helpers(tree: ast.Module, none_aliases: set[str]) -> set[str]:
     """Functions whose CALL always raises AND attaches: the body ends in such a raise.
 
@@ -106,18 +119,35 @@ def _always_raising_helpers(tree: ast.Module, none_aliases: set[str]) -> set[str
     interpreter attaches the caught exception to it exactly as it would in the handler,
     and ``from None`` one frame down suppresses just as little — so the helper's raise is
     judged by the SAME cause classification as a raise written in the handler.
+
+    A function that ENDS in a call to such a helper is one itself: the raise runs one more
+    frame down and attaches exactly as much. Resolution repeats to a fixed point, so a
+    wrapper, a chain of them, and a wrapper around an alias all resolve to the same raise.
+    A function that can RETURN does not always raise, so it is never one.
     """
-    found: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or not node.body:
-            continue
-        last = node.body[-1]
-        if not isinstance(last, ast.Raise) or not _attaches_context(last, none_aliases):
-            continue
-        if any(isinstance(child, ast.Return) for child in ast.walk(node)):
-            continue
-        found.add(node.name)
-    return found
+    candidates = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.body
+        and not any(isinstance(child, ast.Return) for child in ast.walk(node))
+    ]
+    resolved = _helper_aliases(
+        tree,
+        {
+            node.name
+            for node in candidates
+            if isinstance(node.body[-1], ast.Raise) and _attaches_context(node.body[-1], none_aliases)
+        },
+    )
+    grown = True
+    while grown:
+        grown = False
+        for node in candidates:
+            if node.name not in resolved and _terminal_call_name(node) in resolved:
+                resolved = _helper_aliases(tree, resolved | {node.name})
+                grown = True
+    return resolved
 
 
 def _attaches_context(node: ast.Raise, none_aliases: set[str]) -> bool:
@@ -159,7 +189,7 @@ def scan_source(source: str, path: str) -> list[str]:
     """Every context-attaching site that RUNS inside an except handler, as ``path:line``."""
     tree = ast.parse(source, filename=path)
     none_aliases = _none_aliases(tree)
-    helpers = _helper_aliases(tree, _always_raising_helpers(tree, none_aliases))
+    helpers = _always_raising_helpers(tree, none_aliases)
     lines: set[int] = set()
     for handler in ast.walk(tree):
         if not isinstance(handler, ast.ExceptHandler):
@@ -428,3 +458,85 @@ def test_an_alias_of_a_RETURNING_helper_stays_legal() -> None:
         "    raise err\n"
     )
     assert scan_source(source, "t.py") == []
+
+
+_WRAPPER_AROUND_A_RAISING_HELPER = (
+    "def _refuse():\n"
+    "    raise Boom()\n"
+    "\n"
+    "def _wrapper():\n"
+    "    _refuse()\n"
+    "\n"
+    "try:\n"
+    "    trigger()\n"
+    "except ValueError:\n"
+    "    _wrapper()\n"
+)
+_WRAPPER_CHAIN_AROUND_A_RAISING_HELPER = (
+    "def _refuse():\n"
+    "    raise Boom()\n"
+    "\n"
+    "def _inner():\n"
+    "    _refuse()\n"
+    "\n"
+    "def _outer():\n"
+    "    _inner()\n"
+    "\n"
+    "try:\n"
+    "    trigger()\n"
+    "except ValueError:\n"
+    "    _outer()\n"
+)
+_WRAPPER_AROUND_AN_ALIASED_HELPER = (
+    "def _refuse():\n"
+    "    raise Boom()\n"
+    "\n"
+    "_same = _refuse\n"
+    "\n"
+    "def _wrapper():\n"
+    "    _same()\n"
+    "\n"
+    "try:\n"
+    "    trigger()\n"
+    "except ValueError:\n"
+    "    _wrapper()\n"
+)
+_WRAPPER_THAT_MAY_RETURN = (
+    "def _refuse():\n"
+    "    raise Boom()\n"
+    "\n"
+    "def _maybe(flag):\n"
+    "    if flag:\n"
+    "        return None\n"
+    "    _refuse()\n"
+    "\n"
+    "try:\n"
+    "    trigger()\n"
+    "except ValueError:\n"
+    "    _maybe(True)\n"
+    "raise Boom()\n"
+)
+
+
+def test_flags_a_WRAPPER_around_an_always_raising_helper() -> None:
+    """One frame further down is still the handler's frame: the context attaches the same."""
+    assert isinstance(_runtime_context(_WRAPPER_AROUND_A_RAISING_HELPER), ValueError)
+    assert scan_source(_WRAPPER_AROUND_A_RAISING_HELPER, "t.py") == ["t.py:10"]
+
+
+def test_flags_a_CHAIN_of_wrappers_around_an_always_raising_helper() -> None:
+    """Resolution repeats to a fixed point, so depth cannot hide the raise."""
+    assert isinstance(_runtime_context(_WRAPPER_CHAIN_AROUND_A_RAISING_HELPER), ValueError)
+    assert scan_source(_WRAPPER_CHAIN_AROUND_A_RAISING_HELPER, "t.py") == ["t.py:13"]
+
+
+def test_flags_a_wrapper_around_an_ALIASED_helper() -> None:
+    """The alias IS the helper, so a wrapper around the alias is a wrapper around the raise."""
+    assert isinstance(_runtime_context(_WRAPPER_AROUND_AN_ALIASED_HELPER), ValueError)
+    assert scan_source(_WRAPPER_AROUND_AN_ALIASED_HELPER, "t.py") == ["t.py:12"]
+
+
+def test_a_wrapper_that_CAN_RETURN_is_not_an_always_raising_helper() -> None:
+    """It does not always raise, so calling it in a handler is not a raise written there."""
+    assert _runtime_context(_WRAPPER_THAT_MAY_RETURN) is None, "the interpreter attached nothing"
+    assert scan_source(_WRAPPER_THAT_MAY_RETURN, "t.py") == []
