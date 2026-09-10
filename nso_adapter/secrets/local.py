@@ -19,7 +19,7 @@ class LocalSecretsProvider:
 
     For a reference ``"MY_TOKEN"``:
     1. Returns ``os.environ["MY_TOKEN"]`` if set.
-    2. Returns the content of ``os.environ["MY_TOKEN_FILE"]`` if set and the file exists.
+    2. Returns the content of ``os.environ["MY_TOKEN_FILE"]`` if set and the file reads.
     3. Raises :class:`SecretResolutionError` otherwise, classified and without the reference.
     """
 
@@ -30,7 +30,18 @@ class LocalSecretsProvider:
         if val is not None:
             return val
         file_path = os.environ.get(f"{reference}_FILE")
-        if file_path and Path(file_path).exists():
-            return Path(file_path).read_text().strip()
+        failure = None
+        if file_path:
+            try:
+                return Path(file_path).read_text().strip()
+            except FileNotFoundError:
+                pass  # an absent path is "unset", not a read failure — fall through
+            except (OSError, UnicodeError) as exc:
+                # A permission, device or decode failure names the path, and the path is the
+                # deployment's own layout; only the classification is ours to hand back.
+                failure = SecretResolutionError(f"the referenced file could not be read ({type(exc).__name__})")
+        # Raised outside the handler: the OSError would otherwise ride on __context__.
+        if failure is not None:
+            raise failure
         # A reference is an env-var name and the caller holds it; the caller stamps the config slot.
         raise SecretResolutionError("the referenced environment variable is not set")
