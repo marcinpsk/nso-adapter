@@ -98,3 +98,24 @@ def test_a_live_row_without_its_list_key_refuses_instead_of_reading_clean():
     keyless = {"interface": {"interface": [{"ipv4-address": [{"address": "198.18.0.1"}]}]}}
     with pytest.raises(KeyError, match="interface-name"):
         _document_orphans(keyless, body, {})
+
+
+def test_guard_refuses_an_authority_scope_that_names_no_section():
+    """A shape-valid authority under an unknown scope guards nothing, silently.
+
+    ``_removal_keys`` reads the ``static_route`` section only, so a near-miss spelling passes
+    the shape check and then contributes no keys: the removal proceeds with an authority that
+    looks populated and is empty. The scope vocabulary is the section registry, so an
+    unknown name is a malformed authority, not an empty one.
+    """
+    generation = DeploymentGeneration(allowed_removal_keys={"static-route": {"route": [["", "10.0.0.0/8", ""]]}})
+    with pytest.raises(ValueError, match="unknown removal-authority scope"):
+        guard_allowed(generation)
+
+
+def test_guard_accepts_every_scope_the_registry_names():
+    """The validation must admit every section a generation can legitimately carry."""
+    from nso_adapter.core.projection import projection_sections
+
+    for section in sorted(projection_sections()):
+        guard_allowed(DeploymentGeneration(allowed_removal_keys={section: {"route": []}}))
