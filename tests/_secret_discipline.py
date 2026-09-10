@@ -55,5 +55,6 @@ class EchoingVault:
 def assert_records_free_of(records, secrets) -> None:
     """Fail when any captured structlog record repeats one of *secrets*."""
     rendered = repr([dict(record) for record in records])
-    for secret in secrets:
-        assert secret not in rendered, f"a log record repeats {secret!r}"
+    for index, secret in enumerate(secrets):
+        # The index, never the value: a failure prints this into pytest output and CI logs.
+        assert secret not in rendered, f"a log record repeats secret material (secrets[{index}])"
