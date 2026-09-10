@@ -423,10 +423,10 @@ def freeze_static_route_proof(tables: dict[str, list[dict]], *, device_id: int, 
     the selected rows, the CAS coordinates and the carrier watermark are properties of that
     fragment and not of whatever the store holds when a worker gets round to it.
     """
-    from nso_adapter.core.projection import hydrate_section
+    from nso_adapter.core.projection import EXECUTION_KEY, hydrate_section
     from nso_adapter.store.models import StaticRouteIntent, StaticRouteTombstone
 
-    hydrated = hydrate_section({"static_route": {**tables, "_execution": {"context": context}}}, "static_route")
+    hydrated = hydrate_section({"static_route": {**tables, EXECUTION_KEY: {"context": context}}}, "static_route")
     rows = hydrated.get(StaticRouteIntent, [])
     tombstones = hydrated.get(StaticRouteTombstone, [])
     return {"apply": _serialize_apply_plan(classify_apply_plan(rows, tombstones, device_id=device_id))}
