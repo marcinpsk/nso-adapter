@@ -3626,10 +3626,12 @@ async def test_apply_selects_a_claim_less_section_now_that_the_sender_writes_it(
 @pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
 async def test_force_removal_admits_a_claim_less_section_now_that_the_sender_writes_it(adapter_client, stream):
     device_id = await seed_device(nso_device_name=f"sender-lands-force-{stream}", netbox_device_id=None)
-    assert (await _prepare(adapter_client, device_id, stream, {"A": [1]})).status_code == 200
+    revision = (await _prepare(adapter_client, device_id, stream, {"A": [1]})).json()["selection_revision"]
     # A flush re-deploys AUTHORIZED state, so the Apply that authorized this family has to
-    # have happened: a prepared slot alone puts no section in the composed document.
-    assert (await _apply(adapter_client, device_id, {stream: 1})).status_code in (200, 202)
+    # have happened: a prepared slot alone puts no section in the composed document. A
+    # hard-coded revision would answer 200 + skipped=no_prepared_revision and authorize
+    # nothing, and every assertion below would still pass.
+    assert (await _apply(adapter_client, device_id, {stream: revision})).status_code == 202
 
     response = await adapter_client.post(
         f"/api/v1/devices/{device_id}/actions/force-removal",
