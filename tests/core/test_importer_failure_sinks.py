@@ -106,3 +106,70 @@ async def test_the_projected_fanout_classifies_an_httpx_failure_and_repeats_no_s
     records = [r for r in logs if r["event"] == "sync.surface_refresh_failed"]
     assert records, "the failure was not reported at all"
     _assert_classified(records[0])
+
+
+# ── the action's own contract failures keep their own codes ──────────────────
+
+
+def _atomic_output(device_name: str, sections: dict) -> dict:
+    """One certified device-state-read output: atomic, right device, terminal sections."""
+    return {"network-state-export:output": {"atomic": True, "device-name": device_name, **sections}}
+
+
+async def test_a_missing_action_section_is_named_missing_not_malformed(adapter_client):
+    """A requested family the action did not answer is an action contract failure.
+
+    The certification deliberately lets a missing section through (`client.py:128`) because
+    what it means is the caller's to decide, and the single-family escalation already decides
+    `action_section_missing`. Splitting the multi-family output called it `section_malformed`,
+    which says the server sent something unusable rather than nothing at all.
+    """
+    from nso_adapter.core.importer import _fetch_projection
+    from nso_adapter.nso.read_outcome import ReadFailureCode, ReadOperation
+    from tests.nso.test_nso_client_methods import MockTransport, _make_client
+
+    device_id = await seed_device(nso_device_name="split-missing-section")
+    client = _make_client()
+    served = _atomic_output("split-missing-section", {"static-route": {"status": "ok", "route": []}})
+    transport = MockTransport(200, served)
+    client._client = lambda timeout=None: httpx.AsyncClient(transport=transport, base_url="http://nso:8080")
+
+    async with _device_session(device_id) as (_db, device):
+        sections, outcome, failures = await _fetch_projection(
+            client, device, ["static-route", "interface-ip"], atomic=True
+        )
+
+    assert outcome is None, "the supplier answered; only one family is unserved"
+    assert sections["static-route"] == {"status": "ok", "route": []}
+    assert sections["interface-ip"] is None
+    failure = failures["interface-ip"]
+    assert failure.code is ReadFailureCode.action_section_missing
+    assert failure.operation is ReadOperation.device_state_read
+    assert failure.family == "interface-ip"
+
+
+async def test_a_non_terminal_action_section_never_reaches_the_split(adapter_client):
+    """The client refuses a non-terminal status, so the split cannot see a not-ready one.
+
+    `_certify_device_state_output` (client.py:132-137) raises NsoReadContractError unless every
+    requested-and-present section carries ok/unsupported/error, and that raise happens inside
+    the supplier's own try, so the whole read degrades to read_error with the family rows kept.
+    """
+    from nso_adapter.core.importer import _fetch_projection
+    from nso_adapter.nso.read_outcome import ReadOperation, Unavailable, UnavailableReason
+    from tests.nso.test_nso_client_methods import MockTransport, _make_client
+
+    device_id = await seed_device(nso_device_name="split-not-ready")
+    client = _make_client()
+    served = _atomic_output("split-not-ready", {"static-route": {"status": "not-ready"}})
+    transport = MockTransport(200, served)
+    client._client = lambda timeout=None: httpx.AsyncClient(transport=transport, base_url="http://nso:8080")
+
+    async with _device_session(device_id) as (_db, device):
+        sections, outcome, _failures = await _fetch_projection(client, device, ["static-route"], atomic=True)
+
+    assert sections == {}, "nothing may be materialized from an uncertified answer"
+    assert isinstance(outcome, Unavailable)
+    assert outcome.reason is UnavailableReason.read_error
+    assert outcome.failure.error_type == "NsoReadContractError"
+    assert outcome.failure.operation is ReadOperation.device_state_read

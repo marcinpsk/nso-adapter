@@ -332,7 +332,12 @@ def _split_sections(
     operation: ReadOperation,
     failures: dict[str, ReadFailure],
 ) -> dict[str, dict | None]:
-    """Keep the dict sections; classify anything else as a malformed section (rows kept)."""
+    """Keep the dict sections; classify anything else as a malformed section (rows kept).
+
+    An action either answers a REQUESTED family or omits it, and the omission is its own
+    contract failure rather than an unusable body: the certification lets a missing section
+    through on purpose, and the single-family escalation already names it that way.
+    """
     sections: dict[str, dict | None] = {}
     for wire in wire_names:
         section = served.get(wire)
@@ -341,11 +346,12 @@ def _split_sections(
             failures.pop(wire, None)
             continue
         sections[wire] = None
+        absent_from_action = section is None and operation is ReadOperation.device_state_read
         failures[wire] = ReadFailure(
             operation=operation,
             device=device_name,
             family=wire,
-            code=ReadFailureCode.section_malformed,
+            code=ReadFailureCode.action_section_missing if absent_from_action else ReadFailureCode.section_malformed,
         )
     return sections
 
