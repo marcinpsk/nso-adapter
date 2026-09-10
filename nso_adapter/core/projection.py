@@ -505,6 +505,18 @@ def _stream_section() -> dict[str, str]:
     return {stream: owner.get(stream, stream) for stream in _stream_tables()}
 
 
+def _spec_or_refuse(table: str) -> _Section:
+    """Return a table's registry entry, or name the table that is not in it.
+
+    Four call sites need the same refusal, and a bare ``KeyError`` from indexing reaches the
+    generic job-failure handler naming nothing an operator can act on.
+    """
+    spec = _SPEC_BY_TABLE.get(table)
+    if spec is None:
+        raise ValueError(f"unknown projection table {table!r}")
+    return spec
+
+
 @cache
 def projection_sections() -> frozenset[str]:
     """Every section name a stored DOCUMENT can carry — the outbound device families.
@@ -783,25 +795,18 @@ def rows_by_intent_identity(fragment: dict[str, list[dict]], table: str) -> dict
     Each table in the lineage is indexed ONCE per call, parents before children: BGP repeats
     the walk at four levels, so re-deriving a parent per child row is quadratic.
     """
-    spec = _SPEC_BY_TABLE.get(table)
-    if spec is None:
-        raise ValueError(f"unknown projection table {table!r}")
+    spec = _spec_or_refuse(table)
     return _identity_indexes(fragment, _identity_lineage(spec))[spec.model]
 
 
 def is_intent_deletion(table: str, identity: tuple, desired_rows: dict[tuple, dict]) -> bool:
     """Whether a missing projection row is an operator intent deletion, not lifecycle."""
-    spec = _SPEC_BY_TABLE.get(table)
-    if spec is None:
-        raise ValueError(f"unknown projection table {table!r}")
-    return not spec.lifecycle and identity not in desired_rows
+    return not _spec_or_refuse(table).lifecycle and identity not in desired_rows
 
 
 def projection_row_state(table: str, row: dict) -> dict:
     """Return the row state that the device-facing renderer consumes."""
-    spec = _SPEC_BY_TABLE.get(table)
-    if spec is None:
-        raise ValueError(f"unknown projection table {table!r}")
+    spec = _spec_or_refuse(table)
     if spec.model is StaticRouteIntent:
         from nso_adapter.nso.apply import static_route_entry
 
@@ -840,26 +845,9 @@ async def _rows_for(db: AsyncSession, device_id: int, spec: _Spec) -> list[dict]
 #:
 #: Membership is a property of the SECTION, not a switch. Every outbound payload can now be
 #: rebuilt from the stored document. ``test_projection_document.py`` pins the complete set.
-DOCUMENT_EXECUTED_SECTIONS: frozenset[str] = frozenset(
-    {
-        "bgp",
-        "vlan",
-        "snmp",
-        "logging",
-        "svi",
-        "subinterface",
-        "bfd",
-        "interface_config",
-        "interface_mtu",
-        "l2_sap",
-        "isis",
-        "lag",
-        "route_policy",
-        "ospf",
-        "static_route",
-        "switchport",
-    }
-)
+#: DERIVED from the registry, which is what document execution iterates: a second hand-kept
+#: list could only ever disagree with it.
+DOCUMENT_EXECUTED_SECTIONS: frozenset[str] = frozenset(_SECTION_REGISTRY)
 
 #: The manual Apply selection boundary equals the document-executed boundary. Every
 #: projection stream now maps to a section that executes from its stored document.
@@ -1209,7 +1197,7 @@ def prune_consumed_carriers(fragment: dict, existing_ids: frozenset[int]) -> dic
     withdraws an authority the store has already discharged. It changes no intent value, no
     context and no non-carrier proof, and it never reads live intent.
     """
-    carriers = [table for table in fragment_tables(fragment) if _SPEC_BY_TABLE[table].lifecycle]
+    carriers = [table for table in fragment_tables(fragment) if _spec_or_refuse(table).lifecycle]
     consumed = {table: [row for row in fragment[table] if row.get("id") not in existing_ids] for table in carriers}
     if not any(consumed.values()):
         return fragment

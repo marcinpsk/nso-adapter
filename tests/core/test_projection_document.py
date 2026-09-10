@@ -926,3 +926,23 @@ def test_a_stream_whose_section_is_not_what_its_endpoint_promotes_is_refused(mon
         monkeypatch.undo()
         _clear_projection_caches()
     assert projection.stream_section("ip") == "interface_config"
+
+
+def test_pruning_carriers_names_an_unknown_table_instead_of_raising_keyerror():
+    """A stored fragment can hold a table the registry no longer knows.
+
+    Every other registry lookup answers that with the authored ``unknown projection table``
+    error. This one indexed ``_SPEC_BY_TABLE`` directly, so the bare ``KeyError`` reached the
+    generic job-failure handler and named nothing an operator could act on.
+    """
+    from nso_adapter.core.projection import prune_consumed_carriers
+
+    with pytest.raises(ValueError, match="unknown projection table 'retired_intent'"):
+        prune_consumed_carriers({"retired_intent": [{"id": 1}]}, frozenset())
+
+
+def test_document_executed_sections_is_the_section_registry():
+    """The set is DERIVED, so a new section cannot be executed-by-document only by accident."""
+    from nso_adapter.core.projection import DOCUMENT_EXECUTED_SECTIONS, projection_sections
+
+    assert DOCUMENT_EXECUTED_SECTIONS == projection_sections()
