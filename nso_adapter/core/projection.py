@@ -505,7 +505,7 @@ def _stream_section() -> dict[str, str]:
     return {stream: owner.get(stream, stream) for stream in _stream_tables()}
 
 
-def _spec_or_refuse(table: str) -> _Section:
+def _spec_or_refuse(table: str) -> _Spec:
     """Return a table's registry entry, or name the table that is not in it.
 
     Four call sites need the same refusal, and a bare ``KeyError`` from indexing reaches the
