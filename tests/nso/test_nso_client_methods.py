@@ -14,7 +14,8 @@ import httpx
 import pytest
 
 from nso_adapter.config import NsoInstanceConfig
-from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.client import NsoActionFailedError, NsoClient, NsoReadContractError, failure_detail
+from nso_adapter.nso.read_outcome import Unavailable, UnavailableReason
 
 
 def _make_cfg(base_url: str = "http://nso:8080", ca_cert=None, host_header=None):
@@ -607,3 +608,54 @@ async def test_service_instance_state_refuses_an_instance_it_did_not_ask_for(pat
         state = await client.service_instance_state("rtr")
     assert state.status == "inconclusive", label
     assert state.entry is None
+
+
+# ── device-state-read: a non-mapping output can never reach a consumer ────────
+
+
+@pytest.mark.parametrize("output", [["static-route"], "static-route", 7])
+async def test_run_device_state_read_refuses_a_non_mapping_output(patch_client, output):
+    """The certification runs BEFORE the return, so no caller is handed a non-mapping.
+
+    Every consumer reads ``output.get(...)`` straight after the call. What keeps that from
+    being an AttributeError is this refusal, so it belongs to the client, once, rather than
+    to each consumer.
+    """
+    client = _make_client()
+    with patch_client(client, 200, {"network-state-export:output": output}):  # noqa: SIM117
+        with pytest.raises(NsoReadContractError, match="did not certify an atomic snapshot"):
+            await client.run_device_state_read("core-rtr-01", ["static-route"])
+
+
+async def test_the_not_ready_escalation_classifies_a_non_mapping_output(patch_client):
+    """The refusal raises INSIDE the escalation's try, so the family is classified, not crashed."""
+    from nso_adapter.core.refresh_engine import _escalate_not_ready
+    from nso_adapter.store.models import Device
+
+    client = _make_client()
+    device = Device(nso_instance="nso-dev", nso_device_name="core-rtr-01")
+    with patch_client(client, 200, {"network-state-export:output": ["static-route"]}):
+        outcome = await _escalate_not_ready(device, client, "static-route")
+
+    assert isinstance(outcome, Unavailable)
+    assert outcome.reason is UnavailableReason.read_error
+    assert outcome.failure is not None
+    assert outcome.failure.error_type == "NsoReadContractError"
+
+
+async def test_the_host_key_refusal_names_our_device_and_none_of_the_action_text(patch_client):
+    """The identity is ours to print; the action's own result/info/error is not.
+
+    ``failure_detail`` repeats an AUTHORED failure verbatim, and what makes that safe is
+    exactly what the message may hold: the action, the failure kind, and the device we
+    ASKED for — never a value the server chose.
+    """
+    client = _make_client()
+    payload = {"tailf-ncs:output": {"result": "failed", "info": "refused by 203.0.113.9"}}
+    with patch_client(client, 200, payload):  # noqa: SIM117
+        with pytest.raises(NsoActionFailedError) as caught:
+            await client.fetch_host_keys("core-rtr-01")
+
+    detail = failure_detail(caught.value)
+    assert "core-rtr-01" in detail, "the device we asked for is the diagnostic"
+    assert "refused by" not in detail and "203.0.113.9" not in detail, "the action's own words never travel"
