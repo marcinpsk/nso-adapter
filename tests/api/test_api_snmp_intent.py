@@ -346,7 +346,7 @@ async def test_put_removal_enqueues_async_removal_job(adapter_client, monkeypatc
     replace-mode device commit that can stall past the plugin timeout). The worker then
     PUT-replaces the snmp service with the remaining accepted intent (replace=True)."""
     from nso_adapter.core.removal import run_removal
-    from nso_adapter.store.models import Job, JobType
+    from nso_adapter.store.models import Job, JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="snmp-prop-dev", netbox_device_id=967)
 
@@ -364,8 +364,14 @@ async def test_put_removal_enqueues_async_removal_job(adapter_client, monkeypatc
         captured["no_networking"] = kwargs.get("no_networking", False)
         captured["labels"] = [entry["name"] for entry in (containers.get("snmp") or {}).get("community", [])]
 
+    async def _fake_sync_from(client, device_name):
+        # The detach re-aligns CDB with device truth, and a failure FAILS the job. Faked at
+        # the NSO HTTP boundary so the removal's own code path runs for real.
+        return {}
+
     monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", _fake_get_client)
     monkeypatch.setattr("nso_adapter.nso.apply.apply_device_intent", _fake_send)
+    monkeypatch.setattr("nso_adapter.nso.actions.sync_from", _fake_sync_from)
 
     await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH | push_seq())
     # No device call during a pure-add PUT.
@@ -398,9 +404,16 @@ async def test_put_removal_enqueues_async_removal_job(adapter_client, monkeypatc
             "detach": True,
         }
         job_id = jobs[0].id
+        # run_removal is invoked directly below, so nothing else performs the worker head's
+        # queued -> running transition that its terminal CAS expects.
+        jobs[0].status = JobStatus.running
+        jobs[0].run_attempt = 1
+        await db.commit()
 
     # The worker runs the removal → PUTs the document with the dropped community omitted.
     await run_removal(job_id, device_id)
+    async with session() as db:
+        assert (await db.get(Job, job_id)).status is JobStatus.succeeded
     assert captured["device_name"] == "snmp-prop-dev"
     assert captured["no_networking"] is True, "an unmarked drop detaches rather than retracting"
     assert captured["labels"] == ["ro1"]  # rw1 gone from the transmitted document
