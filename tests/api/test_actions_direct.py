@@ -195,8 +195,14 @@ async def test_action_force_removal_interface_config_needs_no_interface_list(ada
         assert job.context == {"scope": "interface_config", "force": True}
 
 
-async def test_action_force_removal_interface_config_carries_the_interfaces(adapter_client):
-    """The names still ride the context: the residue check reads them to know what to look for."""
+async def test_action_force_removal_interface_config_carries_only_its_scope(adapter_client):
+    """A flush takes a scope, not interface names: nothing narrows it to a subset.
+
+    The body once accepted an ``interfaces`` list, and this test's earlier name said the
+    residue check read it. It does not: ``_interface_config_residue`` reads the captured
+    ``removed`` values and returns None for a force-removal, and the sender transmits the
+    whole authorized document, so the names narrowed nothing and only promised otherwise.
+    """
     from nso_adapter.api.actions import ForceRemovalBody, action_force_removal
 
     device_id = await _seed_device("actions-frm-04", 1343)
@@ -204,15 +210,11 @@ async def test_action_force_removal_interface_config_carries_the_interfaces(adap
     async with session() as db:
         result = await action_force_removal(
             device_id=device_id,
-            body=ForceRemovalBody(scope="interface_config", interfaces=["GigabitEthernet0/1"]),
+            body=ForceRemovalBody(scope="interface_config"),
             db=db,
         )
         job = await db.get(Job, result["job_id"])
-        assert job.context == {
-            "scope": "interface_config",
-            "interfaces": ["GigabitEthernet0/1"],
-            "force": True,
-        }
+        assert job.context == {"scope": "interface_config", "force": True}
 
 
 async def test_action_force_removal_refuses_a_family_nothing_authorized(adapter_client):

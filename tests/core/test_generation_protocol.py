@@ -530,7 +530,7 @@ async def test_f8_e_a_force_removal_authorizes_nothing_outside_the_interfaces_it
 
     flush = await adapter_client.post(
         f"/api/v1/devices/{device_id}/actions/force-removal",
-        json={"scope": "interface_config", "interfaces": ["Gi0/1"]},
+        json={"scope": "interface_config"},
         headers=AUTH,
     )
     assert flush.status_code == 202, flush.text

@@ -2682,20 +2682,6 @@
       },
       "ForceRemovalBody": {
         "properties": {
-          "interfaces": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Interfaces"
-          },
           "scope": {
             "title": "Scope",
             "type": "string"

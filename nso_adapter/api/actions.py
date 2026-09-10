@@ -151,7 +151,6 @@ async def _trigger(
 
 class ForceRemovalBody(BaseModel):
     scope: str
-    interfaces: list[str] | None = None
 
 
 @router.post(
@@ -217,7 +216,6 @@ async def _force_removal_job(db: AsyncSession, device_id: int, body: ForceRemova
         marking=None,
         defer_retract=False,
         promotes=(),
-        interfaces=body.interfaces,
         force=True,
     )
 
