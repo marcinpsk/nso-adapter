@@ -78,7 +78,9 @@ async def test_a_tombstone_only_route_refuses_the_cutover_and_passes_once_its_re
     assert job.status is JobStatus.succeeded
     assert fake.sent_keys() == {B}, "the removal must transmit the omission it is authorized for"
     assert fake.service_keys == {B}
-    assert job.result.get("service_clean") is not False, "consumption requires a CERTIFIED clean service"
+    # Emit-on-failure: removal writes service_clean only when it is False, so `is not False`
+    # also passed on a missing key. The absence IS the clean bill.
+    assert "service_clean" not in job.result, "consumption requires a CERTIFIED clean service"
     assert await _generation_statuses(device_id) == [GenerationStatus.settled]
 
     assert await _parked(device_id) == []
