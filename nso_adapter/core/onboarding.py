@@ -789,7 +789,7 @@ async def _seed_onboarding_failover(
         # transaction has to go, or the mirror refresh and the runner's terminal write both
         # die of PendingRollbackError on a device that mapped perfectly well.
         await db.rollback()
-        return {"step": "failover_seed", "status": "failed", "detail": repr(exc)}
+        return {"step": "failover_seed", "status": "failed", "detail": failure_detail(exc)}
 
 
 async def rekey_device(

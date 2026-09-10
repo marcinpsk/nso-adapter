@@ -688,3 +688,40 @@ async def test_set_scope_empty_list_clears_scope(adapter_client_with_nso):
         device = await db.get(Device, device_id)
         result = await set_scope(db, device, [])
         assert result == []
+
+
+# ── _seed_onboarding_failover: the persisted step carries no store diagnostics ──
+
+
+async def test_failover_seed_failure_step_classifies_the_store_error(adapter_client_with_nso, monkeypatch):
+    """A failed seed reports the failure TYPE, never the driver's repr.
+
+    The step is best-effort, so it is persisted and served rather than raised. A SQLAlchemy
+    error repeats the statement it ran and the parameters it bound, and this row's parameters
+    are the device's management addresses.
+    """
+    from nso_adapter.config import get_config
+    from nso_adapter.core.onboarding import _seed_onboarding_failover
+
+    monkeypatch.setattr(get_config().scheduler, "enable_failover", True)
+    absent_device_id = 987654321  # no devices row, so the seed's INSERT violates its FK
+
+    async with session() as db:
+        step = await _seed_onboarding_failover(db, absent_device_id, "198.51.100.10", "203.0.113.10", "primary")
+
+    assert step == {"step": "failover_seed", "status": "failed", "detail": "IntegrityError"}
+
+
+async def test_failover_seed_success_step_is_unchanged(adapter_client_with_nso, monkeypatch):
+    """The ok path still reports the address it seeded: only the failure branch changed."""
+    from nso_adapter.config import get_config
+    from nso_adapter.core.onboarding import _seed_onboarding_failover, onboard_device
+
+    monkeypatch.setattr(get_config().scheduler, "enable_failover", True)
+
+    async with session() as db:
+        device = await onboard_device(db, "nso-dev", f"seed-{uuid4().hex[:8]}", int(uuid4().int % 10**8))
+        await db.commit()
+        step = await _seed_onboarding_failover(db, device.id, "198.51.100.10", "203.0.113.10", "oob")
+
+    assert step == {"step": "failover_seed", "status": "ok", "detail": "oob"}
