@@ -248,16 +248,14 @@ async def _record_projection_deletions(
     if projection is None or not projection.authorized_document:
         return response, frozenset()
     desired = await snapshot_stream(db, device_id, delivery.stream)
-    retired = _restored_deletion_identities(
-        _private_response(receipt.response), fragment_tables(projection.authorized_document), desired
-    )
+    authorized_tables = fragment_tables(projection.authorized_document)
+    retired = _restored_deletion_identities(_private_response(receipt.response), authorized_tables, desired)
     explicit = {
         identity: record
         for record in response.get("_promotion_deletions") or []
         if (identity := promotion_deletion_identity(record)) is not None
     }
     marking = DELETE_ORIGIN_MARKING if receipt.delete_origin else DETACH_MARKING
-    authorized_tables = fragment_tables(projection.authorized_document)
     for table in authorized_tables:
         desired_identities = rows_by_intent_identity(desired, table)
         for identity, row in rows_by_intent_identity(authorized_tables, table).items():
