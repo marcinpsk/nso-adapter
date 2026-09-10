@@ -609,3 +609,38 @@ def test_o2b_7_the_declared_domain_is_the_one_the_receipt_column_can_hold():
 
     assert bounds, declared["schema"]
     assert (bounds[0]["minimum"], bounds[0]["maximum"]) == (MIN_PUSH_SEQ, MAX_PUSH_SEQ)
+
+
+# ── what the refusal envelope may say ─────────────────────────────────────────
+
+
+async def test_the_reuse_envelope_reports_the_digest_the_receipts_endpoint_already_serves(adapter_client):
+    """``admitted_digest`` is what the caller must compare, and it is not a disclosure.
+
+    The refusal says "seq 5 landed with a different body"; without the admitted digest the
+    caller can tell a MODE difference from the three admitted flags but not a body one. The
+    same value is served, under the same bearer dependency, by the receipts endpoint, so the
+    envelope tells an authenticated caller nothing it cannot already read.
+    """
+    device_id = await seed_device(nso_device_name="rcp-digest-envelope", netbox_device_id=None)
+    url = f"/api/v1/devices/{device_id}/vlan-intent"
+    headers = {**AUTH, "X-Push-Seq": "5"}
+
+    first = await adapter_client.put(url, json={"vlans": [{"vlan_id": 10, "name": "ten"}]}, headers=headers)
+    assert first.status_code == 200
+
+    refused = await adapter_client.put(url, json={"vlans": [{"vlan_id": 11, "name": "eleven"}]}, headers=headers)
+    assert refused.status_code == 409
+    error = refused.json()["error"]
+    assert error["code"] == "sequence_reuse"
+    admitted_digest = error["detail"]["admitted_digest"]
+
+    unauthenticated = await adapter_client.put(
+        url, json={"vlans": [{"vlan_id": 11, "name": "eleven"}]}, headers={"X-Push-Seq": "5"}
+    )
+    assert unauthenticated.status_code == 401, "the envelope is never served without the token"
+
+    receipts = await adapter_client.get(f"/api/v1/intent-receipts?device_id={device_id}", headers=AUTH)
+    assert receipts.status_code == 200
+    served = [r["request_digest"] for r in receipts.json()["receipts"] if r["section"] == "vlan"]
+    assert served == [admitted_digest], "the same caller reads the same digest from the receipts endpoint"
