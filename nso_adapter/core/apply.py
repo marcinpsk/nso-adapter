@@ -775,9 +775,14 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
         delta = await apply_device_intent(
             client, device.nso_device_name, body.containers, dry_run=fmt, no_networking=policy.no_networking
         )
+    except NsoApplyError as exc:
+        logger.warning("apply_diff.failed", device=device.nso_device_name, error=exc.message)
+        reason = exc.message
+        return {PREVIEW_KEY: f"!! preview unavailable: {reason}"}
     except Exception as exc:  # noqa: BLE001 — the preview must never fail hard
-        logger.warning("apply_diff.failed", device=device.nso_device_name, error=repr(exc))
-        reason = getattr(exc, "message", None) or repr(exc)
+        internal = internal_error(exc)
+        logger.warning("apply_diff.failed", device=device.nso_device_name, error=internal["message"])
+        reason = internal["message"]
         return {PREVIEW_KEY: f"!! preview unavailable: {reason}"}
     if delta is None:
         return {PREVIEW_KEY: "!! preview unavailable: NSO dry-run was inconclusive"}
@@ -1536,8 +1541,8 @@ async def _commit_document(
     except Exception as exc:  # noqa: BLE001 — surface as a job-level failure
         # The TYPE only: exception text can carry credentials (a RESTCONF error echoes the
         # request, an httpx error its headers) and this payload is persisted on every row.
-        logger.error("apply.commit_internal_error", job_id=job_id, device=device_name, error=repr(exc))
         internal = internal_error(exc)
+        logger.error("apply.commit_internal_error", job_id=job_id, device=device_name, error=internal["message"])
         commit_error = NsoApplyError("internal", internal["message"], detail=internal["detail"])
 
     if commit_error is None:

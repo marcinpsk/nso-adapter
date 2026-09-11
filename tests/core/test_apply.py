@@ -615,23 +615,25 @@ async def test_collect_apply_diff_without_a_generation_reports_unavailable(adapt
     assert diffs[PREVIEW_KEY].startswith("!! preview unavailable")
 
 
-async def test_collect_apply_diff_surfaces_a_failed_dry_run(adapter_client):
-    """A preview that blows up is REPORTED, because the operator approves the apply from it."""
+async def test_collect_apply_diff_classifies_an_unexpected_dry_run_failure(adapter_client):
+    """A preview reports the exception type without exposing its untrusted text."""
     from nso_adapter.core.apply import PREVIEW_KEY, collect_apply_diff
 
     device_id = await _seed_device("rtr-diff-boom", 193)
     await _seed_ospf(device_id)
     await _preview_head(device_id)
+    secret = "placeholder-preview-secret"
 
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
-        patch(_SENDER, AsyncMock(side_effect=RuntimeError("NSO unreachable"))),
+        patch(_SENDER, AsyncMock(side_effect=RuntimeError(secret))),
     ):
         async with session() as db:
             diffs = await collect_apply_diff(db, device_id)
 
     assert diffs[PREVIEW_KEY].startswith("!! preview unavailable")
-    assert "NSO unreachable" in diffs[PREVIEW_KEY]
+    assert "RuntimeError" in diffs[PREVIEW_KEY]
+    assert secret not in diffs[PREVIEW_KEY]
 
 
 async def test_run_apply_all_succeed(adapter_client):

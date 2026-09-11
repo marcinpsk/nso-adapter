@@ -190,6 +190,26 @@ async def test_verification_delta_keeps_no_secret_in_logs_or_errors(adapter_clie
     assert any("nso.apply.verify_mismatch" in record.getMessage() for record in recorded_logs.records)
 
 
+async def test_unexpected_commit_exception_keeps_secret_out_of_logs_and_errors(
+    adapter_client, monkeypatch, recorded_logs
+):
+    device_id, row = await _community()
+
+    async def fail_commit(*args, **kwargs):
+        raise RuntimeError(_SECRET)
+
+    monkeypatch.setattr("nso_adapter.nso.apply.apply_device_intent", fail_commit)
+    client = _client_with(httpx.MockTransport(lambda request: httpx.Response(404)))
+    job = await _run(device_id, client, monkeypatch)
+    async with session() as db:
+        stored = await db.get(SnmpCommunityIntent, row.id)
+
+    assert stored.last_apply_error["code"] == "internal"
+    assert "RuntimeError" in stored.last_apply_error["message"]
+    for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error), _log_surface(recorded_logs)):
+        assert _SECRET not in surface
+
+
 async def test_a_non_reference_secret_never_reaches_the_projection_refusal_chain(adapter_client):
     """The serialization guard refuses raw secret material; its chain must not repeat it."""
     from sqlalchemy import update
