@@ -68,6 +68,11 @@ logger = structlog.get_logger(__name__)
 PREVIEW_KEY = "device_intent"
 
 
+def _apply_error_summary(exc: NsoApplyError) -> str:
+    """Describe a typed apply failure without copying its value-bearing message."""
+    return f"apply error ({exc.code}); see the server log"
+
+
 async def enqueue_apply(
     db: AsyncSession,
     device_id: int,
@@ -723,7 +728,10 @@ async def build_device_containers(
                 sent_route_keys = overlay_retained_routes(body, retained)
         except NsoApplyError as exc:
             logger.error(
-                "apply.section_build_failed", device=device.nso_device_name, section=section, error=exc.message
+                "apply.section_build_failed",
+                device=device.nso_device_name,
+                section=section,
+                error=_apply_error_summary(exc),
             )
             errors[section] = exc
             continue
@@ -776,8 +784,8 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
             client, device.nso_device_name, body.containers, dry_run=fmt, no_networking=policy.no_networking
         )
     except NsoApplyError as exc:
-        logger.warning("apply_diff.failed", device=device.nso_device_name, error=exc.message)
-        reason = exc.message
+        reason = _apply_error_summary(exc)
+        logger.warning("apply_diff.failed", device=device.nso_device_name, error=reason)
         return {PREVIEW_KEY: f"!! preview unavailable: {reason}"}
     except Exception as exc:  # noqa: BLE001 — the preview must never fail hard
         internal = internal_error(exc)

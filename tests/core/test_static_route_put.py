@@ -607,7 +607,7 @@ async def test_c2_9b_the_preview_refuses_an_inconclusive_read_too(adapter_client
     assert rec.calls == []
     # visible in the panel the operator approves from, not silently omitted
     assert "preview unavailable" in diffs[PREVIEW_KEY], diffs[PREVIEW_KEY]
-    assert "uncertified read" in diffs[PREVIEW_KEY]
+    assert "static_route_snapshot_inconclusive" in diffs[PREVIEW_KEY]
 
 
 # ── C2.10 (enqueue half) + the A1 amendment ──────────────────────────────────

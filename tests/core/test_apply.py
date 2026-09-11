@@ -4,12 +4,14 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import ExitStack
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import structlog
 from sqlalchemy import select
 
 from nso_adapter.core.apply import enqueue_apply
@@ -29,6 +31,16 @@ from nso_adapter.store.models import (
     SyncState,
 )
 from tests.conftest import attach_apply_generation, note_projection_write, session
+
+
+@pytest.fixture
+def recorded_logs(caplog):
+    previous = structlog.get_config().copy()
+    structlog.configure(logger_factory=structlog.stdlib.LoggerFactory(), cache_logger_on_first_use=False)
+    caplog.set_level(logging.INFO)
+    yield caplog
+    structlog.configure(**previous)
+
 
 # ── nokia_routed_kind (pure: derives SR OS router context from kind/service/vrf) ──
 
@@ -634,6 +646,30 @@ async def test_collect_apply_diff_classifies_an_unexpected_dry_run_failure(adapt
     assert diffs[PREVIEW_KEY].startswith("!! preview unavailable")
     assert "RuntimeError" in diffs[PREVIEW_KEY]
     assert secret not in diffs[PREVIEW_KEY]
+
+
+async def test_collect_apply_diff_redacts_value_bearing_apply_error(adapter_client, recorded_logs):
+    """A typed apply error cannot make an invalid intent value public."""
+    from nso_adapter.core.apply import PREVIEW_KEY, collect_apply_diff
+
+    device_id = await _seed_device("rtr-diff-invalid", 192)
+    secret = "placeholder-invalid-enabled-secret"
+    await _seed_interface_with_intent(
+        device_id,
+        "GigabitEthernet0/0",
+        "enabled",
+        secret,
+        SyncState.accepted,
+    )
+    await _preview_head(device_id)
+
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()):
+        async with session() as db:
+            diffs = await collect_apply_diff(db, device_id)
+
+    assert "invalid_enabled_value" in diffs[PREVIEW_KEY]
+    assert secret not in diffs[PREVIEW_KEY]
+    assert secret not in repr([record.__dict__ for record in recorded_logs.records])
 
 
 async def test_run_apply_all_succeed(adapter_client):

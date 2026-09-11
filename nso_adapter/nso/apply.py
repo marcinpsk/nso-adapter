@@ -420,7 +420,7 @@ def _coerce_enabled_intent(value) -> bool:
         return False
     raise NsoApplyError(
         "invalid_enabled_value",
-        f"'enabled' intent value {value!r} is not a recognised boolean",
+        "'enabled' intent value is not a recognised boolean",
     )
 
 
