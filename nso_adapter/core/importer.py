@@ -758,7 +758,7 @@ async def _ensure_netbox_interfaces(nb_client, device: Device, device_id: int, i
             [{"name": i.name, "parent_binding": i.parent_binding, "kind": i.kind} for i in interfaces],
         )
     except Exception as exc:
-        logger.warning("netbox.bulk_ensure_failed", device_id=device_id, error=str(exc))
+        logger.warning("netbox.bulk_ensure_failed", device_id=device_id, error=failure_detail(exc))
         return {}
 
 
@@ -894,7 +894,9 @@ async def _record_attrs_read(db, device, outcome, refresh_source: str):
             source_epoch=device.source_epoch,
         )
     except Exception as exc:  # noqa: BLE001 — telemetry write; the sync is the story
-        logger.warning("interface_attributes.outcome.read_record_failed", device_id=device_id, error=repr(exc))
+        logger.warning(
+            "interface_attributes.outcome.read_record_failed", device_id=device_id, error=failure_detail(exc)
+        )
         await _recover_session(db, device, "interface_attributes", device_id)
         return None
 
@@ -925,7 +927,9 @@ async def _record_attrs_result(
             row_count=row_count if available else None,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("interface_attributes.outcome.result_record_failed", attempt_id=attempt_id, error=repr(exc))
+        logger.warning(
+            "interface_attributes.outcome.result_record_failed", attempt_id=attempt_id, error=failure_detail(exc)
+        )
         await _recover_session(db, device, "interface_attributes", device_id)
 
 
@@ -956,7 +960,7 @@ async def _attrs_failure_cleanup(
                 logger.warning(
                     "interface_attributes.savepoint_rollback_failed",
                     device_id=device_id,
-                    error=repr(rollback_exc),
+                    error=failure_detail(rollback_exc),
                 )
             else:
                 if attempt_id is not None:
@@ -997,7 +1001,7 @@ async def _attrs_failure_cleanup(
             "interface_attributes.outcome.terminalize_failed",
             attempt_id=attempt_id,
             device_id=device_id,
-            error=repr(store_exc),
+            error=failure_detail(store_exc),
         )
         try:
             await db.rollback()
@@ -1005,7 +1009,7 @@ async def _attrs_failure_cleanup(
             logger.warning(
                 "interface_attributes.outcome.session_recovery_failed",
                 device_id=device_id,
-                error=repr(recovery_exc),
+                error=failure_detail(recovery_exc),
             )
 
 
@@ -1253,9 +1257,7 @@ async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False,
         try:
             await nb_client.notify_sync_complete(device.netbox_device_id)
         except Exception as exc:
-            logger.warning(
-                "netbox.sync_complete_notify_failed", device_id=device_id, error=str(exc) or type(exc).__name__
-            )
+            logger.warning("netbox.sync_complete_notify_failed", device_id=device_id, error=failure_detail(exc))
 
     summary = {
         "interfaces_written": attrs.interfaces_written,
@@ -1360,7 +1362,7 @@ async def _detect_drift_attributes(
             for nb_iface in await nb_client.list_interfaces(device.netbox_device_id):
                 netbox_attrs[nb_iface["name"]] = nb_iface
         except Exception as exc:
-            logger.warning("netbox.drift_read_failed", device_id=device_id, error=str(exc) or type(exc).__name__)
+            logger.warning("netbox.drift_read_failed", device_id=device_id, error=failure_detail(exc))
 
     for iface in interfaces:
         result_rows = await db.execute(
@@ -1444,7 +1446,7 @@ async def detect_drift(device_id: int, db: AsyncSession) -> dict:
         try:
             await nb_client.notify_sync_complete(device.netbox_device_id)
         except Exception as exc:
-            logger.warning("netbox.drift_notify_failed", device_id=device_id, error=str(exc) or type(exc).__name__)
+            logger.warning("netbox.drift_notify_failed", device_id=device_id, error=failure_detail(exc))
 
     return {"changes_detected": changes_detected}
 
@@ -1457,7 +1459,7 @@ async def discover_devices(db: AsyncSession) -> None:
         try:
             device_list = await client.list_devices()
         except Exception as exc:
-            logger.error("discover.error", instance=inst.name, error=str(exc))
+            logger.error("discover.error", instance=inst.name, error=failure_detail(exc))
             continue
         for dev_data in device_list:
             name = dev_data.get("name")

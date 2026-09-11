@@ -180,8 +180,12 @@ def _validated_vault_ref(value: str | None) -> str | None:
     try:
         parse_vault_ref(value, require_key=True)
     except VaultRefError as exc:
-        raise ValueError(str(exc)) from exc
-    return value
+        reason = exc.reason
+    else:
+        return value
+    # Raise after the handler. Raising in it keeps the parser error, including the
+    # submitted reference, reachable through ``__context__`` even with ``from None``.
+    raise ValueError(reason)
 
 
 # The exact spellings _SNMP_VERSION / _SNMP_NOTIFY / _SNMP_ACCESS can map (nso/apply.py).

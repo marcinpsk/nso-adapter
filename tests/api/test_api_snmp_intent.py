@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import select
 
 from nso_adapter.nso.client import NsoClient
@@ -24,6 +25,7 @@ from nso_adapter.store.models import (
     SnmpSystemInfoIntent,
     SnmpV3UserIntent,
 )
+from tests._secret_discipline import assert_chain_free_of
 from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -93,8 +95,20 @@ async def test_put_rejects_a_community_vault_ref_the_writer_cannot_render(adapte
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=body, headers=AUTH | push_seq())
 
     assert resp.status_code == 422
+    assert bad_ref not in resp.text
     comms, _, _, _ = await _read_intent(device_id)
     assert comms == []  # nothing was stored
+
+
+def test_snmp_ref_validation_keeps_the_reference_out_of_the_authored_error_chain():
+    from nso_adapter.api.snmp import SnmpCommunityEntry
+
+    submitted_ref = "snmp/placeholder-secret #community"
+    with pytest.raises(ValidationError) as exc_info:
+        SnmpCommunityEntry(label="ro1", vault_ref=submitted_ref, access="RO")
+
+    error = exc_info.value.errors(include_url=False, include_input=False)[0]["ctx"]["error"]
+    assert_chain_free_of(error, [submitted_ref, "placeholder-secret"])
 
 
 @pytest.mark.anyio
