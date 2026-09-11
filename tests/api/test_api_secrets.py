@@ -229,13 +229,13 @@ async def test_set_secret_keyed_ref_rejects_other_fields(vault_client):
     client, _, _ = vault_client
     resp = await client.post(
         "/api/v1/secrets",
-        json={"vault_ref": "network/p#community", "values": {"other": "v"}},
+        json={"vault_ref": "network/p#community", "values": {"other": "placeholder-secret-value"}},
         headers=AUTH,
     )
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "invalid_vault_ref"
     # Both halves of the mismatch are the caller's own strings: the refusal states the rule.
-    for echoed in ("other", "network/p#community", "s3cr3t"):
+    for echoed in ("other", "network/p#community", "placeholder-secret-value"):
         assert echoed not in resp.text
     assert "exactly that one field" in resp.json()["error"]["message"]
 

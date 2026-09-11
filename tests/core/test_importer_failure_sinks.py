@@ -11,7 +11,9 @@ projected one).
 
 from __future__ import annotations
 
+import ast
 from contextlib import asynccontextmanager
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import httpx
@@ -24,6 +26,35 @@ from tests.conftest import seed_device, session
 _URL = "https://nso.invalid/restconf/data/placeholder-mount/placeholder-path"
 _REASON = "Placeholder Reason Phrase"
 _LEAKS = [_URL, "placeholder-mount", "placeholder-path", _REASON]
+_IMPORTER = Path(__file__).resolve().parents[2] / "nso_adapter" / "core" / "importer.py"
+
+
+def _raw_log_exception_renderers(source: str) -> list[int]:
+    """Return log-field lines that render an exception with ``str`` or ``repr``."""
+    violations: list[int] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if not isinstance(node.func.value, ast.Name) or node.func.value.id != "logger":
+            continue
+        for keyword in node.keywords:
+            if keyword.arg != "error":
+                continue
+            if any(
+                isinstance(part, ast.Call) and isinstance(part.func, ast.Name) and part.func.id in {"str", "repr"}
+                for part in ast.walk(keyword.value)
+            ):
+                violations.append(keyword.value.lineno)
+    return violations
+
+
+def test_raw_exception_log_guard_detects_str_and_repr() -> None:
+    source = 'logger.warning("event", error=str(exc) or repr(exc))\n'
+    assert _raw_log_exception_renderers(source) == [1]
+
+
+def test_importer_never_logs_raw_exception_text() -> None:
+    assert _raw_log_exception_renderers(_IMPORTER.read_text(encoding="utf-8")) == []
 
 
 @asynccontextmanager
@@ -38,7 +69,12 @@ async def _device_session(device_id: int):
 def _httpx_failure() -> httpx.HTTPStatusError:
     """The REAL httpx-authored error, message built by httpx itself, not by hand."""
     request = httpx.Request("GET", _URL)
-    response = httpx.Response(403, request=request, headers={"x-reason": _REASON}, text=_REASON)
+    response = httpx.Response(
+        403,
+        request=request,
+        extensions={"reason_phrase": _REASON.encode("ascii")},
+        text="placeholder body",
+    )
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:

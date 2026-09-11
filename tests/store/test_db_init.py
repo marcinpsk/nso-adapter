@@ -135,6 +135,7 @@ def test_db_migrate_survives_a_percent_in_the_password_and_prints_no_credential(
         cwd=_REPO_ROOT,
         capture_output=True,
         text=True,
+        timeout=60,
         # Port 1 refuses instantly, so the connection attempt itself is the observable step.
         env={
             "PATH": "/usr/bin:/bin",
