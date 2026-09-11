@@ -150,6 +150,8 @@ async def _trigger(
 
 
 class ForceRemovalBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     scope: str
 
 

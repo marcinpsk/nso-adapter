@@ -16,8 +16,10 @@ from nso_adapter.api.actions import (
 )
 from nso_adapter.api.errors import ApiError
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
-from tests.conftest import session
+from tests.conftest import VALID_TOKEN, session
 from tests.core.removal_helpers import authorize_stream
+
+AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 
 async def _seed_device(nso_device_name: str, netbox_id: int) -> int:
@@ -195,26 +197,20 @@ async def test_action_force_removal_interface_config_needs_no_interface_list(ada
         assert job.context == {"scope": "interface_config", "force": True}
 
 
-async def test_action_force_removal_interface_config_carries_only_its_scope(adapter_client):
-    """A flush takes a scope, not interface names: nothing narrows it to a subset.
-
-    The body once accepted an ``interfaces`` list, and this test's earlier name said the
-    residue check read it. It does not: ``_interface_config_residue`` reads the captured
-    ``removed`` values and returns None for a force-removal, and the sender transmits the
-    whole authorized document, so the names narrowed nothing and only promised otherwise.
-    """
-    from nso_adapter.api.actions import ForceRemovalBody, action_force_removal
-
+async def test_action_force_removal_rejects_the_retired_interfaces_field(adapter_client):
     device_id = await _seed_device("actions-frm-04", 1343)
     await authorize_stream(device_id, "interface_config")
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/force-removal",
+        json={"scope": "interface_config", "interfaces": ["Ethernet1"]},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 422
     async with session() as db:
-        result = await action_force_removal(
-            device_id=device_id,
-            body=ForceRemovalBody(scope="interface_config"),
-            db=db,
-        )
-        job = await db.get(Job, result["job_id"])
-        assert job.context == {"scope": "interface_config", "force": True}
+        jobs = (await db.scalars(select(Job).where(Job.device_id == device_id))).all()
+        assert jobs == []
 
 
 async def test_action_force_removal_refuses_a_family_nothing_authorized(adapter_client):

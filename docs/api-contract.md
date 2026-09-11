@@ -784,10 +784,10 @@ Run the NSO connectivity test.
 ### `POST /api/v1/devices/{id}/actions/force-removal`
 
 Reissue a removal with the collateral guard disabled. The request body is
-`{ "scope": "<scope>", "interfaces": ["<name>", ...] | null }`. Only `scope` is validated:
-a scope outside the removal-scope set is `400 bad_request`, and so is a scope nothing has
-ever authorized on this device, because the composed document then carries no section for
-the flush to act on.
+`{ "scope": "<scope>" }`. The endpoint rejects additional fields, including the retired
+`interfaces` field, with `422`. A scope outside the removal-scope set is `400 bad_request`,
+and so is a scope nothing has ever authorized on this device, because the composed document
+then carries no section for the flush to act on.
 
 **The guard is disabled for the whole document, not for `scope` alone.** One send is the
 device's entire document, so the write flushes every family's orphaned service rows, not
@@ -795,9 +795,8 @@ only the named scope's. `scope` selects the residue check, the pending clears th
 discharges, and (for `static_route`) the suppression of entry retention. It does not narrow
 the write. Review the orphans of every family, not just one, before issuing this.
 
-`interfaces` does not constrain the write either. It is recorded in the job context and
-nothing reads it, so an `interface_config` force-removal flushes every interface the
-document does not re-assert, whatever the list holds. No scope requires the field.
+No scope accepts interface names. An `interface_config` force-removal flushes every
+interface that the document does not re-assert.
 
 Each valid request creates a distinct reissue generation and a distinct removal
 job. A repeated request for the same scope does not reuse or replace an earlier

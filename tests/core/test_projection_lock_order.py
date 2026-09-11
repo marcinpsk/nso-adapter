@@ -538,7 +538,15 @@ async def test_removal_admission_locks_the_projection_before_selecting_the_carri
                 fragments=("from devices", "for no key update"),
             )
             # The rival's store-only clear lands while admission waits for the lock.
-            gate.add(StreamPendingClear(device_id=device_id, stream="vlan", provenance="store_only", revision=1))
+            carrier = StreamPendingClear(
+                device_id=device_id,
+                stream="vlan",
+                provenance="store_only",
+                revision=1,
+            )
+            gate.add(carrier)
+            await gate.flush()
+            carrier_id = carrier.id
             await gate.commit()
             await asyncio.wait_for(admitting, timeout=10)
         finally:
@@ -552,7 +560,7 @@ async def test_removal_admission_locks_the_projection_before_selecting_the_carri
             await db.scalars(sa.select(StreamPendingClear).where(StreamPendingClear.device_id == device_id))
         ).all()
     named = generation.document["vlan"]["_execution"]["operation"]["pending_clear_ids"]
-    assert named, "the operation plane named no carrier while admission deleted one"
+    assert named == [carrier_id], "the operation plane must name the carrier admission discharged"
     assert list(survivors) == [], "the carrier admission named must be the carrier it discharged"
 
 
