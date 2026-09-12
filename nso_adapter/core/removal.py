@@ -662,7 +662,7 @@ async def guarded_device_write(
     Returns the send's R2 §4.4 proof verdict. A guard that swallowed it would leave the
     caller unable to tell a proven commit from an unverified one.
     """
-    from nso_adapter.nso.apply import apply_device_intent
+    from nso_adapter.nso.apply import NsoApplyError, apply_device_intent
 
     context = context or {}
     device_name = device.nso_device_name
@@ -670,7 +670,13 @@ async def guarded_device_write(
         logger.warning("removal.force", device_id=device.id, scope=context.get("scope"))
     elif not no_networking:
         if current is _NO_SNAPSHOT:
-            current = await client.get_service_config(device_name)
+            state = await client.service_instance_state(device_name)
+            if state.inconclusive:
+                raise NsoApplyError(
+                    "service_snapshot_inconclusive",
+                    "could not certify the live service instance; refusing the device-intent PUT",
+                )
+            current = state.entry
         if current:
             orphans = _document_orphans(current, containers, allowed)
             if orphans:

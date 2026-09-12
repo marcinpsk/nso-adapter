@@ -24,7 +24,8 @@ async def test_unasserted_switching_root_blocks_unrelated_vlan_put(adapter_clien
     await seed_settings(device_id, auto_apply=True)
     assert (await _put_vlans(adapter_client, device_id, [100], seq=1)).status_code == 200
     client, rec = recorded_client("switching-collateral")
-    client.get_service_config.return_value = {scope: body}
+    rec.fake.service = []
+    rec.fake.instance.update({scope: body})
     job = await job_row(await run_head(device_id, client))
     assert job.status.value == "failed", job.result
     assert not rec.documents
@@ -105,8 +106,6 @@ async def test_prepared_removal_worker_checks_root_and_child_residue(adapter_cli
     device_state = {}
     client, rec = recorded_client("prepared-residue", device_state=device_state)
     assert (await job_row(await run_head(device_id, client))).status.value == "succeeded"
-    previous = rec.documents[-1]
-    client.get_service_config.return_value = previous
     # The far side of the writer answers in the EXPORT shape, never in the service shape
     # the document just transmitted.
     device_state[wire] = {"status": "ok", **(_export_body(scope, root, child) if survives else {})}

@@ -478,10 +478,12 @@ def test_c1_7b_no_retained_entries_is_the_documents_own_body():
 
 
 def _guard_client(service_config=None):
-    from nso_adapter.nso.client import NsoClient
+    from nso_adapter.nso.client import NsoClient, ServiceInstanceState
 
     client = AsyncMock(spec=NsoClient)
-    client.get_service_config.return_value = service_config
+    client.service_instance_state.return_value = ServiceInstanceState(
+        "absent" if service_config is None else "present", service_config
+    )
     return client
 
 
@@ -517,7 +519,7 @@ async def test_c1_8_supplied_snapshot_suppresses_the_internal_get(supplied, labe
 
     with patch("nso_adapter.nso.apply.apply_device_intent", new_callable=AsyncMock):
         await removal_mod.guarded_device_write(client, _Device(), _containers(A), allowed={}, current=supplied)
-    client.get_service_config.assert_not_awaited(), label
+    client.service_instance_state.assert_not_awaited(), label
 
 
 async def test_c1_8b_a_send_with_no_snapshot_reads_the_instance_itself():
@@ -525,7 +527,7 @@ async def test_c1_8b_a_send_with_no_snapshot_reads_the_instance_itself():
     client = _guard_client(None)
     with patch("nso_adapter.nso.apply.apply_device_intent", new_callable=AsyncMock):
         await removal_mod.guarded_device_write(client, _Device(), {"vlan": {"vlan": []}}, allowed={})
-    client.get_service_config.assert_awaited_once()
+    client.service_instance_state.assert_awaited_once()
 
 
 async def test_c1_8c_a_supplied_snapshot_still_drives_the_guard():
@@ -535,7 +537,7 @@ async def test_c1_8c_a_supplied_snapshot_still_drives_the_guard():
         await removal_mod.guarded_device_write(client, _Device(), _containers(A), allowed={}, current=_instance(A, C))
     # Scope-qualified: the guard is device-wide, and two families both have a `host` list.
     assert excinfo.value.orphans == {"static_route/route": [["", C[1], C[2]]]}
-    client.get_service_config.assert_not_awaited()
+    client.service_instance_state.assert_not_awaited()
 
 
 # ── C1.9 — claim + job_id threading ──────────────────────────────────────────

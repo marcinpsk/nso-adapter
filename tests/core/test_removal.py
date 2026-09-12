@@ -953,7 +953,9 @@ def _guard_client(instance=None):
 
     client = AsyncMock(spec=NsoClient)
     client.get_service_config.return_value = instance
-    client.service_instance_state.return_value = ServiceInstanceState("absent", None)
+    client.service_instance_state.return_value = ServiceInstanceState(
+        "absent" if instance is None else "present", instance
+    )
     return client
 
 
@@ -1163,7 +1165,7 @@ async def test_generic_force_skips_guard_and_service_get(adapter_client):
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
     assert len(_commits(sender)) == 1
-    client.get_service_config.assert_not_awaited()
+    client.service_instance_state.assert_not_awaited()
 
 
 async def test_generic_no_service_instance_skips_guard(adapter_client):
@@ -1456,7 +1458,11 @@ def test_residue_reader_exposes_the_real_action_method():
     """The residue reader fake exposes the real asynchronous action method."""
     import inspect
 
+    from nso_adapter.core.removal import residue_wire_name
     from nso_adapter.nso.client import NsoClient
+
+    aliases = {"l2": "l2_sap", "interface_ips": "interface_config"}
+    assert _TAG_TO_WIRE == {tag: residue_wire_name(aliases.get(tag, tag)) for tag in _TAG_TO_WIRE}
 
     # The residue read and the fake both go through the real action method, not a getter.
     action = getattr(NsoClient, "run_device_state_read", None)
@@ -2137,7 +2143,7 @@ async def test_guarded_device_write_detach_skips_collateral_guard(adapter_client
     # No RemovalBlockedError raised; the send ran exactly once and never read the instance.
     assert len(_commits(sender)) == 1
     assert _commits(sender)[0].kwargs["no_networking"] is True
-    client.get_service_config.assert_not_awaited()
+    client.service_instance_state.assert_not_awaited()
 
 
 async def test_detach_commits_with_no_networking(adapter_client):

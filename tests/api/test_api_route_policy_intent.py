@@ -285,11 +285,13 @@ async def test_put_route_policy_intent_auto_apply_creates_generation(adapter_cli
         running.run_attempt = 1
         await db.commit()
 
-    nso_client = AsyncMock()
+    from nso_adapter.nso.client import NsoClient, ServiceInstanceState
+
+    nso_client = AsyncMock(spec=NsoClient)
     nso_client.get_device_state_doc.return_value = None
     # The device-wide collateral guard reads the live aggregate instance before every send;
-    # None means "no instance", which is what an unwritten device really has.
-    nso_client.get_service_config.return_value = None
+    # A keyed 404 certifies that an unwritten device has no instance.
+    nso_client.service_instance_state.return_value = ServiceInstanceState("absent", None)
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=nso_client),
         patch("nso_adapter.nso.apply.apply_device_intent", new_callable=AsyncMock) as send,

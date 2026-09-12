@@ -280,7 +280,6 @@ async def test_put_ip_intent_removal_enqueues_interface_config_job(adapter_clien
             "removed": {
                 "address": [["Gi0/3", "10.0.0.2/24", ""]],
                 "ipv4-address": [["Gi0/3", "10.0.0.2"]],
-                "interface": [["Gi0/3"]],
             },
             "detach": True,
         }
@@ -544,7 +543,6 @@ async def test_ip_intent_correction_freezes_predecessor_wire_grains(adapter_clie
         job = await db.get(Job, generation.job_id)
         assert job.job_type == JobType.removal
         assert job.context["removed"] == {
-            "interface": [[interface]],
             "address": [[interface, before, ""]],
             label: [[interface, host]],
         }

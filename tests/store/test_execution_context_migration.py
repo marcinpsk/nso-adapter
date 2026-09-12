@@ -171,6 +171,7 @@ def test_the_migration_stamps_interface_proof_and_the_static_route_apply_plan(pg
                                 "vrf": "",
                                 "prefix": "198.18.0.0/24",
                                 "next_hop": "198.18.1.1",
+                                "accepted_at": "2026-09-01T00:00:00+00:00",
                             }
                         ],
                         "static_route_tombstone": [],
@@ -203,6 +204,7 @@ def test_the_migration_stamps_interface_proof_and_the_static_route_apply_plan(pg
 
     plan = hydrate_static_route_apply_plan({"static_route": route_fragment})
     assert plan.tombstone_ids == []
+    assert [row.id for row in plan.rows] == [31]
     # ``mode`` no longer picks a transport: it records whether the stamped document delivers
     # a replacement, and a pre-contract row with no deployed key delivers none.
     assert route_fragment[EXECUTION_KEY]["proof"]["apply"]["mode"] == "PATCH"

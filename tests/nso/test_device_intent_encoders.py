@@ -375,3 +375,8 @@ def test_static_route_legacy_body_paths_are_deleted():
     # _static_route_snapshot survives by design (#1683: the aggregate builder's single
     # retention helper). The per-service SENDERS are what had to go.
     assert not definitions & {"_replace_static_route", "_sr_body"}
+
+
+def test_isis_fixture_encodes_a_supported_circuit_type():
+    body = section_registry()["isis"].encode(_rows("isis"), _execution("isis"))
+    assert body["interface-config"][0]["circuit-type"] == "level-2-only"

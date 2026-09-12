@@ -1304,3 +1304,18 @@ async def test_scenario_2_a_creation_waits_for_a_consumption_and_names_no_consum
 
     await harness.run()
     assert harness.fake.sent_keys() == {S}, "the worker retained a key no carrier claims"
+
+
+async def test_partial_address_removal_has_only_address_authority(adapter_client):
+    device_id = await seed_device(nso_device_name="partial-address")
+    await _seed_interface(device_id, "GigabitEthernet0/1")
+    removed = {"interface": "GigabitEthernet0/1", "address": "198.18.0.1/24", "family": "ipv4"}
+    survivor = {**removed, "address": "198.18.1.1/24"}
+    assert (await _put_addresses(adapter_client, device_id, [removed, survivor], seq=1)).status_code == 200
+    response = await _put_addresses(adapter_client, device_id, [survivor], seq=2)
+    assert response.status_code == 200, response.text
+    generations = await _generations(device_id)
+    removal = next(g for g in generations if g.removal_context)
+    assert removal.removal_context["interfaces"] == ["GigabitEthernet0/1"]
+    assert not removal.allowed_removal_keys["interface_config"].get("interface")
+    assert removal.allowed_removal_keys["interface_config"]["address"] == [["GigabitEthernet0/1", "198.18.0.1/24", ""]]

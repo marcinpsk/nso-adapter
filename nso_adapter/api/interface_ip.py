@@ -341,7 +341,9 @@ async def put_ip_intent(
                 promotes=(delivery.stream,),
                 settlement_cohort=settlement_cohort,
                 interfaces=sorted(removed_interfaces),
-                removed=interface_removal_keys(sorted(removed_interfaces), removed_addresses),
+                removed=interface_removal_keys(
+                    sorted(removed_interfaces - {item.interface for item in body.addresses}), removed_addresses
+                ),
             )
             is not None
         )

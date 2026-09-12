@@ -552,3 +552,45 @@ async def test_delete_tombstones_refuses_a_stale_token(adapter_client):
         await db.rollback()
 
     assert [row_id for row_id, _job in await _tombstones(device_id)] == [first]
+
+
+async def test_empty_tombstone_delete_does_not_create_projection_state(adapter_client):
+    from nso_adapter.store.models import DeviceGenerationCounter
+    from nso_adapter.store.tombstone_store import delete_tombstones
+
+    device_id = await seed_device(nso_device_name="empty-delete")
+    reg = await acquire_claim(device_id, "sweep")
+    try:
+        async with session() as db:
+            assert await db.get(DeviceGenerationCounter, device_id) is None
+            assert await delete_tombstones(db, [], device_id=device_id, claim_token=reg.token) == 0
+            await db.commit()
+            assert await db.get(DeviceGenerationCounter, device_id) is None
+    finally:
+        await release_claim(reg)
+
+
+async def test_refused_sweep_rolls_back_before_releasing_supplied_session(adapter_client):
+    from nso_adapter.core.generation import OperationSectionAbsent
+    from nso_adapter.core.tombstone_sweep import sweep_one_device
+    from nso_adapter.store.models import DeviceClaim, DeviceGenerationCounter, StaticRouteTombstone
+
+    device_id = await seed_device(nso_device_name="refused-sweep")
+    async with session() as db:
+        row = StaticRouteTombstone(
+            device_id=device_id,
+            route_id=1,
+            vrf="",
+            prefix="198.18.0.0/24",
+            next_hop="198.18.1.1",
+            marking="delete_origin",
+        )
+        db.add(row)
+        await db.commit()
+        row_id = row.id
+        with pytest.raises(OperationSectionAbsent):
+            await sweep_one_device(device_id, db=db)
+    async with session() as db:
+        assert await db.get(DeviceClaim, device_id) is None
+        assert (await db.get(StaticRouteTombstone, row_id)).job_id is None
+        assert await db.get(DeviceGenerationCounter, device_id) is None

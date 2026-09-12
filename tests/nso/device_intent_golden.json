@@ -106,7 +106,7 @@
       {
         "af": "ipv4-unicast",
         "bfd-enabled": true,
-        "circuit-type": "2",
+        "circuit-type": "level-2-only",
         "frr-enabled": true,
         "frr-protection": "node",
         "interface-name": "GigabitEthernet0/0",

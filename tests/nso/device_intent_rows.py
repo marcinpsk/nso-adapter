@@ -363,7 +363,7 @@ def section_rows() -> dict[str, dict[type, list[Any]]]:
                     interface_name="GigabitEthernet0/0",
                     af="ipv4-unicast",
                     process_tag="CORE",
-                    circuit_type="2",
+                    circuit_type="level-2",
                     network_type="point-to-point",
                     metric=100,
                     passive=False,

@@ -58,7 +58,10 @@ class _Recorder:
     def _instance(body) -> dict | None:
         """The device-intent list entry a request carried, or ``None`` for anything else."""
         entries = (body or {}).get(_DI_ROOT)
-        return entries[0] if isinstance(entries, list) and entries else None
+        if entries is None:
+            return None
+        assert isinstance(entries, list) and len(entries) == 1, entries
+        return entries[0]
 
     @property
     def commits(self) -> list[dict]:
@@ -1352,3 +1355,36 @@ async def test_f9_c_a_present_key_still_settles_and_stamps_the_row_it_carried(ad
     assert (await _generation_statuses(device_id))[0] == "settled"
     # The successor's row is not stamped by a deployment that never carried its content.
     assert (await vlan_rows(device_id))[10] == ("after", False)
+
+
+@pytest.mark.parametrize("entries", [[], [{"device": "one"}, {"device": "two"}], {}])
+def test_recorder_refuses_non_singleton_documents(entries):
+    with pytest.raises(AssertionError):
+        _Recorder._instance({_DI_ROOT: entries})
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {_DI_ROOT: []},
+        {_DI_ROOT: [{"device": "other"}]},
+        {_DI_ROOT: [{"device": "uncertified"}, {"device": "other"}]},
+    ],
+)
+async def test_vlan_only_apply_refuses_uncertified_service_read(adapter_client, payload):
+    import httpx
+
+    device_id = await seed_device(nso_device_name="uncertified")
+    await seed_settings(device_id)
+    assert (await put_vlans(adapter_client, device_id, [100])).status_code == 200
+    client, rec = recorded_client("uncertified")
+    http = client._client.return_value.__aenter__.return_value
+
+    async def read(url, **kwargs):
+        return httpx.Response(200, request=httpx.Request("GET", url), json=payload)
+
+    http.get.side_effect = read
+    job = await job_row(await run_head(device_id, client))
+    assert job.status.value == "failed"
+    assert rec.commits == [], "an uncertified live instance must never permit a PUT"

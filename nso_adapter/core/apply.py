@@ -1082,7 +1082,10 @@ def _device_error_message(exc) -> str | None:
     nso_error = (getattr(exc, "detail", None) or {}).get("nso_error")
     if not isinstance(nso_error, dict):
         return None
-    errors = (nso_error.get("ietf-restconf:errors") or {}).get("error") or []
+    envelope = nso_error.get("ietf-restconf:errors") or nso_error.get("errors")
+    if not isinstance(envelope, dict):
+        return None
+    errors = envelope.get("error") or []
     for e in errors:
         if isinstance(e, dict) and e.get("error-message"):
             return str(e["error-message"])

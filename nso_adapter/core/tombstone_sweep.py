@@ -125,6 +125,8 @@ async def sweep_one_device(device_id: int, *, db: AsyncSession | None = None) ->
     if reg is None:
         logger.debug("tombstone_sweep.skipped_claimed", device_id=device_id)
         return 0
+    from nso_adapter.core.generation import OperationSectionAbsent
+
     created = 0
     try:
         async with claim_session(db) as conn:
@@ -168,6 +170,10 @@ async def sweep_one_device(device_id: int, *, db: AsyncSession | None = None) ->
                 await reissue_removal_job(conn, device_id, row)
                 created += 1
             await conn.commit()
+    except OperationSectionAbsent:
+        if db is not None:
+            await db.rollback()
+        raise
     finally:
         await release_claim(reg, db=db)
     if created:

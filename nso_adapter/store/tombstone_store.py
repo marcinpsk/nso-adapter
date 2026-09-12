@@ -50,10 +50,10 @@ async def delete_tombstones(
     from nso_adapter.core.generation import lock_projection
 
     await lock_claim(db, ClaimRegistration(device_id, claim_token))
-    await lock_projection(db, device_id)
     ordered = sorted(set(ids))
     if not ordered:
         return 0
+    await lock_projection(db, device_id)
     await db.execute(
         select(StaticRouteTombstone.id)
         .where(StaticRouteTombstone.id.in_(ordered))

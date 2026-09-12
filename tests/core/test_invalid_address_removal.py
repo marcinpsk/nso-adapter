@@ -20,6 +20,7 @@ async def test_malformed_stored_address_refuses_removal_atomically(adapter_clien
     response = await _put_addresses(adapter_client, device_id, [], seq=1)
     assert response.status_code == 409, response.text
     assert response.json()["error"]["code"] == "apply_unexecutable"
+    assert response.json()["error"]["detail"]["streams"] == {"ip": "invalid_stored_address"}
     async with session() as db:
         assert await db.get(InterfaceIpIntent, row_id) is not None
         assert await db.scalar(sa.select(sa.func.count()).select_from(DeploymentGeneration)) == 0

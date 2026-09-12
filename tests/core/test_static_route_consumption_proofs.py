@@ -244,28 +244,25 @@ async def test_a_reclaim_never_consumes_a_carrier_on_a_malformed_service_read(ad
     assert fake.writes == []
 
 
-def test_the_shared_reader_is_the_only_certified_static_route_reader():
-    """One module knows the path and the nesting, so the cutover changes one module.
-
-    A second caller of ``service_instance_state`` would keep expecting a top-level ``route``
-    list and certify ABSENCE over an aggregate-owned key after the cutover.
-    """
+def test_certified_instance_reads_stay_in_the_section_reader_and_document_guard():
+    """The section reader owns route projection; the guard compares the whole instance."""
     callers = set()
     for path in (_REPO_ROOT / "nso_adapter").rglob("*.py"):
-        if path.relative_to(_REPO_ROOT).as_posix() in {
-            "nso_adapter/nso/client.py",
-            "nso_adapter/core/static_route_reader.py",
-        }:
-            continue
         tree = ast.parse(path.read_text())
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "service_instance_state"
-            ):
-                callers.add(str(path.relative_to(_REPO_ROOT)))
-    assert callers == set(), f"certified static-route reads outside the shared reader: {sorted(callers)}"
+        for function in ast.walk(tree):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(function):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "service_instance_state"
+                ):
+                    callers.add((path.relative_to(_REPO_ROOT).as_posix(), function.name))
+    assert callers == {
+        ("nso_adapter/core/static_route_reader.py", "certified_static_route_section"),
+        ("nso_adapter/core/removal.py", "guarded_device_write"),
+    }
 
 
 async def test_a_carrier_claiming_only_a_replaced_predecessor_key_is_not_superseded(adapter_client):

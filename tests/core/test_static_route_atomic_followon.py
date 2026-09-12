@@ -88,6 +88,7 @@ class _AtomicRecorder(_ProofRecorder):
     def __init__(self, device_name: str, dry_run_status: int = 200):
         super().__init__(device_name, dry_run_status=dry_run_status)
         self.fail_commit = False
+        self.error_envelope = "ietf-restconf:errors"
         #: The device error the rejection carries. The ratified refusal shape names its own
         #: family, which is what lets localisation attribute one without a dry-run sweep.
         self.reject_message = "device rejected the commit"
@@ -103,8 +104,7 @@ class _AtomicRecorder(_ProofRecorder):
                 400,
                 request=httpx.Request(method.upper(), url),
                 json={
-                    "ietf-restconf:errors": {"error": [{"error-message": self.reject_message}]},
-                    "errors": {"error": [{"error-message": self.reject_message}]},
+                    self.error_envelope: {"error": [{"error-message": self.reject_message}]},
                 },
             )
         return await super()._handle(method, url, content, headers)
@@ -220,7 +220,8 @@ async def test_c5_2_a_failed_combined_commit_issues_no_follow_on_put(adapter_cli
     assert outcomes(job) == {B: "apply_failed"}
 
 
-async def test_localized_refusal_replaces_previous_errors_on_other_families(adapter_client):
+@pytest.mark.parametrize("envelope", ["ietf-restconf:errors", "errors"])
+async def test_localized_refusal_replaces_previous_errors_on_other_families(adapter_client, envelope):
     """A refused transaction replaces stale errors on every affected row."""
     device_id = await seed_device(nso_device_name="sr-atomic", netbox_device_id=7504)
     stale = {"code": "internal", "message": "a previous apply failed", "detail": {}}
@@ -230,10 +231,12 @@ async def test_localized_refusal_replaces_previous_errors_on_other_families(adap
         "sr-atomic", state=present(wire(A), device_name="sr-atomic"), section=dev_state(wire(B))
     )
     rec.fail_commit = True
+    rec.error_envelope = envelope
     rec.reject_message = "device-intent: refused [family=vlan field=vlan-id]: unsupported"
 
     job = await run_the_apply(device_id, client)
 
+    assert not any(call["dry_run"] for call in rec.calls), "a named refusal needs no localization dry-run"
     entry = job.result["static_route_results"][0]
     assert entry["outcome"] == "apply_failed"
     assert entry["error"] is not None

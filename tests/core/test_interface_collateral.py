@@ -55,7 +55,8 @@ async def test_unasserted_interface_root_blocks_an_unrelated_vlan_put(adapter_cl
     await seed_settings(device_id, auto_apply=True)
     assert (await _put_vlans(adapter_client, device_id, [100], seq=1)).status_code == 200
     client, rec = recorded_client("interface-collateral")
-    client.get_service_config.return_value = _live(description="core link")
+    rec.fake.service = []
+    rec.fake.instance.update(_live(description="core link"))
     job = await job_row(await run_head(device_id, client))
     assert job.status.value == "failed", job.result
     assert await _blocked_orphans(device_id) == {
@@ -71,7 +72,8 @@ async def test_unasserted_interface_address_blocks_an_unrelated_vlan_put(adapter
     await seed_settings(device_id, auto_apply=True)
     assert (await _put_vlans(adapter_client, device_id, [100], seq=1)).status_code == 200
     client, rec = recorded_client("interface-address-collateral")
-    client.get_service_config.return_value = _live(addresses=[{"address": "192.0.2.5", "prefix-length": 24}])
+    rec.fake.service = []
+    rec.fake.instance.update(_live(addresses=[{"address": "192.0.2.5", "prefix-length": 24}]))
     job = await job_row(await run_head(device_id, client))
     assert job.status.value == "failed", job.result
     assert await _blocked_orphans(device_id) == {
@@ -94,7 +96,8 @@ async def test_an_authorized_interface_removal_drops_the_root(adapter_client):
     assert (await _put_attrs(adapter_client, device_id, [], seq=1761, query="?delete_origin=true")).status_code == 200
     assert (await _apply(adapter_client, device_id, {"interface_config": 1761})).status_code == 202
     client, rec = recorded_client("interface-authorized")
-    client.get_service_config.return_value = live
+    rec.fake.service = []
+    rec.fake.instance.update(live)
     job = await job_row(await run_head(device_id, client))
     assert job.status.value == "succeeded", job.error
     assert rec.documents[-1]["interface"] == {"interface": []}
@@ -115,7 +118,8 @@ async def test_an_authorized_address_removal_drops_the_address(adapter_client):
         await _put_addresses(adapter_client, device_id, [], seq=1771, query="?delete_origin=true")
     ).status_code == 200
     client, rec = recorded_client("interface-address-authorized")
-    client.get_service_config.return_value = live
+    rec.fake.service = []
+    rec.fake.instance.update(live)
     job = await job_row(await run_head(device_id, client))
     assert job.status.value == "succeeded", job.error
     assert rec.documents[-1]["interface"] == {"interface": []}
@@ -137,7 +141,8 @@ async def test_unasserted_interface_attribute_blocks_an_ip_only_put(adapter_clie
     client, rec = recorded_client("attribute-collateral")
     live = _live(addresses=[{"address": "192.0.2.5", "prefix-length": 24}])
     live["interface"]["interface"][0][attribute] = value
-    client.get_service_config.return_value = live
+    rec.fake.service = []
+    rec.fake.instance.update(live)
     job = await job_row(await run_head(device_id, client))
     assert job.status.value == "failed", job.result
     async with session() as db:
@@ -165,7 +170,8 @@ async def test_authorized_attribute_removal_keeps_the_address(adapter_client, at
     assert (await _put_attrs(adapter_client, device_id, [], seq=1792, query="?delete_origin=true")).status_code == 200
     assert (await _apply(adapter_client, device_id, {"interface_config": 1792})).status_code == 202
     client, rec = recorded_client("attribute-removal")
-    client.get_service_config.return_value = live
+    rec.fake.service = []
+    rec.fake.instance.update(live)
     job = await job_row(await run_head(device_id, client))
     assert job.status.value == "succeeded", job.error
     entry = rec.documents[-1]["interface"]["interface"][0]
@@ -183,7 +189,8 @@ async def test_ip_only_put_without_attribute_changes_succeeds(adapter_client):
     assert (await _apply(adapter_client, device_id, {"ip": 1800})).status_code == 202
     client, rec = recorded_client("ip-collateral-clean")
     live = _live(addresses=[{"address": "192.0.2.5", "prefix-length": 24}])
-    client.get_service_config.return_value = live
+    rec.fake.service = []
+    rec.fake.instance.update(live)
     job = await job_row(await run_head(device_id, client))
     assert job.status.value == "succeeded", job.error
     entry = rec.documents[-1]["interface"]["interface"][0]
@@ -209,7 +216,8 @@ async def test_automatic_attribute_removal_keeps_enabled(adapter_client):
     response = await _put_attrs(adapter_client, device_id, [enabled], seq=1811, query="?delete_origin=true")
     assert response.status_code == 200, response.text
     client, rec = recorded_client("attribute-auto-removal")
-    client.get_service_config.return_value = live
+    rec.fake.service = []
+    rec.fake.instance.update(live)
     job = await job_row(await run_head(device_id, client))
     assert job.status.value == "succeeded", (job.error, job.result)
     (entry,) = rec.documents[-1]["interface"]["interface"]
@@ -247,7 +255,8 @@ async def test_automatic_attribute_edit_with_detach(adapter_client, reject, queu
         assert current.applied_revision == before.applied_revision
 
     client, rec = recorded_client(name, on_sync_from=check_unsettled)
-    client.get_service_config.return_value = live
+    rec.fake.service = []
+    rec.fake.instance.update(live)
     if queued:
         companion, detach = (await generations(device_id))[-2:]
         assert companion.settlement_cohort is not None
@@ -262,7 +271,6 @@ async def test_automatic_attribute_edit_with_detach(adapter_client, reject, queu
         assert rec.documents[0]["interface"] == live["interface"]
         assert not rec.fake.writes[0]["no_networking"]
         await check_unsettled()
-        client.get_service_config.return_value = rec.documents[-1]
     offset = int(queued)
     if reject:
         rec.fake.reject_containers.add("interface")
@@ -284,7 +292,6 @@ async def test_automatic_attribute_edit_with_detach(adapter_client, reject, queu
         return
 
     assert job.status.value == "succeeded", (job.error, job.result)
-    client.get_service_config.return_value = rec.documents[-1]
     detach = await job_row(await run_head(device_id, client))
     assert detach.status.value == "succeeded", (detach.error, detach.result)
     assert len(rec.documents) == offset + 2
@@ -334,7 +341,8 @@ async def test_manual_attribute_edit_with_detach_refuses_queued_apply(adapter_cl
     assert current.authorized_revision == before.authorized_revision < current.desired_revision
     assert current.applied_revision == before.applied_revision
     client, rec = recorded_client(name)
-    client.get_service_config.return_value = live
+    rec.fake.service = []
+    rec.fake.instance.update(live)
     job = await job_row(await run_head(device_id, client))
     assert job.id == incumbent.job_id
     assert job.status.value == "succeeded", (job.error, job.result)
