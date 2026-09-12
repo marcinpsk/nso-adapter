@@ -276,15 +276,32 @@ def unhandled_exception_response(request: Request, exc: BaseException) -> JSONRe
     )
 
 
+#: Body fields whose entries are keyed by a CALLER-CHOSEN name. Pydantic reports a failing
+#: entry at ``("body", <field>, <key>)``, so the key itself lands in the 422 — and a caller
+#: that named a secret map entry after the secret would read it straight back out. Every
+#: ``dict[str, SecretStr]`` request field belongs here; ``test_secret_maps_are_registered_for_loc_redaction``
+#: derives the set from the app's own models and fails when one is added without it.
+DYNAMIC_KEY_LOCATIONS: frozenset[tuple[str, ...]] = frozenset({("body", "values")})
+
+#: What replaces a caller-chosen key in a reported location.
+REDACTED_LOC = "[redacted]"
+
+
+def _safe_loc(loc: tuple) -> list:
+    """Redact every caller-chosen mapping key from one reported validation location."""
+    return [REDACTED_LOC if tuple(loc[:index]) in DYNAMIC_KEY_LOCATIONS else part for index, part in enumerate(loc)]
+
+
 async def validation_error_handler(request: Request, exc: Exception) -> JSONResponse:
     """Convert FastAPI request-validation failures to the documented envelope.
 
     Pydantic can include the submitted value under ``input`` and a validator's
     exception under ``ctx`` and ``msg``. Any of them can contain secrets, so the
-    public boundary keeps only the location and stable error type.
+    public boundary keeps only the location and stable error type — and the location
+    itself is redacted where a segment is a name the caller chose.
     """
     assert isinstance(exc, RequestValidationError)
-    errors = [{"loc": error["loc"], "type": error["type"], "msg": "Invalid value"} for error in exc.errors()]
+    errors = [{"loc": _safe_loc(error["loc"]), "type": error["type"], "msg": "Invalid value"} for error in exc.errors()]
     return JSONResponse(
         status_code=422,
         content={

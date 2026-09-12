@@ -30,6 +30,7 @@ from nso_adapter.core.claim import (
     resolve_claim_by_token,
 )
 from nso_adapter.core.families import ALL_FAMILY_KEYS
+from nso_adapter.nso.client import failure_detail
 from nso_adapter.store import outcome_store
 from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import (
@@ -44,6 +45,26 @@ from nso_adapter.store.models import (
 )
 
 logger = structlog.get_logger(__name__)
+
+
+class DeviceIdentityRefused(LookupError):
+    """A conflict whose real detail is server-side link state, so the message is authored.
+
+    The caller sent an identity and a NetBox device id; what refuses the request is the link
+    the adapter already holds, which the caller never sent and must not be told. The message
+    repeats none of it, ``reason`` names the refusal for the client, and the full detail goes
+    to the log at the raise site (every caller of onboarding gets it, not just the API).
+    """
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+#: The authored answers. Each states the refusal and interpolates nothing.
+_ONBOARDED_ELSEWHERE = "The NSO device is already onboarded to a different NetBox device"
+_IDENTITY_CLAIMED = "The target NSO identity is already claimed by another device"
+
 
 _READ_MIRROR_ROOTS = (
     "interfaces",
@@ -77,6 +98,9 @@ _READ_MIRROR_ROOTS = (
 )
 
 
+#: The failures whose message the adapter WROTE: it names the failure and repeats nothing
+#: the server said. Every other exception is classified by its type alone — a decode of a
+#: malformed answer carries the server's bytes, and a store failure carries the statement.
 async def _bootstrap_address(client, device_name: str, primary: str, oob_ip: str | None) -> tuple[str, dict | None]:
     """Reachability-aware initial management address.
 
@@ -96,7 +120,11 @@ async def _bootstrap_address(client, device_name: str, primary: str, oob_ip: str
         await client.set_address(device_name, oob_ip)
         await client.disconnect(device_name)
     except Exception as exc:
-        return ActiveAddress.primary.value, {"step": "failover_bootstrap", "status": "failed", "detail": repr(exc)}
+        return ActiveAddress.primary.value, {
+            "step": "failover_bootstrap",
+            "status": "failed",
+            "detail": failure_detail(exc),
+        }
     return ActiveAddress.oob.value, {
         "step": "failover_bootstrap",
         "status": "oob",
@@ -116,12 +144,17 @@ async def _once_with_retry(action, *, backoff: float = _ONBOARD_RETRY_BACKOFF_SE
     for which ``ok(value)`` is falsy — covers both fetch-host-keys (raises) and
     sync-from (returns a bool). The second attempt's exception/result propagates.
     """
+    result = None
+    retry = False
     try:
         result = await action()
     except Exception:
-        await asyncio.sleep(backoff)
-        return await action()
-    if ok is not None and not ok(result):
+        retry = True
+    if not retry and ok is not None and not ok(result):
+        retry = True
+    # The second attempt runs AFTER the handler: inside it, a second failure keeps the FIRST
+    # exception on __context__, and an HTTP reason phrase there carries the server's text.
+    if retry:
         await asyncio.sleep(backoff)
         return await action()
     return result
@@ -184,10 +217,15 @@ async def onboard_device(
             return existing
         # Linked to a DIFFERENT NetBox device → genuine conflict; never silently repoint it.
         if existing.netbox_device_id is not None:
-            raise LookupError(
-                f"NSO device {nso_device_name!r} on {nso_instance!r} is already onboarded "
-                f"to NetBox device {existing.netbox_device_id}"
+            logger.warning(
+                "device.onboard_refused",
+                reason="onboarded_elsewhere",
+                nso_instance=nso_instance,
+                nso_device=nso_device_name,
+                linked_netbox_device_id=existing.netbox_device_id,
+                requested_netbox_device_id=netbox_device_id,
             )
+            raise DeviceIdentityRefused(_ONBOARDED_ELSEWHERE, reason="onboarded_elsewhere")
         # Unlinked leftover — provisioned INTO NSO without a NetBox link (netbox_device_id NULL).
         # ADOPT it: fill the mapping in on the same row. Rejecting here left the plugin's onboard
         # POST failing with 409, which it swallowed, so the device never onboarded. The target
@@ -220,6 +258,7 @@ async def onboard_device(
         mapping_status=MappingStatus.mapped,
     )
     db.add(device)
+    claimed = None
     try:
         # The settle counter is created WITH the device, in this same transaction: a terminal
         # write may never create it (Appendix S §3.3), so every insert site owes one.
@@ -243,9 +282,12 @@ async def onboard_device(
         ).scalar_one_or_none()
         if winner is None or winner.netbox_device_id not in (None, netbox_device_id):
             # The conflict was on netbox_device_id instead: another NSO node claimed it.
-            raise LookupError(f"NetBox device {netbox_device_id} is already onboarded") from None
-        logger.info("device.onboard_race_resolved", device_id=winner.id, nso_device=nso_device_name)
-        return winner
+            claimed = LookupError(f"NetBox device {netbox_device_id} is already onboarded")
+        else:
+            logger.info("device.onboard_race_resolved", device_id=winner.id, nso_device=nso_device_name)
+            return winner
+    if claimed is not None:
+        raise claimed
     await db.refresh(device)
     logger.info("device.onboarded", device_id=device.id, nso_device=nso_device_name)
     return device
@@ -454,9 +496,15 @@ async def _link_existing_under_claim(
     # Linked to a DIFFERENT NetBox device → genuine conflict; never silently repoint it.
     if linked_to is not None:
         await db.rollback()
-        raise LookupError(
-            f"NSO device {nso_device_name!r} on {nso_instance!r} is already onboarded to NetBox device {linked_to}"
+        logger.warning(
+            "device.onboard_refused",
+            reason="onboarded_elsewhere",
+            nso_instance=nso_instance,
+            nso_device=nso_device_name,
+            linked_netbox_device_id=linked_to,
+            requested_netbox_device_id=netbox_device_id,
         )
+        raise DeviceIdentityRefused(_ONBOARDED_ELSEWHERE, reason="onboarded_elsewhere")
     dup_nb = await db.scalar(
         select(Device.id).where(Device.netbox_device_id == netbox_device_id, Device.id != device_id)
     )
@@ -548,7 +596,7 @@ async def provision_nso_device(
             await client.create_device(device_name, address, ned_id, authgroup, ned_type=device_type, port=port)
             _step("create", "ok", f"device-type={device_type}")
     except Exception as exc:
-        _step("create", "failed", repr(exc))
+        _step("create", "failed", failure_detail(exc))
         return _result(False)
 
     # 2. admin-state unlocked — blocking. MUST precede fetch-host-keys: a newly
@@ -558,7 +606,7 @@ async def provision_nso_device(
         await client.set_admin_state(device_name, admin_state)
         _step("admin_state", "ok", admin_state)
     except Exception as exc:
-        _step("admin_state", "failed", repr(exc))
+        _step("admin_state", "failed", failure_detail(exc))
         return _result(False)
 
     # 2b. reachability-aware address: bootstrap a fresh device over OOB if primary is
@@ -574,7 +622,7 @@ async def provision_nso_device(
         await _once_with_retry(lambda: client.fetch_host_keys(device_name))
         _step("fetch_host_keys", "ok")
     except Exception as exc:
-        _step("fetch_host_keys", "failed", repr(exc))
+        _step("fetch_host_keys", "failed", failure_detail(exc))
         # If the bootstrap pinned NSO to the OOB address, don't strand the device: map it and
         # seed the failover row so the loop can fail it back to primary once in-band recovers.
         if active_address == ActiveAddress.oob.value:
@@ -601,7 +649,7 @@ async def provision_nso_device(
             sync_ok = bool(await _once_with_retry(lambda: client.sync_from(device_name), ok=bool))
             _step("sync_from", "ok" if sync_ok else "failed")
         except Exception as exc:
-            _step("sync_from", "failed", repr(exc))
+            _step("sync_from", "failed", failure_detail(exc))
 
     # 5-6. adapter mapping row (so the read pipeline manages it henceforth) + failover row
     #      (IPs + bootstrapped address) so the failover loop can manage it.
@@ -673,7 +721,8 @@ async def _initial_mirror_refresh(
         raise
     except Exception as exc:  # noqa: BLE001 — never fail provisioning on a mirror-read hiccup
         await db.rollback()
-        logger.warning("device.onboard_mirror.failed", device_id=device_id, error=repr(exc))
+        # The mirror read is HTTP against NSO, so the same classification applies here.
+        logger.warning("device.onboard_mirror.failed", device_id=device_id, error=failure_detail(exc))
 
 
 async def _map_and_seed_failover(
@@ -740,7 +789,7 @@ async def _seed_onboarding_failover(
         # transaction has to go, or the mirror refresh and the runner's terminal write both
         # die of PendingRollbackError on a device that mapped perfectly well.
         await db.rollback()
-        return {"step": "failover_seed", "status": "failed", "detail": repr(exc)}
+        return {"step": "failover_seed", "status": "failed", "detail": failure_detail(exc)}
 
 
 async def rekey_device(
@@ -780,7 +829,14 @@ async def rekey_device(
         )
     )
     if dup.scalar_one_or_none():
-        raise LookupError(f"NSO device {target_name!r} on {target_instance!r} is already claimed by another device")
+        logger.warning(
+            "device.rekey_refused",
+            reason="identity_claimed",
+            device_id=device_id,
+            nso_instance=target_instance,
+            nso_device=target_name,
+        )
+        raise DeviceIdentityRefused(_IDENTITY_CLAIMED, reason="identity_claimed")
 
     device.nso_instance = target_instance
     device.nso_device_name = target_name

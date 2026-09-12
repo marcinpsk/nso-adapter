@@ -211,7 +211,8 @@ async def _static_route_device_state(client, device) -> tuple[str, dict]:
         # carry on to the bookkeeping under ownership it no longer has.
         raise
     except Exception as exc:  # noqa: BLE001 — a read-side failure is inconclusive, never a green
-        logger.warning("static_route.device_state_read_failed", device_id=device.id, error=repr(exc))
+        # Metadata only: any exception from the reader can repeat what the server said.
+        logger.warning("static_route.device_state_read_failed", device_id=device.id, error_type=type(exc).__name__)
         return "error", {}
 
 

@@ -17,7 +17,7 @@ from nso_adapter.core.community_dialect import community_dialect_for
 from nso_adapter.nso.apply import NsoApplyError, SectionExecution, apply_device_intent, encode_snmp
 from nso_adapter.nso.client import DEVICE_INTENT_ROOT
 from nso_adapter.store.models import BgpRouterIntent, Job, JobStatus, OspfInterfaceIntent, SnmpCommunityIntent
-from tests._secret_discipline import assert_chain_free_of
+from tests._secret_discipline import assert_chain_free_of, assert_records_free_of
 from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 from tests.core.test_static_route_put import seed_apply_job
 from tests.nso.test_apply_send import _client_with
@@ -539,3 +539,382 @@ async def test_a_failed_residue_read_keeps_the_server_reason_out_of_the_log_and_
     with pytest.raises(RuntimeError) as caught:
         await removal_mod._residue_after_removal(client, device, "snmp", {"scope": "snmp", **removed})
     assert_chain_free_of(caught.value, secrets)
+
+
+# ── an envelope section that reports status=error: the wire reason reaches no sink ──
+
+#: What a real `snmp-config` extract failure can answer in the envelope's own error-reason.
+_SECTION_REASON = f"extract of /snmp:snmp/community[name='{_SECRET}'] failed for {_REF}"
+_SECRETS = [_SECRET, _REF, "placeholder-mount", "placeholder-path", "placeholder-key"]
+
+
+def _envelope_client(wire: str, section: dict, action_output: dict | None = None):
+    """A real NsoClient whose device-state envelope answers *section* for *wire*."""
+
+    def respond(request):
+        if "device-state-read/run" in str(request.url):
+            return httpx.Response(200, json={"network-state-export:output": action_output or {}})
+        if request.url.path.endswith(f"/{wire}"):
+            return httpx.Response(200, json={f"network-state-export:{wire}": section})
+        return httpx.Response(404)
+
+    return _client_with(httpx.MockTransport(respond))
+
+
+async def _refresh_static_route(device_id: int, client):
+    """One real engine refresh for the static_route family, on the real DB."""
+    from nso_adapter.core.refresh_engine import run_family_refresh
+    from nso_adapter.core.static_route import STATIC_ROUTE_SPEC
+    from nso_adapter.store.models import Device
+
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        await run_family_refresh(db, device, client, STATIC_ROUTE_SPEC)
+
+
+async def _outcome_rows(device_id: int) -> list[dict]:
+    from sqlalchemy import select
+
+    from nso_adapter.store.models import RefreshOutcome
+
+    async with session() as db:
+        rows = (await db.execute(select(RefreshOutcome).where(RefreshOutcome.device_id == device_id))).scalars().all()
+        return [{c.name: getattr(row, c.name) for c in row.__table__.columns} for row in rows]
+
+
+async def test_an_error_section_keeps_the_wire_reason_out_of_the_refresh_log(adapter_client):
+    """`static_route.refresh.unavailable` classifies the failure; it never repeats the wire text.
+
+    The envelope's `error-reason` is the server's own text. A `snmp-config` extract failure
+    can answer a community-keyed path there, and the classifier carried it verbatim into the
+    log record the poller writes on every failed read.
+    """
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
+    device_id = await seed_device(nso_device_name="refresh-error-section", netbox_device_id=9421)
+    client = _envelope_client("static-route", {"status": "error", "error-reason": _SECTION_REASON})
+    with capture_logs() as logs:
+        await _refresh_static_route(device_id, client)
+
+    reported = [record for record in logs if record["event"] == "static_route.refresh.unavailable"]
+    assert reported, "the unavailable read was not reported at all"
+    assert reported[0]["reason"] == "read_error", "the reason is the half the operator needs"
+    assert reported[0]["failure_code"] == "section_status_error"
+    assert_records_free_of(logs, _SECRETS)
+    assert_records_free_of(await _outcome_rows(device_id), _SECRETS)
+
+
+async def test_a_refused_escalation_keeps_the_certification_text_out_of_the_refresh_log(adapter_client):
+    """The escalation's own exception is a sink too: only its TYPE may reach the record.
+
+    A `not-ready` section escalates to the device-state-read action. The action's response is
+    certified, and the refusal names what the server echoed — so carrying the exception repr
+    into `detail` re-published it.
+    """
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
+    device_id = await seed_device(nso_device_name="refresh-escalation", netbox_device_id=9422)
+    client = _envelope_client(
+        "static-route",
+        {"status": "not-ready"},
+        action_output={"atomic": True, "device-name": f"other-device-{_SECRET}"},
+    )
+    with capture_logs() as logs:
+        await _refresh_static_route(device_id, client)
+
+    reported = [record for record in logs if record["event"] == "static_route.refresh.unavailable"]
+    assert reported, "the unavailable read was not reported at all"
+    assert reported[0]["reason"] == "read_error"
+    assert reported[0]["read_operation"] == "device_state_read"
+    assert reported[0]["error_type"] == "NsoReadContractError"
+    assert reported[0]["http_status"] is None
+    assert_records_free_of(logs, _SECRETS)
+    assert_records_free_of(await _outcome_rows(device_id), _SECRETS)
+
+
+# ── a refused device-state read: the value the server echoed reaches no sink ──
+
+
+def _action_client(output: dict):
+    """A real NsoClient whose device-state-read action answers *output*."""
+
+    def respond(request):
+        if "device-state-read/run" in str(request.url):
+            return httpx.Response(200, json={"network-state-export:output": output})
+        return httpx.Response(404)
+
+    return _client_with(httpx.MockTransport(respond))
+
+
+@pytest.mark.parametrize("rejected", ["device", "status"])
+async def test_a_refused_device_state_read_keeps_the_echoed_value_out_of_every_sink(adapter_client, rejected):
+    """Certification names the CONSTRUCT it refused, never the value the server sent back.
+
+    Both rejected values are server-chosen. The exception reaches the apply-side reader's
+    `static_route.device_state_read_failed` record, which logged its repr.
+    """
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core import apply as apply_mod
+    from nso_adapter.nso.client import NsoReadContractError
+    from nso_adapter.store.models import Device
+    from tests._secret_discipline import assert_chain_free_of, assert_records_free_of
+
+    name = f"cert-{rejected}-refused"
+    device_id = await seed_device(nso_device_name=name, netbox_device_id=9423 if rejected == "device" else 9424)
+    output = (
+        {"atomic": True, "device-name": f"other-device-{_SECRET}"}
+        if rejected == "device"
+        else {"atomic": True, "device-name": name, "static-route": {"status": f"pending-{_SECRET}"}}
+    )
+    client = _action_client(output)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        with capture_logs() as logs:
+            status, entries = await apply_mod._static_route_device_state(client, device)
+
+    assert (status, entries) == ("error", {}), "a refused read must never report a clean device"
+    failed = [record for record in logs if record["event"] == "static_route.device_state_read_failed"]
+    assert failed, "the failed read was not reported at all"
+    assert_records_free_of(logs, _SECRETS)
+    assert failed[0]["error_type"] == "NsoReadContractError", "the type tells a contract breach from a blip"
+
+    # The same read again, through the same real client: the refusal itself must carry nothing
+    # of the echoed value on any node of its cause/context chain.
+    with pytest.raises(NsoReadContractError) as caught:
+        await client.run_device_state_read(name, ["static-route"])
+    assert_chain_free_of(caught.value, _SECRETS)
+
+
+# ── a failed host-key fetch: the action's own info text reaches no sink ──
+
+#: What NSO answers when the SSH negotiation fails: free text it chose.
+_KEY_INFO = f"ssh connect failed for {_REF} while reading community {_SECRET}"
+
+
+async def test_a_failed_host_key_fetch_keeps_the_action_info_out_of_the_provisioning_steps(adapter_client_with_nso):
+    """The raise names the action, the device and the failure kind, never the server's info.
+
+    The provisioning result persists the step detail and the API returns it, so whatever
+    `fetch-host-keys` put in its message became part of the job record.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.onboarding import provision_nso_device
+    from tests._secret_discipline import assert_chain_free_of, assert_records_free_of
+
+    name = "host-key-secret"
+
+    def respond(request):
+        if "ssh/fetch-host-keys" in str(request.url):
+            return httpx.Response(200, json={"tailf-ncs:output": {"result": "failed", "info": _KEY_INFO}})
+        if request.method == "GET":
+            return httpx.Response(200, json={"tailf-ncs:device": [{"name": name}]})
+        return httpx.Response(200, json={})
+
+    client = _client_with(httpx.MockTransport(respond))
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=client),
+        patch("nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()),
+        capture_logs() as logs,
+    ):
+        async with session() as db:
+            result = await provision_nso_device(
+                db,
+                nso_instance="nso-dev",
+                device_name=name,
+                address="10.0.0.9",
+                ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+                authgroup="network",
+            )
+
+    assert result["ok"] is False
+    step = next(entry for entry in result["steps"] if entry["step"] == "fetch_host_keys")
+    assert step["status"] == "failed"
+    assert "fetch-host-keys" in step["detail"], "the step must still say what failed"
+    for secret in _SECRETS:
+        assert secret not in json.dumps(result), "the persisted step detail repeats server text"
+    assert_records_free_of(logs, _SECRETS)
+
+    with pytest.raises(RuntimeError) as caught:
+        await client.fetch_host_keys(name)
+    assert_chain_free_of(caught.value, _SECRETS)
+
+
+# ── two different HTTP failures must classify differently ────────────────────
+
+#: What a real NSO answers on a refused read: a reason phrase and a body it chose.
+_HTTP_REASON = f"Denied for {_REF}"
+_HTTP_BODY = {"ietf-restconf:errors": {"error": [{"error-message": f"community {_SECRET} rejected"}]}}
+_HTTP_SECRETS = [*_SECRETS, _HTTP_REASON, "Denied for", "rejected"]
+
+
+def _status_client(status: int):
+    """A real NsoClient whose device-state envelope answers *status* with server text."""
+
+    def respond(request):
+        return httpx.Response(
+            status,
+            json=_HTTP_BODY,
+            extensions={"reason_phrase": _HTTP_REASON.encode()},
+        )
+
+    return _client_with(httpx.MockTransport(respond))
+
+
+async def _unavailable_record(device_id: int, client) -> dict:
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        await _refresh_static_route(device_id, client)
+    reported = [record for record in logs if record["event"] == "static_route.refresh.unavailable"]
+    assert reported, "the unavailable read was not reported at all"
+    assert_records_free_of(logs, _HTTP_SECRETS)
+    return reported[0]
+
+
+async def test_an_auth_refusal_and_an_outage_do_not_classify_the_same(adapter_client):
+    """Round 1 collapsed both to "the section GET raised HTTPStatusError".
+
+    A 401 is a credential problem an operator fixes in config; a 503 is an outage they wait
+    out. The record has to separate them, and neither may repeat the reason phrase, the URL
+    or the body NSO answered.
+    """
+    denied_id = await seed_device(nso_device_name="refresh-401", netbox_device_id=9431)
+    outage_id = await seed_device(nso_device_name="refresh-503", netbox_device_id=9432)
+
+    denied = await _unavailable_record(denied_id, _status_client(401))
+    outage = await _unavailable_record(outage_id, _status_client(503))
+
+    assert denied["http_status"] == 401
+    assert outage["http_status"] == 503
+    assert denied["http_status"] != outage["http_status"], "the two failures classify the same"
+    for record in (denied, outage):
+        assert record["reason"] == "read_error"
+        assert record["read_operation"] == "section_get"
+        assert record["error_type"] == "HTTPStatusError"
+        assert record["family"] == "static-route"
+        assert record["failure_code"] is None, "an HTTP answer is not a contract refusal"
+    assert denied["device_name"] == "refresh-401"
+    assert outage["device_name"] == "refresh-503"
+    assert_records_free_of(await _outcome_rows(denied_id), _HTTP_SECRETS)
+
+
+async def test_an_authored_contract_refusal_classifies_apart_from_an_http_failure(adapter_client):
+    """The third operator case: NSO answered 200 and the read contract refused it.
+
+    An authored code says WHICH rule broke, and it carries no status because the server
+    answered a clean one. Round 1 had only the exception type here, and a served
+    ``status=error`` section raises nothing at all, so it had nothing to say.
+    """
+    device_id = await seed_device(nso_device_name="refresh-contract", netbox_device_id=9433)
+    client = _envelope_client("static-route", {"status": "error", "error-reason": _SECTION_REASON})
+
+    record = await _unavailable_record(device_id, client)
+
+    assert record["failure_code"] == "section_status_error"
+    assert record["read_operation"] == "section_classify"
+    assert record["http_status"] is None, "nothing was refused over HTTP"
+    assert record["error_type"] is None, "nothing raised"
+    assert record["family"] == "static-route"
+
+
+# ── provisioning steps: the transport's own words reach no persisted detail ──
+
+#: A real NSO behind a proxy answers a redirect whose Location the proxy chose.
+_REDIRECT_LOCATION = f"https://example.invalid/{_REF}?community={_SECRET}"
+_STEP_SECRETS = [*_SECRETS, _REDIRECT_LOCATION, "example.invalid", "Denied by proxy"]
+
+
+def _host_key_client(*statuses: int):
+    """A real NsoClient whose ssh/fetch-host-keys answers *statuses* in order.
+
+    The FIRST answer carries the server-chosen reason phrase, body and redirect location;
+    later ones are plain. The last answer repeats for any further attempt.
+    """
+    answered: list[int] = []
+
+    def respond(request):
+        if "ssh/fetch-host-keys" in str(request.url):
+            index = min(len(answered), len(statuses) - 1)
+            answered.append(index)
+            if index == 0:
+                return httpx.Response(
+                    statuses[0],
+                    headers={"Location": _REDIRECT_LOCATION},
+                    json={"error": f"Denied by proxy for {_SECRET}"},
+                    extensions={"reason_phrase": b"Denied by proxy"},
+                )
+            return httpx.Response(statuses[index], json={"error": "unavailable"})
+        if request.method == "GET":
+            return httpx.Response(200, json={"tailf-ncs:device": [{"name": "host-key-http"}]})
+        return httpx.Response(200, json={})
+
+    return _client_with(httpx.MockTransport(respond))
+
+
+async def test_a_RETRIED_action_keeps_the_FIRST_failure_off_the_second_chain(adapter_client_with_nso):
+    """The retry ran INSIDE the first exception's handler, so the first stayed on __context__.
+
+    The FIRST attempt answers a redirect whose Location the server chose; the second answers
+    a plain 503 and is what propagates. Suppression is not removal, and nothing suppressed
+    even this: a formatted traceback of the 503 printed the first attempt's location.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from nso_adapter.core.onboarding import _once_with_retry
+    from tests._secret_discipline import assert_chain_free_of, exception_chain
+
+    client = _host_key_client(302, 503)
+    with patch("nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()) as slept:
+        with pytest.raises(httpx.HTTPStatusError) as caught:
+            await _once_with_retry(lambda: client.fetch_host_keys("host-key-http"))
+
+    assert slept.await_count == 1, "the backed-off second attempt must still run"
+    assert caught.value.response.status_code == 503, "the SECOND attempt's failure propagates"
+    assert exception_chain(caught.value) == [caught.value], "the first attempt is still on the chain"
+    assert_chain_free_of(caught.value, _STEP_SECRETS)
+
+
+async def test_a_REDIRECTED_host_key_fetch_records_the_STATUS_and_not_the_location(adapter_client_with_nso):
+    """`repr(exc)` on an httpx failure carries the URL and the Location the server chose.
+
+    The provisioning result persists the step detail and the API returns it, so the redirect
+    target went with it. The numeric status stays: an operator has to tell 302 from 503.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.onboarding import provision_nso_device
+    from tests._secret_discipline import assert_records_free_of
+
+    client = _host_key_client(302)
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=client),
+        patch("nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()),
+        capture_logs() as logs,
+    ):
+        async with session() as db:
+            result = await provision_nso_device(
+                db,
+                nso_instance="nso-dev",
+                device_name="host-key-http",
+                address="10.0.0.11",
+                ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+                authgroup="network",
+            )
+
+    assert result["ok"] is False
+    step = next(entry for entry in result["steps"] if entry["step"] == "fetch_host_keys")
+    assert step["status"] == "failed"
+    assert step["detail"] == "HTTPStatusError (HTTP 302)", "the status is what tells the failures apart"
+    for secret in _STEP_SECRETS:
+        assert secret not in json.dumps(result), "the persisted step detail repeats the transport's own words"
+    assert_records_free_of(logs, _STEP_SECRETS)

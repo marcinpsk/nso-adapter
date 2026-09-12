@@ -496,14 +496,15 @@ async def test_apply_lag_config_refuses_the_request_modes_it_does_not_implement(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("deleted_roots", "reason"),
+    ("deleted_roots", "reason", "code"),
     [
-        pytest.param(["Port-channel2", "Port-channel2"], "repeats", id="duplicate"),
-        pytest.param(["Port-channel1"], "still present", id="still-present"),
-        pytest.param(["Port-channel9"], "not authorized", id="unauthorized"),
+        pytest.param(["Port-channel2", "Port-channel2"], "repeats", "repeated_root", id="duplicate"),
+        pytest.param(["Port-channel1"], "still present", "root_still_present", id="still-present"),
+        pytest.param(["Port-channel9"], "not authorized", "root_not_authorized", id="unauthorized"),
     ],
 )
-async def test_apply_lag_config_refuses_an_invalid_deletion_authority(adapter_client, deleted_roots, reason):
+async def test_apply_lag_config_refuses_an_invalid_deletion_authority(adapter_client, deleted_roots, reason, code):
+    """Three distinct refusals, each answered by its own reason and none by the roots sent."""
     device_id = await seed_device(nso_device_name=f"lag-roots-{reason.split()[0]}", netbox_device_id=None)
     assert (await _post_lag(adapter_client, device_id, _PREPARE_A)).status_code == 200
 
@@ -516,6 +517,9 @@ async def test_apply_lag_config_refuses_an_invalid_deletion_authority(adapter_cl
     assert response.status_code == 422, response.text
     assert response.json()["error"]["code"] == "validation_error"
     assert reason in response.json()["error"]["message"]
+    assert response.json()["error"]["detail"] == {"reason": code}, "the three refusals must stay distinguishable"
+    for root in deleted_roots:
+        assert root not in response.text, "the answer repeats a root the caller sent"
     row = await _stream_row(device_id)
     assert (row.desired_revision, row.prepared_revision) == (1, 1), "a refusal leaves every revision untouched"
 
@@ -826,7 +830,10 @@ async def test_switching_apply_refuses_many_duplicate_roots_promptly(adapter_cli
     elapsed = perf_counter() - started
 
     assert response.status_code == 422, response.text
-    assert response.json()["error"]["message"] == "deleted_roots repeats a root: ['root-a', 'root-z']"
+    assert response.json()["error"]["message"] == "deleted_roots repeats a root"
+    assert response.json()["error"]["detail"] == {"reason": "repeated_root"}
+    for root in ("root-z", "root-a", "root-once"):
+        assert root not in response.text, "the answer lists the roots the caller sent"
     assert elapsed < 5.0, f"80,000 deletion entries took {elapsed:.3f}s; expected less than 5s"
     async with session() as db:
         counts = (

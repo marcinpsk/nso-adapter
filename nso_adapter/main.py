@@ -72,7 +72,7 @@ from nso_adapter.core.worker import start_workers, stop_workers
 from nso_adapter.notifications.persistent_subscriber import persistent_subscriber
 from nso_adapter.notifications.sse_subscriber import SSESubscriber
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.secrets import make_provider
+from nso_adapter.secrets import make_provider, resolve_secret
 from nso_adapter.store.db import get_engine, init_db, session
 
 logger = structlog.get_logger(__name__)
@@ -158,7 +158,7 @@ def _init_secrets(app: FastAPI, cfg, env):
     # vault_ref into the sha256 the device export keys it by (CR-A17) — same module-level
     # registry pattern as the NSO / NetBox clients in core.importer.
     register_secrets_provider(provider)
-    app.state.adapter_token = provider.get(cfg.api.adapter_token_ref)
+    app.state.adapter_token = resolve_secret(provider, cfg.api.adapter_token_ref, slot="api.adapter_token_ref")
     return provider
 
 
@@ -174,16 +174,25 @@ async def _init_database(cfg) -> None:
     # the row, so this takes its read path.
     from nso_adapter.store.meta import ensure_store_meta
 
-    await ensure_store_meta()
-    logger.info("db.ready", url=cfg.database_url)
+    incarnation, _born = await ensure_store_meta()
+    # The URL carries the store password. The incarnation is the adapter's own identity for
+    # the store it just bound, which is what a reader of a readiness record needs.
+    logger.info("db.ready", incarnation=incarnation)
+
+
+def _instance_credentials(provider, inst) -> tuple[str, str]:
+    """Resolve one NSO instance's credential pair, naming the config slot that failed."""
+    return (
+        resolve_secret(provider, inst.username_ref, slot=f"nso_instances[{inst.name}].username_ref"),
+        resolve_secret(provider, inst.password_ref, slot=f"nso_instances[{inst.name}].password_ref"),
+    )
 
 
 def _build_nso_clients(cfg, provider) -> dict[str, NsoClient]:
     """Construct and register one NsoClient per configured instance, resolving creds via the provider."""
     nso_clients: dict[str, NsoClient] = {}
     for inst in cfg.nso_instances:
-        username = provider.get(inst.username_ref)
-        password = provider.get(inst.password_ref)
+        username, password = _instance_credentials(provider, inst)
         client = NsoClient(inst, username, password)
         nso_clients[inst.name] = client
         register_nso_client(inst.name, client)
@@ -195,7 +204,7 @@ def _build_netbox_client(app: FastAPI, cfg, provider):
     """Build the pooled NetBox client, stash it on ``app.state`` and register it with the importer."""
     from nso_adapter.bindings.netbox.client import NetboxClient
 
-    netbox_token = provider.get(cfg.netbox.api_token_ref)
+    netbox_token = resolve_secret(provider, cfg.netbox.api_token_ref, slot="netbox.api_token_ref")
     netbox_client = NetboxClient(
         url=cfg.netbox.base_url,
         token=netbox_token,
@@ -359,8 +368,7 @@ def _start_sse_streams(
     if not cfg.scheduler.enable_nso_streams:
         return sse_tasks
     for inst in cfg.nso_instances:
-        username = provider.get(inst.username_ref)
-        password = provider.get(inst.password_ref)
+        username, password = _instance_credentials(provider, inst)
         subscriber = SSESubscriber(
             base_url=inst.base_url,
             auth=(username, password),

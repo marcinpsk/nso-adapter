@@ -7,12 +7,14 @@ the configured mount (e.g. ``credentials/svc-netbox-nso#netbox_token``).
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import hvac
+import structlog
 
-logger = logging.getLogger(__name__)
+from nso_adapter.secrets.base import SecretResolutionError
+
+logger = structlog.get_logger(__name__)
 
 
 class VaultSecretsProvider:
@@ -61,7 +63,7 @@ class VaultSecretsProvider:
         client.token = resp["auth"]["client_token"]
         self._client = client
         self._cache.clear()
-        logger.info("Vault AppRole login succeeded")
+        logger.info("vault.approle_login")
 
     def _fetch_path(self, path: str) -> dict[str, str]:
         assert self._client is not None
@@ -77,32 +79,45 @@ class VaultSecretsProvider:
     def get(self, reference: str) -> str:
         """Resolve a ``path#field`` reference.
 
+        Every refusal is classified WITHOUT the reference. A reference names a mount, a path
+        and a field; this method runs on the startup path, so whatever it raises lands in the
+        startup diagnostics, and hvac's own text repeats the request URL on top of that. The
+        caller stamps the configuration slot (:func:`nso_adapter.secrets.base.resolve_secret`).
+
         Args:
             reference: Vault KV path and field separated by ``#``,
                        e.g. ``"credentials/svc-netbox-nso#netbox_token"``.
 
         """
         if "#" not in reference:
-            raise ValueError(f"Invalid Vault reference {reference!r} — expected 'path#field' format")
+            raise SecretResolutionError("the reference is not in 'path#field' form")
         path, _, field = reference.partition("#")
 
         # Check per-path cache first
-        if path in self._cache:
-            if field in self._cache[path]:
-                return self._cache[path][field]
-            raise KeyError(f"Field {field!r} not found at {self._mount}/{path}")
+        cached = self._cache.get(path)
+        if cached is not None:
+            if field in cached:
+                return cached[field]
+            raise SecretResolutionError("the referenced field is not at the referenced path")
 
-        if self._client is None:
-            self._authenticate()
+        failure = None
         try:
-            data = self._fetch_path(path)
-        except hvac.exceptions.Forbidden:
-            logger.warning("Vault token expired, re-authenticating")
-            self._authenticate()
-            data = self._fetch_path(path)
+            if self._client is None:
+                self._authenticate()
+            try:
+                data = self._fetch_path(path)
+            except hvac.exceptions.Forbidden:
+                logger.warning("vault.reauthenticating", cause="forbidden")
+                self._authenticate()
+                data = self._fetch_path(path)
+        except Exception as exc:  # noqa: BLE001 — every Vault failure is one classified refusal
+            failure = SecretResolutionError(f"the Vault read failed ({type(exc).__name__})")
+        # Raised outside the handler: hvac's exception would otherwise ride on __context__.
+        if failure is not None:
+            raise failure
 
         if field not in data:
-            raise KeyError(f"Field {field!r} not found at {self._mount}/{path}")
+            raise SecretResolutionError("the referenced field is not at the referenced path")
         return data[field]
 
     # ── mount-explicit read/write (SNMP secrets endpoints) ────────────────────
@@ -118,7 +133,7 @@ class VaultSecretsProvider:
         try:
             return operation()
         except hvac.exceptions.Forbidden:
-            logger.warning("Vault token expired, re-authenticating")
+            logger.warning("vault.reauthenticating", cause="forbidden")
             self._authenticate()
             return operation()
 

@@ -521,7 +521,13 @@ async def test_run_sync_from_nso_fails_job_on_total_supplier_failure(adapter_cli
     from nso_adapter.core import importer as imp
     from nso_adapter.core.jobs import _run_sync_from_nso
     from nso_adapter.nso.client import NsoClient as _NsoClient
-    from nso_adapter.nso.read_outcome import Unavailable, UnavailableReason
+    from nso_adapter.nso.read_outcome import (
+        WHOLE_DEVICE,
+        ReadFailure,
+        ReadOperation,
+        Unavailable,
+        UnavailableReason,
+    )
 
     device_id = await _seed_device("sfn-rtr-down", 92)
     job_id = await _seed_job(device_id, JobStatus.running)
@@ -530,7 +536,16 @@ async def test_run_sync_from_nso_fails_job_on_total_supplier_failure(adapter_cli
     imp._nso_clients["nso-dev"] = client
     imp._netbox_client = None
 
-    supplier = Unavailable(UnavailableReason.read_error, detail="action boom")
+    supplier = Unavailable(
+        UnavailableReason.read_error,
+        failure=ReadFailure(
+            operation=ReadOperation.device_state_read,
+            device="sfn-rtr-down",
+            family=WHOLE_DEVICE,
+            error_type="HTTPStatusError",
+            http_status=503,
+        ),
+    )
     all_kept = [
         "static_route",
         "isis",

@@ -86,10 +86,13 @@ async def get_intent_delivery(
             f"?backfill_only is implemented for the {BACKFILL_ONLY_STREAM!r} stream only",
             {"reason": "backfill_only_unsupported", "section": endpoint.stream},
         )
+    invalid_json = None
     try:
         body = await request.json()
     except ValueError:
-        raise api_error(422, "validation_error", "Request body must contain valid JSON") from None
+        invalid_json = api_error(422, "validation_error", "Request body must contain valid JSON")
+    if invalid_json is not None:
+        raise invalid_json
     return IntentDelivery(
         stream=endpoint.stream,
         identity=PushIdentity(
@@ -109,11 +112,14 @@ async def admit_or_replay(db: AsyncSession, device_id: int, delivery: IntentDeli
     stored response. Both roll the transaction back first — a refused or replayed delivery
     must leave no trace, and the caller's ``note_write`` revision bump is already in it.
     """
+    refused = None
     try:
         admitted = await admit_push(db, device_id, delivery)
     except PushSequenceConflict as conflict:
         await db.rollback()
-        raise push_conflict_error(conflict.code, conflict.message, conflict.detail) from None
+        refused = push_conflict_error(conflict.code, conflict.message, conflict.detail)
+    if refused is not None:
+        raise refused
     if admitted is None:
         return None
     stored, status_code = admitted

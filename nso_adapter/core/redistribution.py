@@ -12,6 +12,7 @@ Entry points:
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import UTC, datetime
 
 import structlog
@@ -20,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.cancelsafe import await_uncancellable
 from nso_adapter.core.refresh_engine import classify_envelope_family_read
-from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.client import NsoClient, failure_detail
 from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
     Freshness,
@@ -202,12 +203,13 @@ async def refresh_redistribution_from_outcomes(
     now = datetime.now(UTC)
 
     # Tier 1 — any confirmed export outage aborts the whole refresh, rows untouched.
-    if any(isinstance(o, Unavailable) and o.reason is UnavailableReason.export_down for o in outcomes.values()):
+    outage = _first_with_reason(outcomes.values(), UnavailableReason.export_down)
+    if outage is not None:
         logger.warning("redistribution.refresh.degraded", device_id=device_id, device_name=name)
         selected = await _record_composite(
             db,
             device,
-            Unavailable(UnavailableReason.export_down),
+            outage,
             refresh_source,
             result="kept",
             succeeded=False,
@@ -227,7 +229,6 @@ async def refresh_redistribution_from_outcomes(
     assert _REDIST_COMPONENTS, "empty _REDIST_COMPONENTS is a programming error"
     replaced = [p for p, o in outcomes.items() if not isinstance(o, Unavailable)]
     errors = [p for p, o in outcomes.items() if isinstance(o, Unavailable) and o.reason not in _NONFAILING_KEEP]
-    kept_nonfailing = [p for p, o in outcomes.items() if isinstance(o, Unavailable) and o.reason in _NONFAILING_KEEP]
     # Worst freshness among the REPLACED authoritative components: fresh < stale
     # (READSEM S5 retired the `aged` approximation — the envelope carries `stale` directly).
     _FRESHNESS_RANK = {Freshness.fresh: 0, Freshness.stale: 1}
@@ -246,16 +247,13 @@ async def refresh_redistribution_from_outcomes(
         composite_ok = not errors
     elif errors:
         # Nothing replaced, at least one real failure → unavailable with the WORST reason.
-        merged = Unavailable(
-            _worst_reason([o for o in outcomes.values() if isinstance(o, Unavailable)]),
-            detail=f"components kept: {sorted(errors + kept_nonfailing)}",
-        )
+        merged = _worst_unavailable([o for o in outcomes.values() if isinstance(o, Unavailable)])
         terminal_result, terminal_succeeded, composite_ok = "kept", False, False
     else:
         # All components are non-failing keeps (unsupported and/or device-absent
         # not_authoritative): nothing was read — never claim fresh-present/replaced, but this is a
         # KEPT SUCCESS (no partial), carrying the most severe of the keep reasons for telemetry.
-        merged = Unavailable(_worst_reason([o for o in outcomes.values() if isinstance(o, Unavailable)]))
+        merged = _worst_unavailable([o for o in outcomes.values() if isinstance(o, Unavailable)])
         terminal_result, terminal_succeeded, composite_ok = "kept", True, True
     attempt_id = None
     try:
@@ -268,7 +266,7 @@ async def refresh_redistribution_from_outcomes(
             source_epoch=source_epoch,
         )
     except Exception as exc:  # noqa: BLE001 — telemetry write; the mirror is the source of truth
-        logger.warning("redistribution.outcome.read_record_failed", device_id=device_id, error=repr(exc))
+        logger.warning("redistribution.outcome.read_record_failed", device_id=device_id, error=failure_detail(exc))
         await _recover_session(db, device, "redistribution", device_id)
 
     # Tier 2 — per-component aggregation under the two-mode materialization guard.
@@ -417,7 +415,9 @@ async def _commit_partitions(
                 )
                 await outcome_store.record_result(db, failed_id, result="error", succeeded=False, row_count=None)
         except Exception as store_exc:  # noqa: BLE001 — telemetry; the materialization error is the story
-            logger.warning("redistribution.outcome.terminalize_failed", device_id=device_id, error=repr(store_exc))
+            logger.warning(
+                "redistribution.outcome.terminalize_failed", device_id=device_id, error=failure_detail(store_exc)
+            )
         raise
     return rebuilt, bool(outcome_row is not None and outcome_row.result == "superseded")
 
@@ -433,13 +433,23 @@ _REASON_SEVERITY = (
 )
 
 
-def _worst_reason(unavailables: list[Unavailable]) -> UnavailableReason:
-    """Pick the most severe reason among *unavailables* per :data:`_REASON_SEVERITY`."""
-    reasons = {o.reason for o in unavailables}
+def _first_with_reason(outcomes: Iterable[ReadOutcome], reason: UnavailableReason) -> Unavailable | None:
+    """Return the first :class:`Unavailable` carrying *reason*, or None."""
+    return next((o for o in outcomes if isinstance(o, Unavailable) and o.reason is reason), None)
+
+
+def _worst_unavailable(unavailables: list[Unavailable]) -> Unavailable:
+    """Pick the most severe :class:`Unavailable` among *unavailables* per :data:`_REASON_SEVERITY`.
+
+    The OBJECT, not the reason: a read failure carries its :class:`ReadFailure` classification
+    (the operation, the device, the family, the exception type, the numeric status), and the
+    merged outcome is the only place the composite still holds it.
+    """
     for reason in _REASON_SEVERITY:
-        if reason in reasons:
-            return reason
-    return UnavailableReason.read_error  # unreachable with a non-empty input
+        found = _first_with_reason(unavailables, reason)
+        if found is not None:
+            return found
+    return Unavailable(UnavailableReason.read_error)  # unreachable with a non-empty input
 
 
 async def _record_composite(
@@ -471,7 +481,7 @@ async def _record_composite(
             db, attempt_id, result=result, succeeded=succeeded, row_count=row_count
         )
     except Exception as exc:  # noqa: BLE001 — telemetry write; the mirror is the source of truth
-        logger.warning("redistribution.outcome.record_failed", device_id=device_id, error=repr(exc))
+        logger.warning("redistribution.outcome.record_failed", device_id=device_id, error=failure_detail(exc))
         await _recover_session(db, device, "redistribution", device_id)
         return None
 

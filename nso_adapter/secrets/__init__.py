@@ -5,11 +5,18 @@ from __future__ import annotations
 
 from nso_adapter.config import AppConfig, EnvSettings, SecretsConfig
 
-from .base import SecretsProvider
+from .base import SecretResolutionError, SecretsProvider, resolve_secret
 from .local import LocalSecretsProvider
 from .vault import VaultSecretsProvider
 
-__all__ = ["SecretsProvider", "LocalSecretsProvider", "VaultSecretsProvider", "make_provider"]
+__all__ = [
+    "LocalSecretsProvider",
+    "SecretResolutionError",
+    "SecretsProvider",
+    "VaultSecretsProvider",
+    "make_provider",
+    "resolve_secret",
+]
 
 
 def make_provider(cfg: AppConfig, env: EnvSettings) -> SecretsProvider:

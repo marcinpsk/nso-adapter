@@ -1899,9 +1899,11 @@ def interface_removal_keys(
         try:
             version = ipaddress.ip_interface(str(address)).version
         except ValueError:
+            version = None
+        if version is None:
             from nso_adapter.core.generation import ApplyUnexecutable
 
-            raise ApplyUnexecutable({"ip": "invalid_stored_address"}) from None
+            raise ApplyUnexecutable({"ip": "invalid_stored_address"})
         keys.setdefault(f"ipv{version}-address", []).append([str(interface), str(address).rsplit("/", 1)[0]])
     if interfaces:
         keys["interface"] = [[str(name)] for name in interfaces]

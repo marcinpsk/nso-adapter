@@ -14,54 +14,63 @@ import pytest
 from nso_adapter.nso.read_outcome import (
     Freshness,
     Present,
+    ReadFailureCode,
+    ReadOperation,
     Unavailable,
     UnavailableReason,
     classify_envelope_section,
 )
 
+_ASKED = {"device": "rg03", "family": "static-route"}
+
 
 class TestStatusMapping:
     def test_ok_is_present_fresh_with_the_section_as_data(self):
         section = {"status": "ok", "last-updated": "2026-07-20T12:00:00+00:00", "route": [{"prefix": "10.0.0.0/8"}]}
-        outcome = classify_envelope_section(section)
+        outcome = classify_envelope_section(section, **_ASKED)
         assert outcome == Present(section)
         assert outcome.freshness is Freshness.fresh
 
     def test_ok_without_list_keys_is_the_authoritative_empty(self):
         """RESTCONF omits empty lists: ok + absent keys REPLACES (clears) via Present."""
-        outcome = classify_envelope_section({"status": "ok"})
+        outcome = classify_envelope_section({"status": "ok"}, **_ASKED)
         assert isinstance(outcome, Present)
         assert outcome.data == {"status": "ok"}
 
     def test_stale_is_present_degraded(self):
         """Operator decision: stale-200 = degraded-success — replace rows, record degraded."""
         section = {"status": "stale", "route": []}
-        outcome = classify_envelope_section(section)
+        outcome = classify_envelope_section(section, **_ASKED)
         assert isinstance(outcome, Present)
         assert outcome.freshness is Freshness.stale
 
     def test_unsupported_keeps_rows(self):
         """The envelope ends the legacy conflation of unsupported with authoritative emptiness."""
-        outcome = classify_envelope_section({"status": "unsupported"})
+        outcome = classify_envelope_section({"status": "unsupported"}, **_ASKED)
         assert outcome == Unavailable(UnavailableReason.unsupported)
 
     def test_not_ready_is_the_escalation_trigger(self):
-        outcome = classify_envelope_section({"status": "not-ready"})
+        outcome = classify_envelope_section({"status": "not-ready"}, **_ASKED)
         assert outcome == Unavailable(UnavailableReason.not_ready)
 
-    def test_error_carries_the_wire_reason(self):
-        outcome = classify_envelope_section({"status": "error", "error-reason": "extract boom"})
+    def test_error_classifies_the_failure_and_drops_the_wire_reason(self):
+        """The error-reason is the server's own text and reaches the operator log — classify it."""
+        outcome = classify_envelope_section({"status": "error", "error-reason": "extract boom"}, **_ASKED)
         assert isinstance(outcome, Unavailable)
         assert outcome.reason is UnavailableReason.read_error
-        assert "extract boom" in outcome.detail
+        assert outcome.failure.code is ReadFailureCode.section_status_error
+        assert outcome.failure.operation is ReadOperation.section_classify
+        assert (outcome.failure.device, outcome.failure.family) == ("rg03", "static-route")
+        assert "extract boom" not in repr(outcome)
 
     @pytest.mark.parametrize("status", [None, "bogus", ""])
     def test_unknown_status_is_never_guessed_at(self, status):
         """A status the adapter does not recognize keeps rows — never clears on a guess."""
         section = {"status": status} if status is not None else {}
-        outcome = classify_envelope_section(section)
+        outcome = classify_envelope_section(section, **_ASKED)
         assert isinstance(outcome, Unavailable)
         assert outcome.reason is UnavailableReason.read_error
+        assert outcome.failure.code is ReadFailureCode.section_status_unrecognized
 
 
 class TestDeviceLevelAbsence:
@@ -70,7 +79,7 @@ class TestDeviceLevelAbsence:
     lifecycle's job."""
 
     def test_device_absence_keeps_rows_for_every_family(self):
-        assert classify_envelope_section(None) == Unavailable(UnavailableReason.not_authoritative)
+        assert classify_envelope_section(None, **_ASKED) == Unavailable(UnavailableReason.not_authoritative)
 
 
 class TestStoredStringValues:

@@ -26,6 +26,16 @@ class NsoExportUnavailableError(RuntimeError):
     """
 
 
+class NsoActionFailedError(RuntimeError):
+    """An NSO action answered 200 while its output reports the work did not happen.
+
+    The message names the action and the failure KIND, both ours; the action's own
+    ``info``/``error``/``result`` text is never repeated. Distinct from a bare
+    ``RuntimeError`` so a sink can tell an adapter-authored refusal, whose message is
+    the diagnostic, from a third-party failure, whose message is not ours to print.
+    """
+
+
 class NsoReadContractError(RuntimeError):
     """A ``device-state-read`` action response that the server did not certify (READSEM 1328).
 
@@ -36,6 +46,27 @@ class NsoReadContractError(RuntimeError):
     not-ready escalation, the atomic importer, and the apply/removal verifiers — abstains and KEEPS
     rows rather than materializing a fabricated section (an ok-empty one would wipe a pop family).
     """
+
+
+#: The failures whose message the adapter authored, so repeating it repeats only our own words.
+AUTHORED_FAILURES = (NsoActionFailedError, NsoExportUnavailableError, NsoReadContractError)
+
+
+def failure_detail(exc: BaseException) -> str:
+    """Classify a failure for a log record, a job step or a response.
+
+    ``repr()`` on an httpx failure carries the reason phrase, the request URL and, on a
+    redirect, the ``Location`` the server chose; a decode failure quotes the bytes the server
+    sent. None of that is ours to print, and every one of these sinks is persisted or served.
+    The numeric status stays, because an operator has to tell an auth refusal from an outage,
+    and an authored message stays, because it is ours. Anything else travels as its TYPE: the
+    caller's own context already says which part of the work failed.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"{type(exc).__name__} (HTTP {exc.response.status_code})"
+    if isinstance(exc, AUTHORED_FAILURES):
+        return repr(exc)
+    return type(exc).__name__
 
 
 # The only statuses a device-state-read action section may carry: the build is a terminal
@@ -86,10 +117,10 @@ def _certify_device_state_output(output: object, device_name: str, wire_families
     """
     if not isinstance(output, dict) or output.get("atomic") is not True:
         raise NsoReadContractError(f"device-state-read for {device_name!r} did not certify an atomic snapshot")
-    echoed = output.get("device-name")
-    if echoed != device_name:
+    if output.get("device-name") != device_name:
+        # The echo is the server's own value: name the device we asked for, never the one it sent.
         raise NsoReadContractError(
-            f"device-state-read echoed device {echoed!r}, expected {device_name!r} — refusing a "
+            f"device-state-read echoed a different device than {device_name!r} — refusing a "
             "version-skewed / wrong-device snapshot"
         )
     for wire in wire_families:
@@ -98,10 +129,10 @@ def _certify_device_state_output(output: object, device_name: str, wire_families
             continue
         if not isinstance(section, dict):
             raise NsoReadContractError(f"device-state-read section {wire!r} is not a dict")
-        status = section.get("status")
-        if status not in _TERMINAL_SECTION_STATUSES:
+        if section.get("status") not in _TERMINAL_SECTION_STATUSES:
+            # The status is the server's own value; the section name is ours and says enough.
             raise NsoReadContractError(
-                f"device-state-read section {wire!r} has non-terminal status {status!r} "
+                f"device-state-read section {wire!r} has a non-terminal status "
                 f"(expected one of {sorted(_TERMINAL_SECTION_STATUSES)})"
             )
 
@@ -324,7 +355,8 @@ class NsoClient:
             if not isinstance(entry, dict) or not entry:
                 return _inconclusive(device_name, "empty instance entry")
             if entry.get("device") != device_name:
-                return _inconclusive(device_name, f"instance echoes device {entry.get('device')!r}")
+                # The echo is the server's own value: name the mismatch, never what it sent.
+                return _inconclusive(device_name, "the instance echoes a different device")
             return ServiceInstanceState("present", entry)
 
     # ── device-state envelope (READSEM S3) — status-declared per-family reads ─────────
@@ -514,11 +546,13 @@ class NsoClient:
         body = out.get("tailf-ncs:output", {}) if isinstance(out, dict) else {}
         result = body.get("result")
         if result not in ("updated", "unchanged") or not body.get("fingerprint"):
-            info = body.get("info") or body.get("error") or ""
-            raise RuntimeError(
-                f"fetch-host-keys for {device_name!r} did not store a key "
-                f"(result={result!r}){f': {info}' if info else ''}"
+            # The action's info/error/result are the server's own text; name the failure kind.
+            kind = (
+                "did not report a stored key"
+                if result not in ("updated", "unchanged")
+                else "reported a stored key with no fingerprint"
             )
+            raise NsoActionFailedError(f"fetch-host-keys for {device_name!r} {kind}")
         return out
 
     async def sync_from(self, device_name: str) -> bool:

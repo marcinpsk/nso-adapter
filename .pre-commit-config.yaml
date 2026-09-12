@@ -45,6 +45,12 @@ repos:
         language: system
         pass_filenames: false
         files: ^tests/.*\.py$
+      - id: credential-discipline
+        name: credential-discipline (no new admin credential literals)
+        entry: python3 -m tests.credential_discipline
+        language: system
+        pass_filenames: false
+        files: ^tests/.*\.py$
       # Companion to ruff's DTZ rules: DTZ polices naive *construction*; this bans the
       # zone *strip* (.replace(tzinfo=None)) everywhere but the iso_z wire serializer.
       - id: tz-discipline
@@ -53,6 +59,18 @@ repos:
         language: system
         pass_filenames: false
         files: ^(nso_adapter|tests|scripts|alembic)/.*\.py$
+      - id: review-patterns
+        name: custom review patterns (OpenGrep)
+        entry: scripts/check-review-patterns scan
+        language: system
+        pass_filenames: false
+        files: ^(nso_adapter/.*\.py|\.opengrep/|scripts/check-review-patterns$)
+      - id: review-pattern-tests
+        name: custom review pattern fixtures (OpenGrep)
+        entry: scripts/check-review-patterns test
+        language: system
+        pass_filenames: false
+        files: ^(\.opengrep/|scripts/check-review-patterns$)
 
   # Type-check nso_adapter and fail only on errors absent from mypy-baseline.txt.
   # Runs on pre-push (not every commit). CI runs the same script in the lint job,

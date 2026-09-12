@@ -68,6 +68,37 @@ async def test_onboard_raises_for_duplicate_nso_device_name(adapter_client_with_
             await onboard_device(db, "nso-dev", "taken-name", 201)
 
 
+async def test_claimed_onboard_refusal_names_no_netbox_link(adapter_client_with_nso):
+    """The provision path refuses under the claim, and that refusal reached the job result.
+
+    Its message named the NetBox device the row is linked to, which the request never sent
+    and the job record then persisted. The refusal states the reason; the link is logged.
+    """
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.claim import ClaimRegistration
+    from nso_adapter.core.onboarding import DeviceIdentityRefused, onboard_device
+    from tests.conftest import seed_device
+
+    await seed_device(nso_instance="nso-dev", nso_device_name="placeholder-claimed-node", netbox_device_id=46431)
+
+    async with session() as db:
+        with capture_logs() as logs, pytest.raises(DeviceIdentityRefused) as caught:
+            await onboard_device(
+                db,
+                "nso-dev",
+                "placeholder-claimed-node",
+                46432,
+                reg=ClaimRegistration(run_attempt=1),
+            )
+
+    assert str(caught.value) == "The NSO device is already onboarded to a different NetBox device"
+    assert caught.value.reason == "onboarded_elsewhere"
+    assert "46431" not in str(caught.value), "the refusal names the link the adapter holds"
+    refused = [record for record in logs if record["event"] == "device.onboard_refused"]
+    assert refused and refused[0]["linked_netbox_device_id"] == 46431
+
+
 async def test_onboard_adopts_unlinked_existing_device(adapter_client_with_nso):
     """A device provisioned INTO NSO without a NetBox link (netbox_device_id IS NULL) must be
     ADOPTED when the operator later marks it managed: onboard_device fills the mapping in on the
@@ -657,3 +688,40 @@ async def test_set_scope_empty_list_clears_scope(adapter_client_with_nso):
         device = await db.get(Device, device_id)
         result = await set_scope(db, device, [])
         assert result == []
+
+
+# ── _seed_onboarding_failover: the persisted step carries no store diagnostics ──
+
+
+async def test_failover_seed_failure_step_classifies_the_store_error(adapter_client_with_nso, monkeypatch):
+    """A failed seed reports the failure TYPE, never the driver's repr.
+
+    The step is best-effort, so it is persisted and served rather than raised. A SQLAlchemy
+    error repeats the statement it ran and the parameters it bound, and this row's parameters
+    are the device's management addresses.
+    """
+    from nso_adapter.config import get_config
+    from nso_adapter.core.onboarding import _seed_onboarding_failover
+
+    monkeypatch.setattr(get_config().scheduler, "enable_failover", True)
+    absent_device_id = 987654321  # no devices row, so the seed's INSERT violates its FK
+
+    async with session() as db:
+        step = await _seed_onboarding_failover(db, absent_device_id, "198.51.100.10", "203.0.113.10", "primary")
+
+    assert step == {"step": "failover_seed", "status": "failed", "detail": "IntegrityError"}
+
+
+async def test_failover_seed_success_step_is_unchanged(adapter_client_with_nso, monkeypatch):
+    """The ok path still reports the address it seeded: only the failure branch changed."""
+    from nso_adapter.config import get_config
+    from nso_adapter.core.onboarding import _seed_onboarding_failover, onboard_device
+
+    monkeypatch.setattr(get_config().scheduler, "enable_failover", True)
+
+    async with session() as db:
+        device = await onboard_device(db, "nso-dev", f"seed-{uuid4().hex[:8]}", int(uuid4().int % 10**8))
+        await db.commit()
+        step = await _seed_onboarding_failover(db, device.id, "198.51.100.10", "203.0.113.10", "oob")
+
+    assert step == {"step": "failover_seed", "status": "ok", "detail": "oob"}
