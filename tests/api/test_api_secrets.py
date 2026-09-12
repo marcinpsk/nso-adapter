@@ -779,11 +779,7 @@ async def test_a_MALFORMED_ref_is_answered_with_the_broken_RULE_not_the_input(va
 
 @pytest.mark.anyio
 async def test_an_UNREGISTERED_instance_answers_502_with_nothing_attached(vault_client, monkeypatch):
-    """The 502 repeated the registry's own text and chained its exception.
-
-    The refusal is adapter-authored, exactly as ``api/capability.py`` writes it for the same
-    registry miss, and it is raised after the handler so nothing rides on the chain.
-    """
+    """The 502 uses fixed text and is raised after the handler with no attached exception."""
     from nso_adapter.api import secrets as secrets_api
     from nso_adapter.api.errors import ApiError, api_error
     from nso_adapter.store.models import Device
@@ -813,7 +809,8 @@ async def test_an_UNREGISTERED_instance_answers_502_with_nothing_attached(vault_
 
     assert resp.status_code == 502
     assert resp.json()["error"]["code"] == "nso_unavailable"
-    assert "nso-not-registered" in resp.json()["error"]["message"], "the operator must still learn which instance"
+    assert resp.json()["error"]["message"] == "No NSO client is registered"
+    assert "nso-not-registered" not in resp.text
     assert built, "the refusal never went through api_error"
     refusal = built[-1]
     assert exception_chain(refusal) == [refusal], "the registry exception is still attached to the 502"

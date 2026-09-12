@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
+rules:
+  - id: nso-outcome-raw-exception-renderer
+    languages: [python]
+    severity: ERROR
+    message: Classify the outcome failure with failure_detail instead of rendering the exception.
+    paths:
+      include:
+        - nso_adapter/core/refresh_engine.py
+        - nso_adapter/core/redistribution.py
+        - review-patterns.py
+    pattern-either:
+      - pattern: logger.$LEVEL(..., error=str($ERROR), ...)
+      - pattern: logger.$LEVEL(..., error=repr($ERROR), ...)
+      - pattern: logger.$LEVEL(..., error=str($ERROR) or repr($ERROR), ...)

@@ -43,6 +43,18 @@ def _fake_probe(monkeypatch, calls):
 
 
 @pytest.mark.asyncio
+async def test_unregistered_instance_refusal_does_not_echo_the_persisted_name(adapter_client):
+    instance = "placeholder-unregistered-instance"
+    device_id = await seed_device(nso_instance=instance, nso_device_name="placeholder-capability-device")
+
+    resp = await adapter_client.post(f"/api/v1/devices/{device_id}/capability/refresh", headers=AUTH)
+
+    assert resp.status_code == 409
+    assert resp.json()["error"] == {"code": "no_nso_client", "message": "No NSO client is registered", "detail": {}}
+    assert instance not in resp.text
+
+
+@pytest.mark.asyncio
 async def test_capability_cache_only_before_probe_is_unknown(adapter_client_with_nso, monkeypatch):  # noqa: F811
     calls: list[str] = []
     _fake_probe(monkeypatch, calls)

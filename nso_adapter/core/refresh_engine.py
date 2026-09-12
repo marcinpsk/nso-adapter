@@ -31,7 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.cancelsafe import await_uncancellable
 from nso_adapter.core.claim import ClaimLostError
-from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
+from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError, failure_detail
 from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
     Present,
@@ -108,7 +108,7 @@ async def _record_read(
         # a revocation here lets the run continue under ownership it has lost.
         raise
     except Exception as exc:  # noqa: BLE001 — telemetry write; the mirror is the source of truth
-        logger.warning(f"{spec.name}.outcome.read_record_failed", device_id=device_id, error=repr(exc))
+        logger.warning(f"{spec.name}.outcome.read_record_failed", device_id=device_id, error=failure_detail(exc))
         await _recover_session(db, device, spec.name, device_id)
         return None
 
@@ -126,7 +126,9 @@ async def _recover_session(db: AsyncSession, device: Device, label: str, device_
             await db.rollback()  # the transaction was doomed at the DB level
         await db.refresh(device)  # un-expire; one SELECT, failure path only
     except Exception as recovery_exc:  # noqa: BLE001 — nothing more we can do; let the caller try
-        logger.warning(f"{label}.outcome.session_recovery_failed", device_id=device_id, error=repr(recovery_exc))
+        logger.warning(
+            f"{label}.outcome.session_recovery_failed", device_id=device_id, error=failure_detail(recovery_exc)
+        )
 
 
 async def _record_result(
@@ -152,7 +154,7 @@ async def _record_result(
         # a revocation here lets the run continue under ownership it has lost.
         raise
     except Exception as exc:  # noqa: BLE001 — telemetry write; never fail the refresh over it
-        logger.warning(f"{spec.name}.outcome.result_record_failed", attempt_id=attempt_id, error=repr(exc))
+        logger.warning(f"{spec.name}.outcome.result_record_failed", attempt_id=attempt_id, error=failure_detail(exc))
         await _recover_session(db, device, spec.name, device_id)
         return None
 
@@ -460,7 +462,9 @@ async def _materialize_guarded(
                 )
                 await outcome_store.record_result(db, failed_id, result="error", succeeded=False, row_count=None)
         except Exception as store_exc:  # noqa: BLE001 — telemetry; the materializer error is the story
-            logger.warning(f"{spec.name}.outcome.terminalize_failed", attempt_id=attempt_id, error=repr(store_exc))
+            logger.warning(
+                f"{spec.name}.outcome.terminalize_failed", attempt_id=attempt_id, error=failure_detail(store_exc)
+            )
         raise
 
 

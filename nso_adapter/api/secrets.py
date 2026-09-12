@@ -257,7 +257,7 @@ async def harvest_community(
     except RuntimeError:
         # Adapter-authored, like the same refusal in api/capability.py. The caught text is
         # not repeated and not chained: a raise inside the handler attaches it either way.
-        unavailable = api_error(502, "nso_unavailable", f"No NSO client for instance {device.nso_instance!r}")
+        unavailable = api_error(502, "nso_unavailable", "No NSO client is registered")
     if unavailable is not None:
         raise unavailable
     payload = await client.get_device_config_subtree(device.nso_device_name, subpath)

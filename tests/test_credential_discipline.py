@@ -53,6 +53,28 @@ def test_flags_new_credential_literals(statement):
 
 
 @pytest.mark.parametrize(
+    "statement",
+    [
+        'lambda password="admin": None',
+        'lambda *, token="admin": None',
+    ],
+)
+def test_flags_credential_literals_in_lambda_defaults(statement):
+    assert len(scan_source(statement, "t.py")) == 1
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        'password = f"admin"',
+        'password = "ad" + "min"',
+    ],
+)
+def test_flags_constant_credential_string_expressions(statement):
+    assert len(scan_source(statement, "t.py")) == 1
+
+
+@pytest.mark.parametrize(
     "source",
     [
         'role = "admin"',
@@ -137,7 +159,15 @@ def test_baseline_round_trip(tmp_path):
 def test_scan_tree_skips_only_its_own_files(tmp_path):
     for name in ("credential_discipline.py", "test_credential_discipline.py", "test_example.py"):
         (tmp_path / name).write_text('username = "admin"\n', encoding="utf-8")
-    assert [v.path for v in scan_tree(tmp_path)] == ["test_example.py"]
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    for name in ("credential_discipline.py", "test_credential_discipline.py"):
+        (nested / name).write_text('username = "admin"\n', encoding="utf-8")
+    assert [v.path for v in scan_tree(tmp_path)] == [
+        "nested/credential_discipline.py",
+        "nested/test_credential_discipline.py",
+        "test_example.py",
+    ]
 
 
 def test_importer_regressions_have_no_baseline_allowance():
