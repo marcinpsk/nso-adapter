@@ -86,6 +86,22 @@ def _name(node: ast.AST) -> str:
     return ""
 
 
+def _constant_string(node: ast.AST) -> str | None:
+    """Return the value of a statically constant string expression."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        if all(isinstance(value, ast.Constant) and isinstance(value.value, str) for value in node.values):
+            return "".join(value.value for value in node.values)
+        return None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _constant_string(node.left)
+        right = _constant_string(node.right)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
 class _Scanner(ast.NodeVisitor):
     """Collect credential literals with their lexical scope."""
 
@@ -100,9 +116,7 @@ class _Scanner(ast.NodeVisitor):
     def hits(self) -> list[Violation]:
         return [self._hits[key] for key in sorted(self._hits)]
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self._scope.append(node.name)
-        args = node.args
+    def _check_defaults(self, args: ast.arguments) -> None:
         positional = args.posonlyargs + args.args
         for arg, value in zip(positional[-len(args.defaults) :], args.defaults):
             if _credential_name(arg.arg):
@@ -110,10 +124,18 @@ class _Scanner(ast.NodeVisitor):
         for arg, value in zip(args.kwonlyargs, args.kw_defaults):
             if value is not None and _credential_name(arg.arg):
                 self._check_value(value, value)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._scope.append(node.name)
+        self._check_defaults(node.args)
         self.generic_visit(node)
         self._scope.pop()
 
     visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._check_defaults(node.args)
+        self.generic_visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self._scope.append(node.name)
@@ -138,7 +160,7 @@ class _Scanner(ast.NodeVisitor):
         if isinstance(value, (ast.Tuple, ast.List)):
             for item in value.elts:
                 self._check_value(item, statement)
-        elif isinstance(value, ast.Constant) and isinstance(value.value, str) and value.value.casefold() == "admin":
+        elif (literal := _constant_string(value)) is not None and literal.casefold() == "admin":
             self._hits[(value.lineno, value.col_offset)] = Violation(
                 self._rel, value.lineno, ".".join(self._scope) or "<module>"
             )
@@ -191,9 +213,10 @@ def scan_tree(root: Path = TESTS_ROOT) -> list[Violation]:
     """Scan every test module except the guard and its self-tests."""
     out: list[Violation] = []
     for path in sorted(root.rglob("*.py")):
-        if path.name in _SELF or "__pycache__" in path.parts:
+        rel = path.relative_to(root).as_posix()
+        if rel in _SELF or "__pycache__" in path.parts:
             continue
-        out.extend(scan_source(path.read_text(encoding="utf-8"), path.relative_to(root).as_posix()))
+        out.extend(scan_source(path.read_text(encoding="utf-8"), rel))
     return out
 
 

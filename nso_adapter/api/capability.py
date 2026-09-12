@@ -123,7 +123,7 @@ async def _device_and_client(device_id: int, db: AsyncSession):
         client = get_nso_client(device.nso_instance)
     except RuntimeError:
         # Built in the handler, raised after it: a raise inside attaches the caught exception.
-        unavailable = api_error(409, "no_nso_client", f"No NSO client for instance {device.nso_instance!r}")
+        unavailable = api_error(409, "no_nso_client", "No NSO client is registered")
     if unavailable is not None:
         raise unavailable
     return device, client

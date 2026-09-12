@@ -32,7 +32,10 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
+
+import pytest
 
 _PACKAGE = Path(__file__).resolve().parents[1] / "nso_adapter"
 
@@ -77,80 +80,466 @@ def _executes_in_handler(handler: ast.ExceptHandler) -> Iterator[ast.AST]:
         if isinstance(node, _FUNCTION_NODES):
             stack.extend(_definition_time_nodes(node))
             continue
+        if isinstance(node, ast.GeneratorExp):
+            stack.append(node.generators[0].iter)
+            continue
         yield node
         stack.extend(ast.iter_child_nodes(node))
 
 
-def _none_aliases(tree: ast.Module) -> set[str]:
-    """Every name the module binds to the literal ``None``.
+_UNKNOWN = object()
+_MISSING = object()
+_NONE = object()
+_Function = ast.FunctionDef | ast.AsyncFunctionDef
 
-    ``raise X from <alias>`` where the alias IS None behaves exactly like ``from None``:
-    the interpreter sets ``__suppress_context__`` and leaves ``__context__`` attached.
-    """
+
+@dataclass(frozen=True)
+class _Alias:
+    """One simple alias expression and the scope where Python evaluates it."""
+
+    value: ast.Name
+    scope: ast.AST
+
+
+def _target_names(target: ast.AST) -> set[str]:
+    """Return every plain name an assignment target binds."""
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return {name for item in target.elts for name in _target_names(item)}
+    if isinstance(target, ast.Starred):
+        return _target_names(target.value)
+    return set()
+
+
+def _pattern_names(pattern: ast.pattern) -> set[str]:
+    """Return the names a structural pattern captures in its lexical scope."""
     names: set[str] = set()
-    for node in ast.walk(tree):
-        value = getattr(node, "value", None)
-        if not (isinstance(value, ast.Constant) and value.value is None):
-            continue
-        if isinstance(node, ast.Assign):
-            names |= {target.id for target in node.targets if isinstance(target, ast.Name)}
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            names.add(node.target.id)
+    for part in ast.walk(pattern):
+        if isinstance(part, (ast.MatchAs, ast.MatchStar)) and part.name:
+            names.add(part.name)
+        elif isinstance(part, ast.MatchMapping) and part.rest:
+            names.add(part.rest)
     return names
 
 
-def _terminal_call_name(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
-    """The name a function's body ENDS in calling, when its last statement is that call."""
-    last = node.body[-1]
-    if not isinstance(last, ast.Expr):
-        return None
-    call = last.value
-    if isinstance(call, ast.Await):
-        call = call.value
-    if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
-        return call.func.id
-    return None
+class _LexicalIndex:
+    """Resolve the guard's supported local calls to one function definition.
 
-
-def _always_raising_helpers(tree: ast.Module, none_aliases: set[str]) -> set[str]:
-    """Functions whose CALL always raises AND attaches: the body ends in such a raise.
-
-    Calling one inside a handler is the same `raise X`, written one frame down. The
-    interpreter attaches the caught exception to it exactly as it would in the handler,
-    and ``from None`` one frame down suppresses just as little — so the helper's raise is
-    judged by the SAME cause classification as a raise written in the handler.
-
-    A function that ENDS in a call to such a helper is one itself: the raise runs one more
-    frame down and attaches exactly as much. Resolution repeats to a fixed point, so a
-    wrapper, a chain of them, and a wrapper around an alias all resolve to the same raise.
-    A function that can RETURN does not always raise, so it is never one.
+    The index is deliberately conservative. A reassignment, conflicting binding,
+    unsupported decorator, or shadowed receiver makes that symbol unknown. It does
+    not guess from a same-spelled definition in another scope.
     """
-    candidates = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.body
-        and not any(isinstance(child, ast.Return) for child in ast.walk(node))
+
+    def __init__(self, tree: ast.Module):
+        self.tree = tree
+        self.scope_of: dict[ast.AST, ast.AST] = {tree: tree}
+        self.parent: dict[ast.AST, ast.AST] = {}
+        self.scope_parent: dict[ast.AST, ast.AST | None] = {tree: None}
+        self.bindings: dict[ast.AST, dict[str, object]] = {tree: {}}
+        self.binding_count: dict[tuple[ast.AST, str], int] = {}
+        self.functions: list[_Function] = []
+        self.comprehension_scopes: set[ast.AST] = set()
+        self.global_names: dict[ast.AST, set[str]] = {}
+        self.nonlocal_names: dict[ast.AST, set[str]] = {}
+        for statement in tree.body:
+            self._walk(statement, tree, tree)
+
+    def _record(self, scope: ast.AST, name: str, value: object) -> None:
+        key = (scope, name)
+        self.binding_count[key] = self.binding_count.get(key, 0) + 1
+        bindings = self.bindings.setdefault(scope, {})
+        bindings[name] = value if name not in bindings else _UNKNOWN
+
+    def _assign(self, scope: ast.AST, name: str, value: object) -> None:
+        """Record a binding in the scope selected by global or nonlocal."""
+        if name in self.global_names.get(scope, set()):
+            self._record(self.tree, name, value)
+            return
+        if name in self.nonlocal_names.get(scope, set()):
+            outer = self.scope_parent.get(scope)
+            while outer is not None:
+                if isinstance(outer, _FUNCTION_NODES):
+                    self._record(outer, name, _UNKNOWN)
+                outer = self.scope_parent.get(outer)
+            return
+        self._record(scope, name, value)
+
+    def _mark(self, node: ast.AST, scope: ast.AST, parent: ast.AST) -> None:
+        self.scope_of[node] = scope
+        self.parent[node] = parent
+
+    def _walk(self, node: ast.AST, scope: ast.AST, parent: ast.AST) -> None:
+        self._mark(node, scope, parent)
+        handler = getattr(self, f"_walk_{type(node).__name__}", self._walk_children)
+        handler(node, scope)
+
+    def _walk_children(self, node: ast.AST, scope: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            self._walk(child, scope, node)
+
+    @staticmethod
+    def _arguments(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> tuple[ast.arg, ...]:
+        arguments = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+        if node.args.vararg is not None:
+            arguments = (*arguments, node.args.vararg)
+        if node.args.kwarg is not None:
+            arguments = (*arguments, node.args.kwarg)
+        return arguments
+
+    def _walk_function(self, node: _Function, scope: ast.AST) -> None:
+        self._assign(scope, node.name, node)
+        self.functions.append(node)
+        for expression in (*node.decorator_list, *node.args.defaults, *node.args.kw_defaults):
+            if expression is not None:
+                self._walk(expression, scope, node)
+        self.scope_parent[node] = scope
+        self.bindings[node] = {}
+        for argument in self._arguments(node):
+            self._record(node, argument.arg, _UNKNOWN)
+        for statement in node.body:
+            self._walk(statement, node, node)
+
+    def _walk_FunctionDef(self, node: ast.FunctionDef, scope: ast.AST) -> None:
+        self._walk_function(node, scope)
+
+    def _walk_AsyncFunctionDef(self, node: ast.AsyncFunctionDef, scope: ast.AST) -> None:
+        self._walk_function(node, scope)
+
+    def _walk_Lambda(self, node: ast.Lambda, scope: ast.AST) -> None:
+        for expression in (*node.args.defaults, *node.args.kw_defaults):
+            if expression is not None:
+                self._walk(expression, scope, node)
+        self.scope_parent[node] = scope
+        self.bindings[node] = {}
+        for argument in self._arguments(node):
+            self._record(node, argument.arg, _UNKNOWN)
+        self._walk(node.body, node, node)
+
+    def _walk_ClassDef(self, node: ast.ClassDef, scope: ast.AST) -> None:
+        self._assign(scope, node.name, _UNKNOWN)
+        for expression in (*node.decorator_list, *node.bases, *(keyword.value for keyword in node.keywords)):
+            self._walk(expression, scope, node)
+        self.scope_parent[node] = scope
+        self.bindings[node] = {}
+        for statement in node.body:
+            self._walk(statement, node, node)
+
+    def _walk_ListComp(self, node: ast.ListComp, scope: ast.AST) -> None:
+        self._walk_comprehension(node, scope)
+
+    def _walk_SetComp(self, node: ast.SetComp, scope: ast.AST) -> None:
+        self._walk_comprehension(node, scope)
+
+    def _walk_GeneratorExp(self, node: ast.GeneratorExp, scope: ast.AST) -> None:
+        self._walk_comprehension(node, scope)
+
+    def _walk_DictComp(self, node: ast.DictComp, scope: ast.AST) -> None:
+        self._walk_comprehension(node, scope)
+
+    def _walk_Assign(self, node: ast.Assign, scope: ast.AST) -> None:
+        self._walk(node.value, scope, node)
+        for target in node.targets:
+            self._walk(target, scope, node)
+        alias = _Alias(node.value, scope) if len(node.targets) == 1 and isinstance(node.value, ast.Name) else None
+        value = _NONE if isinstance(node.value, ast.Constant) and node.value.value is None else alias or _UNKNOWN
+        for target in node.targets:
+            for name in _target_names(target):
+                self._assign(scope, name, value if isinstance(target, ast.Name) else _UNKNOWN)
+
+    def _walk_AnnAssign(self, node: ast.AnnAssign, scope: ast.AST) -> None:
+        if node.value is not None:
+            self._walk(node.value, scope, node)
+        self._walk(node.target, scope, node)
+        alias = _Alias(node.value, scope) if isinstance(node.value, ast.Name) else None
+        value = _NONE if isinstance(node.value, ast.Constant) and node.value.value is None else alias or _UNKNOWN
+        for name in _target_names(node.target):
+            self._assign(scope, name, value if isinstance(node.target, ast.Name) else _UNKNOWN)
+
+    def _walk_NamedExpr(self, node: ast.NamedExpr, scope: ast.AST) -> None:
+        self._walk(node.value, scope, node)
+        binding_scope = scope
+        while binding_scope in self.comprehension_scopes:
+            binding_scope = self.scope_parent[binding_scope]
+        self._walk(node.target, binding_scope, node)
+        for name in _target_names(node.target):
+            self._assign(binding_scope, name, _UNKNOWN)
+
+    def _walk_Match(self, node: ast.Match, scope: ast.AST) -> None:
+        self._walk(node.subject, scope, node)
+        for case in node.cases:
+            self._walk(case.pattern, scope, node)
+            for name in _pattern_names(case.pattern):
+                self._assign(scope, name, _UNKNOWN)
+            if case.guard is not None:
+                self._walk(case.guard, scope, node)
+            for statement in case.body:
+                self._walk(statement, scope, node)
+
+    def _walk_for(self, node: ast.For | ast.AsyncFor, scope: ast.AST) -> None:
+        self._walk(node.iter, scope, node)
+        self._walk(node.target, scope, node)
+        for name in _target_names(node.target):
+            self._assign(scope, name, _UNKNOWN)
+        for statement in (*node.body, *node.orelse):
+            self._walk(statement, scope, node)
+
+    def _walk_For(self, node: ast.For, scope: ast.AST) -> None:
+        self._walk_for(node, scope)
+
+    def _walk_AsyncFor(self, node: ast.AsyncFor, scope: ast.AST) -> None:
+        self._walk_for(node, scope)
+
+    def _walk_with(self, node: ast.With | ast.AsyncWith, scope: ast.AST) -> None:
+        for item in node.items:
+            self._walk(item.context_expr, scope, node)
+            if item.optional_vars is not None:
+                self._walk(item.optional_vars, scope, node)
+                for name in _target_names(item.optional_vars):
+                    self._assign(scope, name, _UNKNOWN)
+        for statement in node.body:
+            self._walk(statement, scope, node)
+
+    def _walk_With(self, node: ast.With, scope: ast.AST) -> None:
+        self._walk_with(node, scope)
+
+    def _walk_AsyncWith(self, node: ast.AsyncWith, scope: ast.AST) -> None:
+        self._walk_with(node, scope)
+
+    def _walk_ExceptHandler(self, node: ast.ExceptHandler, scope: ast.AST) -> None:
+        if node.type is not None:
+            self._walk(node.type, scope, node)
+        if node.name:
+            self._assign(scope, node.name, _UNKNOWN)
+        for statement in node.body:
+            self._walk(statement, scope, node)
+
+    def _walk_import(self, node: ast.Import | ast.ImportFrom, scope: ast.AST) -> None:
+        for alias in node.names:
+            self._assign(scope, alias.asname or alias.name.split(".", 1)[0], _UNKNOWN)
+
+    def _walk_Import(self, node: ast.Import, scope: ast.AST) -> None:
+        self._walk_import(node, scope)
+
+    def _walk_ImportFrom(self, node: ast.ImportFrom, scope: ast.AST) -> None:
+        self._walk_import(node, scope)
+
+    def _walk_Global(self, node: ast.Global, scope: ast.AST) -> None:
+        self.global_names.setdefault(scope, set()).update(node.names)
+
+    def _walk_Nonlocal(self, node: ast.Nonlocal, scope: ast.AST) -> None:
+        self.nonlocal_names.setdefault(scope, set()).update(node.names)
+
+    def _walk_mutating_target(self, node: ast.AugAssign | ast.Delete, scope: ast.AST) -> None:
+        self._walk_children(node, scope)
+        targets = (node.target,) if isinstance(node, ast.AugAssign) else node.targets
+        for target in targets:
+            for name in _target_names(target):
+                self._assign(scope, name, _UNKNOWN)
+
+    def _walk_AugAssign(self, node: ast.AugAssign, scope: ast.AST) -> None:
+        self._walk_mutating_target(node, scope)
+
+    def _walk_Delete(self, node: ast.Delete, scope: ast.AST) -> None:
+        self._walk_mutating_target(node, scope)
+
+    def _walk_comprehension(self, node: ast.AST, outer: ast.AST) -> None:
+        generators = node.generators
+        self._walk(generators[0].iter, outer, node)
+        self.scope_parent[node] = outer
+        self.bindings[node] = {}
+        self.comprehension_scopes.add(node)
+        for index, generator in enumerate(generators):
+            if index:
+                self._walk(generator.iter, node, generator)
+            self._walk(generator.target, node, generator)
+            for name in _target_names(generator.target):
+                self._record(node, name, _UNKNOWN)
+            for condition in generator.ifs:
+                self._walk(condition, node, generator)
+        values = (node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,)
+        for value in values:
+            self._walk(value, node, node)
+
+    def scope(self, node: ast.AST) -> ast.AST:
+        """Return the evaluation scope, including synthetic bare-decorator calls."""
+        scope = self.scope_of.get(node)
+        if scope is None and isinstance(node, ast.Call):
+            scope = self.scope_of.get(node.func)
+        return scope or self.tree
+
+    def _is_function_scope(self, scope: ast.AST) -> bool:
+        return isinstance(scope, _FUNCTION_NODES) or scope in self.comprehension_scopes
+
+    def _binding(self, name: str, start: ast.AST) -> object:
+        return self._resolve_alias(self._binding_without_alias(name, start), set())
+
+    def _resolve_alias(self, value: object, seen: set[tuple[ast.AST, str]]) -> object:
+        if not isinstance(value, _Alias):
+            return value
+        key = (value.scope, value.value.id)
+        if key in seen:
+            return _UNKNOWN
+        seen.add(key)
+        target = self._binding_without_alias(value.value.id, value.scope)
+        return self._resolve_alias(target, seen)
+
+    def _binding_without_alias(self, name: str, start: ast.AST) -> object:
+        scope: ast.AST | None = start
+        started_in_function = self._is_function_scope(start)
+        while scope is not None:
+            if isinstance(scope, ast.ClassDef) and (started_in_function or scope is not start):
+                scope = self.scope_parent.get(scope)
+                continue
+            if scope is not self.tree and name in self.global_names.get(scope, set()):
+                scope = self.tree
+                continue
+            if name in self.nonlocal_names.get(scope, set()):
+                scope = self.scope_parent.get(scope)
+                continue
+            value = self.bindings.get(scope, {}).get(name, _MISSING)
+            if value is not _MISSING:
+                return value
+            if self._is_function_scope(scope):
+                started_in_function = True
+            scope = self.scope_parent.get(scope)
+        return _MISSING
+
+    def _descriptor(self, node: _Function) -> str:
+        owner = self.scope_parent[node]
+        if not isinstance(owner, ast.ClassDef):
+            return "function" if not node.decorator_list else "decorated"
+        if not node.decorator_list:
+            return "instance"
+        if len(node.decorator_list) != 1 or not isinstance(node.decorator_list[0], ast.Name):
+            return "decorated"
+        name = node.decorator_list[0].id
+        if name not in {"classmethod", "staticmethod"} or self._binding(name, owner) is not _MISSING:
+            return "decorated"
+        return "class" if name == "classmethod" else "static"
+
+    def classifiable(self, node: _Function) -> bool:
+        """Whether calling this definition reaches its body with supported semantics."""
+        return self._descriptor(node) != "decorated"
+
+    def _receiver_class(self, name: str, start: ast.AST) -> ast.ClassDef | None:
+        scope: ast.AST | None = start
+        started_in_function = self._is_function_scope(start)
+        while scope is not None:
+            if isinstance(scope, ast.ClassDef) and (started_in_function or scope is not start):
+                scope = self.scope_parent.get(scope)
+                continue
+            if scope is not self.tree and name in self.global_names.get(scope, set()):
+                scope = self.tree
+                continue
+            if name in self.nonlocal_names.get(scope, set()):
+                scope = self.scope_parent.get(scope)
+                continue
+            if name in self.bindings.get(scope, {}):
+                if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    owner = self.scope_parent[scope]
+                    positional = (*scope.args.posonlyargs, *scope.args.args)
+                    descriptor = self._descriptor(scope)
+                    expected = "self" if descriptor == "instance" else "cls" if descriptor == "class" else None
+                    if (
+                        isinstance(owner, ast.ClassDef)
+                        and expected == name
+                        and positional
+                        and positional[0].arg == name
+                        and self.binding_count.get((scope, name)) == 1
+                    ):
+                        return owner
+                return None
+            if self._is_function_scope(scope):
+                started_in_function = True
+            scope = self.scope_parent.get(scope)
+        return None
+
+    def resolve(self, expression: ast.expr, scope: ast.AST) -> _Function | None:
+        """Resolve one supported callable expression to its exact definition."""
+        if isinstance(expression, ast.Name):
+            value = self._binding(expression.id, scope)
+        elif (
+            isinstance(expression, ast.Attribute)
+            and isinstance(expression.value, ast.Name)
+            and expression.value.id in {"self", "cls"}
+        ):
+            owner = self._receiver_class(expression.value.id, scope)
+            value = self.bindings.get(owner, {}).get(expression.attr, _MISSING) if owner is not None else _MISSING
+            value = self._resolve_alias(value, set())
+        else:
+            return None
+        return value if isinstance(value, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
+
+    def is_none(self, expression: ast.Name) -> bool:
+        """Whether this name resolves to a scoped literal-None binding."""
+        return self._binding(expression.id, self.scope(expression)) is _NONE
+
+
+def _executes_during_call(node: _Function) -> Iterator[ast.AST]:
+    """Yield nodes executed by a call, pruning only deferred function bodies."""
+    stack: list[ast.AST] = list(node.body)
+    while stack:
+        child = stack.pop()
+        if isinstance(child, _FUNCTION_NODES):
+            stack.extend(_definition_time_nodes(child))
+            continue
+        yield child
+        stack.extend(ast.iter_child_nodes(child))
+
+
+def _terminal_call(node: _Function) -> tuple[ast.Call, bool] | None:
+    """Return the final direct call and whether the function awaits it."""
+    last = node.body[-1]
+    if not isinstance(last, (ast.Expr, ast.Return)) or last.value is None:
+        return None
+    value = last.value
+    awaited = isinstance(value, ast.Await)
+    if awaited:
+        value = value.value
+    return (value, awaited) if isinstance(value, ast.Call) else None
+
+
+def _call_raises_now(call: ast.Call, *, awaited: bool, index: _LexicalIndex, helpers: set[_Function]) -> bool:
+    target = index.resolve(call.func, index.scope(call))
+    if target not in helpers:
+        return False
+    return not isinstance(target, ast.AsyncFunctionDef) or awaited
+
+
+def _always_raising_helpers(tree: ast.Module, index: _LexicalIndex) -> set[_Function]:
+    """Return exact function definitions whose supported invocation always raises."""
+    candidates: list[tuple[_Function, list[ast.AST]]] = [
+        (node, list(_executes_during_call(node))) for node in index.functions if node.body and index.classifiable(node)
     ]
-    resolved = _helper_aliases(
-        tree,
-        {
-            node.name
-            for node in candidates
-            if isinstance(node.body[-1], ast.Raise) and _attaches_context(node.body[-1], none_aliases)
-        },
-    )
+    helpers = {
+        node
+        for node, executed in candidates
+        if not any(isinstance(child, (ast.Return, ast.Yield, ast.YieldFrom)) for child in executed)
+        and isinstance(node.body[-1], ast.Raise)
+        and _attaches_context(node.body[-1], index)
+    }
     grown = True
     while grown:
         grown = False
-        for node in candidates:
-            if node.name not in resolved and _terminal_call_name(node) in resolved:
-                resolved = _helper_aliases(tree, resolved | {node.name})
+        for node, executed in candidates:
+            if node in helpers or any(isinstance(child, (ast.Yield, ast.YieldFrom)) for child in executed):
+                continue
+            terminal = _terminal_call(node)
+            if terminal is None:
+                continue
+            last = node.body[-1]
+            returns = [child for child in executed if isinstance(child, ast.Return)]
+            if returns and not (isinstance(last, ast.Return) and returns == [last]):
+                continue
+            call, awaited = terminal
+            if _call_raises_now(call, awaited=awaited, index=index, helpers=helpers):
+                helpers.add(node)
                 grown = True
-    return resolved
+    return helpers
 
 
-def _attaches_context(node: ast.Raise, none_aliases: set[str]) -> bool:
+def _attaches_context(node: ast.Raise, index: _LexicalIndex) -> bool:
     """Whether this raise leaves the caught exception on ``__context__``."""
     if node.exc is None:
         return False  # a bare `raise` re-raises the caught exception on purpose
@@ -159,45 +548,27 @@ def _attaches_context(node: ast.Raise, none_aliases: set[str]) -> bool:
         return True  # the implicit half: the interpreter attaches it itself
     if isinstance(cause, ast.Constant):
         return cause.value is None  # `from None` only SUPPRESSES; the context stays
-    return isinstance(cause, ast.Name) and cause.id in none_aliases
-
-
-def _helper_aliases(tree: ast.Module, helpers: set[str]) -> set[str]:
-    """*helpers* plus every name a plain ``alias = helper`` assignment binds to one of them.
-
-    The alias IS the helper: calling it in a handler runs the same raise one frame down.
-    Binding repeats to a fixed point, so a chain of aliases resolves to the same helper.
-    """
-    bindings: list[tuple[str, str]] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
-            bindings += [(target.id, node.value.id) for target in node.targets if isinstance(target, ast.Name)]
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and isinstance(node.value, ast.Name):
-            bindings.append((node.target.id, node.value.id))
-    resolved = set(helpers)
-    bound = True
-    while bound:
-        bound = False
-        for alias, source in bindings:
-            if source in resolved and alias not in resolved:
-                resolved.add(alias)
-                bound = True
-    return resolved
+    return isinstance(cause, ast.Name) and index.is_none(cause)
 
 
 def scan_source(source: str, path: str) -> list[str]:
     """Every context-attaching site that RUNS inside an except handler, as ``path:line``."""
     tree = ast.parse(source, filename=path)
-    none_aliases = _none_aliases(tree)
-    helpers = _always_raising_helpers(tree, none_aliases)
+    index = _LexicalIndex(tree)
+    helpers = _always_raising_helpers(tree, index)
     lines: set[int] = set()
     for handler in ast.walk(tree):
         if not isinstance(handler, ast.ExceptHandler):
             continue
         for node in _executes_in_handler(handler):
-            if isinstance(node, ast.Raise) and _attaches_context(node, none_aliases):
+            if isinstance(node, ast.Raise) and _attaches_context(node, index):
                 lines.add(node.lineno)
-            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in helpers:
+            elif isinstance(node, ast.Call) and _call_raises_now(
+                node,
+                awaited=isinstance(index.parent.get(node), ast.Await),
+                index=index,
+                helpers=helpers,
+            ):
                 lines.add(node.lineno)
     return [f"{path}:{line}" for line in sorted(lines)]
 
@@ -428,6 +799,34 @@ _CHAINED_ALIASES_OF_A_RAISING_HELPER = (
     "except ValueError:\n"
     "    second()\n"
 )
+_SELF_METHOD_RAISING_HELPER = (
+    "class Example:\n"
+    "    def _refuse(self):\n"
+    "        raise Boom()\n"
+    "\n"
+    "    def run(self):\n"
+    "        try:\n"
+    "            trigger()\n"
+    "        except ValueError:\n"
+    "            self._refuse()\n"
+    "\n"
+    "Example().run()\n"
+)
+_CLASS_METHOD_RAISING_HELPER = (
+    "class Example:\n"
+    "    @classmethod\n"
+    "    def _refuse(cls):\n"
+    "        raise Boom()\n"
+    "\n"
+    "    @classmethod\n"
+    "    def run(cls):\n"
+    "        try:\n"
+    "            trigger()\n"
+    "        except ValueError:\n"
+    "            cls._refuse()\n"
+    "\n"
+    "Example.run()\n"
+)
 
 
 def test_flags_an_ALIAS_of_an_always_raising_helper() -> None:
@@ -440,6 +839,18 @@ def test_flags_a_CHAIN_of_aliases_of_an_always_raising_helper() -> None:
     """Resolution repeats to a fixed point, so an alias of an alias resolves too."""
     assert isinstance(_runtime_context(_CHAINED_ALIASES_OF_A_RAISING_HELPER), ValueError)
     assert scan_source(_CHAINED_ALIASES_OF_A_RAISING_HELPER, "t.py") == ["t.py:10"]
+
+
+@pytest.mark.parametrize(
+    ("source", "line"),
+    [
+        (_SELF_METHOD_RAISING_HELPER, 9),
+        (_CLASS_METHOD_RAISING_HELPER, 11),
+    ],
+)
+def test_flags_a_METHOD_call_to_an_always_raising_helper(source: str, line: int) -> None:
+    assert isinstance(_runtime_context(source), ValueError)
+    assert scan_source(source, "t.py") == [f"t.py:{line}"]
 
 
 def test_an_alias_of_a_RETURNING_helper_stays_legal() -> None:
@@ -501,6 +912,18 @@ _WRAPPER_AROUND_AN_ALIASED_HELPER = (
     "except ValueError:\n"
     "    _wrapper()\n"
 )
+_RETURN_WRAPPER_AROUND_A_RAISING_HELPER = (
+    "def _refuse():\n"
+    "    raise Boom()\n"
+    "\n"
+    "def _wrapper():\n"
+    "    return _refuse()\n"
+    "\n"
+    "try:\n"
+    "    trigger()\n"
+    "except ValueError:\n"
+    "    _wrapper()\n"
+)
 _WRAPPER_THAT_MAY_RETURN = (
     "def _refuse():\n"
     "    raise Boom()\n"
@@ -536,7 +959,404 @@ def test_flags_a_wrapper_around_an_ALIASED_helper() -> None:
     assert scan_source(_WRAPPER_AROUND_AN_ALIASED_HELPER, "t.py") == ["t.py:12"]
 
 
+def test_flags_a_RETURN_wrapper_around_an_always_raising_helper() -> None:
+    assert isinstance(_runtime_context(_RETURN_WRAPPER_AROUND_A_RAISING_HELPER), ValueError)
+    assert scan_source(_RETURN_WRAPPER_AROUND_A_RAISING_HELPER, "t.py") == ["t.py:10"]
+
+
 def test_a_wrapper_that_CAN_RETURN_is_not_an_always_raising_helper() -> None:
     """It does not always raise, so calling it in a handler is not a raise written there."""
     assert _runtime_context(_WRAPPER_THAT_MAY_RETURN) is None, "the interpreter attached nothing"
     assert scan_source(_WRAPPER_THAT_MAY_RETURN, "t.py") == []
+
+
+def test_an_unrelated_method_name_does_not_taint_a_module_builder() -> None:
+    source = (
+        "class Unused:\n"
+        "    def build(self):\n"
+        "        raise Boom()\n"
+        "\n"
+        "def build():\n"
+        "    return Boom()\n"
+        "\n"
+        "try:\n"
+        "    trigger()\n"
+        "except ValueError:\n"
+        "    err = build()\n"
+        "raise err\n"
+    )
+    assert _runtime_context(source) is None, "the interpreter attached nothing"
+    assert scan_source(source, "t.py") == []
+
+
+def test_a_return_in_a_nested_body_does_not_hide_an_outer_raise() -> None:
+    source = (
+        "def refuse():\n"
+        "    def build():\n"
+        "        return Boom()\n"
+        "    raise Boom()\n"
+        "\n"
+        "try:\n"
+        "    trigger()\n"
+        "except ValueError:\n"
+        "    refuse()\n"
+    )
+    assert isinstance(_runtime_context(source), ValueError)
+    assert scan_source(source, "t.py") == ["t.py:9"]
+
+
+def test_a_static_method_parameter_has_no_receiver_identity() -> None:
+    source = (
+        "class Safe:\n"
+        "    def refuse(self):\n"
+        "        return Boom()\n"
+        "\n"
+        "class Example:\n"
+        "    def refuse(self):\n"
+        "        raise Boom()\n"
+        "\n"
+        "    @staticmethod\n"
+        "    def run(self):\n"
+        "        try:\n"
+        "            trigger()\n"
+        "        except ValueError:\n"
+        "            return self.refuse()\n"
+        "\n"
+        "raise Example.run(Safe())\n"
+    )
+    assert _runtime_context(source) is None, "the interpreter attached nothing"
+    assert scan_source(source, "t.py") == []
+
+
+def test_a_comprehension_target_shadows_an_outer_raising_helper() -> None:
+    source = (
+        "def refuse():\n"
+        "    raise Boom()\n"
+        "\n"
+        "def build():\n"
+        "    return Boom()\n"
+        "\n"
+        "try:\n"
+        "    trigger()\n"
+        "except ValueError:\n"
+        "    err = [refuse() for refuse in [build]][0]\n"
+        "raise err\n"
+    )
+    assert _runtime_context(source) is None, "the interpreter attached nothing"
+    assert scan_source(source, "t.py") == []
+
+
+def test_an_arbitrary_decorator_makes_the_helper_effect_unknown() -> None:
+    source = (
+        "def safe(fn):\n"
+        "    return lambda: Boom()\n"
+        "\n"
+        "@safe\n"
+        "def refuse():\n"
+        "    raise Boom()\n"
+        "\n"
+        "try:\n"
+        "    trigger()\n"
+        "except ValueError:\n"
+        "    err = refuse()\n"
+        "raise err\n"
+    )
+    assert _runtime_context(source) is None, "the interpreter attached nothing"
+    assert scan_source(source, "t.py") == []
+
+
+def test_creating_a_generator_in_a_handler_does_not_execute_its_raise() -> None:
+    source = (
+        "def refuse():\n"
+        "    def later(value=(yield None)):\n"
+        "        pass\n"
+        "    raise Boom()\n"
+        "\n"
+        "generated = None\n"
+        "try:\n"
+        "    trigger()\n"
+        "except ValueError:\n"
+        "    generated = refuse()\n"
+        "    next(generated)\n"
+        "next(generated)\n"
+    )
+    assert _runtime_context(source) is None, "the interpreter attached nothing"
+    assert scan_source(source, "t.py") == []
+
+
+def test_creating_a_coroutine_in_a_handler_does_not_execute_its_raise() -> None:
+    source = (
+        "import asyncio\n"
+        "\n"
+        "async def refuse():\n"
+        "    raise Boom()\n"
+        "\n"
+        "pending = None\n"
+        "try:\n"
+        "    trigger()\n"
+        "except ValueError:\n"
+        "    pending = refuse()\n"
+        "asyncio.run(pending)\n"
+    )
+    assert _runtime_context(source) is None, "the interpreter attached nothing"
+    assert scan_source(source, "t.py") == []
+
+
+def test_a_class_body_default_uses_the_class_helper_binding() -> None:
+    source = (
+        "class Example:\n"
+        "    def refuse():\n"
+        "        raise Boom()\n"
+        "    try:\n"
+        "        trigger()\n"
+        "    except ValueError:\n"
+        "        def later(value=refuse()):\n"
+        "            pass\n"
+    )
+    assert isinstance(_runtime_context(source), ValueError)
+    assert scan_source(source, "t.py") == ["t.py:7"]
+
+
+def test_a_generator_expression_body_created_in_a_handler_is_deferred() -> None:
+    source = (
+        "def refuse():\n"
+        "    raise Boom()\n"
+        "\n"
+        "pending = None\n"
+        "try:\n"
+        "    trigger()\n"
+        "except ValueError:\n"
+        "    pending = (refuse() for item in [0])\n"
+        "next(pending)\n"
+    )
+    assert _runtime_context(source) is None, "the interpreter attached nothing"
+    assert scan_source(source, "t.py") == []
+
+
+def test_a_match_capture_shadows_an_outer_raising_helper() -> None:
+    source = (
+        "def refuse():\n"
+        "    raise Boom()\n"
+        "\n"
+        "def build():\n"
+        "    return Boom()\n"
+        "\n"
+        "def run():\n"
+        "    match build:\n"
+        "        case refuse:\n"
+        "            pass\n"
+        "    try:\n"
+        "        trigger()\n"
+        "    except ValueError:\n"
+        "        return refuse()\n"
+        "\n"
+        "raise run()\n"
+    )
+    assert _runtime_context(source) is None, "the interpreter attached nothing"
+    assert scan_source(source, "t.py") == []
+
+
+def test_a_comprehension_walrus_binds_in_the_enclosing_function() -> None:
+    source = (
+        "def refuse():\n"
+        "    raise Boom()\n"
+        "\n"
+        "def build():\n"
+        "    return Boom()\n"
+        "\n"
+        "def run():\n"
+        "    [(refuse := build) for item in [0]]\n"
+        "    try:\n"
+        "        trigger()\n"
+        "    except ValueError:\n"
+        "        return refuse()\n"
+        "\n"
+        "raise run()\n"
+    )
+    assert _runtime_context(source) is None, "the interpreter attached nothing"
+    assert scan_source(source, "t.py") == []
+
+
+def test_a_global_walrus_invalidates_the_module_helper_binding() -> None:
+    source = (
+        "def refuse():\n"
+        "    raise Boom()\n"
+        "\n"
+        "def build():\n"
+        "    return Boom()\n"
+        "\n"
+        "def replace():\n"
+        "    global refuse\n"
+        "    [(refuse := build) for item in [0]]\n"
+        "\n"
+        "replace()\n"
+        "try:\n"
+        "    trigger()\n"
+        "except ValueError:\n"
+        "    err = refuse()\n"
+        "raise err\n"
+    )
+    assert _runtime_context(source) is None, "the interpreter attached nothing"
+    assert scan_source(source, "t.py") == []
+
+
+def test_a_nonlocal_match_capture_invalidates_the_enclosing_helper_binding() -> None:
+    source = (
+        "def reject():\n"
+        "    raise Boom()\n"
+        "\n"
+        "def build():\n"
+        "    return Boom()\n"
+        "\n"
+        "def outer():\n"
+        "    refuse = reject\n"
+        "    def replace():\n"
+        "        nonlocal refuse\n"
+        "        match build:\n"
+        "            case refuse:\n"
+        "                pass\n"
+        "    replace()\n"
+        "    try:\n"
+        "        trigger()\n"
+        "    except ValueError:\n"
+        "        return refuse()\n"
+        "\n"
+        "raise outer()\n"
+    )
+    assert _runtime_context(source) is None, "the interpreter attached nothing"
+    assert scan_source(source, "t.py") == []
+
+
+def test_a_generator_expression_outer_iterable_executes_in_the_handler() -> None:
+    source = (
+        "def refuse():\n"
+        "    raise Boom()\n"
+        "\n"
+        "try:\n"
+        "    trigger()\n"
+        "except ValueError:\n"
+        "    pending = (item for item in refuse())\n"
+    )
+    assert isinstance(_runtime_context(source), ValueError)
+    assert scan_source(source, "t.py") == ["t.py:7"]
+
+
+def test_a_global_read_skips_an_enclosing_function_binding() -> None:
+    source = (
+        "def refuse():\n"
+        "    return Boom()\n"
+        "\n"
+        "def outer():\n"
+        "    def refuse():\n"
+        "        raise Boom()\n"
+        "\n"
+        "    def inner():\n"
+        "        global refuse\n"
+        "        try:\n"
+        "            trigger()\n"
+        "        except ValueError:\n"
+        "            return refuse()\n"
+        "\n"
+        "    return inner()\n"
+        "\n"
+        "raise outer()\n"
+    )
+    assert _runtime_context(source) is None, "the interpreter attached nothing"
+    assert scan_source(source, "t.py") == []
+
+
+def test_an_ordinary_global_assignment_invalidates_the_module_helper() -> None:
+    source = (
+        "def refuse():\n"
+        "    raise Boom()\n"
+        "\n"
+        "def build():\n"
+        "    return Boom()\n"
+        "\n"
+        "def replace():\n"
+        "    global refuse\n"
+        "    refuse = build\n"
+        "\n"
+        "replace()\n"
+        "try:\n"
+        "    trigger()\n"
+        "except ValueError:\n"
+        "    err = refuse()\n"
+        "raise err\n"
+    )
+    assert _runtime_context(source) is None, "the interpreter attached nothing"
+    assert scan_source(source, "t.py") == []
+
+
+def test_a_global_receiver_skips_an_enclosing_method_receiver() -> None:
+    source = (
+        "class Safe:\n"
+        "    def refuse(self):\n"
+        "        return Boom()\n"
+        "\n"
+        "self = Safe()\n"
+        "\n"
+        "class Example:\n"
+        "    def refuse(self):\n"
+        "        raise Boom()\n"
+        "\n"
+        "    def run(self):\n"
+        "        def inner():\n"
+        "            global self\n"
+        "            try:\n"
+        "                trigger()\n"
+        "            except ValueError:\n"
+        "                return self.refuse()\n"
+        "        return inner()\n"
+        "\n"
+        "raise Example().run()\n"
+    )
+    assert _runtime_context(source) is None, "the interpreter attached nothing"
+    assert scan_source(source, "t.py") == []
+
+
+def test_a_method_skips_class_scope_declarations_and_bindings() -> None:
+    source = (
+        "def refuse():\n"
+        "    raise Boom()\n"
+        "\n"
+        "def outer():\n"
+        "    def refuse():\n"
+        "        return Boom()\n"
+        "\n"
+        "    class Example:\n"
+        "        global refuse\n"
+        "\n"
+        "        def run(self):\n"
+        "            try:\n"
+        "                trigger()\n"
+        "            except ValueError:\n"
+        "                return refuse()\n"
+        "\n"
+        "    return Example().run()\n"
+        "\n"
+        "raise outer()\n"
+    )
+    assert _runtime_context(source) is None, "the interpreter attached nothing"
+    assert scan_source(source, "t.py") == []
+
+
+def test_a_nested_class_body_skips_its_enclosing_class_namespace() -> None:
+    source = (
+        "def refuse():\n"
+        "    return Boom()\n"
+        "\n"
+        "class Outer:\n"
+        "    def refuse():\n"
+        "        raise Boom()\n"
+        "\n"
+        "    class Inner:\n"
+        "        try:\n"
+        "            trigger()\n"
+        "        except ValueError:\n"
+        "            err = refuse()\n"
+        "\n"
+        "raise Outer.Inner.err\n"
+    )
+    assert _runtime_context(source) is None, "the interpreter attached nothing"
+    assert scan_source(source, "t.py") == []

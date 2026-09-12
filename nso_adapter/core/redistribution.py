@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.cancelsafe import await_uncancellable
 from nso_adapter.core.refresh_engine import classify_envelope_family_read
-from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.client import NsoClient, failure_detail
 from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
     Freshness,
@@ -266,7 +266,7 @@ async def refresh_redistribution_from_outcomes(
             source_epoch=source_epoch,
         )
     except Exception as exc:  # noqa: BLE001 — telemetry write; the mirror is the source of truth
-        logger.warning("redistribution.outcome.read_record_failed", device_id=device_id, error=repr(exc))
+        logger.warning("redistribution.outcome.read_record_failed", device_id=device_id, error=failure_detail(exc))
         await _recover_session(db, device, "redistribution", device_id)
 
     # Tier 2 — per-component aggregation under the two-mode materialization guard.
@@ -415,7 +415,9 @@ async def _commit_partitions(
                 )
                 await outcome_store.record_result(db, failed_id, result="error", succeeded=False, row_count=None)
         except Exception as store_exc:  # noqa: BLE001 — telemetry; the materialization error is the story
-            logger.warning("redistribution.outcome.terminalize_failed", device_id=device_id, error=repr(store_exc))
+            logger.warning(
+                "redistribution.outcome.terminalize_failed", device_id=device_id, error=failure_detail(store_exc)
+            )
         raise
     return rebuilt, bool(outcome_row is not None and outcome_row.result == "superseded")
 
@@ -479,7 +481,7 @@ async def _record_composite(
             db, attempt_id, result=result, succeeded=succeeded, row_count=row_count
         )
     except Exception as exc:  # noqa: BLE001 — telemetry write; the mirror is the source of truth
-        logger.warning("redistribution.outcome.record_failed", device_id=device_id, error=repr(exc))
+        logger.warning("redistribution.outcome.record_failed", device_id=device_id, error=failure_detail(exc))
         await _recover_session(db, device, "redistribution", device_id)
         return None
 
