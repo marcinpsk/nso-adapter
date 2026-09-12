@@ -259,6 +259,7 @@
         "vrf": "RED"
       },
       {
+        "enabled": true,
         "process-id": "9",
         "redistribute": [
           {

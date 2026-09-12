@@ -1393,7 +1393,7 @@ def encode_ospf(rows: SectionRows, execution: SectionExecution) -> dict:
     emitted_pids = {p["process-id"] for p in processes}
     for pid, redist_list in redist_by_proc.items():
         if pid not in emitted_pids:
-            processes.append({"process-id": pid, "redistribute": redist_list})
+            processes.append({"process-id": pid, "enabled": True, "redistribute": redist_list})
             emitted_pids.add(pid)
 
     interfaces = [_ospf_interface_entry(row) for row in rows["ospf_interface_intent"]]

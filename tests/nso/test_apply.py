@@ -719,6 +719,7 @@ def test_ospf_orphan_redistribute_synthesizes_a_process():
 
     procs = body["process-config"]
     assert [p["process-id"] for p in procs] == ["1"]
+    assert procs[0]["enabled"] is True
     assert procs[0]["redistribute"] == [{"source-protocol": "connected", "source-ref": ""}]
 
 
