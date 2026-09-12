@@ -4,13 +4,14 @@
 
 from __future__ import annotations
 
+import ipaddress
 from collections import defaultdict
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal, Self
 
 import structlog
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -133,8 +134,8 @@ async def get_interface_ips(device_id: int, db: AsyncSession = Depends(get_read_
 
 class IpAddressEntry(BaseModel):
     interface: str
-    address: str  # "ip/prefix-length" — e.g. "10.0.0.1/24" or "2001:db8::1/64"
-    family: str  # "ipv4" | "ipv6"
+    address: str  # IP address with a numeric prefix length.
+    family: Literal["ipv4", "ipv6"]
     secondary: bool = False
     vrf: str = ""  # "" = global/default routing table
     accepted_at: UtcInstant | None = None
@@ -144,6 +145,16 @@ class IpAddressEntry(BaseModel):
     routed: bool = False  # this is a Nokia routed logical interface (create DbInterface if absent)
     parent_binding: str | None = None  # the bound port/LAG, e.g. "lag-99"
     encap_tag: str | None = None  # dot1q tag, e.g. "99"
+
+    @model_validator(mode="after")
+    def validate_address_family(self) -> Self:
+        _, separator, prefix = self.address.rpartition("/")
+        if not separator or not prefix.isascii() or not prefix.isdecimal():
+            raise ValueError("address must contain an IP address and a numeric prefix length")
+        address = ipaddress.ip_interface(self.address)
+        if self.family != f"ipv{address.version}":
+            raise ValueError("address family must agree with family")
+        return self
 
 
 class IpIntentUpdate(BaseModel):
@@ -315,7 +326,7 @@ async def put_ip_intent(
     # every other service's replace_on_removal, and always runs (removal is not auto_apply-gated).
     replaced = False
     if removed_interfaces:
-        from nso_adapter.core.removal import enqueue_removal, query_flag_marking
+        from nso_adapter.core.removal import enqueue_removal, interface_removal_keys, query_flag_marking
 
         marks = query_flag_marking(deletes=True)
         replaced = (
@@ -330,7 +341,9 @@ async def put_ip_intent(
                 promotes=(delivery.stream,),
                 settlement_cohort=settlement_cohort,
                 interfaces=sorted(removed_interfaces),
-                removed={"address": removed_addresses},
+                removed=interface_removal_keys(
+                    sorted(removed_interfaces - {item.interface for item in body.addresses}), removed_addresses
+                ),
             )
             is not None
         )

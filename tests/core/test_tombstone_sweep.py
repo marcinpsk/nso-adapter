@@ -11,6 +11,7 @@ at acquisition rather than getting a subset of the work.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 
 import pytest
 import sqlalchemy as sa
@@ -19,10 +20,36 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from nso_adapter.core.claim import ClaimLostError, acquire_claim, release_claim
 from nso_adapter.core.tombstone_sweep import sweep_tombstones
 from tests.conftest import seed_device, session
+from tests.core.removal_helpers import authorize_static_route
 
 A = ("", "10.0.0.0/24", "192.0.2.1")
 B = ("", "10.0.1.0/24", "192.0.2.2")
 C = ("", "10.0.2.0/24", "192.0.2.3")
+
+
+async def _seed_route(device_id: int, triple: tuple[str, str, str], *, route_id: int) -> None:
+    """Seed one ACCEPTED route so the device's authorized document renders it.
+
+    A key the live service holds and the document does not render is collateral now: one PUT
+    carries every family, so omitting it would retract it and the device-wide guard blocks
+    the write. A sibling route that must survive a removal is therefore an authorized row,
+    which is what it always was in production.
+    """
+    from nso_adapter.store.models import StaticRouteIntent
+
+    vrf, prefix, next_hop = triple
+    async with session() as db:
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id,
+                vrf=vrf,
+                prefix=prefix,
+                next_hop=next_hop,
+                route_id=route_id,
+                accepted_at=datetime(2026, 6, 1, tzinfo=UTC),
+            )
+        )
+        await db.commit()
 
 
 async def _seed_tombstone(
@@ -53,7 +80,11 @@ async def _seed_tombstone(
             row.id = tombstone_id
         db.add(row)
         await db.commit()
-        return row.id
+        tomb_id = row.id
+    # The push that wrote this carrier also promoted the stream, so the device has an
+    # authorized static-route fragment for the sweeper's reissue to compose.
+    await authorize_static_route(device_id)
+    return tomb_id
 
 
 async def _seed_job(device_id: int, status, job_type=None) -> int:
@@ -148,7 +179,7 @@ async def test_a_sweep_rejects_a_carrier_that_cannot_take_its_generation(adapter
             device_id,
             mode=GenerationMode.detach,
             removal_context=context,
-            allowed_removal_keys=context["removed"],
+            allowed_removal_keys={"static_route": context["removed"]},
         )
         carrier = await create_dedicated_job(db, device_id, JobType.removal, context=context)
         assert await attach_to_job(db, first, carrier)
@@ -162,11 +193,12 @@ async def test_a_sweep_rejects_a_carrier_that_cannot_take_its_generation(adapter
 
     monkeypatch.setattr(sweep_mod, "create_dedicated_job", _occupied_carrier)
 
-    with pytest.raises(
-        GenerationCarrierCorruption,
-        match=rf"dedicated carrier {carrier_id} rejected generation \d+",
-    ):
-        await sweep_tombstones()
+    async with session() as db:
+        with pytest.raises(
+            GenerationCarrierCorruption,
+            match=rf"dedicated carrier {carrier_id} rejected generation \d+",
+        ):
+            await sweep_mod.sweep_one_device(device_id, db=db)
 
     async with session() as db:
         generations = (
@@ -213,6 +245,7 @@ async def test_the_reissued_job_runs_with_the_marking_the_tombstone_recorded(ada
     device_name = f"sw-m5-2-{marking}"
     device_id = await seed_device(nso_device_name=device_name, netbox_device_id=9630)
     failed_id = await _seed_job(device_id, JobStatus.failed)
+    await _seed_route(device_id, A, route_id=9)
     await _seed_tombstone(device_id, B, route_id=8, marking=marking, job_id=failed_id)
 
     assert await sweep_tombstones() == 1
@@ -248,6 +281,7 @@ async def test_a_failed_sweep_retry_removes_the_tombstone_and_deployed_keys(adap
 
     device_name = "sw-m5-retry-divergent"
     device_id = await seed_device(nso_device_name=device_name, netbox_device_id=9631)
+    await _seed_route(device_id, C, route_id=9)
     await _seed_tombstone(device_id, B, marking="delete_origin", deployed_key=A)
 
     assert await sweep_tombstones() == 1
@@ -266,7 +300,7 @@ async def test_a_failed_sweep_retry_removes_the_tombstone_and_deployed_keys(adap
     succeeded = await run_removal_job(device_id, retried_id, sr_client(fake))
 
     assert succeeded.status is JobStatus.succeeded
-    assert fake.sent_keys() == {C}, "the retry kept a key recorded only as deployed_key"
+    assert fake.sent_keys() == {C}, "the retry dropped a key its own document still renders"
     async with session() as db:
         remaining = (
             await db.scalars(sa.select(StaticRouteTombstone).where(StaticRouteTombstone.device_id == device_id))
@@ -519,3 +553,45 @@ async def test_delete_tombstones_refuses_a_stale_token(adapter_client):
         await db.rollback()
 
     assert [row_id for row_id, _job in await _tombstones(device_id)] == [first]
+
+
+async def test_empty_tombstone_delete_does_not_create_projection_state(adapter_client):
+    from nso_adapter.store.models import DeviceGenerationCounter
+    from nso_adapter.store.tombstone_store import delete_tombstones
+
+    device_id = await seed_device(nso_device_name="empty-delete")
+    reg = await acquire_claim(device_id, "sweep")
+    try:
+        async with session() as db:
+            assert await db.get(DeviceGenerationCounter, device_id) is None
+            assert await delete_tombstones(db, [], device_id=device_id, claim_token=reg.token) == 0
+            await db.commit()
+            assert await db.get(DeviceGenerationCounter, device_id) is None
+    finally:
+        await release_claim(reg)
+
+
+async def test_refused_sweep_rolls_back_before_releasing_supplied_session(adapter_client):
+    from nso_adapter.core.generation import OperationSectionAbsent
+    from nso_adapter.core.tombstone_sweep import sweep_one_device
+    from nso_adapter.store.models import DeviceClaim, DeviceGenerationCounter, StaticRouteTombstone
+
+    device_id = await seed_device(nso_device_name="refused-sweep")
+    async with session() as db:
+        row = StaticRouteTombstone(
+            device_id=device_id,
+            route_id=1,
+            vrf="",
+            prefix="198.18.0.0/24",
+            next_hop="198.18.1.1",
+            marking="delete_origin",
+        )
+        db.add(row)
+        await db.commit()
+        row_id = row.id
+        with pytest.raises(OperationSectionAbsent):
+            await sweep_one_device(device_id, db=db)
+    async with session() as db:
+        assert await db.get(DeviceClaim, device_id) is None
+        assert (await db.get(StaticRouteTombstone, row_id)).job_id is None
+        assert await db.get(DeviceGenerationCounter, device_id) is None

@@ -67,13 +67,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.core.projection import (
     EXECUTION_KEY,
     InterfaceEligibilityUnresolved,
+    compose_section_execution,
     fragment_context,
     fragment_tables,
     freeze_fragment,
     is_intent_deletion,
     projection_row_state,
     projection_streams,
-    record_interface_execution,
+    prune_consumed_carriers,
+    retained_proof,
     rows_by_intent_identity,
     snapshot_stream,
     stream_section,
@@ -139,6 +141,22 @@ class ApplyUnexecutable(RuntimeError):
     def __init__(self, reasons: dict[str, str]):
         super().__init__("selected projection cannot be executed faithfully")
         self.reasons = reasons
+
+
+class OperationSectionAbsent(RuntimeError):
+    """An operation names a section the composed document does not carry.
+
+    Recording the operation plane is not optional: it is where the carriers this deployment
+    discharges are named, and admission deletes those carriers on the strength of it. Skipping
+    it and creating the generation anyway loses the record while the carrier is already gone,
+    so creation is REFUSED and the whole transaction rolls back with the carrier intact.
+    """
+
+    reason = "no_authorized_section"
+
+    def __init__(self, scope: str):
+        super().__init__(f"the device has no authorized {scope!r} section for this operation to act on")
+        self.scope = scope
 
 
 class ActionApplyResult(NamedTuple):
@@ -314,22 +332,26 @@ def _compose_document(fragments: dict[str, dict]) -> dict:
     """Compose ``{stream: fragment}`` into the ``{section: {table: rows}}`` outbound document.
 
     Streams own disjoint tables inside a section, so a section's tables are the union of its
-    streams' fragments and no fragment can overwrite a sibling's table.
+    streams' fragments and no fragment can overwrite a sibling's table. The section's
+    ``_execution`` is COMPOSED rather than overwritten: the context is the owner stream's and
+    the proof merges per row, so a lane that was not reauthorized keeps its own decisions.
     """
-    document: dict[str, dict] = {}
+    contributions: dict[str, list[tuple[str, dict]]] = {}
     for stream, fragment in sorted(fragments.items()):
-        document.setdefault(stream_section(stream), {}).update(fragment)
+        contributions.setdefault(stream_section(stream), []).append((stream, fragment))
+    document: dict[str, dict] = {}
+    for section, contributing in contributions.items():
+        body: dict = {}
+        for _stream, fragment in contributing:
+            body.update(fragment_tables(fragment))
+        body[EXECUTION_KEY] = compose_section_execution(section, contributing)
+        document[section] = body
     return document
 
 
 async def _authorized_fragments(db: AsyncSession, device_id: int) -> dict[str, dict]:
     """Every stream's last-authorized fragment for this device. Unpromoted lanes are absent."""
-    rows = (
-        (await db.execute(select(DeviceProjectionStream).where(DeviceProjectionStream.device_id == device_id)))
-        .scalars()
-        .all()
-    )
-    return {row.stream: row.authorized_document for row in rows if row.authorized_document}
+    return await refresh_consumed_carriers(db, device_id)
 
 
 async def _compose_authorized_document(db: AsyncSession, device_id: int, promoted: dict[str, dict]) -> dict:
@@ -398,9 +420,16 @@ def _fragment_deletions(
     default = DELETE_ORIGIN_MARKING if receipt.delete_origin else DETACH_MARKING
     networked: dict[str, list[dict]] = {}
     detached: dict[str, list[dict]] = {}
-    for table, previous in sorted((old or {}).items()):
-        desired_rows = rows_by_intent_identity(desired, table)
-        for identity, row in rows_by_intent_identity(old or {}, table).items():
+    old_tables = fragment_tables(old)
+    desired_tables = fragment_tables(desired)
+    for table in sorted(old_tables):
+        desired_rows = rows_by_intent_identity(desired_tables, table)
+        successor_route_ids = (
+            {after["route_id"] for after in desired_rows.values() if after.get("route_id") is not None}
+            if table == "static_route_intent"
+            else set()
+        )
+        for identity, row in rows_by_intent_identity(old_tables, table).items():
             if not is_intent_deletion(table, identity, desired_rows):
                 continue
             row_id = row.get("id")
@@ -411,17 +440,36 @@ def _fragment_deletions(
                 marking = explicit.get((table, "route_id", row["route_id"]), marking)
             key = (row.get("vrf") or "", row.get("prefix") or "", row.get("next_hop") or "")
             marking = explicit.get((table, "key", key), marking)
+            # A correlated key move is positive intent, not a removal operation.
+            if row.get("route_id") in successor_route_ids:
+                continue
             target = networked if marking == DELETE_ORIGIN_MARKING else detached
             target.setdefault(table, []).append(row)
     return networked, detached
 
 
-def _retain_rows(desired: dict, retained: dict[str, list[dict]]) -> dict:
-    """Overlay removed detach-only rows on the desired fragment deterministically."""
+def _retain_rows(desired: dict, retained: dict[str, list[dict]], stream: str, source: dict | None) -> dict:
+    """Overlay removed detach-only rows on the desired fragment deterministically.
+
+    A fragment producer: the retained rows keep the DECISIONS the fragment they were
+    retained FROM recorded for them, so an attribute that has since become ineligible still
+    reaches the intermediate document its detach link has not yet retired.
+    """
     result = deepcopy(desired)
     for table, rows in retained.items():
-        result.setdefault(table, []).extend(deepcopy(rows))
-        result[table].sort(key=lambda row: row["id"])
+        combined = [*result.get(table, []), *deepcopy(rows)]
+        if len({row["id"] for row in combined}) != len(combined):
+            raise ValueError(f"{stream}/{table}: retained rows duplicate a desired row id")
+        result[table] = sorted(combined, key=lambda row: row["id"])
+    execution = result.setdefault(EXECUTION_KEY, {})
+    proof = retained_proof(
+        stream,
+        execution.get("proof"),
+        ((source or {}).get(EXECUTION_KEY) or {}).get("proof"),
+        retained,
+    )
+    if proof is not None:
+        execution["proof"] = proof
     return result
 
 
@@ -434,9 +482,11 @@ def _content_losing_rows(old: dict | None, desired: dict) -> dict[str, list[dict
     from nso_adapter.core.removal import lost_content
 
     replacement: dict[str, list[dict]] = {}
-    for table, previous in sorted((old or {}).items()):
-        desired_by_identity = rows_by_intent_identity(desired, table)
-        for identity, row in rows_by_intent_identity(old or {}, table).items():
+    old_tables = fragment_tables(old)
+    desired_tables = fragment_tables(desired)
+    for table in sorted(old_tables):
+        desired_by_identity = rows_by_intent_identity(desired_tables, table)
+        for identity, row in rows_by_intent_identity(old_tables, table).items():
             after = desired_by_identity.get(identity)
             if after is not None and lost_content(projection_row_state(table, row), projection_row_state(table, after)):
                 replacement.setdefault(table, []).append(row)
@@ -458,9 +508,11 @@ def _has_positive_content(before, after) -> bool:
 
 def _has_positive_delta(old: dict | None, desired: dict) -> bool:
     """Whether the desired fragment adds or changes any retained row."""
-    for table in sorted(set(old or {}) | set(desired)):
-        previous_by_identity = rows_by_intent_identity(old or {}, table)
-        for identity, row in rows_by_intent_identity(desired, table).items():
+    old_tables = fragment_tables(old)
+    desired_tables = fragment_tables(desired)
+    for table in sorted(set(old_tables) | set(desired_tables)):
+        previous_by_identity = rows_by_intent_identity(old_tables, table)
+        for identity, row in rows_by_intent_identity(desired_tables, table).items():
             before = previous_by_identity.get(identity)
             if before is None or _has_positive_content(
                 projection_row_state(table, before), projection_row_state(table, row)
@@ -483,6 +535,67 @@ async def _promote_static_route_clears(db: AsyncSession, device_id: int) -> None
         authorized = sorted({*(carrier.get(AUTHORIZED) or ()), *stored})
         row.pending_clear = {AUTHORIZED: authorized, STORE_ONLY: []}
     await db.flush()
+
+
+class CarrierGone(RuntimeError):
+    """An operation selected a lifecycle carrier the store has already discharged."""
+
+
+async def _freeze(db: AsyncSession, device, stream: str, tables: dict[str, list[dict]]) -> dict:
+    """Freeze one stream's fragment, naming the section an unresolved eligibility blocks."""
+    try:
+        return await freeze_fragment(db, device, stream, tables)
+    except InterfaceEligibilityUnresolved as exc:
+        logger.warning(
+            "generation.interface_eligibility_unresolved",
+            device_id=device.id,
+            detail=str(exc),
+            exc_info=True,
+        )
+        raise ApplyUnexecutable({"interface_config": "interface_attribute_eligibility_unresolved"}) from None
+
+
+async def refresh_consumed_carriers(
+    db: AsyncSession, device_id: int, *, selected: tuple[int, ...] = ()
+) -> dict[str, dict]:
+    """Prune settled carriers out of every stored fragment and return the fragments.
+
+    Runs before every composition, generation and reissue alike, with the projection lock
+    held, and REWRITES the stored fragment so document and fragment agree literally. An
+    INHERITED carrier that no longer exists was consumed by a settlement and is pruned; a
+    carrier the operation EXPLICITLY SELECTED that no longer exists refuses the creation,
+    because the operation asserts an authority it cannot prove.
+    """
+    from nso_adapter.store.models import StaticRouteTombstone
+
+    existing = frozenset(
+        (await db.execute(select(StaticRouteTombstone.id).where(StaticRouteTombstone.device_id == device_id)))
+        .scalars()
+        .all()
+    )
+    missing = sorted(set(selected) - existing)
+    if missing:
+        raise CarrierGone(f"device {device_id} selected static-route tombstones {missing} that no longer exist")
+    rows = (
+        (await db.execute(select(DeviceProjectionStream).where(DeviceProjectionStream.device_id == device_id)))
+        .scalars()
+        .all()
+    )
+    changed = False
+    fragments: dict[str, dict] = {}
+    for row in rows:
+        if not row.authorized_document:
+            continue
+        pruned = prune_consumed_carriers(row.authorized_document, existing)
+        if pruned is not row.authorized_document:
+            row.authorized_document = pruned
+            row.updated_at = _now()
+            changed = True
+            logger.info("generation.carriers_pruned", device_id=device_id, stream=row.stream)
+        fragments[row.stream] = pruned
+    if changed:
+        await db.flush()
+    return fragments
 
 
 class _Promotion(NamedTuple):
@@ -567,15 +680,25 @@ def _prepared_deletions(groups: dict | None) -> tuple[dict[str, list[dict]], dic
     return networked, deepcopy(resolved.get("detach") or {})
 
 
+def _merge_authority(base: dict[str, dict[str, list]], extra: dict[str, dict[str, list]]) -> dict[str, dict[str, list]]:
+    """Merge two scope-qualified removal authorities, section by section and list by list."""
+    merged = {section: {label: list(keys) for label, keys in labels.items()} for section, labels in base.items()}
+    for section, labels in extra.items():
+        target = merged.setdefault(section, {})
+        for label, keys in labels.items():
+            target.setdefault(label, []).extend(keys)
+    return merged
+
+
 def _switching_removal_keys(
     stream: str, authorized_tables: dict[str, list[dict]], networked: dict[str, list[dict]]
-) -> dict[str, list]:
+) -> dict[str, dict[str, list]]:
     """Return the scope-qualified removal authority for one stream's networked omissions.
 
     The identities come from the AUTHORIZED tables, because an owned-content child's root is
     retained and so is absent from the networked rows: indexing the group alone could not
-    resolve the parent prefix. The label carries the scope, so two switching scopes selected
-    by one Apply cannot collide in the union.
+    resolve the parent prefix. Qualified by SECTION, like every other family's authority, so
+    two scopes selected by one Apply cannot collide in the union.
     """
     section = stream_section(stream)
     keys: dict[str, list] = {}
@@ -587,8 +710,8 @@ def _switching_removal_keys(
             if row.get("id") in removed_ids
         )
         if identities:
-            keys[f"{section}/{table}"] = [list(identity) for identity in identities]
-    return keys
+            keys[table] = [list(identity) for identity in identities]
+    return {section: keys} if keys else {}
 
 
 async def _resolve_receipt_selection(
@@ -635,7 +758,6 @@ async def _selected_promotions(
 ) -> tuple[dict[str, _Selection], dict[str, str], dict[str, dict]]:
     """Resolve exact selected receipts and prepared snapshots, and report every stale selection."""
     from nso_adapter.core.intent_protocol import OUT_OF_PROTOCOL_STREAMS
-    from nso_adapter.core.projection import AWAITING_SENDER_SECTIONS
     from nso_adapter.core.receipt import latest_receipts
 
     rows = {
@@ -660,10 +782,6 @@ async def _selected_promotions(
     receipts = await latest_receipts(db, device_id, keyed)
     for stream, selector in sorted(selected.items()):
         row = rows.get(stream)
-        if stream_section(stream) in AWAITING_SENDER_SECTIONS:
-            # No device writer yet, so the section is unselectable and never reaches a job.
-            skipped[stream] = "awaiting_aggregate_sender"
-            continue
         if stream in OUT_OF_PROTOCOL_STREAMS:
             reason = _resolve_prepared_selection(row, selector)
             selection = None
@@ -835,8 +953,20 @@ def _settle_wire_equivalent(promotion: _Promotion) -> None:
     revision = promotion.revision if promotion.revision is not None else promotion.row.desired_revision
     promotion.row.authorized_revision = revision
     promotion.row.applied_revision = revision
-    promotion.row.authorized_document = deepcopy(promotion.desired)
+    promotion.row.authorized_document = _authorized_assignment(promotion.row.stream, promotion.desired)
     promotion.row.updated_at = _now()
+
+
+def _authorized_assignment(stream: str, fragment: dict) -> dict:
+    """Refuse to store anything but a producer's fragment as a stream's authorized state.
+
+    Every assignment of ``authorized_document`` is an authorization, so the value must carry
+    the context it was authorized under; a hand-built dict would be an authorization nobody
+    made and no encode could read.
+    """
+    if fragment_context(fragment) is None:
+        raise ValueError(f"stream {stream!r} would store an authorized fragment with no execution context")
+    return deepcopy(fragment)
 
 
 async def _enqueue_action_removal_links(
@@ -844,17 +974,24 @@ async def _enqueue_action_removal_links(
     device_id: int,
     links: list[_RemovalLink],
     *,
-    apply_attempt_id: UUID,
+    apply_attempt_id: UUID | None,
     cohort: int | None,
     intermediate_document: dict,
     final_document: dict,
-    removal_authority: dict[str, list],
+    removal_authority: dict[str, dict[str, list]],
     frozen_fragments: dict[str, dict],
-) -> list[DeploymentGeneration]:
+) -> tuple[list[DeploymentGeneration], dict[str, dict[str, list]]]:
+    from nso_adapter.core.projection import CLAIM_LESS_SECTIONS
     from nso_adapter.core.removal import PromotionInterfaceUnresolved, enqueue_removal, promotion_removal_context
     from nso_adapter.core.request_flags import DELETE_ORIGIN_MARKING, DETACH_MARKING
+    from nso_adapter.core.static_route_plan import promotion_removal_keys, scope_qualified
 
-    generations = []
+    # TWO passes on purpose. Every networked generation carries the shared intermediate
+    # document and so omits the same rows; it must therefore carry the SAME authority, which
+    # is only known once every link's own keys are classified. Under the device-wide guard a
+    # link carrying less than the union would be blocked by a sibling's authorized omission.
+    contexts: dict[str, tuple] = {}
+    union = dict(removal_authority)
     for link in links:
         scope = stream_section(link.stream)
         try:
@@ -869,15 +1006,19 @@ async def _enqueue_action_removal_links(
             raise ApplyUnexecutable({link.stream: "unresolved_interface_identity"}) from None
         if scope == "interface_config" and not context.interfaces:
             raise ApplyUnexecutable({link.stream: "no_executable_interface"})
-        allowed_removal_keys = context.removed
-        if scope == "static_route":
-            from nso_adapter.core.static_route_plan import promotion_removal_keys
+        if scope in CLAIM_LESS_SECTIONS and link.mode is GenerationMode.networked:
+            context = context._replace(removed=removal_authority.get(scope) or None)
+        own = promotion_removal_keys(link.removed) if scope == "static_route" else context.removed
+        contexts[link.stream] = (context, scope_qualified(scope, own))
+        if link.mode is GenerationMode.networked and scope not in CLAIM_LESS_SECTIONS:
+            union = _merge_authority(union, scope_qualified(scope, own))
 
-            allowed_removal_keys = promotion_removal_keys(link.removed)
-        if link.mode is GenerationMode.networked:
-            # Every generation carrying the shared intermediate document omits the same rows,
-            # so it must carry the same authority; a detach link carries the final and none.
-            allowed_removal_keys = {**(allowed_removal_keys or {}), **removal_authority}
+    generations = []
+    for link in links:
+        scope = stream_section(link.stream)
+        context, own_keys = contexts[link.stream]
+        # A detach link carries the final document and no authority: nothing reaches the device.
+        allowed_removal_keys = union if link.mode is GenerationMode.networked else own_keys
         marking = DELETE_ORIGIN_MARKING if link.mode is GenerationMode.networked and link.removed else None
         if link.mode is GenerationMode.detach:
             marking = DETACH_MARKING
@@ -907,7 +1048,7 @@ async def _enqueue_action_removal_links(
         if generation is None:  # pragma: no cover - enqueue_removal attaches before returning
             raise RuntimeError(f"removal job {job.id} has no deployment generation")
         generations.append(generation)
-    return generations
+    return generations, union
 
 
 async def _enqueue_action_apply_job(
@@ -915,21 +1056,13 @@ async def _enqueue_action_apply_job(
     device_id: int,
     streams: set[str],
     *,
-    apply_attempt_id: UUID,
+    apply_attempt_id: UUID | None,
     document: dict,
     cohort: int | None,
-    removal_authority: dict[str, list],
+    removal_authority: dict[str, dict[str, list]],
     frozen_fragments: dict[str, dict],
 ) -> DeploymentGeneration:
-    """Create the companion Apply generation and give it a carrier.
-
-    It shares the intermediate document with the removal links, so it omits the same rows and
-    carries the same authority. A companion that carries authority takes a DEDICATED carrier:
-    an unrelated auto-Apply may otherwise join the coalescible one and execute the shared
-    document with an empty authority, which is exactly what the device-wide guard blocks.
-    """
-    from nso_adapter.core.jobs import admit_coalescible_job, create_dedicated_job
-
+    """Create the companion Apply generation and admit its carrier."""
     generation = await create_generation(
         db,
         device_id,
@@ -941,17 +1074,33 @@ async def _enqueue_action_apply_job(
         apply_attempt_id=apply_attempt_id,
         frozen_fragments=frozen_fragments,
     )
-    if removal_authority:
-        carrier = await create_dedicated_job(db, device_id, JobType.apply)
-    else:
-        admitted, winner = await admit_coalescible_job(db, device_id, JobType.apply)
-        if winner is not None:
-            raise ApplyJobConflict(winner.id)
-        if admitted is None:  # pragma: no cover - bounded admission retries exhausted
-            raise RuntimeError(f"could not admit an apply job for device {device_id}")
-        carrier = admitted
-    await require_attach_to_job(db, generation, carrier)
+    await admit_apply_generation(db, generation)
     return generation
+
+
+async def admit_apply_generation(db: AsyncSession, generation: DeploymentGeneration) -> Job | None:
+    """Admit an Apply carrier without letting coalescing absorb a chain companion.
+
+    Cohort members and generations with removal authority need dedicated carriers.
+    Ordinary automatic generations can join a queued winner if they are contiguous.
+    Return the new carrier, or None when admission found an existing queued job.
+    """
+    from nso_adapter.core.jobs import admit_coalescible_job, create_dedicated_job
+
+    if generation.settlement_cohort is not None or generation.allowed_removal_keys:
+        dedicated = await create_dedicated_job(db, generation.device_id, JobType.apply)
+        await require_attach_to_job(db, generation, dedicated)
+        return dedicated
+
+    created, winner = await admit_coalescible_job(db, generation.device_id, JobType.apply)
+    if winner is not None and generation.apply_attempt_id is not None:
+        raise ApplyJobConflict(winner.id)
+    carrier = created or winner
+    if carrier is None:  # pragma: no cover - bounded admission retries exhausted
+        raise RuntimeError(f"could not admit an apply job for device {generation.device_id}")
+    # A noncontiguous successor waits for advancement to assign its own carrier.
+    await attach_to_job(db, generation, carrier)
+    return created
 
 
 async def create_action_apply(
@@ -961,8 +1110,6 @@ async def create_action_apply(
     apply_attempt_id: UUID,
 ) -> ActionApplyResult:
     """Promote selected streams and compose removal work with the established runners."""
-    from nso_adapter.core.receipt import consume_promotion_provenance
-
     await lock_projection(db, device_id)
     selected_rows, skipped, skipped_detail = await _selected_promotions(db, device_id, selected)
     if not selected_rows:
@@ -976,6 +1123,42 @@ async def create_action_apply(
     if active_job_id is not None:
         raise ApplyJobConflict(active_job_id)
 
+    result = await _create_apply_chain(db, device_id, selected_rows, apply_attempt_id)
+    return ActionApplyResult(result.generations, {**skipped, **result.skipped}, skipped_detail)
+
+
+#: Selection reasons an automatic delivery legitimately meets: the push is already carried,
+#: or it authorizes no device work. Every other reason breaks an invariant of this call
+#: site, which wrote the very receipt the selection reads.
+_BENIGN_AUTOMATIC_SKIPS = frozenset({"already_applied", "already_authorized", "backfill_only", "superseded"})
+
+
+async def create_automatic_apply(db: AsyncSession, device_id: int, stream: str, push_seq: int) -> None:
+    """Plan an admitted automatic delivery through the shared promotion chain."""
+    await lock_projection(db, device_id)
+    selected_rows, skipped, _ = await _selected_promotions(db, device_id, {stream: push_seq})
+    unexpected = {name: reason for name, reason in skipped.items() if reason not in _BENIGN_AUTOMATIC_SKIPS}
+    if unexpected:
+        raise RuntimeError(f"automatic delivery for device {device_id} could not promote: {unexpected}")
+    if not selected_rows:
+        return
+    await _create_apply_chain(db, device_id, selected_rows, None)
+
+
+async def _create_apply_chain(
+    db: AsyncSession,
+    device_id: int,
+    selected_rows: dict[str, _Selection],
+    apply_attempt_id: UUID | None,
+) -> ActionApplyResult:
+    """Freeze and enqueue ordered promotion links with one settlement cohort."""
+    from nso_adapter.core.receipt import consume_promotion_provenance
+    from nso_adapter.core.request_flags import STORE_ONLY
+
+    if STORE_ONLY.get():
+        raise RuntimeError("_create_apply_chain reached under a store-only request - store-only never promotes")
+
+    skipped: dict[str, str] = {}
     if "static_route" in selected_rows:
         await _promote_static_route_clears(db, device_id)
 
@@ -989,27 +1172,30 @@ async def create_action_apply(
     promotions: dict[str, _Promotion] = {}
     intermediate_fragments: dict[str, dict] = {}
     frozen_fragments: dict[str, dict] = {}
-    removal_authority: dict[str, list] = {}
+    removal_authority: dict[str, dict[str, list]] = {}
     for stream, selection in selected_rows.items():
         row, receipt, revision = selection
+        # ONE freeze per selected stream, here, and this fragment is what every link of the
+        # chain and the stored authorized document use. A second freeze performs the same
+        # live non-intent reads again and could disagree with the one that shaped the chain.
         if revision is None:
-            desired = await snapshot_stream(db, device_id, stream)
+            desired = await _freeze(db, device, stream, await snapshot_stream(db, device_id, stream))
             networked, detached = _fragment_deletions(row.authorized_document, desired, receipt)
             replacement = _content_losing_rows(row.authorized_document, desired)
             positive = _has_positive_delta(row.authorized_document, desired)
         else:
-            # The prepared snapshot is frozen ONCE here, and this fragment is what every
-            # link of the chain and the stored authorized document use.
             tables = row.prepared_tables or {}
-            desired = freeze_fragment(tables, device)
-            frozen_fragments[stream] = desired
+            desired = await _freeze(db, device, stream, tables)
             authorized_tables = fragment_tables(row.authorized_document)
             networked, detached = _prepared_deletions(row.prepared_deletions)
             replacement = _content_losing_rows(authorized_tables, tables)
             positive = _has_positive_delta(authorized_tables, tables)
-            removal_authority.update(_switching_removal_keys(stream, authorized_tables, networked))
+            removal_authority = _merge_authority(
+                removal_authority, _switching_removal_keys(stream, authorized_tables, networked)
+            )
+        frozen_fragments[stream] = desired
         promotions[stream] = _Promotion(row, receipt, desired, networked, detached, replacement, positive, revision)
-        intermediate_fragments[stream] = _retain_rows(desired, detached)
+        intermediate_fragments[stream] = _retain_rows(desired, detached, stream, row.authorized_document)
 
     final_fragments = dict(authorized)
     final_fragments.update({stream: promotion.desired for stream, promotion in promotions.items()})
@@ -1028,7 +1214,7 @@ async def create_action_apply(
 
     link_count = len(networked_links) + len(detach_links) + bool(apply_streams)
     cohort = await allocate_settlement_cohort(db) if link_count > 1 else None
-    generations = await _enqueue_action_removal_links(
+    generations, removal_authority = await _enqueue_action_removal_links(
         db,
         device_id,
         networked_links,
@@ -1053,25 +1239,24 @@ async def create_action_apply(
         )
         generations.append(generation)
 
-    generations.extend(
-        await _enqueue_action_removal_links(
-            db,
-            device_id,
-            detach_links,
-            apply_attempt_id=apply_attempt_id,
-            cohort=cohort,
-            intermediate_document=intermediate_document,
-            final_document=final_document,
-            removal_authority={},
-            frozen_fragments=frozen_fragments,
-        )
+    detach_generations, _ = await _enqueue_action_removal_links(
+        db,
+        device_id,
+        detach_links,
+        apply_attempt_id=apply_attempt_id,
+        cohort=cohort,
+        intermediate_document=intermediate_document,
+        final_document=final_document,
+        removal_authority={},
+        frozen_fragments=frozen_fragments,
     )
+    generations.extend(detach_generations)
 
     for promotion in promotions.values():
         if promotion.receipt is not None:
             consume_promotion_provenance(promotion.receipt)
     await db.flush()
-    return ActionApplyResult(generations, skipped, skipped_detail)
+    return ActionApplyResult(generations, skipped, {})
 
 
 async def create_generation(
@@ -1085,6 +1270,7 @@ async def create_generation(
     removal_context: dict | None = None,
     settlement_cohort: int | None = None,
     static_route_tombstone_ids: tuple[int, ...] = (),
+    discharged_clear_ids: tuple[int, ...] = (),
     apply_attempt_id: UUID | None = None,
     frozen_fragments: dict[str, dict] | None = None,
 ) -> DeploymentGeneration:
@@ -1098,10 +1284,11 @@ async def create_generation(
     seam #1522's aggregate device-intent builder plugs into. *removal_context* is the job
     context a removal's generation must keep so a retry can rebuild the job that executes it.
 
-    *frozen_fragments* carries the already-frozen fragment of every out-of-protocol stream
-    named in *streams*. Those two streams promote their PREPARED slot, never a fresh
-    snapshot: the store-only isolation point is exactly that the live rows are not read here,
-    and the freeze happened once, in the Apply that resolved the selection.
+    *frozen_fragments* carries the already-frozen fragment of a stream the caller froze
+    itself. Manual Apply freezes every selected stream once and passes them all; a stream
+    with no entry is snapshotted and frozen here. The two out-of-protocol streams promote
+    their PREPARED slot, never a fresh snapshot, so their fragment is always the caller's:
+    the store-only isolation point is exactly that the live rows are not read for them.
     """
     from nso_adapter.core.intent_protocol import OUT_OF_PROTOCOL_STREAMS
     from nso_adapter.core.request_flags import STORE_ONLY
@@ -1111,6 +1298,14 @@ async def create_generation(
     if not streams:
         raise ValueError("a generation must name at least one projection stream")
     await lock_projection(db, device_id)
+    await refresh_consumed_carriers(db, device_id, selected=static_route_tombstone_ids)
+    device = None
+    if any(stream not in (frozen_fragments or {}) for stream in streams):
+        # populate_existing: a caller that loaded the device before taking the projection
+        # lock holds a copy whose NED id a concurrent transaction may already have replaced.
+        device = await db.get(Device, device_id, populate_existing=True)
+        if device is None:  # pragma: no cover - lock_projection proved the device exists
+            raise DeviceProjectionGone(f"device {device_id} no longer exists")
 
     stream_revisions: dict[str, int] = {}
     source_push_seq: dict[str, int | None] = {}
@@ -1157,7 +1352,12 @@ async def create_generation(
             raise RuntimeError(f"device {device_id} stream {stream!r} has no accepted write to promote")
         stream_revisions[stream] = row.desired_revision
         source_push_seq[stream] = row.source_push_seq
-        promoted[stream] = await snapshot_stream(db, device_id, stream)
+        fragment = (frozen_fragments or {}).get(stream)
+        promoted[stream] = (
+            fragment
+            if fragment is not None
+            else await _freeze(db, device, stream, await snapshot_stream(db, device_id, stream))
+        )
 
     # The promoted streams become the new last-authorized fragments, so the NEXT generation of
     # any other lane composes THIS state in rather than whatever the store drifts to.
@@ -1165,7 +1365,7 @@ async def create_generation(
         await db.execute(
             sa_update(DeviceProjectionStream)
             .where(DeviceProjectionStream.device_id == device_id, DeviceProjectionStream.stream == stream)
-            .values(authorized_document=fragment, updated_at=_now())
+            .values(authorized_document=_authorized_assignment(stream, fragment), updated_at=_now())
             .execution_options(synchronize_session=False)
         )
     body = document if document is not None else await _compose_authorized_document(db, device_id, promoted)
@@ -1180,6 +1380,7 @@ async def create_generation(
         removal_context=removal_context,
         settlement_cohort=settlement_cohort,
         static_route_tombstone_ids=static_route_tombstone_ids,
+        discharged_clear_ids=discharged_clear_ids,
         apply_attempt_id=apply_attempt_id,
     )
 
@@ -1196,54 +1397,46 @@ async def _store_generation(
     removal_context: dict | None,
     settlement_cohort: int | None,
     static_route_tombstone_ids: tuple[int, ...],
+    discharged_clear_ids: tuple[int, ...],
     apply_attempt_id: UUID | None,
 ) -> DeploymentGeneration:
-    """Allocate the sequence and write the immutable row. The projection lock is held."""
-    body = deepcopy(document)
-    # Only a promotion freezes execution-time store facts. A reissue carries no promoted
-    # revisions and keeps its established live-store, job-row and tombstone-row semantics.
-    if stream_revisions:
-        promoted_sections = {stream_section(stream) for stream in stream_revisions}
-        if "interface_config" in body and "interface_config" not in promoted_sections:
-            # A complete successor document carries the authorized interface section. Keep
-            # its last immutable execution plan instead of resolving changed live state.
-            previous_document = await db.scalar(
-                select(DeploymentGeneration.document)
-                .where(
-                    DeploymentGeneration.device_id == device_id,
-                    DeploymentGeneration.document["interface_config"][EXECUTION_KEY].is_not(None),
-                )
-                .order_by(DeploymentGeneration.seq.desc())
-                .limit(1)
-            )
-            previous_execution = ((previous_document or {}).get("interface_config") or {}).get(EXECUTION_KEY)
-            if previous_execution is not None:
-                body["interface_config"][EXECUTION_KEY] = deepcopy(previous_execution)
-        if "interface_config" in promoted_sections:
-            if (removal_context or {}).get("scope") == "interface_config":
-                section = body.setdefault("interface_config", {})
-                section.setdefault("interface_intent", [])
-                section.setdefault("interface_ip_intent", [])
-            try:
-                await record_interface_execution(db, device_id, body)
-            except InterfaceEligibilityUnresolved as exc:
-                logger.warning(
-                    "generation.interface_eligibility_unresolved",
-                    device_id=device_id,
-                    detail=str(exc),
-                    exc_info=True,
-                )
-                raise ApplyUnexecutable({"interface_config": "interface_attribute_eligibility_unresolved"}) from None
-        from nso_adapter.core.static_route_plan import record_static_route_execution
+    """Allocate the sequence and write the immutable row. The projection lock is held.
 
-        await record_static_route_execution(
-            db,
-            device_id,
-            body,
-            removal_context=removal_context,
-            allowed_removal_keys=allowed_removal_keys,
-            tombstone_ids=static_route_tombstone_ids,
-        )
+    It writes the OPERATION plane and nothing else. Context and proof belong to the
+    fragments the document composes, and are written by the producers that wrote those
+    fragments; deriving either here would describe an authorization nobody made.
+    """
+    from nso_adapter.core.static_route_plan import validate_removal_authority
+
+    validate_removal_authority(allowed_removal_keys)
+    body = deepcopy(document)
+    scope = (removal_context or {}).get("scope")
+    if scope is not None:
+        section = body.get(scope)
+        if section is None:
+            # The operation addresses a section this document does not carry, so its plane has
+            # nowhere to live. Refusing is the only safe answer: admission deletes the carriers
+            # the plane names, and a generation created without it would leave the deletion
+            # record gone and unrecorded. The whole transaction rolls back, carrier intact.
+            logger.error("generation.operation_section_absent", device_id=device_id, scope=scope)
+            raise OperationSectionAbsent(scope)
+        # One deployment's facts, never a fragment's: which carriers this operation
+        # discharges, and — for static-route — how it classified the authority it was given.
+        operation: dict = {"pending_clear_ids": sorted(discharged_clear_ids)}
+        if scope == "static_route":
+            from nso_adapter.core.static_route_plan import build_static_route_operation
+
+            operation.update(
+                await build_static_route_operation(
+                    db,
+                    device_id,
+                    body,
+                    removal_context=removal_context,
+                    allowed_removal_keys=allowed_removal_keys,
+                    tombstone_ids=static_route_tombstone_ids,
+                )
+            )
+        section.setdefault(EXECUTION_KEY, {})["operation"] = operation
     generation = DeploymentGeneration(
         device_id=device_id,
         seq=await _next_seq(db, device_id),
@@ -1283,6 +1476,8 @@ async def create_reissue_generation(
     mode: GenerationMode,
     removal_context: dict | None = None,
     allowed_removal_keys: dict | None = None,
+    static_route_tombstone_ids: tuple[int, ...] = (),
+    discharged_clear_ids: tuple[int, ...] = (),
 ) -> DeploymentGeneration:
     """Order a NEW deployment of the state that is ALREADY authorized. Promotes nothing.
 
@@ -1298,30 +1493,31 @@ async def create_reissue_generation(
     (:func:`core.removal.enqueue_removal`) and the two scheduled producers carry no request.
 
     It therefore settles NOTHING: ``stream_revisions`` is empty. Its composed authorized
-    fragments carry no execution plan. The job behind it executes ONE removal context's
-    scope from live state, and settlement advances exactly what a generation lists. Listing
+    fragments carry the context and proof their own authorizations froze, and this creation
+    adds only the operation plane. Settlement advances exactly what a generation lists. Listing
     every authorized revision let a static-route reissue certify a VLAN revision whose own
     deployment had failed or been abandoned. The reissue never carried that lane.
     ``source_push_seq`` stays: it is provenance, not a settlement target.
     """
     await lock_projection(db, device_id)
+    fragments = await refresh_consumed_carriers(db, device_id, selected=static_route_tombstone_ids)
     rows = (
         (await db.execute(select(DeviceProjectionStream).where(DeviceProjectionStream.device_id == device_id)))
         .scalars()
         .all()
     )
-    fragments = {row.stream: row.authorized_document for row in rows if row.authorized_document}
     return await _store_generation(
         db,
         device_id,
         mode=mode,
         document=_compose_document(fragments),
         allowed_removal_keys=allowed_removal_keys or {},
-        source_push_seq={row.stream: row.source_push_seq for row in rows if row.authorized_document},
+        source_push_seq={row.stream: row.source_push_seq for row in rows if row.stream in fragments},
         stream_revisions={},
         removal_context=removal_context,
         settlement_cohort=None,
-        static_route_tombstone_ids=(),
+        static_route_tombstone_ids=static_route_tombstone_ids,
+        discharged_clear_ids=discharged_clear_ids,
         apply_attempt_id=None,
     )
 
@@ -1357,6 +1553,23 @@ class GenerationTampered(RuntimeError):
     """A stored generation's digest no longer matches its document. It is not executed."""
 
 
+class ExecutionPolicy(NamedTuple):
+    """Commit policy from the generation's frozen removal context."""
+
+    context: dict
+    retain_static_routes: bool
+    no_networking: bool
+
+
+def execution_policy(generation: DeploymentGeneration) -> ExecutionPolicy:
+    context = dict(generation.removal_context or {})
+    return ExecutionPolicy(
+        context,
+        not (context.get("force") and context.get("scope") == "static_route"),
+        bool(context.get("detach")),
+    )
+
+
 async def executing_generation(db: AsyncSession, job_id: int) -> DeploymentGeneration | None:
     """Return the generation a job must deploy, digest verified.
 
@@ -1376,12 +1589,19 @@ async def executing_generation(db: AsyncSession, job_id: int) -> DeploymentGener
     if not carried:
         return None
     generation = carried[-1]
+    from nso_adapter.core.static_route_plan import validate_removal_authority
+
+    validate_removal_authority(generation.allowed_removal_keys)
     expected = digest_document(generation.mode, generation.document, generation.allowed_removal_keys or {})
     if expected != generation.digest:
         raise GenerationTampered(
             f"generation {generation.id} (device {generation.device_id} seq {generation.seq}) digest "
             f"{generation.digest[:12]} does not match its document"
         )
+    from nso_adapter.core.projection import section_context
+
+    for section in generation.document:
+        section_context(generation.document, section)
     return generation
 
 
@@ -2006,6 +2226,7 @@ __all__ = [
     "GenerationNotBlocked",
     "GenerationTampered",
     "LIVE_JOB_STATUSES",
+    "admit_apply_generation",
     "advance_device_generations",
     "advance_generations_locked",
     "allocate_settlement_cohort",

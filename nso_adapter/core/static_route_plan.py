@@ -2,8 +2,8 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """One static-route replacement classifier, one plan — #1396 R2 §3.
 
-Generation creation classifies the store snapshot and records the result. Workers hydrate
-that result. Preview uses :func:`build_plan` over live rows.
+Generation creation classifies the store snapshot and records the result; workers and the
+preview hydrate that result, so nothing re-classifies live rows at execution.
 Two predicates decide the apply plan:
 
 * ``FENCE_OPEN(rows)``    — no row of the device carries ``route_id IS NULL``. Only the
@@ -19,17 +19,17 @@ Both live here so the endpoint, the removal branches and the proof cannot drift 
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import NamedTuple
 
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.projection import EXECUTION_KEY
-
 logger = structlog.get_logger(__name__)
 
-#: A destructive replace whose proof is structurally unavailable must not run (§4.4).
+#: A destructive replace whose proof is structurally unavailable must not run (§4.4). Logged
+#: by the worker, which refuses the job rather than sending a document it cannot prove.
 PUT_REFUSED_EVENT = "static_route.put_refused_verify_disabled"
 
 #: Store fields whose clearing must reach the device, in ``_STATE_FIELDS`` order.
@@ -258,92 +258,81 @@ class SrRemovalPlan(NamedTuple):
     reclaimed: tuple[Triple, ...]
 
 
-def _verify_after_apply() -> bool:
-    """Read the flag live — it is a module constant tests flip, not a config object."""
-    from nso_adapter.nso import apply as nso_apply
-
-    return nso_apply.VERIFY_AFTER_APPLY
-
-
-def classify_apply_plan(all_rows: list, tombstones: list, *, eligible_rows: list, device_id: int) -> SrPlan:
+def classify_apply_plan(all_rows: list, tombstones: list, *, device_id: int) -> SrPlan:
     """Classify one immutable row snapshot into the static-route apply plan.
 
-    Callers derive scope execution, ``any_eligible``, atomic admission, row stamping and
-    the per-route results from ``plan.rows`` — never from the old eligible list. Deriving
-    ``any_eligible`` from the eligible list lets a ``force=False`` apply take the all-zero
-    early success AFTER a real PUT.
+    Every send is the device's whole document, so the body is ALWAYS the accepted rows and
+    the authority always names the predecessor keys the send drops. ``mode`` no longer picks
+    a transport — there is one — it records whether this document DELIVERS A REPLACEMENT, so
+    the worker can refuse to send one whose proof is structurally unavailable
+    (``_refuse_unverifiable_recorded_put``).
+
+    ``FENCE_OPEN`` no longer gates that record. It gated the PATCH-versus-PUT choice, and a
+    shut fence therefore used to leave a predecessor on the device; one document drops it
+    either way, so making the record fence-dependent would only drop the PROOF requirement on
+    exactly the devices least able to justify the write. The fence's real job is unchanged and
+    lives at the intent endpoint, where it decides whether a removed row earns a deletion
+    record at all.
+
+    Callers derive scope execution, ``any_eligible``, row stamping and the per-route results
+    from ``plan.rows``, never from an eligible list: an eligible-only body would retract
+    every accepted-and-clean route.
     """
     accepted = [r for r in all_rows if r.accepted_at is not None]
-    open_fence = fence_open(all_rows)
-    wants_put = open_fence and any(replacement_open(r) for r in accepted)
-
-    mode = "PATCH"
-    if wants_put:
-        if _verify_after_apply():
-            mode = "PUT"
-        else:
-            # A destructive replace whose proof is structurally unavailable must not run:
-            # the merge-PATCH that follows must also not CAS, or it closes the replacement
-            # while the predecessor is still on the device.
-            logger.warning(PUT_REFUSED_EVENT, device_id=device_id)
-
-    rows = accepted if mode == "PUT" else list(eligible_rows)
+    mode = "PUT" if any(replacement_open(r) for r in accepted) else "PATCH"
+    rows = accepted
 
     allowed: set[Triple] = set()
-    if mode == "PUT":
-        for row in rows:
-            deployed = as_triple(row.deployed_key)
-            if deployed is not None and deployed != triple_of(row):
-                allowed.add(deployed)
-        # X4 belt: rev 4.1's body retains every unconsumed tombstone's still-present keys
-        # verbatim, so those keys are re-asserted and cannot be orphans. Kept because the
-        # authority names it, not because it is reachable.
-        for tomb in tombstones:
-            allowed.add((tomb.vrf or "", tomb.prefix or "", tomb.next_hop or ""))
-            deployed = as_triple(tomb.deployed_key)
-            if deployed is not None:
-                allowed.add(deployed)
+    for row in rows:
+        deployed = as_triple(row.deployed_key)
+        if deployed is not None and deployed != triple_of(row):
+            allowed.add(deployed)
+    # X4 belt: the body retains every unconsumed tombstone's still-present keys verbatim, so
+    # those keys are re-asserted and cannot be orphans. Kept because the authority names it,
+    # not because it is reachable.
+    for tomb in tombstones:
+        allowed.add((tomb.vrf or "", tomb.prefix or "", tomb.next_hop or ""))
+        deployed = as_triple(tomb.deployed_key)
+        if deployed is not None:
+            allowed.add(deployed)
 
     cas = [SrCas(row.id, row.route_id, triple_of(row), row.deployed_key) for row in rows]
     watermark = max((t.id for t in tombstones), default=0)
     return SrPlan(mode, rows, allowed, tombstones, cas, watermark)
 
 
-async def build_plan(db: AsyncSession, device, *, eligible_rows: list) -> SrPlan:
-    """Build the live plan used by preview."""
-    from nso_adapter.store.models import StaticRouteIntent, StaticRouteTombstone
+def validate_removal_authority(value: object) -> None:
+    """Refuse removal authority that does not name its section and key grain.
 
-    device_id = device.id
-    all_rows = list(
-        (
-            await db.execute(
-                select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id).order_by(StaticRouteIntent.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    tombstones = list(
-        (
-            await db.execute(
-                select(StaticRouteTombstone)
-                .where(StaticRouteTombstone.device_id == device_id)
-                .order_by(StaticRouteTombstone.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    return classify_apply_plan(all_rows, tombstones, eligible_rows=eligible_rows, device_id=device_id)
+    The scope vocabulary is the section registry. A scope outside it reads as an EMPTY
+    authority downstream, because each reader indexes its own section by name, so a
+    near-miss spelling would guard nothing while looking populated.
+    """
+    from nso_adapter.core.projection import section_registry
+
+    if not isinstance(value, dict) or any(not isinstance(labels, dict) for labels in value.values()):
+        raise ValueError("allowed_removal_keys must be scope-qualified")
+    registry = section_registry()
+    unknown = sorted(set(value) - set(registry))
+    if unknown:
+        raise ValueError(f"unknown removal-authority scope {unknown[0]!r}")
+    for scope, labels in value.items():
+        unknown = sorted(set(labels) - registry[scope].removal_authority_labels)
+        if unknown:
+            raise ValueError(f"unknown removal-authority label {unknown[0]!r} for scope {scope!r}")
 
 
 def _removal_keys(value) -> set[Triple]:
     """Normalize the generation's guarded static-route key set.
 
-    Through :func:`_sr_key`: these entries come from the stored document too, so a malformed
-    one must name itself rather than raise ``as_triple``'s bare unpack error.
+    The authority is SCOPE-QUALIFIED (``{section: {list: keys}}``) because the collateral
+    guard is device-wide and two families both have a ``host`` list. Through :func:`_sr_key`:
+    these entries come from the stored document too, so a malformed one must name itself
+    rather than raise ``as_triple``'s bare unpack error.
     """
-    return {_sr_key(raw) for raw in (value or {}).get("route") or ()}
+    validate_removal_authority(value)
+    section = value.get("static_route") or {}
+    return {_sr_key(raw) for raw in section.get("route") or ()}
 
 
 def promotion_removal_keys(removed_rows: dict[str, list[dict]]) -> dict[str, list[list[str]]]:
@@ -354,6 +343,11 @@ def promotion_removal_keys(removed_rows: dict[str, list[dict]]) -> dict[str, lis
         if (deployed := as_triple(row.get("deployed_key"))) is not None:
             keys.add(deployed)
     return {"route": [list(key) for key in sorted(keys)]} if keys else {}
+
+
+def scope_qualified(scope: str, removed: dict | None) -> dict:
+    """Return one scope's guarded keys under the device-wide authority's own shape."""
+    return {scope: dict(removed)} if removed else {}
 
 
 def classify_removal_plan(
@@ -370,13 +364,17 @@ def classify_removal_plan(
         if (deployed := as_triple(tombstone.deployed_key)) is not None:
             authorized.add(deployed)
 
-    claimed: set[Triple] = set()
+    # Supersession is by a RENDERED key only, never by a deployed-only claim. A row whose
+    # identity moved from K to L still names K as its predecessor, and subtracting K would
+    # consume a carrier that owes K's cleanup as `superseded` while K is still on the
+    # service. `classify_apply_plan` already treats a predecessor key this way.
+    rendered: set[Triple] = {triple_of(row) for row in rows}
+    claimed: set[Triple] = set(rendered)
     for row in rows:
-        claimed.add(triple_of(row))
         if (deployed := as_triple(row.deployed_key)) is not None:
             claimed.add(deployed)
-    reclaimed = tuple(sorted(authorized & claimed))
-    authorized -= claimed
+    reclaimed = tuple(sorted(authorized & rendered))
+    authorized -= rendered
 
     clears: list[SrClear] = []
     if not clears_suppressed(context):
@@ -423,7 +421,89 @@ def _serialize_removal_plan(plan: SrRemovalPlan) -> dict:
     }
 
 
-async def record_static_route_execution(
+def freeze_static_route_proof(tables: dict[str, list[dict]], *, device_id: int, context: dict) -> dict:
+    """Freeze the APPLY PLAN of a static-route fragment's own rows and carriers.
+
+    Pure: the plan is classified from the tables the authorization serialized, so the mode,
+    the selected rows, the CAS coordinates and the carrier watermark are properties of that
+    fragment and not of whatever the store holds when a worker gets round to it.
+    """
+    from nso_adapter.core.projection import EXECUTION_KEY, hydrate_section
+    from nso_adapter.store.models import StaticRouteIntent, StaticRouteTombstone
+
+    hydrated = hydrate_section({"static_route": {**tables, EXECUTION_KEY: {"context": context}}}, "static_route")
+    rows = hydrated.get(StaticRouteIntent, [])
+    tombstones = hydrated.get(StaticRouteTombstone, [])
+    return {"apply": _serialize_apply_plan(classify_apply_plan(rows, tombstones, device_id=device_id))}
+
+
+def prune_apply_plan(plan: dict, rows: list[dict], tombstones: list[dict]) -> dict:
+    """Rebuild the CARRIER-derived halves of a frozen apply plan over the surviving carriers.
+
+    Everything else is left byte for byte: the mode, the selected row ids and the CAS
+    coordinates are properties of the fragment's intent rows, which a consumed carrier does
+    not touch.
+    """
+    allowed: set[Triple] = set()
+    selected = set(plan["row_ids"])
+    for row in rows:
+        if row.get("id") not in selected:
+            continue
+        deployed = as_triple(row.get("deployed_key"))
+        if deployed is not None and deployed != _row_triple(row):
+            allowed.add(deployed)
+    for tomb in tombstones:
+        allowed.add(_row_triple(tomb))
+        deployed = as_triple(tomb.get("deployed_key"))
+        if deployed is not None:
+            allowed.add(deployed)
+    return {
+        **plan,
+        "allowed_removal_keys": [list(key) for key in sorted(allowed)],
+        "tombstone_ids": [tomb["id"] for tomb in tombstones],
+        "tombstone_id_watermark": max((tomb["id"] for tomb in tombstones), default=0),
+    }
+
+
+def _row_triple(row: dict) -> Triple:
+    return (row.get("vrf") or "", row.get("prefix") or "", row.get("next_hop") or "")
+
+
+def extend_apply_plan(desired: dict | None, source: dict, retained_rows: list[dict]) -> dict:
+    """Add the retained rows' plan entries, taken from the fragment they were retained FROM."""
+    if desired is None:
+        raise ValueError("a retained static-route fragment carries no apply plan to extend")
+    if not retained_rows:
+        return desired
+    source_cas = {item["row_id"]: item for item in source.get("cas") or []}
+    by_id = {row_id: None for row_id in desired["row_ids"]}
+    cas = {item["row_id"]: item for item in desired["cas"]}
+    allowed = {tuple(key) for key in desired["allowed_removal_keys"]}
+    mode = desired["mode"]
+    for row in retained_rows:
+        row_id = row.get("id")
+        if row_id in by_id:
+            continue
+        item = source_cas.get(row_id)
+        if item is None:
+            raise ValueError(f"retained static-route row {row_id} has no recorded CAS coordinates")
+        by_id[row_id] = None
+        cas[row_id] = deepcopy(item)
+        deployed = as_triple(row.get("deployed_key"))
+        if deployed is not None and deployed != _row_triple(row):
+            allowed.add(deployed)
+            mode = "PUT"
+    ordered = sorted(by_id)
+    return {
+        **desired,
+        "mode": mode,
+        "row_ids": ordered,
+        "cas": [cas[row_id] for row_id in ordered],
+        "allowed_removal_keys": [list(key) for key in sorted(allowed)],
+    }
+
+
+async def build_static_route_operation(
     db: AsyncSession,
     device_id: int,
     document: dict,
@@ -431,85 +511,75 @@ async def record_static_route_execution(
     removal_context: dict | None,
     allowed_removal_keys: dict,
     tombstone_ids: tuple[int, ...],
-) -> None:
-    """Record every store-side fact a static-route worker would otherwise re-read."""
+) -> dict:
+    """Build the OPERATION plane of a static-route removal from its section.
+
+    The operation plane belongs to one deployment and to no fragment: the removal
+    classification, and the carriers this operation selects. The selected carriers are read
+    by primary key from the carrier table, scoped to the device — the only creation-time
+    lifecycle read a removal makes, and it promotes nothing.
+    """
     from nso_adapter.core.projection import hydrate_section
     from nso_adapter.store.models import StaticRouteIntent, StaticRouteTombstone
 
     section = document.get("static_route")
     if section is None:
-        return
+        raise ValueError("a static_route removal generation carries no static_route section to classify")
     hydrated = hydrate_section(document, "static_route")
     rows = hydrated.get(StaticRouteIntent, [])
-    tombstones = hydrated.get(StaticRouteTombstone, [])
-    accepted = [row for row in rows if row.accepted_at is not None]
-    execution = {
-        "apply": _serialize_apply_plan(
-            classify_apply_plan(rows, tombstones, eligible_rows=accepted, device_id=device_id)
-        )
-    }
-    if (removal_context or {}).get("scope") == "static_route":
-        tombstones_by_id = {row.id: row for row in tombstones}
-        selected_tombstones = []
-        if tombstone_ids:
-            selected_tombstones = [tombstones_by_id[row_id] for row_id in tombstone_ids if row_id in tombstones_by_id]
-            missing_ids = [row_id for row_id in tombstone_ids if row_id not in tombstones_by_id]
-            if missing_ids:
-                selected_tombstones.extend(
-                    list(
-                        (
-                            await db.execute(
-                                select(StaticRouteTombstone)
-                                .where(
-                                    StaticRouteTombstone.device_id == device_id,
-                                    StaticRouteTombstone.id.in_(missing_ids),
-                                )
-                                .order_by(StaticRouteTombstone.id)
-                            )
-                        )
-                        .scalars()
-                        .all()
+    selected: list = []
+    if tombstone_ids:
+        selected = list(
+            (
+                await db.execute(
+                    select(StaticRouteTombstone)
+                    .where(
+                        StaticRouteTombstone.device_id == device_id,
+                        StaticRouteTombstone.id.in_(list(tombstone_ids)),
                     )
+                    .order_by(StaticRouteTombstone.id)
                 )
-                selected_tombstones.sort(key=lambda row: tombstone_ids.index(row.id))
-            if [row.id for row in selected_tombstones] != list(tombstone_ids):
-                raise RuntimeError(f"static_route removal references missing tombstones {list(tombstone_ids)}")
-        execution["removal"] = _serialize_removal_plan(
-            classify_removal_plan(
-                rows,
-                selected_tombstones,
-                allowed_removal_keys=allowed_removal_keys,
-                context=removal_context or {},
             )
+            .scalars()
+            .all()
         )
-    section[EXECUTION_KEY] = execution
+        if {row.id for row in selected} != set(tombstone_ids):
+            raise RuntimeError(f"static_route removal references missing tombstones {sorted(tombstone_ids)}")
+    plan = classify_removal_plan(
+        rows,
+        selected,
+        allowed_removal_keys=allowed_removal_keys,
+        context=removal_context or {},
+    )
+    return {"removal": _serialize_removal_plan(plan), "tombstone_ids": sorted(tombstone_ids)}
 
 
-def _recorded_execution(document: dict) -> dict:
-    section = document.get("static_route") or {}
-    execution = section.get(EXECUTION_KEY)
-    if not isinstance(execution, dict):
-        raise ValueError("document section 'static_route' has no recorded execution plan")
-    return execution
+def _recorded_apply(document: dict) -> dict | None:
+    from nso_adapter.core.projection import section_proof
+
+    return (section_proof(document, "static_route") or {}).get("apply")
 
 
 def recorded_static_route_apply_mode(document: dict) -> str | None:
     """Return the generation's recorded apply mode, or None without this section."""
     if "static_route" not in document:
         return None
-    record = _recorded_execution(document).get("apply")
+    record = _recorded_apply(document)
     mode = record.get("mode") if isinstance(record, dict) else None
     if mode not in {"PATCH", "PUT"}:
         raise ValueError("document section 'static_route' has an invalid recorded apply mode")
     return mode
 
 
-def hydrate_static_route_apply_plan(document: dict, *, eligible_rows: list) -> SrPlan:
+def hydrate_static_route_apply_plan(document: dict) -> SrPlan:
     """Hydrate the immutable apply plan from a generation document."""
-    from nso_adapter.core.projection import hydrate_section
+    from nso_adapter.core.projection import hydrate_section, section_context
     from nso_adapter.store.models import StaticRouteIntent, StaticRouteTombstone
 
-    record = _recorded_execution(document).get("apply")
+    # Validated HERE, before any device I/O: a pre-contract section with a valid plan would
+    # otherwise hydrate and only fail at the encode site.
+    section_context(document, "static_route")
+    record = _recorded_apply(document)
     required = {"mode", "row_ids", "allowed_removal_keys", "tombstone_ids", "cas", "tombstone_id_watermark"}
     if not isinstance(record, dict) or set(record) != required or record.get("mode") not in {"PATCH", "PUT"}:
         raise ValueError("document section 'static_route' has an invalid recorded apply plan")
@@ -522,8 +592,8 @@ def hydrate_static_route_apply_plan(document: dict, *, eligible_rows: list) -> S
         raise ValueError("document section 'static_route' apply plan does not match its rows")
     if not isinstance(tombstone_ids, list) or any(row_id not in tombstones_by_id for row_id in tombstone_ids):
         raise ValueError("document section 'static_route' apply plan does not match its tombstones")
-    selected_ids = set(row_ids) if record["mode"] == "PUT" else {row.id for row in eligible_rows}
-    rows = [rows_by_id[row_id] for row_id in row_ids if row_id in selected_ids]
+    selected_ids = set(row_ids)
+    rows = [rows_by_id[row_id] for row_id in row_ids]
     cas = [
         SrCas(
             item["row_id"],
@@ -546,6 +616,38 @@ def hydrate_static_route_apply_plan(document: dict, *, eligible_rows: list) -> S
     )
 
 
+def _certify_clears(document: dict, clears: tuple[SrClear, ...]) -> None:
+    """Refuse a recorded clear the document's own rows do not describe.
+
+    Checking the outer keys only let a plan name any row id, any key and any field: the clear
+    is discharged against the row it names and its fields are what settlement proves gone, so
+    a mismatched entry retires an obligation the document never carried. Each clear must name
+    a row THIS document carries, at the triple that row renders, over fields that row's own
+    authorized carrier holds wire-unset.
+    """
+    if not clears:
+        return
+    rows = {row.get("id"): row for row in (document.get("static_route") or {}).get("static_route_intent", [])}
+    for clear in clears:
+        row = rows.get(clear.row_id)
+        if row is None:
+            raise ValueError(
+                f"recorded static-route clear names row {clear.row_id}, which this document does not carry"
+            )
+        if clear.key != _row_triple(row):
+            raise ValueError(
+                f"recorded static-route clear for row {clear.row_id} names key {list(clear.key)}, "
+                f"which is not the {list(_row_triple(row))} that row renders"
+            )
+        authorized = authorized_clear_fields(row.get("pending_clear"))
+        unset = {field for field in authorized if not wire_set(field, row.get(field))}
+        if not set(clear.fields) <= unset:
+            raise ValueError(
+                f"recorded static-route clear for row {clear.row_id} names fields "
+                f"{sorted(set(clear.fields) - unset)} its carrier does not hold wire-unset"
+            )
+
+
 def _sr_key(value) -> Triple:
     """Return the execution key *value* names, naming a malformed one.
 
@@ -560,13 +662,17 @@ def _sr_key(value) -> Triple:
 
 def hydrate_static_route_removal_plan(document: dict) -> SrRemovalPlan:
     """Hydrate the immutable removal classification from a generation document."""
-    record = _recorded_execution(document).get("removal")
+    from nso_adapter.core.projection import section_context, section_operation
+
+    section_context(document, "static_route")
+    record = section_operation(document, "static_route").get("removal")
     required = {"authorized_removal_keys", "claimed_keys", "tombstone_ids", "candidate_clears", "reclaimed_keys"}
     if not isinstance(record, dict) or set(record) != required:
         raise ValueError("document section 'static_route' has an invalid recorded removal plan")
     clears = tuple(
         SrClear(item["row_id"], _sr_key(item["key"]), tuple(item["fields"])) for item in record["candidate_clears"]
     )
+    _certify_clears(document, clears)
     return SrRemovalPlan(
         frozenset(_sr_key(key) for key in record["authorized_removal_keys"]),
         frozenset(_sr_key(key) for key in record["claimed_keys"]),
@@ -587,19 +693,21 @@ __all__: list[str] = [
     "SrRemovalPlan",
     "as_triple",
     "authorized_clear_fields",
-    "build_plan",
+    "build_static_route_operation",
     "candidate_clear_fields",
     "classify_apply_plan",
     "classify_removal_plan",
     "clears_suppressed",
+    "extend_apply_plan",
     "fence_open",
+    "freeze_static_route_proof",
     "hydrate_static_route_apply_plan",
     "hydrate_static_route_removal_plan",
     "leaf_is_neutral",
     "null_route_id_count",
     "pending_clear_fields",
     "promotion_removal_keys",
-    "record_static_route_execution",
+    "prune_apply_plan",
     "recorded_static_route_apply_mode",
     "replacement_open",
     "sr_is_cleared",

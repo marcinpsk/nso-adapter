@@ -4,17 +4,19 @@
 
 from __future__ import annotations
 
-import asyncio
+import logging
 from contextlib import ExitStack
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import structlog
 from sqlalchemy import select
 
-from nso_adapter.core.apply import _nokia_routed_kind, enqueue_apply
+from nso_adapter.core.apply import enqueue_apply
 from nso_adapter.core.apply import run_apply as _run_apply_worker
+from nso_adapter.nso.apply import nokia_routed_kind
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import (
@@ -30,7 +32,17 @@ from nso_adapter.store.models import (
 )
 from tests.conftest import attach_apply_generation, note_projection_write, session
 
-# ── _nokia_routed_kind (pure: derives SR OS router context from kind/service/vrf) ──
+
+@pytest.fixture
+def recorded_logs(caplog):
+    previous = structlog.get_config().copy()
+    structlog.configure(logger_factory=structlog.stdlib.LoggerFactory(), cache_logger_on_first_use=False)
+    caplog.set_level(logging.INFO)
+    yield caplog
+    structlog.configure(**previous)
+
+
+# ── nokia_routed_kind (pure: derives SR OS router context from kind/service/vrf) ──
 
 
 def _iface(kind, service="", vrf=""):
@@ -38,22 +50,22 @@ def _iface(kind, service="", vrf=""):
 
 
 def test_nokia_routed_kind_none_for_non_routed_interfaces():
-    assert _nokia_routed_kind(_iface("physical")) is None
-    assert _nokia_routed_kind(_iface("lag")) is None
+    assert nokia_routed_kind(_iface("physical")) is None
+    assert nokia_routed_kind(_iface("lag")) is None
 
 
 def test_nokia_routed_kind_base_when_no_service():
-    assert _nokia_routed_kind(_iface("loopback")) == "base"
-    assert _nokia_routed_kind(_iface("logical")) == "base"
+    assert nokia_routed_kind(_iface("loopback")) == "base"
+    assert nokia_routed_kind(_iface("logical")) == "base"
 
 
 def test_nokia_routed_kind_vprn_when_vrf_equals_service():
-    assert _nokia_routed_kind(_iface("logical", service="VPRN-A", vrf="VPRN-A")) == "vprn"
+    assert nokia_routed_kind(_iface("logical", service="VPRN-A", vrf="VPRN-A")) == "vprn"
 
 
 def test_nokia_routed_kind_ies_when_service_global_table_or_mismatched_vrf():
-    assert _nokia_routed_kind(_iface("logical", service="IES-1", vrf="")) == "ies"
-    assert _nokia_routed_kind(_iface("logical", service="SVC", vrf="other")) == "ies"
+    assert nokia_routed_kind(_iface("logical", service="IES-1", vrf="")) == "ies"
+    assert nokia_routed_kind(_iface("logical", service="SVC", vrf="other")) == "ies"
 
 
 # ── _nokia_attr_kind (attribute-write context: routed kinds + lag) ────────────────
@@ -62,149 +74,20 @@ def test_nokia_routed_kind_ies_when_service_global_table_or_mismatched_vrf():
 def test_nokia_attr_kind_lag_for_a_lag_interface():
     """A Nokia LAG's description/admin-state belong on `configure lag`, so the attribute-write
     context is 'lag' — routed-kind returns None for a lag (it never carries an IP)."""
-    from nso_adapter.core.apply import _nokia_attr_kind
+    from nso_adapter.nso.apply import nokia_attr_kind
 
-    assert _nokia_attr_kind(_iface("lag")) == "lag"
+    assert nokia_attr_kind(_iface("lag")) == "lag"
 
 
 def test_nokia_attr_kind_matches_routed_for_l3_and_ports():
     """For everything except a lag, the attribute context is the routed context: base/ies/vprn
     for L3 routed interfaces, None for a physical port (→ the legacy port path)."""
-    from nso_adapter.core.apply import _nokia_attr_kind
+    from nso_adapter.nso.apply import nokia_attr_kind
 
-    assert _nokia_attr_kind(_iface("loopback")) == "base"
-    assert _nokia_attr_kind(_iface("logical", service="VPRN-A", vrf="VPRN-A")) == "vprn"
-    assert _nokia_attr_kind(_iface("logical", service="IES-1", vrf="")) == "ies"
-    assert _nokia_attr_kind(_iface("physical")) is None
-
-
-# ── _apply_attributes threads the Nokia routed context (Finding C-drift) ──────────
-
-
-def _capturing_nso_client() -> tuple[NsoClient, list]:
-    """A spec'd NsoClient whose HTTP pool records every PATCH content. Only the RESTCONF
-    boundary is faked; the real ``_apply_attributes`` → ``apply_interface_attribute`` body
-    building runs unchanged. Returns (client, list-of-decoded-PATCH-bodies)."""
-    import json
-    from unittest.mock import MagicMock
-
-    import httpx
-
-    from nso_adapter.nso.client import NsoClient as _Client
-
-    bodies: list = []
-
-    async def _patch(url, content=None, headers=None):
-        bodies.append(json.loads(content))
-        return httpx.Response(204, request=httpx.Request("PATCH", url), text="")
-
-    http = AsyncMock()
-    http.patch.side_effect = _patch
-    client = MagicMock(spec=_Client)
-    client._base = "http://nso"
-    client._action_timeout = 120.0
-    cm = client._client.return_value
-    cm.__aenter__.return_value = http
-    cm.__aexit__.return_value = False
-    return client, bodies
-
-
-async def test_apply_attributes_threads_nokia_routed_context():
-    """The real per-scope apply path derives base|ies|vprn for a Nokia routed interface and
-    threads it into the attribute PATCH, so description/enabled land on the router/service
-    interface — not a phantom ``configure port <logical-name>`` (Finding C-drift root cause)."""
-    from nso_adapter.core.apply import _apply_attributes
-    from nso_adapter.nso.apply import apply_interface_attribute
-
-    iface = DbInterface(
-        device_id=1,
-        netbox_interface_id=7001,
-        name="CRPD-VPN:LO7",
-        kind="loopback",
-        service="CRPD-VPN",
-        vrf="CRPD-VPN",  # vrf == service ⇒ vprn
-        parent_binding="lag-99",
-        encap_tag="10",
-    )
-    attr_state = InterfaceAttrState(interface_id=1, attribute="description", sync_state=SyncState.accepted)
-    intent = InterfaceIntent(interface_id=1, attribute="description", intent_value="loopback for CRPD-VPN")
-    # The live row differs from the document row, so the PATCH-value assertion below can
-    # tell the document-selected slot from the stamp slot.
-    live = InterfaceIntent(interface_id=1, attribute="description", intent_value="moved-on live description")
-
-    client, bodies = _capturing_nso_client()
-    ok, failed, failures = await _apply_attributes(
-        [(attr_state, intent, iface, live)],
-        apply_interface_attribute,
-        client=client,
-        device_name="ra1",
-        job_id=1,
-        now=datetime.now(UTC),
-    )
-
-    assert (ok, failed) == (1, 0)
-    assert attr_state.sync_state == SyncState.in_sync
-    entry = bodies[0]["interface-reconciler:interface-config"][0]
-    assert entry["kind"] == "vprn"
-    assert entry["service"] == "CRPD-VPN"
-    assert entry["parent-binding"] == "lag-99"
-    assert entry["encap-tag"] == "10"
-    assert entry["description"] == "loopback for CRPD-VPN"
-    assert live.last_apply_at is not None, "the success stamp missed the live row"
-
-
-async def test_apply_attributes_threads_lag_kind_for_a_nokia_lag():
-    """A Nokia LAG's attribute PATCH carries kind='lag' (no service/binding), so the reconciler
-    writes description/admin-state to `configure lag`, not a phantom `configure port lag-N`."""
-    from nso_adapter.core.apply import _apply_attributes
-    from nso_adapter.nso.apply import apply_interface_attribute
-
-    iface = DbInterface(device_id=1, netbox_interface_id=7003, name="lag-30", kind="lag")
-    attr_state = InterfaceAttrState(interface_id=1, attribute="description", sync_state=SyncState.accepted)
-    intent = InterfaceIntent(interface_id=1, attribute="description", intent_value="uplink bundle")
-    live = InterfaceIntent(interface_id=1, attribute="description", intent_value="moved-on live description")
-
-    client, bodies = _capturing_nso_client()
-    await _apply_attributes(
-        [(attr_state, intent, iface, live)],
-        apply_interface_attribute,
-        client=client,
-        device_name="ra1",
-        job_id=1,
-        now=datetime.now(UTC),
-    )
-
-    entry = bodies[0]["interface-reconciler:interface-config"][0]
-    assert entry["kind"] == "lag"
-    assert entry["description"] == "uplink bundle"
-    assert "service" not in entry  # a LAG is not an IES/VPRN service
-
-
-async def test_apply_attributes_ios_interface_omits_routed_context():
-    """A non-Nokia interface (kind unset) carries no routed context — the per-scope path is
-    unchanged for IOS/Junos, guarding against a false kind leaking into every PATCH."""
-    from nso_adapter.core.apply import _apply_attributes
-    from nso_adapter.nso.apply import apply_interface_attribute
-
-    iface = DbInterface(device_id=1, netbox_interface_id=7002, name="GigabitEthernet0/0")
-    attr_state = InterfaceAttrState(interface_id=1, attribute="enabled", sync_state=SyncState.accepted)
-    intent = InterfaceIntent(interface_id=1, attribute="enabled", intent_value="true")
-    live = InterfaceIntent(interface_id=1, attribute="enabled", intent_value="false")
-
-    client, bodies = _capturing_nso_client()
-    await _apply_attributes(
-        [(attr_state, intent, iface, live)],
-        apply_interface_attribute,
-        client=client,
-        device_name="core-rtr-01",
-        job_id=1,
-        now=datetime.now(UTC),
-    )
-
-    entry = bodies[0]["interface-reconciler:interface-config"][0]
-    assert entry["enabled"] is True
-    assert "kind" not in entry and "service" not in entry
-    assert "parent-binding" not in entry and "encap-tag" not in entry
+    assert nokia_attr_kind(_iface("loopback")) == "base"
+    assert nokia_attr_kind(_iface("logical", service="VPRN-A", vrf="VPRN-A")) == "vprn"
+    assert nokia_attr_kind(_iface("logical", service="IES-1", vrf="")) == "ies"
+    assert nokia_attr_kind(_iface("physical")) is None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -250,6 +133,37 @@ async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -
     await _run_apply_worker(job_id=job_id, device_id=device_id, force=force, reg=reg)
 
 
+#: The ONE sender every deployment goes through: a PUT of the device's whole document.
+_SENDER = "nso_adapter.nso.apply.apply_device_intent"
+
+
+def _nso_client(**attrs) -> AsyncMock:
+    """A client whose ``device-intent`` instance is ABSENT.
+
+    Nothing is retained and the device-wide collateral guard has no live row to block on, so a
+    test that is not about retention or collateral sees exactly the send it seeded.
+    """
+    from nso_adapter.nso.client import ServiceInstanceState
+
+    client = AsyncMock(spec=NsoClient)
+    client.get_service_config = AsyncMock(return_value=None)
+    client.service_instance_state = AsyncMock(return_value=ServiceInstanceState("absent", None))
+    for name, value in attrs.items():
+        setattr(client, name, value)
+    return client
+
+
+def sent_document(sender: AsyncMock, index: int = -1) -> dict:
+    """The families one transmitted document carried: ``{YANG container: body}``."""
+    call = sender.await_args_list[index]
+    return call.args[2] if len(call.args) > 2 else call.kwargs["containers"]
+
+
+def sent_list(sender: AsyncMock, container: str, label: str, index: int = -1) -> list:
+    """One YANG list out of a transmitted family, empty when the family carried none."""
+    return (sent_document(sender, index).get(container) or {}).get(label) or []
+
+
 async def _seed_interface_with_intent(
     device_id: int,
     iface_name: str,
@@ -257,6 +171,7 @@ async def _seed_interface_with_intent(
     intent_value: str,
     sync_state: SyncState,
     netbox_id: int = 100,
+    **iface_fields,
 ) -> tuple[int, int]:
     """Create DbInterface + InterfaceAttrState + InterfaceIntent, return (iface_id, attr_id)."""
     async with session() as db:
@@ -264,6 +179,7 @@ async def _seed_interface_with_intent(
             device_id=device_id,
             netbox_interface_id=netbox_id,
             name=iface_name,
+            **iface_fields,
         )
         db.add(iface)
         await db.flush()
@@ -286,6 +202,98 @@ async def _seed_interface_with_intent(
         await db.refresh(iface)
         await db.refresh(attr_state)
         return iface.id, attr_state.id
+
+
+# ── the interface family's writer context reaches the wire (Finding C-drift) ──────
+#
+# The per-item attribute PATCH is gone with the reconcilers: description and admin state now
+# ride the ONE interface entry of the device's document. The subject is unchanged, so these
+# drive the real worker and read the transmitted container.
+
+
+async def test_the_transmitted_interface_entry_carries_the_nokia_routed_context(adapter_client):
+    """A Nokia routed interface is written as base|ies|vprn, not as a phantom port.
+
+    The routed context decides WHERE the description lands on SR OS, so losing it writes
+    ``configure port <logical-name>`` for an interface that has no port (Finding C-drift).
+    """
+    device_id = await _seed_device("ra1", 7001)
+    job_id = await _seed_apply_job(device_id)
+    await _seed_interface_with_intent(
+        device_id,
+        "CRPD-VPN:LO7",
+        "description",
+        "loopback for CRPD-VPN",
+        SyncState.accepted,
+        netbox_id=7001,
+        kind="loopback",
+        service="CRPD-VPN",
+        vrf="CRPD-VPN",  # vrf == service ⇒ vprn
+        parent_binding="lag-99",
+        encap_tag="10",
+    )
+
+    sender = AsyncMock(return_value=None)
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, sender),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    (entry,) = sent_list(sender, "interface", "interface")
+    # RED against the aggregate encoder: the routed context is emitted only for an interface
+    # that also carries an address, so an attribute-only interface loses it (reported).
+    assert entry["kind"] == "vprn"
+    assert entry["service"] == "CRPD-VPN"
+    assert entry["parent-binding"] == "lag-99"
+    assert entry["encap-tag"] == "10"
+    assert entry["description"] == "loopback for CRPD-VPN"
+    async with session() as db:
+        rows = (await db.execute(select(InterfaceIntent))).scalars().all()
+        assert all(row.last_apply_at is not None for row in rows), "the success stamp missed the live row"
+
+
+async def test_the_transmitted_interface_entry_carries_lag_kind_for_a_nokia_lag(adapter_client):
+    """A Nokia LAG is written as ``kind=lag``, so the description lands on ``configure lag``."""
+    device_id = await _seed_device("ra2", 7003)
+    job_id = await _seed_apply_job(device_id)
+    await _seed_interface_with_intent(
+        device_id, "lag-30", "description", "uplink bundle", SyncState.accepted, netbox_id=7003, kind="lag"
+    )
+
+    sender = AsyncMock(return_value=None)
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, sender),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    (entry,) = sent_list(sender, "interface", "interface")
+    # RED for the same reason as the vprn case above (reported).
+    assert entry["kind"] == "lag"
+    assert entry["description"] == "uplink bundle"
+    assert "service" not in entry, "a LAG is not an IES/VPRN service"
+
+
+async def test_the_transmitted_interface_entry_omits_the_routed_context_off_nokia(adapter_client):
+    """An interface with no kind carries no routed context, so no false kind leaks to IOS."""
+    device_id = await _seed_device("core-rtr-01", 7002)
+    job_id = await _seed_apply_job(device_id)
+    await _seed_interface_with_intent(
+        device_id, "GigabitEthernet0/0", "enabled", "true", SyncState.accepted, netbox_id=7002
+    )
+
+    sender = AsyncMock(return_value=None)
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, sender),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    (entry,) = sent_list(sender, "interface", "interface")
+    assert entry["enabled"] is True
+    assert "kind" not in entry and "service" not in entry
+    assert "parent-binding" not in entry and "encap-tag" not in entry
 
 
 # ── enqueue_apply ─────────────────────────────────────────────────────────────
@@ -384,32 +392,28 @@ async def test_run_apply_device_not_found(adapter_client):
 
 
 async def test_run_apply_nothing_eligible(adapter_client):
-    """run_apply marks job succeeded when no interfaces are eligible."""
-    device_id = await _seed_device("rtr-a12", 112)
+    """No eligible row anywhere: succeed with an all-zero result and touch no device.
+
+    The counters are the registry's, so a family added later gets its zero for free instead
+    of silently missing from the result the plugin reads.
+    """
+    from nso_adapter.core.apply import _result_keys
+
+    device_id = await _seed_device("rtr-empty", 200)
     job_id = await _seed_apply_job(device_id)
 
-    mock_client = AsyncMock()
-    with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client):
+    sender = AsyncMock(return_value=None)
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, sender),
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
+    sender.assert_not_awaited()
     async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
-        assert job.result == {
-            "attribute_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "ip_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "snmp_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "static_route_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "subinterface_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "vlan_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "bfd_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "interface_mtu_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "l2_sap_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "isis_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "bgp_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "route_policy_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-            "ospf_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-        }
+        assert job.result == {f"{key}_count_by_outcome": {"in_sync": 0, "apply_failed": 0} for key in _result_keys()}
 
 
 async def _set_sync_before_apply(device_id: int, value: bool) -> None:
@@ -425,7 +429,7 @@ async def test_run_apply_syncs_from_device_by_default(adapter_client):
     device_id = await _seed_device("rtr-sync-on", 130)
     job_id = await _seed_apply_job(device_id)
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -439,7 +443,7 @@ async def test_run_apply_skips_sync_from_when_disabled(adapter_client):
     await _set_sync_before_apply(device_id, False)
     job_id = await _seed_apply_job(device_id)
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -451,7 +455,7 @@ async def test_run_apply_survives_sync_from_failure(adapter_client):
     device_id = await _seed_device("rtr-sync-err", 132)
     job_id = await _seed_apply_job(device_id)
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     mock_client.sync_from.side_effect = RuntimeError("transport timeout")
     with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
@@ -461,85 +465,89 @@ async def test_run_apply_survives_sync_from_failure(adapter_client):
         assert job.status == JobStatus.succeeded  # nothing eligible, sync error swallowed
 
 
-async def test_collect_apply_diff_returns_scope_deltas(adapter_client):
-    """collect_apply_diff dry-runs each scope's intent and returns the native device delta."""
-    from nso_adapter.core.apply import collect_apply_diff
+async def _preview_head(device_id: int) -> int:
+    """Give the device an executable generation head — the document a preview is bound to."""
+    job_id = await _seed_apply_job(device_id)
+    await attach_apply_generation(job_id, device_id)
+    return job_id
+
+
+async def _seed_ospf(device_id: int, router_id: str = "1.1.1.1") -> None:
     from nso_adapter.store.models import OspfInstanceIntent
 
-    device_id = await _seed_device("rtr-diff", 199)
     async with session() as db:
         db.add(
-            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.now(UTC))
+            OspfInstanceIntent(device_id=device_id, process_id="1", router_id=router_id, accepted_at=datetime.now(UTC))
         )
         await db.commit()
 
-    mock_client = AsyncMock()
+
+async def test_collect_apply_diff_returns_the_documents_delta(adapter_client):
+    """One document is one transaction, so the preview is ONE dry-run and ONE delta."""
+    from nso_adapter.core.apply import PREVIEW_KEY, collect_apply_diff
+
+    device_id = await _seed_device("rtr-diff", 199)
+    await _seed_ospf(device_id)
+    await _preview_head(device_id)
+
+    sender = AsyncMock(return_value="DEVICE NATIVE DELTA")
     with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_ospf_config", new_callable=AsyncMock, return_value="OSPF NATIVE DELTA"),
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, sender),
     ):
         async with session() as db:
             diffs = await collect_apply_diff(db, device_id)
-    assert diffs == {"ospf": "OSPF NATIVE DELTA"}
+
+    assert diffs == {PREVIEW_KEY: "DEVICE NATIVE DELTA"}
+    assert sender.await_args.kwargs["dry_run"] is True, "a preview commits nothing"
+    assert sent_list(sender, "ospf", "process-config")[0]["process-id"] == "1"
 
 
-async def test_collect_apply_diff_empty_scope_omitted(adapter_client):
-    """A scope whose dry-run shows no change (empty delta) is omitted from the result."""
+async def test_collect_apply_diff_empty_delta_is_omitted(adapter_client):
+    """A device already holding its document previews nothing, not an empty string."""
     from nso_adapter.core.apply import collect_apply_diff
-    from nso_adapter.store.models import OspfInstanceIntent
 
     device_id = await _seed_device("rtr-diff2", 198)
-    async with session() as db:
-        db.add(
-            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.now(UTC))
-        )
-        await db.commit()
+    await _seed_ospf(device_id)
+    await _preview_head(device_id)
 
-    mock_client = AsyncMock()
     with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_ospf_config", new_callable=AsyncMock, return_value="   "),
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, AsyncMock(return_value="   ")),
     ):
         async with session() as db:
             diffs = await collect_apply_diff(db, device_id)
     assert diffs == {}
 
 
-async def test_collect_apply_diff_outformat_cli_threads_format(adapter_client):
-    """outformat='cli' threads dry_run='cli' into every scope apply — NSO then renders the
-    NED-uniform +/- tree diff (the apply-preview 'diff -u' panel) instead of device-native."""
-    from nso_adapter.core.apply import collect_apply_diff
-    from nso_adapter.store.models import OspfInstanceIntent
+async def test_collect_apply_diff_outformat_cli_threads_the_format(adapter_client):
+    """``outformat='cli'`` asks NSO for the NED-uniform tree diff the preview panel renders."""
+    from nso_adapter.core.apply import PREVIEW_KEY, collect_apply_diff
 
     device_id = await _seed_device("rtr-diff-cli", 197)
-    async with session() as db:
-        db.add(
-            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.now(UTC))
-        )
-        await db.commit()
+    await _seed_ospf(device_id)
+    await _preview_head(device_id)
 
-    mock_client = AsyncMock()
-    ospf = AsyncMock(return_value="+ router ospf 1")
+    sender = AsyncMock(return_value="+ router ospf 1")
     with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_ospf_config", ospf),
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, sender),
     ):
         async with session() as db:
             diffs = await collect_apply_diff(db, device_id, outformat="cli")
-    assert diffs == {"ospf": "+ router ospf 1"}
-    assert ospf.await_args.kwargs["dry_run"] == "cli"
+
+    assert diffs == {PREVIEW_KEY: "+ router ospf 1"}
+    assert sender.await_args.kwargs["dry_run"] == "cli"
 
 
-async def test_collect_apply_diff_covers_multiple_scopes(adapter_client):
-    """collect_apply_diff dry-runs every scope with accepted intent, keyed by scope name."""
+async def test_collect_apply_diff_previews_every_family_of_the_document(adapter_client):
+    """The previewed body is the whole document: one dry-run carries every family at once."""
     from nso_adapter.core.apply import collect_apply_diff
-    from nso_adapter.store.models import OspfInstanceIntent, StaticRouteIntent
+    from nso_adapter.store.models import StaticRouteIntent
 
-    device_id = await _seed_device("rtr-diff3", 197)
+    device_id = await _seed_device("rtr-diff3", 196)
+    await _seed_ospf(device_id)
     async with session() as db:
-        db.add(
-            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.now(UTC))
-        )
         db.add(
             StaticRouteIntent(
                 device_id=device_id,
@@ -550,20 +558,53 @@ async def test_collect_apply_diff_covers_multiple_scopes(adapter_client):
             )
         )
         await db.commit()
+    await _preview_head(device_id)
 
-    mock_client = AsyncMock()
+    sender = AsyncMock(return_value="DELTA")
     with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_ospf_config", new_callable=AsyncMock, return_value="OSPF DELTA"),
-        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock, return_value="STATIC DELTA"),
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, sender),
     ):
         async with session() as db:
-            diffs = await collect_apply_diff(db, device_id)
-    assert diffs == {"ospf": "OSPF DELTA", "static_route": "STATIC DELTA"}
+            await collect_apply_diff(db, device_id)
+
+    sender.assert_awaited_once()
+    assert sent_list(sender, "ospf", "process-config")[0]["process-id"] == "1"
+    assert sent_list(sender, "static-route", "route")[0]["prefix"] == "10.0.0.0/24"
+
+
+async def test_collect_apply_diff_previews_the_document_not_the_live_store(adapter_client):
+    """A store-only edit never reaches the device, so it must never reach the preview either.
+
+    The preview is the dry-run OF THE DOCUMENT BEING COMMITTED (#1683): showing a live-store
+    estimate would render a diff the commit cannot produce.
+    """
+    from nso_adapter.core.apply import collect_apply_diff
+    from nso_adapter.store.models import OspfInstanceIntent
+
+    device_id = await _seed_device("rtr-diff-store-only", 195)
+    await _seed_ospf(device_id, router_id="1.1.1.1")
+    await _preview_head(device_id)
+    async with session() as db:
+        row = (
+            await db.execute(select(OspfInstanceIntent).where(OspfInstanceIntent.device_id == device_id))
+        ).scalar_one()
+        row.router_id = "9.9.9.9"
+        await db.commit()
+
+    sender = AsyncMock(return_value="DELTA")
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, sender),
+    ):
+        async with session() as db:
+            await collect_apply_diff(db, device_id)
+
+    assert sent_list(sender, "ospf", "process-config")[0]["router-id"] == "1.1.1.1"
 
 
 async def test_collect_apply_diff_device_not_found(adapter_client):
-    """A dry-run preview for an unknown device returns an empty mapping (no NSO call)."""
+    """A preview for an unknown device returns an empty mapping (no NSO call)."""
     from nso_adapter.core.apply import collect_apply_diff
 
     async with session() as db:
@@ -571,246 +612,64 @@ async def test_collect_apply_diff_device_not_found(adapter_client):
     assert diffs == {}
 
 
-async def test_collect_apply_diff_covers_every_scope(adapter_client):
-    """Every scope with accepted intent gets dry-run and keyed by scope name.
+async def test_collect_apply_diff_without_a_generation_reports_unavailable(adapter_client):
+    """UNAVAILABLE, never empty: an empty preview reads as "nothing to do" to the operator."""
+    from nso_adapter.core.apply import PREVIEW_KEY, collect_apply_diff
 
-    Locks the per-scope wiring in collect_apply_diff: interface attrs/IPs, OSPF, IS-IS,
-    BGP, route-policy, SNMP, static routes, logging, SVI, subinterface, VLAN, BFD, MTU
-    and L2 SAP each produce their own delta.
-    """
-    from nso_adapter.core.apply import collect_apply_diff
-    from nso_adapter.store import models as m
+    device_id = await _seed_device("rtr-diff-none", 194)
+    await _seed_ospf(device_id)
 
-    device_id = await _seed_device("rtr-diff-all", 196)
-    async with session() as db:
-        dev = await db.get(Device, device_id)
-        dev.ned_id = "cisco-ios-cli-6.95"
-        iface = DbInterface(device_id=device_id, name="GigabitEthernet0/0", netbox_interface_id=900)
-        db.add(iface)
-        await db.flush()
-        db.add(
-            m.InterfaceIntent(
-                interface_id=iface.id, attribute="description", intent_value="uplink", accepted_at=datetime.now(UTC)
-            )
-        )
-        db.add(
-            m.InterfaceIpIntent(
-                interface_id=iface.id, address="10.0.0.1/24", family="ipv4", accepted_at=datetime.now(UTC)
-            )
-        )
-        db.add(
-            m.OspfInstanceIntent(
-                device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.now(UTC)
-            )
-        )
-        db.add(
-            m.IsisInterfaceIntent(device_id=device_id, interface_name="Gi0/0", af="ipv4", accepted_at=datetime.now(UTC))
-        )
-        db.add(m.BgpRouterIntent(device_id=device_id, asn="65000", accepted_at=datetime.now(UTC)))
-        db.add(
-            m.RoutePolicyObjectIntent(
-                device_id=device_id, family="ipv4", name="RM", entries=[], accepted_at=datetime.now(UTC)
-            )
-        )
-        db.add(
-            m.SnmpCommunityIntent(
-                device_id=device_id,
-                label="ro",
-                vault_ref="network/netbox/snmp/community/ro#community",
-                access="ro",
-                accepted_at=datetime.now(UTC),
-            )
-        )
-        db.add(
-            m.StaticRouteIntent(
-                device_id=device_id, prefix="10.1.0.0/24", next_hop="10.1.0.1", accepted_at=datetime.now(UTC)
-            )
-        )
-        db.add(m.LoggingHostIntent(device_id=device_id, address="10.0.0.99", accepted_at=datetime.now(UTC)))
-        db.add(m.SviIntent(device_id=device_id, interface_name="Vlan10", vlan_id=10, accepted_at=datetime.now(UTC)))
-        db.add(m.SubinterfaceIntent(device_id=device_id, interface_name="Gi0/0.10", accepted_at=datetime.now(UTC)))
-        db.add(m.VlanIntent(device_id=device_id, vlan_id=20, accepted_at=datetime.now(UTC)))
-        db.add(m.BfdIntent(device_id=device_id, interface_name="Gi0/1", accepted_at=datetime.now(UTC)))
-        db.add(
-            m.InterfaceMtuIntent(device_id=device_id, interface_name="Gi0/2", mtu=9000, accepted_at=datetime.now(UTC))
-        )
-        db.add(
-            m.L2SapIntent(
-                device_id=device_id,
-                service_name="EPIPE-1",
-                service_type="epipe",
-                sap_id="1/1/1",
-                accepted_at=datetime.now(UTC),
-            )
-        )
-        await db.commit()
-
-    mock_client = AsyncMock()
-    # Each dry-run returns a distinct, non-empty native delta keyed off its scope.
-    patches = {
-        "apply_interface_attribute": "ATTR",
-        "apply_interface_ips": "IP",
-        "apply_ospf_config": "OSPF",
-        "apply_isis_interfaces": "ISIS",
-        "apply_bgp_config": "BGP",
-        "apply_route_policy_config": "RP",
-        "apply_snmp_config": "SNMP",
-        "apply_static_routes": "SR",
-        "apply_logging_config": "LOG",
-        "apply_svi_config": "SVI",
-        "apply_subinterface_config": "SUBIF",
-        "apply_vlan_config": "VLAN",
-        "apply_bfd_config": "BFD",
-        "apply_mtu_config": "MTU",
-        "apply_l2_saps": "L2",
-    }
-    with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client):
-        with ExitStack() as stack:
-            for fn, delta in patches.items():
-                stack.enter_context(patch(f"nso_adapter.nso.apply.{fn}", new_callable=AsyncMock, return_value=delta))
-            async with session() as db:
-                diffs = await collect_apply_diff(db, device_id)
-
-    assert diffs == {
-        "interface_attribute": "ATTR",
-        "interface_ip": "IP",
-        "ospf": "OSPF",
-        "isis": "ISIS",
-        "bgp": "BGP",
-        "route_policy": "RP",
-        "snmp": "SNMP",
-        "static_route": "SR",
-        "logging": "LOG",
-        "svi": "SVI",
-        "subinterface": "SUBIF",
-        "vlan": "VLAN",
-        "bfd": "BFD",
-        "interface_mtu": "MTU",
-        "l2_sap": "L2",
-    }
-
-
-async def test_collect_apply_diff_scope_failure_is_isolated(adapter_client):
-    """A scope whose dry-run raises must not block the others — but must not vanish either.
-
-    The operator approves the apply FROM this panel, and an omitted scope reads as "nothing
-    to do". A body-builder error (a vault_ref the writer cannot render, an unmappable enum)
-    is precisely what will fail the real apply, so it has to be visible here first.
-    """
-    from nso_adapter.core.apply import collect_apply_diff
-    from nso_adapter.store.models import OspfInstanceIntent, StaticRouteIntent
-
-    device_id = await _seed_device("rtr-diff-iso", 195)
-    async with session() as db:
-        db.add(
-            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.now(UTC))
-        )
-        db.add(
-            StaticRouteIntent(
-                device_id=device_id, prefix="10.2.0.0/24", next_hop="10.2.0.1", accepted_at=datetime.now(UTC)
-            )
-        )
-        await db.commit()
-
-    mock_client = AsyncMock()
-    with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch(
-            "nso_adapter.nso.apply.apply_ospf_config", new_callable=AsyncMock, side_effect=RuntimeError("dry-run boom")
-        ),
-        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock, return_value="STATIC DELTA"),
-    ):
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()):
         async with session() as db:
             diffs = await collect_apply_diff(db, device_id)
-    # static_route still previews normally; ospf's failure is REPORTED, not swallowed
-    assert diffs["static_route"] == "STATIC DELTA"
-    assert "dry-run boom" in diffs["ospf"]
-    assert diffs["ospf"].startswith("!! preview unavailable")
+
+    assert list(diffs) == [PREVIEW_KEY]
+    assert diffs[PREVIEW_KEY].startswith("!! preview unavailable")
 
 
-async def test_collect_apply_diff_interface_scope_failures_and_skips(adapter_client):
-    """The interface attr/IP previews skip non-eligible attrs and swallow per-slice dry-run errors."""
-    from nso_adapter.core.apply import collect_apply_diff
-    from nso_adapter.store.models import InterfaceIpIntent
+async def test_collect_apply_diff_classifies_an_unexpected_dry_run_failure(adapter_client):
+    """A preview reports the exception type without exposing its untrusted text."""
+    from nso_adapter.core.apply import PREVIEW_KEY, collect_apply_diff
 
-    device_id = await _seed_device("rtr-diff-ifaceerr", 194)
-    async with session() as db:
-        iface = DbInterface(device_id=device_id, name="GigabitEthernet0/0", netbox_interface_id=910)
-        db.add(iface)
-        await db.flush()
-        # eligible description slice — its dry-run will be made to raise
-        db.add(
-            InterfaceIntent(
-                interface_id=iface.id, attribute="description", intent_value="up", accepted_at=datetime.now(UTC)
-            )
-        )
-        # non-eligible attribute (skipped before any dry-run)
-        db.add(
-            InterfaceIntent(interface_id=iface.id, attribute="mtu", intent_value="9000", accepted_at=datetime.now(UTC))
-        )
-        # eligible attribute but not accepted (also skipped)
-        db.add(InterfaceIntent(interface_id=iface.id, attribute="enabled", intent_value="true"))
-        # IP intent whose dry-run will be made to raise
-        db.add(
-            InterfaceIpIntent(
-                interface_id=iface.id, address="10.0.0.1/24", family="ipv4", accepted_at=datetime.now(UTC)
-            )
-        )
-        await db.commit()
+    device_id = await _seed_device("rtr-diff-boom", 193)
+    await _seed_ospf(device_id)
+    await _preview_head(device_id)
+    secret = "placeholder-preview-secret"
 
-    mock_client = AsyncMock()
     with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch(
-            "nso_adapter.nso.apply.apply_interface_attribute",
-            new_callable=AsyncMock,
-            side_effect=RuntimeError("attr dry-run boom"),
-        ),
-        patch(
-            "nso_adapter.nso.apply.apply_interface_ips",
-            new_callable=AsyncMock,
-            side_effect=RuntimeError("ip dry-run boom"),
-        ),
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, AsyncMock(side_effect=RuntimeError(secret))),
     ):
         async with session() as db:
             diffs = await collect_apply_diff(db, device_id)
 
-    # both interface scopes failed → omitted; preview never raised
-    assert diffs == {}
+    assert diffs[PREVIEW_KEY].startswith("!! preview unavailable")
+    assert "RuntimeError" in diffs[PREVIEW_KEY]
+    assert secret not in diffs[PREVIEW_KEY]
 
 
-async def test_collect_apply_diff_interface_in_sync_yields_no_entry(adapter_client):
-    """An interface already in sync (empty dry-run delta) contributes no preview entry."""
-    from nso_adapter.core.apply import collect_apply_diff
-    from nso_adapter.store.models import InterfaceIpIntent
+async def test_collect_apply_diff_redacts_value_bearing_apply_error(adapter_client, recorded_logs):
+    """A typed apply error cannot make an invalid intent value public."""
+    from nso_adapter.core.apply import PREVIEW_KEY, collect_apply_diff
 
-    device_id = await _seed_device("rtr-diff-insync", 193)
-    async with session() as db:
-        iface = DbInterface(device_id=device_id, name="GigabitEthernet0/0", netbox_interface_id=911)
-        db.add(iface)
-        await db.flush()
-        db.add(
-            InterfaceIntent(
-                interface_id=iface.id, attribute="description", intent_value="up", accepted_at=datetime.now(UTC)
-            )
-        )
-        db.add(
-            InterfaceIpIntent(
-                interface_id=iface.id, address="10.0.0.1/24", family="ipv4", accepted_at=datetime.now(UTC)
-            )
-        )
-        await db.commit()
+    device_id = await _seed_device("rtr-diff-invalid", 192)
+    secret = "placeholder-invalid-enabled-secret"
+    await _seed_interface_with_intent(
+        device_id,
+        "GigabitEthernet0/0",
+        "enabled",
+        secret,
+        SyncState.accepted,
+    )
+    await _preview_head(device_id)
 
-    mock_client = AsyncMock()
-    with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_interface_attribute", new_callable=AsyncMock, return_value=""),
-        patch("nso_adapter.nso.apply.apply_interface_ips", new_callable=AsyncMock, return_value=None),
-    ):
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()):
         async with session() as db:
             diffs = await collect_apply_diff(db, device_id)
 
-    assert diffs == {}
+    assert "invalid_enabled_value" in diffs[PREVIEW_KEY]
+    assert secret not in diffs[PREVIEW_KEY]
+    assert secret not in repr([record.__dict__ for record in recorded_logs.records])
 
 
 async def test_run_apply_all_succeed(adapter_client):
@@ -826,10 +685,10 @@ async def test_run_apply_all_succeed(adapter_client):
         netbox_id=200,
     )
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_interface_attribute", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -862,7 +721,7 @@ async def test_run_apply_refreshes_mirror_and_notifies_plugin(adapter_client):
         netbox_id=400,
     )
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     # READSEM grain b: post-apply consumes the projected doc. Serve BOTH families' sections
     # with a row each so their materializers demonstrably run.
     mock_client.get_device_state_doc.return_value = {
@@ -876,7 +735,7 @@ async def test_run_apply_refreshes_mirror_and_notifies_plugin(adapter_client):
     try:
         with (
             patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-            patch("nso_adapter.nso.apply.apply_interface_attribute", new_callable=AsyncMock),
+            patch(_SENDER, new_callable=AsyncMock),
         ):
             await run_apply(job_id=job_id, device_id=device_id, force=True)
     finally:
@@ -922,11 +781,11 @@ async def test_run_apply_post_refresh_failure_does_not_fail_job(adapter_client):
         netbox_id=401,
     )
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     imp._netbox_client = None  # get_netbox_client() -> None; helper must still not raise
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_interface_attribute", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock),
         patch(
             "nso_adapter.core.importer.refresh_routing_surfaces_for_device",
             new_callable=AsyncMock,
@@ -955,11 +814,11 @@ async def test_run_apply_partial_failure(adapter_client):
         netbox_id=201,
     )
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     nso_err = NsoApplyError(code="nso_error", message="NSO rejected commit", detail={})
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_interface_attribute", new_callable=AsyncMock, side_effect=nso_err),
+        patch(_SENDER, new_callable=AsyncMock, side_effect=nso_err),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -983,14 +842,10 @@ async def test_run_apply_unexpected_exception_on_attribute(adapter_client):
         netbox_id=202,
     )
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch(
-            "nso_adapter.nso.apply.apply_interface_attribute",
-            new_callable=AsyncMock,
-            side_effect=RuntimeError("unexpected internal error"),
-        ),
+        patch(_SENDER, new_callable=AsyncMock, side_effect=RuntimeError("unexpected internal error")),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -1017,10 +872,10 @@ async def test_run_apply_does_not_reselect_recorded_interface_eligibility(adapte
         netbox_id=203,
     )
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_interface_attribute", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=False)
 
@@ -1098,13 +953,11 @@ async def test_run_apply_ip_intent_success(adapter_client):
     job_id = await _seed_apply_job(device_id)
     await _seed_ip_intent(iface_id, address="10.0.0.1/24", family="ipv4")
 
-    mock_nso = AsyncMock(spec=NsoClient)  # opaque token: apply_interface_ips is patched below
-    mock_nso._base = "http://fake-nso"
-    mock_nso._action_timeout = 30
+    mock_nso = _nso_client()
 
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_nso),
-        patch("nso_adapter.nso.apply.apply_interface_ips", new_callable=AsyncMock) as mock_ip_apply,
+        patch(_SENDER, new_callable=AsyncMock) as sender,
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -1123,12 +976,12 @@ async def test_run_apply_ip_intent_success(adapter_client):
         assert ip_rows[0].last_apply_at is not None
         assert ip_rows[0].last_apply_error is None
 
-    mock_ip_apply.assert_awaited_once()
+    sender.assert_awaited_once()
 
 
 @pytest.mark.anyio
 async def test_run_apply_ip_intent_failure_marks_error(adapter_client):
-    """When apply_interface_ips raises NsoApplyError, last_apply_error is stored."""
+    """When the document PUT is rejected, every address row records the error."""
     from sqlalchemy import select
 
     from nso_adapter.nso.apply import NsoApplyError
@@ -1139,12 +992,12 @@ async def test_run_apply_ip_intent_failure_marks_error(adapter_client):
     job_id = await _seed_apply_job(device_id)
     await _seed_ip_intent(iface_id, address="10.0.1.1/30", family="ipv4")
 
-    mock_nso = AsyncMock()
+    mock_nso = _nso_client()
 
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_nso),
         patch(
-            "nso_adapter.nso.apply.apply_interface_ips",
+            _SENDER,
             new_callable=AsyncMock,
             side_effect=NsoApplyError("nso_patch_failed", "NSO returned 500"),
         ),
@@ -1172,15 +1025,15 @@ async def test_run_apply_ip_intent_not_accepted_skipped(adapter_client):
     job_id = await _seed_apply_job(device_id)
     await _seed_ip_intent(iface_id, address="10.0.2.1/24", family="ipv4", accepted=False)
 
-    mock_nso = AsyncMock()
+    mock_nso = _nso_client()
 
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_nso),
-        patch("nso_adapter.nso.apply.apply_interface_ips", new_callable=AsyncMock) as mock_ip_apply,
+        patch(_SENDER, new_callable=AsyncMock) as sender,
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    mock_ip_apply.assert_not_awaited()
+    sender.assert_not_awaited()
 
 
 @pytest.mark.anyio
@@ -1208,15 +1061,15 @@ async def test_run_apply_ip_already_applied_skipped_without_force(adapter_client
         rows[0].last_apply_error = None
         await db.commit()
 
-    mock_nso = AsyncMock()
+    mock_nso = _nso_client()
 
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_nso),
-        patch("nso_adapter.nso.apply.apply_interface_ips", new_callable=AsyncMock) as mock_ip_apply,
+        patch(_SENDER, new_callable=AsyncMock) as sender,
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=False)
 
-    mock_ip_apply.assert_not_awaited()
+    sender.assert_not_awaited()
 
 
 async def test_run_apply_bgp_intent_does_not_crash_on_commit(adapter_client):
@@ -1237,10 +1090,10 @@ async def test_run_apply_bgp_intent_does_not_crash_on_commit(adapter_client):
         db.add(BgpRouterIntent(device_id=device_id, asn="65100", accepted_at=datetime.now(UTC)))
         await db.commit()
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_bgp_config", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)  # must not raise
 
@@ -1250,46 +1103,72 @@ async def test_run_apply_bgp_intent_does_not_crash_on_commit(adapter_client):
         assert job.result["bgp_count_by_outcome"]["in_sync"] == 1
 
 
-# ── Per-scope apply passes (SNMP / static-route / logging / SVI / subif / VLAN /
-#    BFD / MTU / L2-SAP / IS-IS / route-policy / OSPF) ─────────────────────────
+# ── one family at a time, through the ONE sender ──────────────────────────────
 #
-# These passes share one shape: collect accepted rows → call the scope's
-# nso.apply function → on success stamp last_apply_at and report in_sync; on
-# NsoApplyError/other stamp last_apply_error and report apply_failed. The
-# parametrized success test locks the wiring (right apply fn, right result key,
-# rows stamped) for every single-list scope; dedicated tests below cover the
-# multi-list scopes and the failure paths.
+# Every family shares one shape now: the document's rows are encoded under the family's YANG
+# container, the whole document is PUT once, and on success every row the body carried is
+# stamped in_sync. The parametrized case locks that wiring (right container, right list, right
+# result counter, rows stamped) for every single-list family; the cases below cover the
+# multi-list families and the failure paths.
 
 
-# (model_name, row kwargs, patched nso.apply fn, result-dict key)
+# (model_name, row kwargs, YANG container, YANG list, result-dict key)
 _SCOPE_CASES = [
-    ("StaticRouteIntent", dict(prefix="10.9.0.0/24", next_hop="10.9.0.1"), "apply_static_routes", "static_route"),
-    ("LoggingHostIntent", dict(address="10.9.0.99"), "apply_logging_config", "logging"),
-    ("SviIntent", dict(interface_name="Vlan10", vlan_id=10), "apply_svi_config", "svi"),
-    ("SubinterfaceIntent", dict(interface_name="GigabitEthernet0/0.10"), "apply_subinterface_config", "subinterface"),
-    ("VlanIntent", dict(vlan_id=20), "apply_vlan_config", "vlan"),
-    ("BfdIntent", dict(interface_name="GigabitEthernet0/1"), "apply_bfd_config", "bfd"),
-    ("InterfaceMtuIntent", dict(interface_name="GigabitEthernet0/2", mtu=9000), "apply_mtu_config", "interface_mtu"),
+    (
+        "StaticRouteIntent",
+        dict(vrf="", prefix="10.9.0.0/24", next_hop="10.9.0.1"),
+        "static-route",
+        "route",
+        "static_route",
+    ),
+    ("LoggingHostIntent", dict(address="10.9.0.99"), "logging", "host", "logging"),
+    ("SviIntent", dict(interface_name="Vlan10", vlan_id=10), "svi", "interface", "svi"),
+    (
+        "SubinterfaceIntent",
+        dict(interface_name="GigabitEthernet0/0.10"),
+        "subinterface",
+        "interface",
+        "subinterface",
+    ),
+    ("VlanIntent", dict(vlan_id=20), "vlan", "vlan", "vlan"),
+    ("BfdIntent", dict(interface_name="GigabitEthernet0/1"), "bfd", "interface", "bfd"),
+    (
+        "InterfaceMtuIntent",
+        dict(interface_name="GigabitEthernet0/2", mtu=9000),
+        "mtu",
+        "interface",
+        "interface_mtu",
+    ),
     (
         "L2SapIntent",
         dict(service_name="EPIPE-1", service_type="epipe", sap_id="1/1/1"),
-        "apply_l2_saps",
+        "l2-sap",
+        "sap",
         "l2_sap",
     ),
     (
         "SnmpCommunityIntent",
         dict(label="ro", vault_ref="network/netbox/snmp/community/ro#community", access="ro"),
-        "apply_snmp_config",
+        "snmp",
+        "community",
         "snmp",
     ),
-    ("OspfInstanceIntent", dict(process_id="1", router_id="9.9.9.9"), "apply_ospf_config", "ospf"),
-    ("IsisInterfaceIntent", dict(interface_name="GigabitEthernet0/3", af="ipv4"), "apply_isis_interfaces", "isis"),
+    ("OspfInstanceIntent", dict(process_id="1", router_id="9.9.9.9"), "ospf", "process-config", "ospf"),
+    (
+        "IsisInterfaceIntent",
+        dict(interface_name="GigabitEthernet0/3", af="ipv4"),
+        "isis",
+        "interface-config",
+        "isis",
+    ),
 ]
 
 
-@pytest.mark.parametrize("model_name, kwargs, apply_fn, result_key", _SCOPE_CASES)
-async def test_run_apply_scope_success(adapter_client, model_name, kwargs, apply_fn, result_key):
-    """Each single-list scope applies its accepted rows and reports them in_sync."""
+@pytest.mark.parametrize("model_name, kwargs, container, label, result_key", _SCOPE_CASES)
+async def test_run_apply_family_is_transmitted_and_stamped(
+    adapter_client, model_name, kwargs, container, label, result_key
+):
+    """Each single-list family reaches the wire under its container and reports in_sync."""
     from nso_adapter.store import models as m
 
     device_id = await _seed_device(f"rtr-{result_key}", 300)
@@ -1299,14 +1178,15 @@ async def test_run_apply_scope_success(adapter_client, model_name, kwargs, apply
         db.add(model(device_id=device_id, accepted_at=datetime.now(UTC), **kwargs))
         await db.commit()
 
-    mock_client = AsyncMock()
+    sender = AsyncMock(return_value=None)
     with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch(f"nso_adapter.nso.apply.{apply_fn}", new_callable=AsyncMock) as mock_apply,
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, sender),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    mock_apply.assert_awaited_once()
+    sender.assert_awaited_once()
+    assert len(sent_list(sender, container, label)) == 1, sent_document(sender)
     async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
@@ -1317,9 +1197,8 @@ async def test_run_apply_scope_success(adapter_client, model_name, kwargs, apply
         assert rows[0].last_apply_error is None
 
 
-async def test_run_apply_logging_threads_and_stamps_levels_intent(adapter_client):
-    """The accepted local-levels singleton rides the logging scope: threaded to
-    apply_logging_config as levels_intent_row and stamped alongside the host rows."""
+async def test_run_apply_logging_transmits_and_stamps_the_levels_singleton(adapter_client):
+    """The accepted local-levels singleton rides the logging container and is stamped with it."""
     from nso_adapter.store.models import LoggingHostIntent, LoggingLevelsIntent
 
     device_id = await _seed_device("rtr-logging-lvl", 311)
@@ -1329,15 +1208,17 @@ async def test_run_apply_logging_threads_and_stamps_levels_intent(adapter_client
         db.add(LoggingLevelsIntent(device_id=device_id, console_severity="CRITICAL", accepted_at=datetime.now(UTC)))
         await db.commit()
 
-    mock_client = AsyncMock()
+    sender = AsyncMock(return_value=None)
     with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_logging_config", new_callable=AsyncMock) as mock_apply,
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, sender),
+        patch("nso_adapter.nso.apply.local_levels_write_enabled", return_value=True),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    mock_apply.assert_awaited_once()
-    assert mock_apply.await_args.kwargs["levels_intent_row"] is not None
+    logging_body = sent_document(sender)["logging"]
+    assert logging_body["host"][0]["address"] == "10.9.0.98"
+    assert logging_body["local-levels"]["console-severity"] == "CRITICAL"
     async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
@@ -1351,7 +1232,7 @@ async def test_run_apply_logging_threads_and_stamps_levels_intent(adapter_client
 
 
 async def test_run_apply_logging_levels_only_is_eligible(adapter_client):
-    """A levels-only accept (no host intent at all) must still trigger the logging scope."""
+    """A levels-only accept (no host intent at all) must still make the job do work."""
     from nso_adapter.store.models import LoggingLevelsIntent
 
     device_id = await _seed_device("rtr-logging-lvl2", 312)
@@ -1360,40 +1241,81 @@ async def test_run_apply_logging_levels_only_is_eligible(adapter_client):
         db.add(LoggingLevelsIntent(device_id=device_id, monitor_severity="NOTICE", accepted_at=datetime.now(UTC)))
         await db.commit()
 
-    mock_client = AsyncMock()
+    sender = AsyncMock(return_value=None)
     with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_logging_config", new_callable=AsyncMock) as mock_apply,
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, sender),
+        patch("nso_adapter.nso.apply.local_levels_write_enabled", return_value=True),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    mock_apply.assert_awaited_once()
+    sender.assert_awaited_once()
     async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result["logging_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
 
 
-async def test_run_apply_scope_failure_marks_error(adapter_client):
-    """A scope NsoApplyError fails the job, stamps last_apply_error, and tags the item."""
+async def test_gated_local_levels_refuse_the_whole_send(adapter_client):
+    """The deploy gate refuses the DOCUMENT, because one document is one transaction.
+
+    Omitting the logging family would retract it and sending a host-only body would
+    FASTMAP-retract the severities the device already holds, so neither weaker send exists:
+    the job fails having transmitted nothing, and every family stays pending.
+    """
+    from nso_adapter.store.models import LoggingLevelsIntent, VlanIntent
+
+    device_id = await _seed_device("rtr-logging-gated", 313)
+    job_id = await _seed_apply_job(device_id)
+    async with session() as db:
+        db.add(LoggingLevelsIntent(device_id=device_id, monitor_severity="NOTICE", accepted_at=datetime.now(UTC)))
+        db.add(VlanIntent(device_id=device_id, vlan_id=77, accepted_at=datetime.now(UTC)))
+        await db.commit()
+
+    sender = AsyncMock(return_value=None)
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, sender),
+        patch("nso_adapter.nso.apply.local_levels_write_enabled", return_value=False),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    sender.assert_not_awaited()
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.result["logging_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
+        # the unrelated family never reached the device either, so it stays pending
+        assert job.result["vlan_count_by_outcome"] == {"in_sync": 0, "apply_failed": 0}
+        row = (await db.execute(select(VlanIntent).where(VlanIntent.device_id == device_id))).scalar_one()
+        assert row.last_apply_at is None and row.last_apply_error is None
+
+
+async def test_run_apply_a_rejected_commit_fails_every_family_it_carried(adapter_client):
+    """One transaction, one outcome: a rejected PUT landed NOTHING, so nothing is in_sync.
+
+    The old per-scope path could fail one family and commit the rest. Under a full-document
+    PUT that is a lie: the whole transaction rolled back, and claiming otherwise would settle
+    rows the device never took.
+    """
     from nso_adapter.nso.apply import NsoApplyError
-    from nso_adapter.store.models import StaticRouteIntent
+    from nso_adapter.store.models import StaticRouteIntent, VlanIntent
 
     device_id = await _seed_device("rtr-sr-fail", 310)
     job_id = await _seed_apply_job(device_id)
     async with session() as db:
         db.add(
             StaticRouteIntent(
-                device_id=device_id, prefix="10.8.0.0/24", next_hop="10.8.0.1", accepted_at=datetime.now(UTC)
+                device_id=device_id, vrf="", prefix="10.8.0.0/24", next_hop="10.8.0.1", accepted_at=datetime.now(UTC)
             )
         )
+        db.add(VlanIntent(device_id=device_id, vlan_id=42, accepted_at=datetime.now(UTC)))
         await db.commit()
 
-    mock_client = AsyncMock()
     nso_err = NsoApplyError(code="nso_error", message="route rejected", detail={"x": 1})
     with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock, side_effect=nso_err),
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, AsyncMock(side_effect=nso_err)),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -1401,19 +1323,25 @@ async def test_run_apply_scope_failure_marks_error(adapter_client):
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.result["static_route_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
+        assert job.result["vlan_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
         assert job.error["code"] == "nso_commit_failed"
         items = job.error["detail"]["items"]
-        assert {"type": "static_route", "error": "route rejected"} in items
+        safe_message = "apply error (nso_error); see the server log"
+        assert {"type": "static_route", "error": safe_message} in items
         rows = (
             (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
             .scalars()
             .all()
         )
-        assert rows[0].last_apply_error == {"code": "nso_error", "message": "route rejected", "detail": {"x": 1}}
+        assert rows[0].last_apply_error == {"code": "nso_error", "message": safe_message, "detail": {"x": 1}}
 
 
-async def test_run_apply_scope_unexpected_exception(adapter_client):
-    """A non-NsoApplyError from a scope is caught, recorded as 'internal', job failed."""
+async def test_run_apply_unexpected_send_exception_is_recorded_as_internal(adapter_client):
+    """A non-NsoApplyError from the send is caught, recorded as 'internal', job failed.
+
+    The exception TEXT never reaches the persisted error: a transport exception can carry a
+    URL with credentials in it.
+    """
     from nso_adapter.store.models import VlanIntent
 
     device_id = await _seed_device("rtr-vlan-boom", 311)
@@ -1422,14 +1350,10 @@ async def test_run_apply_scope_unexpected_exception(adapter_client):
         db.add(VlanIntent(device_id=device_id, vlan_id=42, accepted_at=datetime.now(UTC)))
         await db.commit()
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch(
-            "nso_adapter.nso.apply.apply_vlan_config",
-            new_callable=AsyncMock,
-            side_effect=RuntimeError("kaboom"),
-        ),
+        patch(_SENDER, new_callable=AsyncMock, side_effect=RuntimeError("kaboom")),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -1441,7 +1365,7 @@ async def test_run_apply_scope_unexpected_exception(adapter_client):
         assert rows[0].last_apply_error["code"] == "internal"
         assert "kaboom" not in str(rows[0].last_apply_error), "exception text reached the persisted error"
         assert "kaboom" not in str(job.error), "exception text reached the persisted failure items"
-        assert "RuntimeError" in rows[0].last_apply_error["message"]
+        assert rows[0].last_apply_error["message"] == "apply error (internal); see the server log"
 
 
 # The IS-IS sub-collections (process/level/flex) are eligible on their OWN — a per-level
@@ -1475,8 +1399,8 @@ async def test_run_apply_isis_subscope_failure_fails_the_job(adapter_client, mod
 
     nso_err = NsoApplyError(code="nso_error", message="level rejected", detail={})
     with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=AsyncMock()),
-        patch("nso_adapter.nso.apply.apply_isis_interfaces", new_callable=AsyncMock, side_effect=nso_err),
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, new_callable=AsyncMock, side_effect=nso_err),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -1486,7 +1410,7 @@ async def test_run_apply_isis_subscope_failure_fails_the_job(adapter_client, mod
         assert job.result["isis_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
         assert job.error["code"] == "nso_commit_failed"
         rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
-        assert rows[0].last_apply_error["message"] == "level rejected"
+        assert rows[0].last_apply_error["message"] == "apply error (nso_error); see the server log"
 
 
 @pytest.mark.parametrize("model_name, kwargs", _ISIS_SUBSCOPE_CASES)
@@ -1502,8 +1426,8 @@ async def test_run_apply_isis_subscope_success_is_counted(adapter_client, model_
         await db.commit()
 
     with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=AsyncMock()),
-        patch("nso_adapter.nso.apply.apply_isis_interfaces", new_callable=AsyncMock) as mock_apply,
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, new_callable=AsyncMock) as mock_apply,
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -1543,19 +1467,19 @@ async def test_run_apply_isis_applies_process_redist_and_flexalgo(adapter_client
         )
         await db.commit()
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_isis_interfaces", new_callable=AsyncMock) as mock_isis,
+        patch(_SENDER, new_callable=AsyncMock) as sender,
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    mock_isis.assert_awaited_once()
-    call = mock_isis.await_args.kwargs
-    assert len(call["isis_intent_rows"]) == 1
-    assert len(call["isis_process_rows"]) == 1
-    assert len(call["redistribution_rows"]) == 1
-    assert len(call["flex_algo_rows"]) == 1
+    sender.assert_awaited_once()
+    isis = sent_document(sender)["isis"]
+    assert len(isis["interface-config"]) == 1
+    (process,) = isis["process-config"]
+    assert len(process["redistribute"]) == 1
+    assert len(process["flex-algo"]) == 1
     async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
@@ -1590,19 +1514,18 @@ async def test_run_apply_ospf_applies_instance_interface_and_redist(adapter_clie
         )
         await db.commit()
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_ospf_config", new_callable=AsyncMock) as mock_ospf,
-        patch("nso_adapter.nso.apply.apply_bgp_config", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock) as sender,
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    mock_ospf.assert_awaited_once()
-    call = mock_ospf.await_args.kwargs
-    assert len(call["process_intent_rows"]) == 1
-    assert len(call["interface_intent_rows"]) == 1
-    assert len(call["redistribution_rows"]) == 1  # only the ospf-destined row
+    sender.assert_awaited_once()
+    ospf = sent_document(sender)["ospf"]
+    assert len(ospf["interface-config"]) == 1
+    redistributed = [entry for process in ospf["process-config"] for entry in process.get("redistribute", [])]
+    assert len(redistributed) == 1  # only the ospf-destined row
     async with session() as db:
         job = await db.get(Job, job_id)
         assert job.result["ospf_count_by_outcome"] == {"in_sync": 3, "apply_failed": 0}
@@ -1643,19 +1566,19 @@ async def test_run_apply_snmp_applies_all_row_types(adapter_client):
         db.add(SnmpSystemInfoIntent(device_id=device_id, location="rack-7", accepted_at=datetime.now(UTC)))
         await db.commit()
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_snmp_config", new_callable=AsyncMock) as mock_snmp,
+        patch(_SENDER, new_callable=AsyncMock) as sender,
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    mock_snmp.assert_awaited_once()
-    call = mock_snmp.await_args.kwargs
-    assert len(call["community_intents"]) == 1
-    assert len(call["v3_user_intents"]) == 1
-    assert len(call["host_intents"]) == 1
-    assert call["system_info_intent"] is not None
+    sender.assert_awaited_once()
+    snmp = sent_document(sender)["snmp"]
+    assert len(snmp["community"]) == 1
+    assert len(snmp["v3-user"]) == 1
+    assert len(snmp["host"]) == 1
+    assert snmp["location"] == "rack-7"
     async with session() as db:
         job = await db.get(Job, job_id)
         # 3 list rows + 1 system-info row
@@ -1690,12 +1613,12 @@ async def test_run_apply_route_policy_failure_records_capability(adapter_client)
         )
         await db.commit()
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     nso_err = NsoApplyError(code="nso_error", message="unsupported set community RM-IN", detail={})
     rec = AsyncMock()
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_route_policy_config", new_callable=AsyncMock, side_effect=nso_err),
+        patch(_SENDER, new_callable=AsyncMock, side_effect=nso_err),
         patch(
             "nso_adapter.core.capability.refresh_device_capability",
             new_callable=AsyncMock,
@@ -1731,11 +1654,11 @@ async def test_run_apply_route_policy_capability_recording_is_best_effort(adapte
         )
         await db.commit()
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     nso_err = NsoApplyError(code="nso_error", message="boom", detail={})
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_route_policy_config", new_callable=AsyncMock, side_effect=nso_err),
+        patch(_SENDER, new_callable=AsyncMock, side_effect=nso_err),
         patch(
             "nso_adapter.core.capability.refresh_device_capability",
             new_callable=AsyncMock,
@@ -1765,12 +1688,12 @@ async def test_run_apply_route_policy_capability_skips_record_when_unparseable(a
         )
         await db.commit()
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     nso_err = NsoApplyError(code="nso_error", message="opaque error", detail={})
     rec = AsyncMock()
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_route_policy_config", new_callable=AsyncMock, side_effect=nso_err),
+        patch(_SENDER, new_callable=AsyncMock, side_effect=nso_err),
         patch(
             "nso_adapter.core.capability.refresh_device_capability",
             new_callable=AsyncMock,
@@ -1796,11 +1719,11 @@ async def test_run_apply_ip_unexpected_exception(adapter_client):
     job_id = await _seed_apply_job(device_id)
     await _seed_ip_intent(iface_id, address="10.6.0.1/24", family="ipv4")
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(
-            "nso_adapter.nso.apply.apply_interface_ips",
+            _SENDER,
             new_callable=AsyncMock,
             side_effect=RuntimeError("transport exploded"),
         ),
@@ -1819,10 +1742,10 @@ async def test_run_apply_ip_unexpected_exception(adapter_client):
         assert rows[0].last_apply_error["code"] == "internal"
         assert "transport exploded" not in str(rows[0].last_apply_error), "exception text reached the persisted error"
         assert "transport exploded" not in str(job.error), "exception text reached the persisted failure items"
-        assert "RuntimeError" in rows[0].last_apply_error["message"]
+        assert rows[0].last_apply_error["message"] == "apply error (internal); see the server log"
 
 
-# ── Atomic apply (NSO_ADAPTER_ATOMIC_APPLY): subif + IP in one transaction ─────
+# ── one document, one transaction, one commit ─────────────────────────────────
 
 
 async def _seed_subif_and_ip(device_id: int, iface_name: str = "ae99.999") -> int:
@@ -1888,32 +1811,28 @@ async def _seed_snmp_and_static_route(device_id: int) -> None:
         return
 
 
-@pytest.mark.asyncio
-async def test_run_apply_atomic_stages_subif_and_ip_in_one_commit(adapter_client, monkeypatch):
-    """With NSO_ADAPTER_ATOMIC_APPLY on, subif + IP are staged (by the REAL body-builders)
-    and committed via ONE apply_combined call carrying both module bodies in one transaction."""
-    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
+async def test_the_document_carries_the_subif_and_its_address_in_one_commit(adapter_client):
+    """A subinterface and the address on it land in ONE transaction, so FASTMAP orders them.
+
+    The greenfield ordering dependency (an address on a unit the same push defines) is what
+    the single transaction dissolves; two commits could not express it.
+    """
     device_id = await _seed_device(name="sw01")
     await _seed_subif_and_ip(device_id)
     job_id = await _seed_apply_job(device_id)
 
-    mock_client = AsyncMock()
-    combined = AsyncMock(return_value=None)
-    with ExitStack() as stack:
-        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
-        # Only the NSO commit boundary is mocked — the real scope body-builders run, staging
-        # their bodies into the combined modules dict that apply_combined receives.
-        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", combined))
+    sender = AsyncMock(return_value=None)
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, sender),
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    combined.assert_awaited_once()
-    modules = combined.await_args.args[2]
-    assert set(modules) == {"subinterface-reconciler:subif-config", "interface-reconciler:interface-config"}
-    # The IP rides ae99.999 in the SAME edit as the subif that defines its unit.
-    iface_entry = modules["interface-reconciler:interface-config"][0]
+    sender.assert_awaited_once()
+    (iface_entry,) = sent_list(sender, "interface", "interface")
     assert iface_entry["interface-name"] == "ae99.999"
     assert iface_entry["ipv4-address"][0]["address"] == "198.18.1.1"
-    assert modules["subinterface-reconciler:subif-config"][0]["interface"][0]["interface-name"] == "ae99.999"
+    assert sent_list(sender, "subinterface", "interface")[0]["interface-name"] == "ae99.999"
 
     subif_rows, ip_rows = await _ip_and_subif_rows(device_id)
     assert all(r.last_apply_at is not None and r.last_apply_error is None for r in subif_rows + ip_rows)
@@ -1922,97 +1841,45 @@ async def test_run_apply_atomic_stages_subif_and_ip_in_one_commit(adapter_client
         assert job.status == JobStatus.succeeded
 
 
-@pytest.mark.asyncio
-async def test_run_apply_atomic_stages_all_scopes_in_one_commit(adapter_client, monkeypatch):
-    """I3b: every scope (not just subif+IP) lands in ONE apply_combined transaction."""
-    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
+async def test_the_document_carries_every_family_the_device_authorized(adapter_client):
+    """One PUT, every family: a family the body omits is a family the PUT RETRACTS.
+
+    So the send is never a subset of what the device holds, even when the job only settles
+    the families its own generation promoted.
+    """
+    from nso_adapter.core.projection import section_registry
+
     device_id = await _seed_device(name="sw01")
     await _seed_subif_and_ip(device_id)
     await _seed_snmp_and_static_route(device_id)
     job_id = await _seed_apply_job(device_id)
 
-    mock_client = AsyncMock()
-    combined = AsyncMock(return_value=None)
-    with ExitStack() as stack:
-        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
-        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", combined))
+    sender = AsyncMock(return_value=None)
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, sender),
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    combined.assert_awaited_once()
-    modules = combined.await_args.args[2]
-    assert {
-        "subinterface-reconciler:subif-config",
-        "interface-reconciler:interface-config",
-        "snmp-reconciler:snmp-config",
-        "static-route-reconciler:static-route-config",
-    } <= set(modules)
+    sender.assert_awaited_once()
+    containers = sent_document(sender)
+    assert {"subinterface", "interface", "snmp", "static-route"} <= set(containers)
+    # Every family the document carries reaches the wire, empty ones included: an absent
+    # container owns nothing, which is not the same statement as an empty one.
+    registry = section_registry()
+    document_families = {registry[section].container for section in ("bgp", "vlan", "isis", "ospf", "logging")}
+    assert document_families <= set(containers)
     async with session() as db:
         assert (await db.get(Job, job_id)).status == JobStatus.succeeded
 
 
-@pytest.mark.asyncio
-async def test_run_apply_atomic_unrenderable_scope_does_not_take_down_the_job(adapter_client, monkeypatch):
-    """A scope whose BODY cannot be built must fail alone — not the entire apply.
+async def test_attributes_and_addresses_merge_into_one_interface_entry(adapter_client):
+    """Attribute + address intent on ONE interface merge into ONE keyed entry.
 
-    A renderer error while _stage_atomic_modules assembles the combined body must not fail
-    unrelated scopes. Isolate the offender, stamp its rows, drop it from the transaction,
-    and commit the rest.
+    They share the interface-name key, so two list items would be a duplicate-key conflict.
     """
-    from nso_adapter.nso.apply import NsoApplyError
-    from nso_adapter.store.models import SnmpCommunityIntent, StaticRouteIntent
-
-    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
-    device_id = await _seed_device(name="sw01-unrenderable")
-    await _seed_snmp_and_static_route(device_id)
-    job_id = await _seed_apply_job(device_id)
-
-    mock_client = AsyncMock()
-    combined = AsyncMock(return_value=None)
-    with ExitStack() as stack:
-        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
-        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", combined))
-        stack.enter_context(
-            patch(
-                "nso_adapter.nso.apply.apply_snmp_config",
-                new_callable=AsyncMock,
-                side_effect=NsoApplyError("invalid_vault_ref", "SNMP render refused its recorded reference"),
-            )
-        )
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
-
-    # The healthy scopes still committed, without the offender's module.
-    combined.assert_awaited_once()
-    modules = combined.await_args.args[2]
-    assert "static-route-reconciler:static-route-config" in modules
-    assert "snmp-reconciler:snmp-config" not in modules
-
-    async with session() as db:
-        job = await db.get(Job, job_id)
-        assert job.status == JobStatus.failed  # the snmp scope really did fail
-        assert job.result["snmp_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
-        assert job.result["static_route_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
-        comm = (
-            (await db.execute(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id)))
-            .scalars()
-            .one()
-        )
-        assert comm.last_apply_error["code"] == "invalid_vault_ref"
-        sr = (
-            (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
-            .scalars()
-            .one()
-        )
-        assert sr.last_apply_error is None  # an innocent scope was not punished
-        assert sr.last_apply_at is not None
-
-
-@pytest.mark.asyncio
-async def test_run_apply_atomic_merges_attr_and_ip_into_one_interface_entry(adapter_client, monkeypatch):
-    """Attribute + IP intent on the SAME interface merge into ONE interface-config entry
-    (they share the (device, interface-name) key — two list items would conflict)."""
     from nso_adapter.store.models import InterfaceIpIntent
 
-    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await _seed_device(name="sw01")
     iface_id, _attr_id = await _seed_interface_with_intent(
         device_id, "Gi0/1", "description", "uplink", SyncState.accepted
@@ -2030,62 +1897,57 @@ async def test_run_apply_atomic_merges_attr_and_ip_into_one_interface_entry(adap
         await db.commit()
     job_id = await _seed_apply_job(device_id)
 
-    mock_client = AsyncMock()
-    combined = AsyncMock(return_value=None)
-    with ExitStack() as stack:
-        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
-        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", combined))
+    sender = AsyncMock(return_value=None)
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, sender),
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    entries = combined.await_args.args[2]["interface-reconciler:interface-config"]
-    gi = [e for e in entries if e["interface-name"] == "Gi0/1"]
+    gi = [e for e in sent_list(sender, "interface", "interface") if e["interface-name"] == "Gi0/1"]
     assert len(gi) == 1  # ONE merged entry, not two
     assert gi[0]["description"] == "uplink"
     assert gi[0]["ipv4-address"][0]["address"] == "10.0.0.1"
 
 
-@pytest.mark.asyncio
-async def test_run_apply_atomic_failure_localizes_offender_others_pending(adapter_client, monkeypatch):
-    """An atomic failure fails only the localised offender scope; non-offenders are pending
-    (rolled back, untouched → retried next apply). The job fails."""
+async def test_a_rejected_commit_fails_all_families_with_localized_attribution(adapter_client):
+    """A localized refusal fails every row in the rolled-back transaction."""
     from nso_adapter.nso.apply import NsoApplyError
     from nso_adapter.store.models import SnmpCommunityIntent, StaticRouteIntent
 
-    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await _seed_device(name="sw01")
     await _seed_snmp_and_static_route(device_id)
     job_id = await _seed_apply_job(device_id)
 
-    mock_client = AsyncMock()
-    boom = AsyncMock(side_effect=NsoApplyError("nso_patch_failed", "static route rejected"))
+    boom = AsyncMock(side_effect=NsoApplyError("nso_put_failed", "static route rejected"))
 
     async def _fake_localize(*_a, **_k):
-        return {"static-route-reconciler:static-route-config": "static route rejected"}, (None, None)
+        return {"static-route": "static route rejected"}, (None, None)
 
-    with ExitStack() as stack:
-        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
-        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", boom))
-        stack.enter_context(patch("nso_adapter.core.apply._localize_atomic_failure", _fake_localize))
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, boom),
+        patch("nso_adapter.core.apply._localize_document_failure", _fake_localize),
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     async with session() as db:
         sr = (await db.execute(select(StaticRouteIntent))).scalars().all()
         sc = (await db.execute(select(SnmpCommunityIntent))).scalars().all()
         assert sr and all(r.last_apply_error is not None for r in sr)  # offender → failed
-        assert sc and all(r.last_apply_error is None and r.last_apply_at is None for r in sc)  # pending
+        assert sc and all(r.last_apply_error is not None and r.last_apply_at is None for r in sc)
         assert (await db.get(Job, job_id)).status == JobStatus.failed
 
 
-@pytest.mark.asyncio
-async def test_run_apply_atomic_failure_records_scope_capability(adapter_client, monkeypatch):
-    """An atomic failure records a capability rejection for the localised offender scope —
-    generalised beyond route-policy. The NED rejecting a scope's dry-run is a real capability
-    gap, so the matrix learns ``(ned, sw, static_route) = unsupported``; the scope that
-    compiled fine (snmp) gets no row."""
+async def test_localisation_empties_one_family_at_a_time_and_records_its_capability(adapter_client):
+    """The family whose REMOVAL lets the document compile is the offender, and it is recorded.
+
+    The NED refusing a family it cannot compile is a real capability gap, so the matrix learns
+    ``(ned, sw, static_route) = unsupported``; the family that compiled fine gets no row.
+    """
     from nso_adapter.nso.apply import NsoApplyError
     from nso_adapter.store.models import Device, DeviceCapability, SnmpCommunityIntent, StaticRouteIntent
 
-    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await _seed_device(name="sw01")
     await _seed_snmp_and_static_route(device_id)
     async with session() as db:  # give the device a known (ned, sw) so no probe is needed
@@ -2094,18 +1956,18 @@ async def test_run_apply_atomic_failure_records_scope_capability(adapter_client,
         await db.commit()
     job_id = await _seed_apply_job(device_id)
 
-    async def _combined(client, device_name, modules, *, dry_run=False, strict=False):
+    async def _sender(client, device_name, containers, *, dry_run=False, no_networking=False, strict=False):
         if not dry_run:
-            raise NsoApplyError("nso_patch_failed", "static route rejected by NED")
-        # per-scope dry-run localisation (strict): only static-route conclusively rejects
-        if "static-route-reconciler:static-route-config" in modules:
+            raise NsoApplyError("nso_put_failed", "static route rejected by NED")
+        # the localisation trials: only the document WITHOUT static-route compiles
+        if "static-route" in containers:
             raise NsoApplyError("dry_run_rejected", "static route cannot compile on this NED")
         return "delta"
 
-    mock_client = AsyncMock()
-    with ExitStack() as stack:
-        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
-        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", _combined))
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, _sender),
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     async with session() as db:
@@ -2117,25 +1979,67 @@ async def test_run_apply_atomic_failure_records_scope_capability(adapter_client,
         by_scope = {c.scope: c for c in caps}
         assert "static_route" in by_scope and by_scope["static_route"].status == "unsupported"
         assert "snmp" not in by_scope  # compiled fine → not an offender → no capability row
-        # offender failed, snmp pending, job failed
+        # Every transmitted family failed.
         sr = (await db.execute(select(StaticRouteIntent))).scalars().all()
         sc = (await db.execute(select(SnmpCommunityIntent))).scalars().all()
         assert all(r.last_apply_error is not None for r in sr)
-        assert all(r.last_apply_error is None and r.last_apply_at is None for r in sc)
+        assert all(r.last_apply_error is not None and r.last_apply_at is None for r in sc)
         assert (await db.get(Job, job_id)).status == JobStatus.failed
 
 
-@pytest.mark.asyncio
-async def test_run_apply_atomic_iface_rejection_attributed_to_offending_half(adapter_client, monkeypatch):
-    """H2: a rejected merged interface-config module whose error names the IP half records
-    ONLY (interface_ip, <construct>) — interface_attribute no longer falsely warns (the old
-    coarse recording marked BOTH scopes on one rejection)."""
-    from datetime import datetime
+async def test_a_refusal_that_names_its_family_skips_the_localisation_loop(adapter_client):
+    """The aggregate names the offending family in its refusal, so no dry-run loop is needed.
 
+    ``device-intent: refused [family=<container> ...]`` is the ratified refusal shape; reading
+    it is exact, where emptying families one at a time is only a fallback.
+    """
+    from nso_adapter.nso.apply import NsoApplyError
+    from nso_adapter.store.models import Device, DeviceCapability, SnmpCommunityIntent
+
+    device_id = await _seed_device(name="sw01-named-refusal")
+    await _seed_snmp_and_static_route(device_id)
+    async with session() as db:
+        dev = await db.get(Device, device_id)
+        dev.ned_id, dev.sw_version = "cisco-ios-cli:cisco-ios", "15.7"
+        await db.commit()
+    job_id = await _seed_apply_job(device_id)
+
+    refusal = "device-intent: refused [family=snmp field=community]: no such construct"
+    trials: list[set[str]] = []
+
+    async def _sender(client, device_name, containers, *, dry_run=False, no_networking=False, strict=False):
+        if dry_run:
+            trials.append(set(containers))
+            return "delta"
+        raise NsoApplyError(
+            "nso_put_failed",
+            "commit rejected",
+            detail={"nso_error": {"ietf-restconf:errors": {"error": [{"error-message": refusal}]}}},
+        )
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, _sender),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    assert trials == [], "the refusal named its own family, so no localisation dry-run was needed"
+    async with session() as db:
+        caps = (await db.execute(select(DeviceCapability))).scalars().all()
+        assert {c.scope for c in caps} == {"snmp"}
+        comm = (await db.execute(select(SnmpCommunityIntent))).scalars().one()
+        assert comm.last_apply_error is not None
+
+
+async def test_a_rejected_interface_family_is_attributed_to_the_offending_half(adapter_client):
+    """H2: a rejection naming the address node records ONLY ``interface_ip``.
+
+    The interface container carries both halves, so coarse recording made the attribute half
+    falsely warn that it is unsupported.
+    """
     from nso_adapter.nso.apply import NsoApplyError
     from nso_adapter.store.models import Device, DeviceCapability, InterfaceIpIntent
 
-    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await _seed_device(name="sw01")
     iface_id, _attr_id = await _seed_interface_with_intent(
         device_id, "Gi0/1", "description", "uplink", SyncState.accepted
@@ -2162,17 +2066,21 @@ async def test_run_apply_atomic_iface_rejection_attributed_to_offending_half(ada
         ' "99" is out of range.'
     )
 
-    async def _combined(client, device_name, modules, *, dry_run=False, strict=False):
+    async def _sender(client, device_name, containers, *, dry_run=False, no_networking=False, strict=False):
         if not dry_run:
-            raise NsoApplyError("nso_patch_failed", reject_msg)
-        if "interface-reconciler:interface-config" in modules:
+            raise NsoApplyError(
+                "nso_put_failed",
+                reject_msg,
+                detail={"nso_error": {"ietf-restconf:errors": {"error": [{"error-message": reject_msg}]}}},
+            )
+        if "interface" in containers:
             raise NsoApplyError("dry_run_rejected", reject_msg)
         return "delta"
 
-    mock_client = AsyncMock()
-    with ExitStack() as stack:
-        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
-        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", _combined))
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, _sender),
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     async with session() as db:
@@ -2187,16 +2095,14 @@ async def test_run_apply_atomic_iface_rejection_attributed_to_offending_half(ada
         assert "interface_attribute" not in by_scope  # the attribute half no longer falsely warns
 
 
-@pytest.mark.asyncio
-async def test_run_apply_atomic_iface_rejection_unattributable_falls_back_to_both(adapter_client, monkeypatch):
-    """When the rejection names no known construct, the fail-safe records BOTH halves coarse —
-    losing precision, never losing the record."""
-    from datetime import datetime
+async def test_an_unattributable_interface_rejection_records_both_halves(adapter_client):
+    """When the rejection names no known construct, the fail-safe records BOTH halves coarse.
 
+    Losing precision, never losing the record.
+    """
     from nso_adapter.nso.apply import NsoApplyError
     from nso_adapter.store.models import Device, DeviceCapability, InterfaceIpIntent
 
-    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await _seed_device(name="sw01")
     iface_id, _attr_id = await _seed_interface_with_intent(
         device_id, "Gi0/2", "description", "uplink", SyncState.accepted
@@ -2216,17 +2122,17 @@ async def test_run_apply_atomic_iface_rejection_unattributable_falls_back_to_bot
         await db.commit()
     job_id = await _seed_apply_job(device_id)
 
-    async def _combined(client, device_name, modules, *, dry_run=False, strict=False):
+    async def _sender(client, device_name, containers, *, dry_run=False, no_networking=False, strict=False):
         if not dry_run:
-            raise NsoApplyError("nso_patch_failed", "opaque NED failure")
-        if "interface-reconciler:interface-config" in modules:
+            raise NsoApplyError("nso_put_failed", "opaque NED failure")
+        if "interface" in containers:
             raise NsoApplyError("dry_run_rejected", "opaque NED failure")
         return "delta"
 
-    mock_client = AsyncMock()
-    with ExitStack() as stack:
-        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
-        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", _combined))
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, _sender),
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     async with session() as db:
@@ -2239,15 +2145,15 @@ async def test_run_apply_atomic_iface_rejection_unattributable_falls_back_to_bot
         assert "interface_ip" in by_scope and "interface_attribute" in by_scope  # coarse fallback
 
 
-@pytest.mark.asyncio
-async def test_run_apply_atomic_success_clears_stale_reactive_unsupported(adapter_client, monkeypatch):
-    """A clean atomic commit is the strongest positive signal — it clears a prior reactive
-    'unsupported' verdict for the applied scopes so the gap does not stick forever (a probe
-    cannot downgrade an apply-rejection). A scope that was NOT applied, and any route-policy
-    fine-grained construct row, are left untouched."""
+async def test_a_clean_commit_clears_the_stale_reactive_unsupported(adapter_client):
+    """A clean commit proves every family in the document applies, so stale gaps are cleared.
+
+    A probe cannot downgrade an apply-rejection, so without this the gap sticks forever. The
+    scope set is the DOCUMENT's families now, not only the ones with rows; a fine-grained
+    construct row is still never cleared.
+    """
     from nso_adapter.store.models import Device, DeviceCapability
 
-    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await _seed_device(name="sw01")
     await _seed_snmp_and_static_route(device_id)
     ned = "cisco-ios-cli:cisco-ios"
@@ -2269,15 +2175,6 @@ async def test_run_apply_atomic_success_clears_stale_reactive_unsupported(adapte
                 DeviceCapability(
                     ned_id=ned,
                     sw_version="15.7",
-                    scope="route_policy",
-                    name="route_policy",
-                    status="unsupported",
-                    detail="old error",
-                    source="apply",
-                ),
-                DeviceCapability(
-                    ned_id=ned,
-                    sw_version="15.7",
                     scope="rm-set",
                     name="set extcommunity color",
                     status="unsupported",
@@ -2289,11 +2186,10 @@ async def test_run_apply_atomic_success_clears_stale_reactive_unsupported(adapte
         await db.commit()
     job_id = await _seed_apply_job(device_id)
 
-    mock_client = AsyncMock()
-    combined = AsyncMock(return_value=None)  # clean commit (snmp + static_route both apply)
-    with ExitStack() as stack:
-        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
-        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", combined))
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, AsyncMock(return_value=None)),
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     async with session() as db:
@@ -2301,8 +2197,7 @@ async def test_run_apply_atomic_success_clears_stale_reactive_unsupported(adapte
             (c.scope, c.name): c
             for c in (await db.execute(select(DeviceCapability).where(DeviceCapability.ned_id == ned))).scalars().all()
         }
-        assert ("snmp", "snmp") not in by_key  # applied scope → stale rejection cleared
-        assert ("route_policy", "route_policy") in by_key  # NOT applied → untouched
+        assert ("snmp", "snmp") not in by_key  # a family the commit carried → stale rejection cleared
         assert ("rm-set", "set extcommunity color") in by_key  # fine-grained → never cleared
         assert (await db.get(Job, job_id)).status == JobStatus.succeeded
 
@@ -2326,7 +2221,7 @@ async def _seed_route_map_intent(device_id, ned_id):
 
 
 @pytest.mark.asyncio
-async def test_run_apply_atomic_misconfig_device_rejection_records_no_capability(adapter_client, monkeypatch):
+async def test_run_apply_misconfig_device_rejection_records_no_capability(adapter_client):
     """A generic device rejection that no per-scope dry-run localises — e.g. a route-map
     referencing a prefix-list not included in the push (a MISCONFIGURATION, not a NED limit) —
     must NOT record capability; that would be a false 'unsupported' verdict. The job still fails
@@ -2335,14 +2230,13 @@ async def test_run_apply_atomic_misconfig_device_rejection_records_no_capability
     from nso_adapter.nso.apply import NsoApplyError
     from nso_adapter.store.models import DeviceCapability, RoutePolicyObjectIntent
 
-    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await _seed_device(name="sw01")
     await _seed_route_map_intent(device_id, "juniper-junos-nc-4.19:junos")
     job_id = await _seed_apply_job(device_id)
 
     device_err = "RPC error towards sw01: Policy error: PL-X prefix-list referenced (in term 10) but not defined"
 
-    async def _combined(client, device_name, modules, *, dry_run=False, strict=False):
+    async def _sender(client, device_name, containers, *, dry_run=False, no_networking=False, strict=False):
         if not dry_run:
             raise NsoApplyError(
                 "nso_patch_failed",
@@ -2351,10 +2245,10 @@ async def test_run_apply_atomic_misconfig_device_rejection_records_no_capability
             )
         return "rendered-delta"  # route-policy renders clean in dry-run → not localised
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     with ExitStack() as stack:
         stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
-        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", _combined))
+        stack.enter_context(patch(_SENDER, _sender))
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     async with session() as db:
@@ -2365,25 +2259,24 @@ async def test_run_apply_atomic_misconfig_device_rejection_records_no_capability
 
 
 @pytest.mark.asyncio
-async def test_run_apply_atomic_transient_failure_records_no_capability(adapter_client, monkeypatch):
+async def test_run_apply_transient_failure_records_no_capability(adapter_client):
     """A transport/internal failure (no device rejection) records NO capability — no false verdict."""
     from nso_adapter.nso.apply import NsoApplyError
     from nso_adapter.store.models import DeviceCapability
 
-    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await _seed_device(name="sw01")
     await _seed_route_map_intent(device_id, "juniper-junos-nc-4.19:junos")
     job_id = await _seed_apply_job(device_id)
 
-    async def _combined(client, device_name, modules, *, dry_run=False, strict=False):
+    async def _sender(client, device_name, containers, *, dry_run=False, no_networking=False, strict=False):
         if not dry_run:
             raise NsoApplyError("internal", "connection timed out")  # transport — no nso_error
         return "rendered-delta"
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     with ExitStack() as stack:
         stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
-        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", _combined))
+        stack.enter_context(patch(_SENDER, _sender))
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     async with session() as db:
@@ -2392,13 +2285,12 @@ async def test_run_apply_atomic_transient_failure_records_no_capability(adapter_
 
 
 @pytest.mark.asyncio
-async def test_run_apply_atomic_transient_during_localize_records_no_capability(adapter_client, monkeypatch):
+async def test_run_apply_transient_during_localize_records_no_capability(adapter_client):
     """A transient transport error DURING per-scope localisation must NOT brand the scope
     'unsupported' — only a conclusive rejection is a capability signal (finding #10)."""
     from nso_adapter.nso.apply import NsoApplyError
     from nso_adapter.store.models import Device, DeviceCapability
 
-    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await _seed_device(name="sw01")
     await _seed_snmp_and_static_route(device_id)
     async with session() as db:
@@ -2409,7 +2301,7 @@ async def test_run_apply_atomic_transient_during_localize_records_no_capability(
 
     device_err = "RPC error: something rejected"
 
-    async def _combined(client, device_name, modules, *, dry_run=False, strict=False):
+    async def _sender(client, device_name, containers, *, dry_run=False, no_networking=False, strict=False):
         if not dry_run:
             raise NsoApplyError(
                 "nso_patch_failed",
@@ -2418,10 +2310,10 @@ async def test_run_apply_atomic_transient_during_localize_records_no_capability(
             )
         raise ConnectionError("transient blip during localisation")  # transport, not a conclusive reject
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     with ExitStack() as stack:
         stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
-        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", _combined))
+        stack.enter_context(patch(_SENDER, _sender))
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     async with session() as db:
@@ -2462,12 +2354,13 @@ async def test_run_apply_marks_failed_even_when_session_poisoned(adapter_client,
 
 
 @pytest.mark.asyncio
-async def test_run_apply_atomic_staging_failure_reverts_deploying(adapter_client, monkeypatch):
-    """If a body-builder raises during staging (e.g. a malformed IP address), the attr states
-    just marked 'deploying' must be reverted, not left stuck deploying forever (#12)."""
+async def test_a_body_build_failure_reverts_deploying(adapter_client):
+    """A body-builder raising (a malformed address) must revert the attrs just marked deploying.
+
+    Otherwise they are stuck deploying forever, since nothing else re-reads them (#12).
+    """
     from nso_adapter.store.models import InterfaceAttrState
 
-    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await _seed_device(name="sw01")
     iface_id, attr_id = await _seed_interface_with_intent(
         device_id, "Gi0/0", "description", "uplink", SyncState.accepted
@@ -2475,7 +2368,7 @@ async def test_run_apply_atomic_staging_failure_reverts_deploying(adapter_client
     await _seed_ip_intent(iface_id, address="10.0.0.1", accepted=True)  # malformed: no /prefix → build raises
     job_id = await _seed_apply_job(device_id)
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -2487,85 +2380,71 @@ async def test_run_apply_atomic_staging_failure_reverts_deploying(adapter_client
 
 
 def test_capability_scopes_for_interface_config_covers_attribute_and_ip():
-    """The merged interface-config module carries BOTH the attribute and IP scopes, so a
-    rejection must record capability under both (else a preflight for interface_attribute
-    sees a false 'fully supported') (#17)."""
-    from nso_adapter.core.apply import _IFACE_CONFIG_ROOT, _capability_scopes_for
+    """The interface container carries BOTH the attribute and IP scopes, so a rejection of it
+    records capability under both — else a preflight for interface_attribute sees a false
+    'fully supported' (#17). Every mapping comes off the registry."""
+    from nso_adapter.core.apply import _capability_scopes_for
 
-    assert _capability_scopes_for(_IFACE_CONFIG_ROOT) == ["interface_attribute", "interface_ip"]
-    assert _capability_scopes_for("snmp-reconciler:snmp-config") == ["snmp"]
-    assert _capability_scopes_for("no-such-root") == []
-
-
-@pytest.mark.asyncio
-async def test_diff_interface_ips_preview_excludes_unaccepted(adapter_client):
-    """The Apply-diff IP preview must gate on accepted_at like the attribute preview and the
-    real apply eligibility — an un-accepted IP intent must not appear in the preview (#19)."""
-    from types import SimpleNamespace
-
-    from nso_adapter.core.apply import _diff_interface_ips
-
-    device_id = await _seed_device("rtr-diff", 301)
-    iface_id = await _seed_iface(device_id, "Gi0/1")
-    await _seed_ip_intent(iface_id, address="10.0.0.1/24", accepted=True)
-    await _seed_ip_intent(iface_id, address="10.0.0.2/24", accepted=False)
-
-    seen_rows: list = []
-
-    async def _apply_ips(*, client, device_name, interface_name, ip_intent_rows, **kw):
-        seen_rows.extend(ip_intent_rows)
-        return ""
-
-    nso_apply = SimpleNamespace(apply_interface_ips=_apply_ips)
-    async with session() as db:
-        iface = await db.get(DbInterface, iface_id)
-        await _diff_interface_ips(db, nso_apply, object(), "rtr-diff", {iface_id: iface})
-
-    assert {r.address for r in seen_rows} == {"10.0.0.1/24"}  # un-accepted 10.0.0.2/24 excluded
+    assert _capability_scopes_for("interface") == ["interface_attribute", "interface_ip"]
+    assert _capability_scopes_for("snmp") == ["snmp"]
+    assert _capability_scopes_for("no-such-family") == []
 
 
-@pytest.mark.asyncio
-async def test_run_apply_atomic_off_uses_per_scope(adapter_client, monkeypatch):
-    """Flag off (default): apply_combined is never used; the per-scope subif + IP writers run."""
-    monkeypatch.delenv("NSO_ADAPTER_ATOMIC_APPLY", raising=False)
-    device_id = await _seed_device(name="sw01")
-    await _seed_subif_and_ip(device_id)
+async def test_an_apply_is_blocked_when_the_document_would_flush_a_live_orphan(adapter_client):
+    """The collateral guard runs on an APPLY too, because one PUT makes every omission a retraction.
+
+    A live VLAN the document neither renders nor is authorized to drop would be silently
+    flushed off the device by an ordinary apply, which is the incident the guard exists for.
+    """
+    from nso_adapter.nso.client import ServiceInstanceState
+    from nso_adapter.store.models import VlanIntent
+
+    device_id = await _seed_device(name="sw01-collateral")
     job_id = await _seed_apply_job(device_id)
+    async with session() as db:
+        db.add(VlanIntent(device_id=device_id, vlan_id=10, accepted_at=datetime.now(UTC)))
+        await db.commit()
 
-    mock_client = AsyncMock()
-    combined = AsyncMock(return_value=None)
-    with ExitStack() as stack:
-        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
-        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", combined))
-        per_subif = stack.enter_context(
-            patch("nso_adapter.nso.apply.apply_subinterface_config", new_callable=AsyncMock, return_value=None)
-        )
-        per_ip = stack.enter_context(
-            patch("nso_adapter.nso.apply.apply_interface_ips", new_callable=AsyncMock, return_value=None)
-        )
+    live = {
+        "device": "sw01-collateral",
+        "vlan": {"vlan": [{"vlan-id": 10}, {"vlan-id": 999}]},  # 999 is nobody's intent
+        "static-route": {"route": []},
+    }
+    client = _nso_client()
+    client.service_instance_state = AsyncMock(return_value=ServiceInstanceState("present", live))
+
+    sender = AsyncMock(return_value=None)
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=client),
+        patch(_SENDER, sender),
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    combined.assert_not_called()
-    per_subif.assert_awaited_once()
-    per_ip.assert_awaited_once()
+    committed = [call for call in sender.await_args_list if not call.kwargs.get("dry_run")]
+    assert committed == [], "a blocked document must not be committed"
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        row = (await db.execute(select(VlanIntent).where(VlanIntent.device_id == device_id))).scalar_one()
+        assert row.last_apply_error["code"] == "removal_blocked_collateral"
+        assert row.last_apply_error["detail"]["orphans"] == {"vlan/vlan": [["999"]]}
 
 
-@pytest.mark.asyncio
-async def test_run_apply_atomic_failure_marks_both_subif_and_ip(adapter_client, monkeypatch):
-    """An atomic commit failure is all-or-nothing: every subif AND IP row records the
-    error and the job fails (the whole pair rolled back together)."""
+async def test_a_failed_commit_marks_both_the_subif_and_its_address(adapter_client):
+    """The commit is all-or-nothing: every subif AND address row records the error.
+
+    They rolled back together, so a half-applied report would be a lie.
+    """
     from nso_adapter.nso.apply import NsoApplyError
 
-    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await _seed_device(name="sw01")
     await _seed_subif_and_ip(device_id)
     job_id = await _seed_apply_job(device_id)
 
-    mock_client = AsyncMock()
-    boom = AsyncMock(side_effect=NsoApplyError("nso_patch_failed", "device said no"))
-    with ExitStack() as stack:
-        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
-        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", boom))
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, AsyncMock(side_effect=NsoApplyError("nso_put_failed", "device said no"))),
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     subif_rows, ip_rows = await _ip_and_subif_rows(device_id)
@@ -2623,13 +2502,13 @@ async def test_run_apply_reader_compare_flags_silent_drop(adapter_client):
         )
         await db.commit()
 
-    mock_client = AsyncMock(spec=NsoClient)
+    mock_client = _nso_client()
     mock_client.run_device_state_read.return_value = _rc_action(
         "rtr-rc-drop", "static_route", {"status": "ok", "route": []}
     )  # commit "ok", key never landed
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -2665,7 +2544,7 @@ async def test_run_apply_reader_compare_ok_when_key_lands(adapter_client):
         )
         await db.commit()
 
-    mock_client = AsyncMock(spec=NsoClient)
+    mock_client = _nso_client()
     mock_client.run_device_state_read.return_value = _rc_action(
         "rtr-rc-ok",
         "static_route",
@@ -2673,7 +2552,7 @@ async def test_run_apply_reader_compare_ok_when_key_lands(adapter_client):
     )
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -2725,7 +2604,7 @@ async def test_run_apply_reader_compare_does_not_fail_a_landed_community(adapter
         )
         await db.commit()
 
-    mock_client = AsyncMock(spec=NsoClient)
+    mock_client = _nso_client()
     # The community IS on the device — under its hashed export identity.
     mock_client.get_device_state_section.return_value = {
         "status": "ok",
@@ -2735,7 +2614,7 @@ async def test_run_apply_reader_compare_does_not_fail_a_landed_community(adapter
     }
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_snmp_config", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -2771,13 +2650,13 @@ async def test_run_apply_reader_compare_still_catches_a_dropped_snmp_host(adapte
         )
         await db.commit()
 
-    mock_client = AsyncMock(spec=NsoClient)
+    mock_client = _nso_client()
     mock_client.run_device_state_read.return_value = _rc_action(
         "rtr-rc-snmp-host", "snmp", {"status": "ok", "community": [], "v3-user": [], "host": []}
     )  # never landed
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_snmp_config", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -2815,13 +2694,13 @@ async def test_run_apply_reader_compare_absent_reader_surface_is_not_a_drop(adap
         )
         await db.commit()
 
-    mock_client = AsyncMock(spec=NsoClient)
+    mock_client = _nso_client()
     mock_client.run_device_state_read.return_value = _rc_action(
         "rtr-rc-none", "static_route", {"status": "unsupported"}
     )  # no export surface on this NED
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -2857,13 +2736,13 @@ async def test_run_apply_reader_compare_empty_list_payload_is_still_a_drop(adapt
         )
         await db.commit()
 
-    mock_client = AsyncMock(spec=NsoClient)
+    mock_client = _nso_client()
     mock_client.run_device_state_read.return_value = _rc_action(
         "rtr-rc-empty", "static_route", {"status": "ok", "route": []}
     )  # answered — and the route is NOT there
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -2917,7 +2796,7 @@ async def test_run_apply_reader_compare_skips_a_fully_unrepresentable_community_
         )
         await db.commit()
 
-    mock_client = AsyncMock(spec=NsoClient)
+    mock_client = _nso_client()
     # The export answers — the object legitimately is not there, because nothing was rendered.
     mock_client.get_device_state_section.return_value = {
         "status": "ok",
@@ -2927,7 +2806,7 @@ async def test_run_apply_reader_compare_skips_a_fully_unrepresentable_community_
     }
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_route_policy_config", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -2961,7 +2840,7 @@ async def test_run_apply_reader_compare_still_fails_a_representable_community_li
         )
         await db.commit()
 
-    mock_client = AsyncMock(spec=NsoClient)
+    mock_client = _nso_client()
     # reader-compare reads the device-state ACTION; device-name is echoed by the real action but
     # ignored on this method mock (cert is exercised in test_device_state_client.py).
     mock_client.run_device_state_read.return_value = {
@@ -2971,7 +2850,7 @@ async def test_run_apply_reader_compare_still_fails_a_representable_community_li
     }
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_route_policy_config", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -3000,11 +2879,11 @@ async def test_run_apply_reader_compare_reader_error_is_nonfatal(adapter_client)
         )
         await db.commit()
 
-    mock_client = AsyncMock(spec=NsoClient)
+    mock_client = _nso_client()
     mock_client.run_device_state_read.side_effect = RuntimeError("reader down")
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -3033,7 +2912,7 @@ async def test_run_apply_reader_compare_bgp_checks_router_and_peers(adapter_clie
         db.add(BgpPeerIntent(scope_id=scope.id, peer_address="10.0.0.9"))
         await db.commit()
 
-    mock_client = AsyncMock(spec=NsoClient)
+    mock_client = _nso_client()
     mock_client.run_device_state_read.return_value = _rc_action(
         "rtr-rc-bgp",
         "bgp",
@@ -3041,7 +2920,7 @@ async def test_run_apply_reader_compare_bgp_checks_router_and_peers(adapter_clie
     )  # 10.0.0.9 silently dropped
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_bgp_config", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -3073,7 +2952,7 @@ async def test_run_apply_reader_compare_isis_flags_only_missing_model(adapter_cl
         db.add(IsisProcessIntent(device_id=device_id, process_tag="CORE", accepted_at=datetime.now(UTC)))
         await db.commit()
 
-    mock_client = AsyncMock(spec=NsoClient)
+    mock_client = _nso_client()
     mock_client.run_device_state_read.return_value = _rc_action(
         "rtr-rc-isis",
         "isis",
@@ -3085,7 +2964,7 @@ async def test_run_apply_reader_compare_isis_flags_only_missing_model(adapter_cl
     )
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_isis_interfaces", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -3137,7 +3016,7 @@ async def _seed_community(device_id: int, *, label="prod-ro", vault_ref=SNMP_VAU
 
 
 async def _apply_snmp(device_id: int, job_id: int, snmp_view: dict) -> Job:
-    mock_client = AsyncMock(spec=NsoClient)
+    mock_client = _nso_client()
     section = {"status": "ok", **snmp_view}
 
     async def _read(device_name, families, *, timeout=None):
@@ -3148,7 +3027,7 @@ async def _apply_snmp(device_id: int, job_id: int, snmp_view: dict) -> Job:
     mock_client.run_device_state_read.side_effect = _read
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_snmp_config", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
     async with session() as db:
@@ -3230,6 +3109,45 @@ async def test_VAULT_DOWN_must_not_stamp_a_landed_community_apply_failed(adapter
         assert row.last_apply_error is None, "a Vault outage must never accuse the WRITER of dropping"
 
 
+_LEAKY_REF = "placeholder-mount/placeholder-path#placeholder-key"
+_LEAKY_COMPONENTS = [_LEAKY_REF, "placeholder-mount", "placeholder-path", "placeholder-key", "placeholder-secret"]
+
+
+async def test_a_VAULT_OUTAGE_puts_no_part_of_the_REFERENCE_in_the_apply_logs(adapter_client):
+    """The same sink on the apply side, where every verified apply reads Vault.
+
+    The reference names a Vault mount, path and key, and the provider's exception can repeat the
+    request and the payload. Only the community LABEL and the failure TYPE may be logged.
+    """
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core import snmp_verify
+    from tests._secret_discipline import EchoingVault, assert_records_free_of
+
+    provider = EchoingVault(_LEAKY_REF, "placeholder-secret")
+    snmp_verify.register_secrets_provider(provider)
+    try:
+        device_id = await _seed_device("rtr-a17-vaultleak", 437)
+        job_id = await _seed_apply_job(device_id)
+        await _seed_community(device_id, vault_ref=_LEAKY_REF)
+        with capture_logs() as logs:
+            job = await _apply_snmp(
+                device_id,
+                job_id,
+                {"community": [{"name": community_export_name(SNMP_COMMUNITY)}], "v3-user": [], "host": []},
+            )
+    finally:
+        snmp_verify.register_secrets_provider(None)
+
+    assert provider.reads == 1, "the outage was never reached"
+    assert job.status == JobStatus.succeeded  # still fails open
+    failed = [record for record in logs if record["event"] == "snmp_verify.vault_read_failed"]
+    assert failed, "the failed read was not reported at all"
+    assert failed[0]["label"] == "prod-ro", "the label is the half the operator needs"
+    assert_records_free_of(logs, _LEAKY_COMPONENTS)
+    assert failed[0]["exception_type"] == "RuntimeError"
+
+
 async def test_a_dropped_HOST_is_still_caught_when_the_community_grain_goes_dark(adapter_client, vault):
     """One grain being unverifiable must not blunt the others — the address-keyed host still fails."""
     from nso_adapter.store.models import SnmpHostIntent
@@ -3307,10 +3225,10 @@ async def test_all_unverifiable_scope_runs_NO_action_and_is_unknown(adapter_clie
     job_id = await _seed_apply_job(device_id)
     await _seed_community(device_id)
 
-    mock_client = AsyncMock(spec=NsoClient)
+    mock_client = _nso_client()
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_snmp_config", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -3321,68 +3239,14 @@ async def test_all_unverifiable_scope_runs_NO_action_and_is_unknown(adapter_clie
         assert job.result["reader_compare"]["snmp"] == "unknown"
 
 
-async def test_reader_compare_budget_exhaustion_yields_unknown(adapter_client, monkeypatch):
-    """r4-M1: the default-path verify is HARD-bounded. The FIRST scope's action blocks past the
-    wall-clock budget → it is asyncio.wait_for-cut to 'unknown'; a LATER checkable scope then sees
-    the budget already spent and SKIPS to 'unknown' without running the (heavy) action at all. The
-    apply still SUCCEEDS — a slow or semaphore-contended action can never wedge or fail a good apply.
-    Exercises both the timeout branch and the remaining<=0 skip (via _reader_compare_checkable)."""
-    from nso_adapter.store.models import StaticRouteIntent, VlanIntent
+async def test_reader_compare_batches_ONE_action_for_every_family(adapter_client):
+    """One commit is ONE post-commit point, so the presence check runs ONE batched action.
 
-    # shrink both the per-apply budget and the per-call ceiling to sub-second (generous enough
-    # that the first scope reliably reaches the action, tight enough that its cut spends the budget)
-    monkeypatch.setattr("nso_adapter.core.removal._VERIFY_TOTAL_BUDGET", 0.3)
-    monkeypatch.setattr("nso_adapter.core.removal._VERIFY_PER_CALL_TIMEOUT", 0.3)
-    device_id = await _seed_device("rtr-rc-budget", 440)
-    job_id = await _seed_apply_job(device_id)
-    async with session() as db:
-        db.add(
-            StaticRouteIntent(
-                device_id=device_id, vrf="", prefix="198.18.40.0/24", next_hop="10.0.0.1", accepted_at=datetime.now(UTC)
-            )
-        )
-        db.add(VlanIntent(device_id=device_id, vlan_id=444, name="rc-budget", accepted_at=datetime.now(UTC)))
-        await db.commit()
-
-    mock_client = AsyncMock(spec=NsoClient)
-    reads: list[str] = []
-
-    async def _slow_read(device_name, families, *, timeout=None):
-        reads.append(families[0])
-        await asyncio.sleep(5)  # far past the 0.05s budget — must be cancelled, not awaited
-        return _rc_action(device_name, "static_route", {"status": "ok", "route": []})
-
-    mock_client.run_device_state_read.side_effect = _slow_read
-    with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
-        patch("nso_adapter.nso.apply.apply_vlan_config", new_callable=AsyncMock),
-    ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
-
-    # exactly ONE scope ever reached the action (the first); the budget was spent, so the
-    # second scope skipped to unknown without a second action call.
-    assert len(reads) == 1, f"a budget-spent scope must NOT run the action, got {reads}"
-    async with session() as db:
-        job = await db.get(Job, job_id)
-        assert job.status == JobStatus.succeeded  # the verify never fails the apply
-        assert job.result["reader_compare"]["static_route"] == "unknown"  # budget-cut
-        assert job.result["reader_compare"]["vlan"] == "unknown"  # budget-spent skip
-        row = (
-            (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
-            .scalars()
-            .one()
-        )
-        assert row.last_apply_error is None  # never accused of a silent drop
-
-
-async def test_atomic_reader_compare_batches_ONE_action_for_all_scopes(adapter_client, monkeypatch):
-    """r1-m3: with atomic apply on, every scope commits in ONE transaction, so the presence check
-    runs ONE batched device-state action for all checkable wire_names (not one per scope), and
-    classifies each section independently — a landed route stays ok while a dropped host fails."""
+    Each family is still classified independently: a landed route stays ok while a dropped
+    host fails.
+    """
     from nso_adapter.store.models import SnmpHostIntent, StaticRouteIntent
 
-    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await _seed_device(name="sw01-atomic-rc")
     async with session() as db:
         db.add(
@@ -3414,11 +3278,12 @@ async def test_atomic_reader_compare_batches_ONE_action_for_all_scopes(adapter_c
             "snmp-config": {"status": "ok", "community": [], "v3-user": [], "host": []},  # host dropped
         }
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     mock_client.run_device_state_read.side_effect = _read
-    with ExitStack() as stack:
-        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
-        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", AsyncMock(return_value=None)))
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch(_SENDER, AsyncMock(return_value=None)),
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     assert len(calls) == 1, f"expected exactly one batched action, got {calls}"
@@ -3447,13 +3312,13 @@ async def test_reader_compare_non_terminal_section_is_error(adapter_client):
         )
         await db.commit()
 
-    mock_client = AsyncMock(spec=NsoClient)
+    mock_client = _nso_client()
     mock_client.run_device_state_read.return_value = _rc_action(
         "rtr-rc-notready", "static_route", {"status": "not-ready"}
     )
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -3482,7 +3347,7 @@ async def test_reader_compare_malformed_ok_section_is_error_not_job_crash(adapte
         )
         await db.commit()
 
-    mock_client = AsyncMock(spec=NsoClient)
+    mock_client = _nso_client()
     mock_client.run_device_state_read.return_value = _rc_action(
         "rtr-rc-malformed",
         "static_route",
@@ -3490,7 +3355,7 @@ async def test_reader_compare_malformed_ok_section_is_error_not_job_crash(adapte
     )
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -3506,12 +3371,13 @@ async def test_reader_compare_malformed_ok_section_is_error_not_job_crash(adapte
         assert row.last_apply_error is None  # never accused of a silent drop
 
 
-async def test_atomic_reader_compare_malformed_section_is_error_not_job_crash(adapter_client, monkeypatch):
-    """codex P2 (atomic path): the batched classifier is likewise guarded — a malformed section
-    for one scope records 'error' and leaves the successful atomic commit intact."""
+async def test_reader_compare_malformed_batched_section_is_error_not_job_crash(adapter_client):
+    """codex P2: the batched classifier is guarded — a malformed section records 'error'.
+
+    A read-side glitch must never turn a successful commit into a job failure.
+    """
     from nso_adapter.store.models import StaticRouteIntent
 
-    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await _seed_device(name="sw01-atomic-malformed")
     async with session() as db:
         db.add(
@@ -3522,15 +3388,16 @@ async def test_atomic_reader_compare_malformed_section_is_error_not_job_crash(ad
         await db.commit()
     job_id = await _seed_apply_job(device_id)
 
-    mock_client = AsyncMock()
+    mock_client = _nso_client()
     mock_client.run_device_state_read.return_value = {
         "atomic": True,
         "device-name": "sw01-atomic-malformed",
         "static-route": {"status": "ok", "route": [1]},  # malformed
     }
-    with ExitStack() as stack:
-        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
-        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", AsyncMock(return_value=None)))
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch(_SENDER, AsyncMock(return_value=None)),
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     async with session() as db:
@@ -3563,11 +3430,11 @@ async def test_action_failure_preserves_unverifiable_labels(adapter_client, vaul
         )
         await db.commit()
 
-    mock_client = AsyncMock(spec=NsoClient)
+    mock_client = _nso_client()
     mock_client.run_device_state_read.side_effect = RuntimeError("action exploded")
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_snmp_config", new_callable=AsyncMock),
+        patch(_SENDER, new_callable=AsyncMock),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -3576,42 +3443,3 @@ async def test_action_failure_preserves_unverifiable_labels(adapter_client, vaul
         assert job.status == JobStatus.succeeded  # a read error never fails a good apply
         assert job.result["reader_compare"]["snmp"] == "error"
         assert job.result["reader_compare_unverifiable"]["snmp"], "the unverifiable community must survive the error"
-
-
-async def test_verifier_budget_excludes_commit_latency(adapter_client, monkeypatch):
-    """codex P1: only VERIFY time counts against _VERIFY_TOTAL_BUDGET — a slow device COMMIT must
-    not starve the scope's own silent-drop verification. With a 0.1s budget and a 0.5s commit, the
-    scope must STILL be verified ('ok'), not skipped to 'unknown' because the commit ate the clock."""
-    from nso_adapter.store.models import StaticRouteIntent
-
-    monkeypatch.setattr("nso_adapter.core.removal._VERIFY_TOTAL_BUDGET", 0.1)
-    device_id = await _seed_device("rtr-rc-commitslow", 444)
-    job_id = await _seed_apply_job(device_id)
-    async with session() as db:
-        db.add(
-            StaticRouteIntent(
-                device_id=device_id, vrf="", prefix="198.18.44.0/24", next_hop="10.0.0.1", accepted_at=datetime.now(UTC)
-            )
-        )
-        await db.commit()
-
-    mock_client = AsyncMock(spec=NsoClient)
-    mock_client.run_device_state_read.return_value = _rc_action(
-        "rtr-rc-commitslow",
-        "static_route",
-        {"status": "ok", "route": [{"vrf": "", "prefix": "198.18.44.0/24", "next-hop": "10.0.0.1"}]},
-    )
-
-    async def _slow_commit(*_a, **_k):
-        await asyncio.sleep(0.5)  # the device commit dwarfs the 0.1s verify budget
-
-    with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock, side_effect=_slow_commit),
-    ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
-
-    async with session() as db:
-        job = await db.get(Job, job_id)
-        assert job.status == JobStatus.succeeded
-        assert job.result["reader_compare"]["static_route"] == "ok"  # verified despite the slow commit

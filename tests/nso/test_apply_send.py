@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""The shared apply send/verify tail (native_dry_run / _send_service_config / verify).
+"""The apply send/verify tail: native_dry_run, apply_device_intent, verify.
 
-Every apply_* write flows through this machinery, so covering it once via a real httpx
+Every write now flows through ONE sender, so covering it once via a real httpx
 MockTransport (a boundary fake — the actual NsoClient + apply code run for real, no method
-mocks) exercises the build→send→dry-run-verify path that the per-family functions reuse.
+mocks) exercises the encode→send→dry-run-verify path the whole write path reuses. The
+per-family cases drive that same real send with one container in the document, so what they
+assert is the bytes NSO would receive, container name included.
 """
 
 from __future__ import annotations
@@ -16,35 +18,39 @@ import httpx
 import pytest
 
 from nso_adapter.config import NsoInstanceConfig
+from nso_adapter.core.community_dialect import community_dialect_for
 from nso_adapter.nso.apply import (
     VERIFY_CONCLUSIVE,
     NsoApplyError,
-    _send_service_config,
+    SectionExecution,
     _verify_native_or_raise,
-    apply_bfd_config,
-    apply_bgp_config,
-    apply_combined,
-    apply_interface_ips,
-    apply_isis_interfaces,
-    apply_logging_config,
-    apply_mtu_config,
-    apply_ospf_config,
-    apply_snmp_config,
-    apply_static_routes,
-    build_interface_ip_entry,
+    apply_device_intent,
+    build_interface_ip_body,
+    encode_bfd,
+    encode_bgp,
+    encode_interface_mtu,
+    encode_isis,
+    encode_logging,
+    encode_ospf,
+    encode_snmp,
+    encode_static_route,
+    local_levels_write_enabled,
     native_dry_run,
-    replace_service_instance,
+    refuse_gated_local_levels,
 )
-from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.client import DEVICE_INTENT_ROOT, NsoClient
 from nso_adapter.nso.nso_json import NSO_LEX_CHUNK, straddling_bare_tokens
 from nso_adapter.store.models import OspfInstanceIntent, OspfInterfaceIntent, RedistributionIntent
 
 _EMPTY_DRYRUN = {"dry-run-result": {"native": {}}}
 
+#: What an encoder that reads no NED-conditioned fact is handed.
+_PLAIN = SectionExecution(None, community_dialect_for(None))
+
 
 class _RecordingTransport(httpx.AsyncBaseTransport):
     """Records every request; replies 200 + a dry-run body to ``dry-run=native`` URLs and
-    ``send_status`` to the apply PATCH/PUT. ``raise_exc`` simulates a transport failure."""
+    ``send_status`` to the apply PUT. ``raise_exc`` simulates a transport failure."""
 
     def __init__(
         self,
@@ -90,6 +96,16 @@ def _client_with(transport: _RecordingTransport) -> NsoClient:
     return client
 
 
+def _sent_document(transport: _RecordingTransport, index: int = 0) -> dict:
+    """The ``list device-intent`` entry the request carried."""
+    return json.loads(transport.requests[index].content)[DEVICE_INTENT_ROOT][0]
+
+
+def _sent(transport: _RecordingTransport, container: str) -> dict:
+    """One family's body out of the transmitted document."""
+    return _sent_document(transport)[container]
+
+
 # ── native_dry_run ─────────────────────────────────────────────────────────────
 
 
@@ -115,64 +131,100 @@ async def test_native_dry_run_none_on_transport_error():
     assert await native_dry_run(client, "http://nso/x", "{}", "sw03") is None
 
 
-# ── _send_service_config ───────────────────────────────────────────────────────
+# ── apply_device_intent: the ONE sender ────────────────────────────────────────
 
 
-async def test_send_service_config_patches_then_verifies_clean():
-    transport = _RecordingTransport(send_status=204)  # PATCH 204, verify dry-run → empty
+async def test_the_sender_puts_the_keyed_instance_then_verifies_clean():
+    transport = _RecordingTransport(send_status=204)  # PUT 204, verify dry-run → empty
     client = _client_with(transport)
 
-    result = await _send_service_config(
-        client, "/restconf/data/svc:cfg", "svc:cfg", "sw03", {"device": "sw03", "x": 1}, scope="snmp"
-    )
+    result = await apply_device_intent(client, "sw03", {"vlan": {"vlan": [{"vlan-id": 10}]}})
 
     # R2 §4.4: a committing send returns its PROOF VERDICT, not None — a consumer that is
     # about to record deletion authority has to tell "proven" from "we did not look".
     assert result == VERIFY_CONCLUSIVE
-    patch_req = transport.requests[0]
-    assert patch_req.method == "PATCH"
-    assert json.loads(patch_req.content) == {"svc:cfg": [{"device": "sw03", "x": 1}]}
-    assert "reconcile=" in str(patch_req.url)
-    # a verify dry-run followed the apply
-    assert any("dry-run=native" in str(r.url) for r in transport.requests[1:])
-
-
-async def test_send_service_config_replace_uses_put_keyed_instance():
-    transport = _RecordingTransport(send_status=200)
-    client = _client_with(transport)
-
-    await _send_service_config(
-        client, "/restconf/data/svc:cfg", "svc:cfg", "sw03", {"device": "sw03"}, scope="isis", replace=True
-    )
-
     put_req = transport.requests[0]
     assert put_req.method == "PUT"
-    assert str(put_req.url).startswith("http://nso/restconf/data/svc:cfg=sw03")
+    assert str(put_req.url).startswith("http://nso/restconf/data/device-intent:device-intent=sw03")
+    assert json.loads(put_req.content) == {
+        DEVICE_INTENT_ROOT: [{"device": "sw03", "vlan": {"vlan": [{"vlan-id": 10}]}}]
+    }
+    assert "reconcile=" in str(put_req.url)
+    # a verify dry-run followed the apply, and it re-issues the SAME method
+    assert any("dry-run=native" in str(r.url) and r.method == "PUT" for r in transport.requests[1:])
 
 
-async def test_send_service_config_raises_on_send_error():
+async def test_the_sender_carries_every_family_in_one_request():
+    """One document is one transaction: the families are keys of ONE instance, not N sends."""
+    transport = _RecordingTransport()
+    client = _client_with(transport)
+
+    await apply_device_intent(
+        client,
+        "sw03",
+        {"vlan": {"vlan": [{"vlan-id": 10}]}, "svi": {"interface": [{"interface-name": "Vlan10"}]}},
+    )
+
+    assert len([r for r in transport.requests if "dry-run" not in str(r.url)]) == 1
+    assert set(_sent_document(transport)) == {"device", "vlan", "svi"}
+
+
+async def test_an_empty_family_body_is_transmitted_rather_than_dropped():
+    """An empty container and an absent one both mean "this family owns nothing" (#1522 D2).
+
+    The sender must not silently drop either: which families the document carries is the
+    registry walk's decision, and a body the sender edited would no longer be the document
+    the generation froze.
+    """
+    transport = _RecordingTransport()
+    client = _client_with(transport)
+
+    await apply_device_intent(client, "sw03", {"vlan": {"vlan": []}, "snmp": {}})
+
+    assert _sent_document(transport) == {"device": "sw03", "vlan": {"vlan": []}, "snmp": {}}
+
+
+async def test_the_sender_raises_on_a_rejected_commit():
     transport = _RecordingTransport(send_status=409)
     client = _client_with(transport)
 
     with pytest.raises(NsoApplyError) as exc:
-        await _send_service_config(
-            client, "/restconf/data/svc:cfg", "svc:cfg", "sw03", {"device": "sw03"}, scope="snmp"
-        )
-    assert exc.value.code == "nso_patch_failed"
+        await apply_device_intent(client, "sw03", {"snmp": {}})
+    assert exc.value.code == "nso_put_failed"
 
 
-async def test_send_service_config_dry_run_returns_delta_without_committing():
+async def test_the_sender_dry_run_returns_the_delta_without_committing():
     body = {"dry-run-result": {"native": {"device": [{"name": "sw03", "data": "snmp-server\n"}]}}}
     transport = _RecordingTransport(dryrun_body=body)
     client = _client_with(transport)
 
-    delta = await _send_service_config(
-        client, "/restconf/data/svc:cfg", "svc:cfg", "sw03", {"device": "sw03"}, scope="snmp", dry_run=True
-    )
+    delta = await apply_device_intent(client, "sw03", {"snmp": {}}, dry_run=True)
 
     assert delta == "snmp-server\n"
-    # dry-run only — no plain (non-dry-run) PATCH was sent
+    # dry-run only — no plain (non-dry-run) PUT was sent
     assert all("dry-run=native" in str(r.url) for r in transport.requests)
+
+
+async def test_no_networking_reaches_the_wire_as_a_commit_param():
+    """The detach path (#106) drops service governance without touching the device."""
+    transport = _RecordingTransport()
+    client = _client_with(transport)
+
+    await apply_device_intent(client, "sw03", {"snmp": {}}, no_networking=True)
+
+    assert "no-networking" in str(transport.requests[0].url)
+
+
+async def test_no_networking_also_reaches_the_post_commit_verification():
+    """A detach commit must be verified the way it was committed: CDB only, no device read."""
+    transport = _RecordingTransport()
+    client = _client_with(transport)
+
+    await apply_device_intent(client, "sw03", {"snmp": {}}, no_networking=True)
+
+    verify = [r for r in transport.requests[1:] if "dry-run=native" in str(r.url)]
+    assert verify, [str(r.url) for r in transport.requests]
+    assert all("no-networking" in str(r.url) for r in verify), [str(r.url) for r in verify]
 
 
 # ── _verify_native_or_raise ────────────────────────────────────────────────────
@@ -192,34 +244,32 @@ async def test_verify_passes_when_delta_empty():
     await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="snmp")  # no raise
 
 
-# ── per-family apply_* body building (dry-run captures the exact payload sent) ──
-# SimpleNamespace intent rows (no mocks); dry_run=True routes through native_dry_run
-# so the captured request body is the JSON the apply would PATCH.
+# ── per-family wire vocabulary (the real send captures the exact container body) ──
+# SimpleNamespace intent rows (no mocks) keyed by TABLE NAME, exactly as the stored
+# document keys them; dry_run=True routes through native_dry_run so the captured request
+# body is the JSON the commit would PUT.
 
 
-def _sent_body(transport: _RecordingTransport) -> dict:
-    return json.loads(transport.requests[0].content)
-
-
-async def test_apply_static_routes_builds_route_body():
+async def test_static_route_container_carries_the_route_list():
     transport = _RecordingTransport()
     client = _client_with(transport)
     rows = [
         SimpleNamespace(vrf="", prefix="10.0.0.0/8", next_hop="192.0.2.1", metric=10, permanent=True, tag=None),
         SimpleNamespace(vrf="MGMT", prefix="0.0.0.0/0", next_hop="192.0.2.254", metric=None, permanent=False, tag=5),
     ]
-    delta = await apply_static_routes(client, "sw03", rows, dry_run=True)
+    body = encode_static_route({"static_route_intent": rows}, _PLAIN)
+    delta = await apply_device_intent(client, "sw03", {"static-route": body}, dry_run=True)
 
     assert delta == ""
-    routes = _sent_body(transport)["static-route-reconciler:static-route-config"][0]["route"]
+    routes = _sent(transport, "static-route")["route"]
     assert routes[0] == {"vrf": "", "prefix": "10.0.0.0/8", "next-hop": "192.0.2.1", "metric": 10, "permanent": True}
     assert routes[1] == {"vrf": "MGMT", "prefix": "0.0.0.0/0", "next-hop": "192.0.2.254", "tag": 5}
 
 
-async def test_apply_static_routes_emits_interface_and_next_hop_vrf():
+async def test_static_route_emits_interface_and_next_hop_vrf():
     """IOS-XR next-hop forms round-trip: an interface next-hop and an inter-VRF (leaked)
-    next-hop VRF are carried into the reconciler body (VTEST-9). A row missing the attrs
-    entirely (the common plain-IP case) carries neither — getattr-defaulted, not required.
+    next-hop VRF are carried into the container (VTEST-9). A row missing the attrs entirely
+    (the common plain-IP case) carries neither — getattr-defaulted, not required.
     """
     transport = _RecordingTransport()
     client = _client_with(transport)
@@ -246,9 +296,10 @@ async def test_apply_static_routes_emits_interface_and_next_hop_vrf():
         ),
         SimpleNamespace(vrf="", prefix="10.0.0.0/8", next_hop="192.0.2.1", metric=None, permanent=False, tag=None),
     ]
-    await apply_static_routes(client, "ra1xr", rows, dry_run=True)
+    body = encode_static_route({"static_route_intent": rows}, _PLAIN)
+    await apply_device_intent(client, "ra1xr", {"static-route": body}, dry_run=True)
 
-    routes = _sent_body(transport)["static-route-reconciler:static-route-config"][0]["route"]
+    routes = _sent(transport, "static-route")["route"]
     assert routes[0]["next-hop-vrf"] == "TMS-P"
     assert "interface-next-hop" not in routes[0]  # empty string → omitted
     assert routes[1]["interface-next-hop"] == "MgmtEth0/RSP0/CPU0/0"
@@ -257,38 +308,39 @@ async def test_apply_static_routes_emits_interface_and_next_hop_vrf():
     assert "next-hop-vrf" not in routes[2] and "interface-next-hop" not in routes[2]
 
 
-async def test_apply_bfd_config_builds_interface_body():
+async def test_bfd_container_carries_the_interface_list():
     transport = _RecordingTransport()
     client = _client_with(transport)
     rows = [
         SimpleNamespace(interface_name="ae1", micro_bfd=True, min_tx=300, min_rx=300, multiplier=3),
         SimpleNamespace(interface_name="ae2", micro_bfd=False, min_tx=None, min_rx=None, multiplier=None),
     ]
-    await apply_bfd_config(client, "sw03", rows, dry_run=True)
+    await apply_device_intent(client, "sw03", {"bfd": encode_bfd({"bfd_intent": rows}, _PLAIN)}, dry_run=True)
 
-    ifaces = _sent_body(transport)["bfd-reconciler:bfd-config"][0]["interface"]
+    ifaces = _sent(transport, "bfd")["interface"]
     assert ifaces[0] == {"interface-name": "ae1", "micro-bfd": True, "min-tx": 300, "min-rx": 300, "multiplier": 3}
     assert ifaces[1] == {"interface-name": "ae2", "micro-bfd": False}
 
 
-async def test_apply_mtu_config_builds_interface_body():
+async def test_mtu_container_carries_the_interface_list():
     transport = _RecordingTransport()
     client = _client_with(transport)
     rows = [
         SimpleNamespace(interface_name="Gi0/1", mtu=9000, ip_mtu=8986, mpls_mtu=None),
         SimpleNamespace(interface_name="Gi0/2", mtu=None, ip_mtu=None, mpls_mtu=1500),
     ]
-    await apply_mtu_config(client, "sw03", rows, dry_run=True)
+    body = encode_interface_mtu({"interface_mtu_intent": rows}, _PLAIN)
+    await apply_device_intent(client, "sw03", {"mtu": body}, dry_run=True)
 
-    ifaces = _sent_body(transport)["mtu-reconciler:mtu-config"][0]["interface"]
+    ifaces = _sent(transport, "mtu")["interface"]
     assert ifaces[0] == {"interface-name": "Gi0/1", "mtu": 9000, "ip-mtu": 8986}
     assert ifaces[1] == {"interface-name": "Gi0/2", "mpls-mtu": 1500}
 
 
-async def test_snmp_apply_body_uses_vault_triples_and_yang_enums():
+async def test_snmp_container_uses_vault_triples_and_yang_enums():
     """Real-shape intent rows (plugin spellings: access=RO, notify_type=trap, full
-    mount/path#key refs) must land as the exact snmp-reconciler YANG contract:
-    list key ``name``, split vault-mount/path/key triples, lowercase enums."""
+    mount/path#key refs) must land as the exact snmp YANG contract: list key ``name``,
+    split vault-mount/path/key triples, lowercase enums."""
     transport = _RecordingTransport()
     client = _client_with(transport)
     communities = [
@@ -329,9 +381,18 @@ async def test_snmp_apply_body_uses_vault_triples_and_yang_enums():
     ]
     system = SimpleNamespace(location="DC-A", contact=None)
 
-    await apply_snmp_config(client, "sw03", communities, v3_users, hosts, system, dry_run=True)
+    body = encode_snmp(
+        {
+            "snmp_community_intent": communities,
+            "snmp_v3_user_intent": v3_users,
+            "snmp_host_intent": hosts,
+            "snmp_system_info_intent": [system],
+        },
+        _PLAIN,
+    )
+    await apply_device_intent(client, "sw03", {"snmp": body}, dry_run=True)
 
-    entry = _sent_body(transport)["snmp-reconciler:snmp-config"][0]
+    entry = _sent(transport, "snmp")
     assert entry["community"] == [
         {
             "name": "9f2a41c3d0be77aa",
@@ -380,34 +441,45 @@ async def test_snmp_apply_body_uses_vault_triples_and_yang_enums():
     assert "contact" not in entry  # None contact omitted
 
 
-async def test_snmp_apply_accepts_the_bare_2_version_spelling():
+def test_snmp_accepts_the_bare_2_version_spelling():
     """A bare "2" is a legitimate SNMPv2c spelling the API accepts (version is a plain str),
     and pre-#121 host rows may already hold it — but _SNMP_VERSION had no entry for it, so
-    _snmp_enum raised WHILE the body was being built. That aborted the whole SNMP scope:
+    _snmp_enum raised WHILE the body was being built. That aborted the whole SNMP family:
     the device's communities and v3 users, which had applied fine for months, were never
     pushed either, on every apply."""
-    transport = _RecordingTransport()
-    client = _client_with(transport)
     hosts = [SimpleNamespace(address="192.0.2.98", version="2", notify_type="trap", community_or_user="ro", port=None)]
 
-    await apply_snmp_config(client, "ri6", [], [], hosts, None, dry_run=True)
+    body = encode_snmp(
+        {
+            "snmp_community_intent": [],
+            "snmp_v3_user_intent": [],
+            "snmp_host_intent": hosts,
+            "snmp_system_info_intent": [],
+        },
+        _PLAIN,
+    )
 
-    entry = _sent_body(transport)["snmp-reconciler:snmp-config"][0]
-    assert entry["host"][0]["version"] == "v2c"
+    assert body["host"][0]["version"] == "v2c"
 
 
-async def test_snmp_apply_host_without_binding_omits_community_or_user():
+def test_snmp_host_without_binding_omits_community_or_user():
     """A host with no community/user binding (ArcOS targets carry none — the platform
     binds via target-parameters, not the target) must OMIT the optional
     community-or-user leaf, not send a JSON null the RESTCONF layer rejects.
     """
-    transport = _RecordingTransport()
-    client = _client_with(transport)
     hosts = [SimpleNamespace(address="192.0.2.99", version="2c", notify_type="trap", community_or_user=None, port=162)]
-    await apply_snmp_config(client, "ri6", [], [], hosts, None, dry_run=True)
 
-    entry = _sent_body(transport)["snmp-reconciler:snmp-config"][0]
-    assert entry["host"] == [{"address": "192.0.2.99", "version": "v2c", "notify-type": "traps", "port": 162}]
+    body = encode_snmp(
+        {
+            "snmp_community_intent": [],
+            "snmp_v3_user_intent": [],
+            "snmp_host_intent": hosts,
+            "snmp_system_info_intent": [],
+        },
+        _PLAIN,
+    )
+
+    assert body["host"] == [{"address": "192.0.2.99", "version": "v2c", "notify-type": "traps", "port": 162}]
 
 
 @pytest.mark.parametrize(
@@ -421,20 +493,34 @@ async def test_snmp_apply_host_without_binding_omits_community_or_user():
         "network/netbox snmp#community",  # whitespace
     ],
 )
-async def test_snmp_apply_rejects_malformed_vault_ref(bad_ref):
-    """A community that cannot produce the mandatory vault triples must fail the
-    apply with a structured error (never a silent drop: replace-mode would delete
-    the community from the device)."""
-    transport = _RecordingTransport()
-    client = _client_with(transport)
+def test_snmp_rejects_a_malformed_vault_ref(bad_ref):
+    """A community that cannot produce the mandatory vault triples must fail the encode with
+    a structured error (never a silent drop: an omitted family is a retracted family, so the
+    community would be deleted from the device)."""
     communities = [SimpleNamespace(label="ro", vault_ref=bad_ref, access="RO", acl=None)]
 
-    with pytest.raises(NsoApplyError, match="vault_ref"):
-        await apply_snmp_config(client, "sw03", communities, [], [], None, dry_run=True)
-    assert not transport.requests  # rejected before anything was sent
+    with pytest.raises(NsoApplyError, match="vault_ref") as caught:
+        encode_snmp(
+            {
+                "snmp_community_intent": communities,
+                "snmp_v3_user_intent": [],
+                "snmp_host_intent": [],
+                "snmp_system_info_intent": [],
+            },
+            _PLAIN,
+        )
+
+    import traceback
+
+    from tests._secret_discipline import assert_chain_free_of
+
+    if bad_ref:
+        assert bad_ref not in str(caught.value)
+        assert bad_ref not in "".join(traceback.format_exception(caught.value))
+        assert_chain_free_of(caught.value, [bad_ref])
 
 
-async def test_apply_logging_config_builds_host_body():
+async def test_logging_container_carries_the_host_list():
     transport = _RecordingTransport()
     client = _client_with(transport)
     rows = [
@@ -449,9 +535,10 @@ async def test_apply_logging_config_builds_host_body():
         ),
         SimpleNamespace(address="192.0.2.6", port=None, severity="", facility="", transport="", vrf="", source=""),
     ]
-    await apply_logging_config(client, "sw03", rows, dry_run=True)
+    body = encode_logging({"logging_host_intent": rows, "logging_levels_intent": []}, _PLAIN)
+    await apply_device_intent(client, "sw03", {"logging": body}, dry_run=True)
 
-    hosts = _sent_body(transport)["logging-reconciler:logging-config"][0]["host"]
+    hosts = _sent(transport, "logging")["host"]
     assert hosts[0] == {
         "address": "192.0.2.5",
         "port": 514,
@@ -468,79 +555,58 @@ def _levels_row(console=None, monitor=None, module=None):
     return SimpleNamespace(console_severity=console, monitor_severity=monitor, module_severity=module)
 
 
-async def test_apply_logging_config_emits_local_levels_when_gate_on(monkeypatch):
-    """With the R2/F4 write-gate ON, the accepted levels intent rides the service body;
-    unset severities are omitted (no clears — FASTMAP retraction owns removal)."""
-    monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "1")
-    transport = _RecordingTransport()
-    client = _client_with(transport)
-
-    await apply_logging_config(
-        client, "nx-t11", [], levels_intent_row=_levels_row(console="CRITICAL", module="NOTICE"), dry_run=True
+def test_logging_emits_the_set_local_levels():
+    """The accepted levels intent rides the logging container; unset severities are omitted
+    (no clears — FASTMAP retraction owns removal)."""
+    body = encode_logging(
+        {"logging_host_intent": [], "logging_levels_intent": [_levels_row(console="CRITICAL", module="NOTICE")]},
+        _PLAIN,
     )
 
-    entry = _sent_body(transport)["logging-reconciler:logging-config"][0]
-    assert entry["local-levels"] == {"console-severity": "CRITICAL", "module-severity": "NOTICE"}
+    assert body["local-levels"] == {"console-severity": "CRITICAL", "module-severity": "NOTICE"}
 
 
-async def test_apply_logging_config_gate_off_refuses_levels_intent(monkeypatch):
-    """Default gate OFF + an accepted levels intent → structured REFUSAL, nothing sent.
+def test_the_send_gate_refuses_local_levels_while_it_is_closed(monkeypatch):
+    """Gate OFF + an accepted levels intent → structured REFUSAL at the send boundary.
 
-    Proceeding with a host-only body would stamp the levels row in_sync without any
-    severity landing (a silent drop), and a replace-mode body missing local-levels
-    would FASTMAP-retract previously-owned severities — on NX that DISABLES the
-    destination. Weaker-than-intent must never report success (codex P4a-adapter P1).
+    Proceeding with a host-only body would stamp the levels row in_sync without any severity
+    landing (a silent drop), and the document PUT missing local-levels would FASTMAP-retract
+    previously-owned severities — on NX that DISABLES the destination. The refusal is the
+    SEND's, never the encoder's: one document must encode the same bytes in every process.
     """
     monkeypatch.delenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", raising=False)
-    transport = _RecordingTransport()
-    client = _client_with(transport)
+    rows = {"logging_host_intent": [], "logging_levels_intent": [_levels_row(console="CRITICAL")]}
 
+    assert not local_levels_write_enabled()
     with pytest.raises(NsoApplyError, match="NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE"):
-        await apply_logging_config(
-            client,
-            "nx-t11",
-            [
-                SimpleNamespace(
-                    address="192.0.2.7", port=None, severity="", facility="", transport="", vrf="", source=""
-                )
-            ],
-            levels_intent_row=_levels_row(console="CRITICAL"),
-            dry_run=True,
-        )
-    assert not transport.requests  # refused before anything was sent
+        refuse_gated_local_levels(rows)
+    # The encoder itself is unconditional: the same rows encode the same bytes either way.
+    assert encode_logging(rows, _PLAIN)["local-levels"] == {"console-severity": "CRITICAL"}
 
 
-async def test_apply_logging_config_gate_off_hosts_only_unaffected(monkeypatch):
-    """The gate only guards the levels container: a hosts-only apply (levels_intent_row
-    None — every non-NX device today) proceeds untouched with the gate off."""
-    monkeypatch.delenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", raising=False)
-    transport = _RecordingTransport()
-    client = _client_with(transport)
-
-    await apply_logging_config(
-        client,
-        "sw03",
-        [SimpleNamespace(address="192.0.2.7", port=None, severity="", facility="", transport="", vrf="", source="")],
-        levels_intent_row=None,
-        dry_run=True,
-    )
-
-    entry = _sent_body(transport)["logging-reconciler:logging-config"][0]
-    assert "local-levels" not in entry
-    assert entry["host"] == [{"address": "192.0.2.7"}]
-
-
-async def test_apply_logging_config_no_levels_row_no_container(monkeypatch):
+def test_the_open_gate_admits_local_levels(monkeypatch):
     monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "1")
-    transport = _RecordingTransport()
-    client = _client_with(transport)
-
-    await apply_logging_config(client, "sw03", [], levels_intent_row=None, dry_run=True)
-
-    assert "local-levels" not in _sent_body(transport)["logging-reconciler:logging-config"][0]
+    refuse_gated_local_levels({"logging_levels_intent": [_levels_row(console="CRITICAL")]})  # no raise
 
 
-async def test_apply_isis_interfaces_builds_process_and_interface_config():
+def test_the_gate_ignores_a_body_with_no_levels(monkeypatch):
+    """The gate guards the levels container only: a hosts-only apply (every non-NX device
+    today) proceeds untouched with the gate off."""
+    monkeypatch.delenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", raising=False)
+    rows = {
+        "logging_host_intent": [
+            SimpleNamespace(address="192.0.2.7", port=None, severity="", facility="", transport="", vrf="", source="")
+        ],
+        "logging_levels_intent": [],
+    }
+
+    refuse_gated_local_levels(rows)  # no raise
+    body = encode_logging(rows, _PLAIN)
+    assert "local-levels" not in body
+    assert body["host"] == [{"address": "192.0.2.7"}]
+
+
+async def test_isis_container_carries_process_and_interface_config():
     transport = _RecordingTransport()
     client = _client_with(transport)
     iface = SimpleNamespace(
@@ -563,11 +629,21 @@ async def test_apply_isis_interfaces_builds_process_and_interface_config():
         domain_auth_type="",
         domain_auth_key=None,
     )
-    await apply_isis_interfaces(client, "sw03", [iface], isis_process_rows=[proc], dry_run=True)
+    body = encode_isis(
+        {
+            "isis_interface_intent": [iface],
+            "isis_process_intent": [proc],
+            "isis_level_intent": [],
+            "isis_flex_algo_intent": [],
+            "redistribution_intent": [],
+        },
+        _PLAIN,
+    )
+    await apply_device_intent(client, "sw03", {"isis": body}, dry_run=True)
 
-    body = _sent_body(transport)["isis-reconciler:isis-config"][0]
-    assert body["interface-config"][0]["circuit-type"] == "level-2-only"  # 'level-2' normalised
-    assert body["process-config"][0] == {
+    sent = _sent(transport, "isis")
+    assert sent["interface-config"][0]["circuit-type"] == "level-2-only"  # 'level-2' normalised
+    assert sent["process-config"][0] == {
         "process-tag": "0",
         "net": "49.0001.00",
         "is-type": "level-2-only",
@@ -575,9 +651,17 @@ async def test_apply_isis_interfaces_builds_process_and_interface_config():
     }
 
 
-async def test_apply_ospf_config_builds_process_interface_and_redistribute():
+def _ospf_rows(process_rows, interface_rows, redistribution_rows=()):
+    return {
+        "ospf_instance_intent": list(process_rows),
+        "ospf_interface_intent": list(interface_rows),
+        "redistribution_intent": list(redistribution_rows),
+    }
+
+
+async def test_ospf_container_carries_process_interface_and_redistribute():
     # Real ORM rows so the assembled body reflects the actual model fields, not a fake's
-    # attribute names; the NsoClient + apply code run for real over a MockTransport.
+    # attribute names; the NsoClient + sender run for real over a MockTransport.
     transport = _RecordingTransport()
     client = _client_with(transport)
     proc = OspfInstanceIntent(process_id="1", router_id="1.1.1.1", vrf="")  # enabled unset → default True
@@ -601,53 +685,52 @@ async def test_apply_ospf_config_builds_process_interface_and_redistribute():
         metric=20,
         metric_type="type-1",
     )
-    await apply_ospf_config(client, "sw03", [proc], [iface], redistribution_rows=[redist], dry_run=True)
+    body = encode_ospf(_ospf_rows([proc], [iface], [redist]), _PLAIN)
+    await apply_device_intent(client, "sw03", {"ospf": body}, dry_run=True)
 
-    body = _sent_body(transport)["ospf-reconciler:ospf-config"][0]
-    p = body["process-config"][0]
+    sent = _sent(transport, "ospf")
+    p = sent["process-config"][0]
     assert p["process-id"] == "1"
     assert p["enabled"] is True  # delete-guard default-enable
     assert p["redistribute"] == [
         {"source-protocol": "connected", "source-ref": "", "route-map": "RM", "metric": 20, "metric-type": "type-1"}
     ]
-    i = body["interface-config"][0]
+    i = sent["interface-config"][0]
     assert i["network-type"] == "point-to-point"
     assert i["auth-type"] == "md5" and i["auth-key"] == "secret"
 
 
-async def test_apply_ospf_config_interface_only_omits_process_config():
+def test_ospf_interface_only_omits_process_config():
     """With no process rows the body carries interface-config but no process-config key."""
-    transport = _RecordingTransport()
-    client = _client_with(transport)
     iface = OspfInterfaceIntent(interface_name="Gi0/9", process_id="1", area_id="0", passive=False)
-    await apply_ospf_config(client, "sw03", [], [iface], dry_run=True)
 
-    body = _sent_body(transport)["ospf-reconciler:ospf-config"][0]
+    body = encode_ospf(_ospf_rows([], [iface]), _PLAIN)
+
     assert "process-config" not in body
     assert body["interface-config"][0]["interface-name"] == "Gi0/9"
 
 
-async def test_apply_ospf_config_commits_then_verifies():
-    """A real (non-dry-run) OSPF apply PATCHes the merge path then runs the verify dry-run."""
-    transport = _RecordingTransport(send_status=204)  # PATCH 204, verify dry-run → empty
+async def test_a_real_ospf_commit_puts_then_verifies():
+    """A real (non-dry-run) send PUTs the instance then runs the verify dry-run."""
+    transport = _RecordingTransport(send_status=204)  # PUT 204, verify dry-run → empty
     client = _client_with(transport)
     proc = OspfInstanceIntent(process_id="1", vrf="", enabled=False)  # operator-down preserved
     iface = OspfInterfaceIntent(interface_name="Gi0/1", process_id="1", area_id="0", passive=False)
 
-    result = await apply_ospf_config(client, "sw03", [proc], [iface])
+    body = encode_ospf(_ospf_rows([proc], [iface]), _PLAIN)
+    result = await apply_device_intent(client, "sw03", {"ospf": body})
 
-    assert result == VERIFY_CONCLUSIVE  # the verdict rides out of every committing send
-    patch_req = transport.requests[0]
-    assert patch_req.method == "PATCH"
-    assert "dry-run=native" not in str(patch_req.url)
-    assert "reconcile=" in str(patch_req.url)
-    body = json.loads(patch_req.content)["ospf-reconciler:ospf-config"][0]
-    assert body["process-config"][0]["enabled"] is False
+    assert result == VERIFY_CONCLUSIVE  # the verdict rides out of the committing send
+    put_req = transport.requests[0]
+    assert put_req.method == "PUT"
+    assert "dry-run=native" not in str(put_req.url)
+    assert "reconcile=" in str(put_req.url)
+    assert _sent(transport, "ospf")["process-config"][0]["enabled"] is False
     # a verify dry-run followed the commit
     assert any("dry-run=native" in str(r.url) for r in transport.requests[1:])
 
 
-async def test_apply_bgp_config_builds_router_scope_peer_tree():
+async def test_bgp_container_carries_the_router_scope_peer_tree():
     transport = _RecordingTransport()
     client = _client_with(transport)
     paf = SimpleNamespace(
@@ -670,9 +753,10 @@ async def test_apply_bgp_config_builds_router_scope_peer_tree():
     redist = SimpleNamespace(
         dest_ref="65000::ipv4-unicast", source_protocol="connected", source_ref="", route_map=None, metric=None
     )
-    await apply_bgp_config(client, "sw03", [router], redistribution_rows=[redist], dry_run=True)
+    body = encode_bgp({"bgp_router_intent": [router], "redistribution_intent": [redist]}, _PLAIN)
+    await apply_device_intent(client, "sw03", {"bgp": body}, dry_run=True)
 
-    r = _sent_body(transport)["bgp-reconciler:bgp-config"][0]["router"][0]
+    r = _sent(transport, "bgp")["router"][0]
     assert r["asn"] == 65000
     sc = r["scope"][0]
     assert sc["address-family"][0]["redistribute"] == [{"source-protocol": "connected", "source-ref": ""}]
@@ -686,19 +770,19 @@ async def test_apply_bgp_config_builds_router_scope_peer_tree():
 # NSO 6.7's RESTCONF JSON lexer loses token state at its 64KiB read-buffer
 # refill — a bare literal straddling byte k*65536 400s the whole request
 # ("1: Bad JSON character: f"). Every apply-path body must therefore leave the
-# adapter with no bare token on a boundary. These tests drive the REAL apply
-# functions over the recording transport and assert on the actual bytes handed
-# to httpx; each fixture asserts its own premise (default serialization DOES
-# straddle), so a sizing drift fails loudly instead of passing vacuously.
+# adapter with no bare token on a boundary. These tests drive the REAL sender
+# over the recording transport and assert on the actual bytes handed to httpx;
+# each fixture asserts its own premise (default serialization DOES straddle),
+# so a sizing drift fails loudly instead of passing vacuously.
 
 
-def _straddling_service_body(wrap) -> dict:
-    """A service body whose default-serialized WRAPPED request straddles a boundary.
+def _straddling_container_body(wrap) -> dict:
+    """A container body whose default-serialized WRAPPED request straddles a boundary.
 
-    *wrap* replicates exactly how the function under test wraps the body into the
-    request payload; the pad places the first ``false`` 2 bytes across byte 65536.
+    *wrap* replicates exactly how the sender wraps the body into the request payload; the
+    pad places the first ``false`` 2 bytes across byte 65536.
     """
-    probe = {"device": "sw03", "pad": "", "rows": [{"secondary": False, "n": 1234} for _ in range(40)]}
+    probe = {"pad": "", "rows": [{"secondary": False, "n": 1234} for _ in range(40)]}
     first_false = json.dumps(wrap(probe)).index("false")
     body = {**probe, "pad": "x" * (NSO_LEX_CHUNK - first_false - 2)}
     assert straddling_bare_tokens(json.dumps(wrap(body))), "fixture premise: default dumps DOES straddle"
@@ -713,58 +797,41 @@ def _assert_wire_boundary_safe(transport: _RecordingTransport) -> None:
         assert straddling_bare_tokens(b) == []
 
 
-async def test_send_service_config_oversized_body_is_boundary_safe():
+def _wrap_container(body: dict) -> dict:
+    return {DEVICE_INTENT_ROOT: [{"device": "sw03", "snmp": body}]}
+
+
+async def test_an_oversized_document_is_boundary_safe():
     transport = _RecordingTransport(send_status=204)
     client = _client_with(transport)
-    body = _straddling_service_body(lambda b: {"svc:cfg": [b]})
+    body = _straddling_container_body(_wrap_container)
 
-    await _send_service_config(client, "/restconf/data/svc:cfg", "svc:cfg", "sw03", body, scope="snmp")
+    await apply_device_intent(client, "sw03", {"snmp": body})
 
     _assert_wire_boundary_safe(transport)
     # whitespace-only protection: the parsed intent is unchanged
-    assert json.loads(transport.requests[0].content) == {"svc:cfg": [body]}
+    assert _sent(transport, "snmp") == body
 
 
-async def test_apply_combined_oversized_body_is_boundary_safe():
-    transport = _RecordingTransport(send_status=204)
-    client = _client_with(transport)
-    body = _straddling_service_body(lambda b: {"svc:cfg": [b]})
-
-    await apply_combined(client, "sw03", {"svc:cfg": [body]})
-
-    _assert_wire_boundary_safe(transport)
-    assert json.loads(transport.requests[0].content) == {"svc:cfg": [body]}
-
-
-async def test_replace_service_instance_oversized_body_is_boundary_safe():
-    transport = _RecordingTransport(send_status=204)
-    client = _client_with(transport)
-    body = _straddling_service_body(lambda b: {"svc:cfg": [b]})
-
-    await replace_service_instance(client, "/restconf/data/svc:cfg", "svc:cfg", "sw03", body)
-
-    assert transport.requests[0].method == "PUT"
-    _assert_wire_boundary_safe(transport)
-    assert json.loads(transport.requests[0].content) == {"svc:cfg": [body]}
-
-
-async def test_apply_interface_ips_production_scale_body_is_boundary_safe():
+async def test_a_production_scale_interface_body_is_boundary_safe():
     """The exact shape that hit production scale: thousands of ``"secondary": false`` rows."""
     transport = _RecordingTransport(send_status=204)
     client = _client_with(transport)
     rows = [SimpleNamespace(address="10.0.0.1/24", family="ipv4", secondary=False, vrf="") for _ in range(120)]
-    # The interface name precedes every row in the entry, so sizing it shifts each
-    # row token by the same amount — place the first `false` across byte 65536.
-    base_entry = build_interface_ip_entry("sw03", "ae0", rows)
-    first_false = json.dumps({"interface-reconciler:interface-config": [base_entry]}).index("false")
+    # The interface name precedes every row in the entry, so sizing it shifts each row token
+    # by the same amount — place the first `false` across byte 65536.
+    base = {
+        DEVICE_INTENT_ROOT: [{"device": "sw03", "interface": {"interface": [build_interface_ip_body("ae0", rows)]}}]
+    }
+    first_false = json.dumps(base).index("false")
     name = "ae0" + "x" * (NSO_LEX_CHUNK - first_false - 2)
-    entry = build_interface_ip_entry("sw03", name, rows)
-    payload = json.dumps({"interface-reconciler:interface-config": [entry]})
+    entry = build_interface_ip_body(name, rows)
+    payload = json.dumps({DEVICE_INTENT_ROOT: [{"device": "sw03", "interface": {"interface": [entry]}}]})
     assert straddling_bare_tokens(payload), "fixture premise: default dumps DOES straddle"
 
-    await apply_interface_ips(client, "sw03", name, rows)
+    await apply_device_intent(client, "sw03", {"interface": {"interface": [entry]}})
 
     _assert_wire_boundary_safe(transport)
-    sent = json.loads(transport.requests[0].content)["interface-reconciler:interface-config"][0]
+    sent = _sent(transport, "interface")["interface"][0]
     assert sent["interface-name"] == name
     assert len(sent["ipv4-address"]) == 120

@@ -51,7 +51,7 @@ class JobTriggerOut(BaseModel):
 
 
 class ApplyDiffOut(BaseModel):
-    """apply-diff preview — {scope: native_delta} for scopes with a non-empty change."""
+    """One device_intent native delta, or a preview-unavailable reason, for the executable document."""
 
     device_id: int
     outformat: str
@@ -59,7 +59,14 @@ class ApplyDiffOut(BaseModel):
 
 
 class ActionApplyIn(BaseModel):
-    """The exact push sequences this manual Apply is allowed to promote."""
+    """The exact per-stream selections this manual Apply is allowed to promote.
+
+    A selection value carries one of two identities. For an in-protocol stream it is a
+    push sequence, resolved against that stream's delivery receipt. For the two
+    out-of-protocol streams, ``lag`` and ``switchport``, it is the ``selection_revision``
+    the preparation returned, resolved against the stored prepared revision, because
+    neither stream carries a receipt.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -110,7 +117,6 @@ class ActionApplyOut(BaseModel):
             "revision_mismatch",
             # The two out-of-protocol switching streams: no receipt, no push sequence.
             "no_prepared_revision",
-            "awaiting_aggregate_sender",
         ],
     ]
     skipped_detail: dict[str, ActionApplySkippedDetailOut] | None
@@ -144,8 +150,9 @@ async def _trigger(
 
 
 class ForceRemovalBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     scope: str
-    interfaces: list[str] | None = None
 
 
 @router.post(
@@ -162,16 +169,15 @@ async def action_force_removal(
 ):
     """Re-run a scope's removal with the collateral guard DISABLED.
 
-    The operator override for a ``removal_blocked_collateral`` failure: after
-    reviewing the blocked job's orphan list + dry-run preview, this deliberately
-    flushes the orphaned service rows (PUT-replace with only the remaining intent).
+    The operator override for a ``removal_blocked_collateral`` failure: after reviewing the
+    blocked job's orphan keys (the refusal persists no device delta; ``actions/apply-diff``
+    renders it on demand), this deliberately flushes the orphaned service rows (PUT-replace
+    with only the remaining intent).
 
-    ``interface_config`` is per-instance (interface-reconciler is keyed by
-    ``(device, interface-name)``), so its removal job flushes exactly the interfaces named
-    in *interfaces* — with none, ``_replace_interface_config`` iterates an empty list and
-    the job succeeds having pushed NOTHING, telling the operator their orphaned addresses
-    were flushed while the config is still live on the device. Reject that rather than
-    succeed at nothing.
+    The flush is the device's whole document with the guard off: every family keeps its
+    authorized rows and the orphans the guard was blocking on are simply not in it. The
+    static-route section additionally suppresses retention, so a carrier-claimed key the
+    operator is flushing is not preserved by the very write that flushes it (#1683).
 
     It PROMOTES NOTHING (#1522 §G2). The flush re-deploys state an earlier push already
     authorized, with the guard off, so ``enqueue_removal`` gives it a reissue generation.
@@ -179,40 +185,44 @@ async def action_force_removal(
     settlement then certified them applied — the sibling lane's un-promoted store-only state
     included, on interfaces this job never sends.
     """
-    from nso_adapter.core.projection import AWAITING_SENDER_SECTIONS
-    from nso_adapter.core.removal import VALID_REMOVAL_SCOPES, enqueue_removal
+    from nso_adapter.core.generation import OperationSectionAbsent
+    from nso_adapter.core.removal import valid_removal_scopes
 
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
-    if body.scope not in VALID_REMOVAL_SCOPES:
+    if body.scope not in valid_removal_scopes():
         raise api_error(400, "bad_request", f"Unknown removal scope {body.scope!r}")
-    # Refused at ADMISSION, before any generation or job: a section with no device writer has
-    # no dispatch handler, and a failed head would block every later device write.
-    if body.scope in AWAITING_SENDER_SECTIONS:
+    try:
+        job = await _force_removal_job(db, device_id, body)
+    except OperationSectionAbsent as absent:
+        # Nothing was ever authorized for this family, so there is no document section for the
+        # flush to act on and no carrier of ours to discharge. Refuse rather than create a
+        # generation whose operation plane could not be recorded.
         raise api_error(
             400,
             "bad_request",
-            f"Removal scope {body.scope!r} has no device writer yet",
-            {"scope": body.scope, "reason": "awaiting_aggregate_sender"},
-        )
-    if body.scope == "interface_config" and not body.interfaces:
-        raise api_error(
-            400,
-            "bad_request",
-            "force-removal of interface_config requires 'interfaces': the interface-reconciler "
-            "is keyed per interface, so with none named the job would flush nothing.",
-        )
-    job = await enqueue_removal(
+            f"Nothing is authorized for {body.scope!r} on this device, so there is nothing to flush",
+            {"scope": body.scope, "reason": absent.reason},
+        ) from None
+    return await _force_removal_response(db, job)
+
+
+async def _force_removal_job(db: AsyncSession, device_id: int, body: ForceRemovalBody):
+    from nso_adapter.core.removal import enqueue_removal
+
+    return await enqueue_removal(
         db,
         device_id,
         body.scope,
         marking=None,
         defer_retract=False,
         promotes=(),
-        interfaces=body.interfaces,
         force=True,
     )
+
+
+async def _force_removal_response(db: AsyncSession, job) -> dict:
     await db.commit()
     return {"job_id": job.id}
 

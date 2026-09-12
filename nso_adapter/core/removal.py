@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+from collections.abc import Sequence
 from functools import cache
 from typing import NamedTuple
 from uuid import UUID
@@ -30,6 +31,7 @@ from sqlalchemy import delete, exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, JobError, error_envelope
+from nso_adapter.core.projection import GuardList as _GuardList
 from nso_adapter.core.request_flags import (
     AUTHORIZED_PROVENANCE,
     DELETE_ORIGIN_MARKING,
@@ -93,150 +95,69 @@ def _verifier_section_status(section: dict) -> str:
     return "error"
 
 
-# scope → (intent store model name, apply function name) for the "simple" services
-# whose apply takes a single ``(client, device_name, rows, replace=True)`` signature.
-# logging is listed for the model→scope map/valid-scope set but dispatches bespoke
-# (_replace_logging): its PUT-replace must also carry the local-levels singleton.
-_SIMPLE_TARGETS: dict[str, tuple[str, str]] = {
-    "route_policy": ("RoutePolicyObjectIntent", "apply_route_policy_config"),
-    "bfd": ("BfdIntent", "apply_bfd_config"),
-    "svi": ("SviIntent", "apply_svi_config"),
-    "subinterface": ("SubinterfaceIntent", "apply_subinterface_config"),
-    "static_route": ("StaticRouteIntent", "apply_static_routes"),
-    "interface_mtu": ("InterfaceMtuIntent", "apply_mtu_config"),
-    "vlan": ("VlanIntent", "apply_vlan_config"),
-    "logging": ("LoggingHostIntent", "apply_logging_config"),
-    "l2_sap": ("L2SapIntent", "apply_l2_saps"),
-}
+#: Every removal scope: the write-path families, which ARE the document's sections. There is
+#: no separate list — a scope is a family the document can carry, and the registry says which.
+def valid_removal_scopes() -> frozenset[str]:
+    """Return the sections a removal may empty. Derived, never restated."""
+    from nso_adapter.core.projection import projection_sections
 
-# Reverse map: intent store model name → removal scope.
-_SCOPE_BY_MODEL: dict[str, str] = {model: scope for scope, (model, _) in _SIMPLE_TARGETS.items()}
-
-# Scopes whose apply function translates values to the device's NED dialect and so
-# takes a ``ned_id`` kwarg. The PUT-replace MUST thread it — otherwise the identity
-# dialect pushes canonical (wrong) wire form and fails to skip unrepresentable members
-# (route-policy communities). Kept as an explicit set so it survives mocking/refactors.
-_NED_DIALECT_SCOPES: frozenset[str] = frozenset({"route_policy"})
-
-# OSPF/BGP/IS-IS have multi-row applies; interface_config is a compound-key (device,interface)
-# list whose removal PUT-replaces/deletes per-interface instances — all bespoke below.
-# switchport and lag have NO dispatch handler and no guard: they are here because
-# projection_sections() refuses any difference between this set and _SECTION_TABLES, and
-# C9 deletes this set outright. Admission refuses them (AWAITING_SENDER_SECTIONS).
-VALID_REMOVAL_SCOPES: set[str] = set(_SIMPLE_TARGETS) | {
-    "ospf",
-    "bgp",
-    "isis",
-    "interface_config",
-    "snmp",
-    "switchport",
-    "lag",
-}
+    return projection_sections()
 
 
 class RemovalBlockedError(Exception):
     """A PUT-replace would retract service rows nobody just removed (collateral).
 
-    Raised by the scope guard BEFORE anything is committed; carries the orphan keys
-    per YANG list and a native dry-run preview so the failed job's detail gives the
-    operator the full would-be device delta to review (the ra1 lo0 incident guard).
+    Raised by the scope guard BEFORE anything is committed; carries the orphan keys per
+    YANG list, which name the rows the operator must re-accept or flush (the ra1 lo0
+    incident guard). It carries no device delta: native config is opaque text that holds
+    resolved communities and auth keys, and this payload is persisted on the job and rows.
     """
 
-    def __init__(self, orphans: dict[str, list], preview: str | None):
+    def __init__(self, orphans: dict[str, list]):
         self.orphans = orphans
-        self.preview = preview
         super().__init__(f"PUT-replace would retract rows not in intent: {orphans}")
 
 
 # ── collateral guard (#90) — every device-keyed PUT-replace scope ─────────────
 
 
-class _GuardList(NamedTuple):
-    """One keyed YANG list the guard compares.
+@cache
+def _section_by_model() -> dict[str, str]:
+    """Intent model name → the document section it belongs to, off the registry.
 
-    ``label`` names the list in ``context["removed"]`` and in the orphan report;
-    ``path`` walks nested lists from the service entry root to the keyed list
-    (bgp peers live at router→scope→peer); ``keys`` are the key leaf names.
+    A DISCRIMINATED table is excluded: one redistribution model serves three sections, so its
+    section cannot be resolved from the model alone and the caller passes the stream instead.
     """
+    from nso_adapter.core.projection import section_registry
 
-    label: str
-    path: tuple[str, ...]
-    keys: tuple[str, ...]
+    by_model: dict[str, str] = {}
+    for section, entry in section_registry().items():
+        for spec in entry.tables:
+            if spec.discriminator is None:
+                by_model.setdefault(spec.model.__name__, section)
+    return by_model
 
 
-class _GuardSpec(NamedTuple):
-    service_path: str
-    lists: tuple[_GuardList, ...]
+def section_guard_lists(section: str) -> tuple[_GuardList, ...]:
+    """Return the guarded YANG lists of one section, empty when it has none."""
+    from nso_adapter.core.projection import section_registry
+
+    return section_registry()[section].guard_lists if section in section_registry() else ()
 
 
 @cache
-def _guard_specs() -> dict[str, _GuardSpec]:
-    """Scope → service instance path + the keyed YANG lists a PUT-replace can retract.
+def residue_wire_name(section: str) -> str | None:
+    """Return the device-state envelope section a family's residue is read from.
 
-    Service paths come from the apply module (single source of truth). Nested
-    non-keyed content (route-map entries, redistribute rows, bgp address-families,
-    snmp system-info scalars) is intentionally NOT guarded: the collateral unit is
-    the keyed config object a stale service row would silently flush off the device.
-    interface_config is excluded — its removal is per-instance PUT/DELETE by design.
+    The registry names the READ family a write family verifies against, and the read
+    engine's ``FamilySpec`` names its wire section, so the two sides cannot drift: there is
+    no third table saying what ``l2_sap`` reads (memo A8).
     """
-    from nso_adapter.nso import apply as A
+    from nso_adapter.core.importer import projectable_spec
+    from nso_adapter.core.projection import section_registry
 
-    return {
-        "isis": _GuardSpec(
-            A._ISIS_SERVICE_PATH,
-            (
-                _GuardList("interface-config", ("interface-config",), ("interface-name", "af")),
-                _GuardList("process-config", ("process-config",), ("process-tag",)),
-            ),
-        ),
-        "ospf": _GuardSpec(
-            A._OSPF_SERVICE_PATH,
-            (
-                _GuardList("interface-config", ("interface-config",), ("interface-name",)),
-                _GuardList("process-config", ("process-config",), ("process-id",)),
-            ),
-        ),
-        "bgp": _GuardSpec(
-            A._BGP_SERVICE_PATH,
-            (
-                _GuardList("router", ("router",), ("asn",)),
-                # device-wide flatten: the trigger can only produce peer addresses
-                # across all routers/scopes, so the guard compares at the same grain
-                _GuardList("peer", ("router", "scope", "peer"), ("peer-address",)),
-            ),
-        ),
-        "snmp": _GuardSpec(
-            A._SNMP_SERVICE_PATH,
-            (
-                _GuardList("community", ("community",), ("name",)),
-                _GuardList("v3-user", ("v3-user",), ("username",)),
-                _GuardList("host", ("host",), ("address",)),
-            ),
-        ),
-        "route_policy": _GuardSpec(
-            A._ROUTE_POLICY_SERVICE_PATH,
-            (
-                _GuardList("prefix-list", ("prefix-list",), ("name",)),
-                _GuardList("community-list", ("community-list",), ("name",)),
-                _GuardList("as-path", ("as-path",), ("name",)),
-                _GuardList("route-map", ("route-map",), ("name",)),
-            ),
-        ),
-        "bfd": _GuardSpec(A._BFD_SERVICE_PATH, (_GuardList("interface", ("interface",), ("interface-name",)),)),
-        "svi": _GuardSpec(A._SVI_SERVICE_PATH, (_GuardList("interface", ("interface",), ("interface-name",)),)),
-        "subinterface": _GuardSpec(
-            A._SUBIF_SERVICE_PATH, (_GuardList("interface", ("interface",), ("interface-name",)),)
-        ),
-        "static_route": _GuardSpec(
-            A._STATIC_ROUTE_SERVICE_PATH, (_GuardList("route", ("route",), ("vrf", "prefix", "next-hop")),)
-        ),
-        "interface_mtu": _GuardSpec(
-            A._MTU_SERVICE_PATH, (_GuardList("interface", ("interface",), ("interface-name",)),)
-        ),
-        "vlan": _GuardSpec(A._VLAN_SERVICE_PATH, (_GuardList("vlan", ("vlan",), ("vlan-id",)),)),
-        "logging": _GuardSpec(A._LOGGING_SERVICE_PATH, (_GuardList("host", ("host",), ("address",)),)),
-        "l2_sap": _GuardSpec(A._L2_SAP_SERVICE_PATH, (_GuardList("sap", ("sap",), ("service-name", "sap-id")),)),
-    }
+    spec = projectable_spec(section_registry()[section].read_family)
+    return spec.wire_name if spec is not None else None
 
 
 _EXPLICIT_FALSE_EMISSION_FIELDS = frozenset(
@@ -349,6 +270,22 @@ def _norm_key(key) -> tuple[str, ...]:
 
 def _leaf_keys(entry: dict, guard_list: _GuardList) -> set[tuple[str, ...]]:
     """Collect the key tuples of *guard_list*'s leaf entries under *entry*."""
+    if guard_list.presence:
+        assert guard_list.parent_key is not None
+        return {
+            (str(parent[guard_list.parent_key]),)
+            for parent in entry.get(guard_list.path[0]) or []
+            if guard_list.path[1] in parent
+        }
+    if guard_list.parent_key is not None:
+        return {
+            (
+                str(parent[guard_list.parent_key]),
+                *((str(child),) if guard_list.scalar else tuple(str(child[k]) for k in guard_list.keys)),
+            )
+            for parent in entry.get(guard_list.path[0]) or []
+            for child in parent.get(guard_list.path[1]) or []
+        }
     level = [entry]
     for name in guard_list.path:
         level = [child for node in level for child in (node.get(name) or [])]
@@ -356,46 +293,9 @@ def _leaf_keys(entry: dict, guard_list: _GuardList) -> set[tuple[str, ...]]:
 
 
 def _removed_context(scope: str, context: dict) -> dict[str, list]:
-    """Return the trigger's just-removed keys per YANG list (with pre-#90 isis compat)."""
-    removed = dict(context.get("removed") or {})
-    if scope == "isis":  # legacy context shape from jobs queued before the generalization
-        removed.setdefault("interface-config", context.get("removed_interfaces", []))
-        removed.setdefault("process-config", context.get("removed_processes", []))
-    return removed
+    """Return the trigger's just-removed keys per YANG list."""
+    return dict(context.get("removed") or {})
 
-
-# Scope → the device-state envelope SECTION name for that scope (READSEM 1328). The residue
-# check reads the section through the ``device-state-read`` ACTION (a fresh post-commit CDB
-# extraction inside a whole-build txid bracket, read as soon as possible after the replace
-# commit) rather than the legacy per-family getter. The action is fresher than those getters
-# (they are SUBSCRIBER-CACHE-backed — served from a cache re-extracted only on a miss or an
-# async CDB-subscriber notification, so they can lag a just-made commit) and never serves the
-# record-served facade's stale/not-ready. Its terminal per-family status closes the legacy
-# None/empty blind spot: an ``unsupported`` section reports residue_check="unsupported"
-# (transparency over a silent "clean" — intent-integrity), never a fabricated clean bill.
-# Names are pinned to the real envelope section set by
-# test_residue_wire_names_match_the_envelope_sections.
-_RESIDUE_WIRE_NAMES: dict[str, str] = {
-    "svi": "svi",
-    "subinterface": "subinterface",
-    "static_route": "static-route",
-    "vlan": "vlan-database",
-    "logging": "logging-config",
-    "interface_mtu": "interface-mtu",
-    "bfd": "bfd-config",
-    "l2_sap": "l2-service",
-    # #104 phase-2 — the guarded complex scopes; same key grain as the guard lists.
-    "bgp": "bgp-config",
-    "isis": "isis-interface",
-    "ospf": "ospf-config",
-    "route_policy": "route-policy",
-    "snmp": "snmp-config",
-    # #104 phase-3 — value grain, bespoke compare in _interface_config_residue: the
-    # per-instance replace/delete retracts address VALUES, not keyed rows, so the
-    # check intersects the trigger's removed (interface, address, vrf) triples with
-    # the interface-ip section instead of walking a guard spec.
-    "interface_config": "interface-ip",
-}
 
 # Guard-list label → the network-state-export list path, for the scopes where the
 # export YANG names its lists differently from the reconciler-service YANG (the
@@ -405,6 +305,8 @@ _READER_LIST_PATHS: dict[tuple[str, str], tuple[str, ...]] = {
     ("isis", "process-config"): ("process",),
     ("ospf", "interface-config"): ("interface",),
     ("ospf", "process-config"): ("instance",),
+    ("lag", "lag_bundle_intent"): ("lag",),
+    ("lag", "lag_member_intent"): ("lag", "member"),
 }
 
 
@@ -413,15 +315,25 @@ def _reader_keys(scope: str, entry: dict, guard_list: _GuardList) -> set[tuple[s
 
     The reader lists mirror the reconciler-service shapes (bgp's router→scope→peer
     nesting included), so the guard's own ``_leaf_keys`` walk applies as-is — except
-    the isis/ospf list renames in ``_READER_LIST_PATHS`` and l2, where the reader
-    nests ``sap`` under ``service`` while the service list is flat (service-name,
-    sap-id) — a parent-level key leaf the generic walk cannot express.
+    the list renames in ``_READER_LIST_PATHS`` and the two grains the export renders
+    in a different SHAPE: l2 nests ``sap`` under ``service`` while the service list is
+    flat (service-name, sap-id), and switchport emits its tagged VLANs as one comma/range
+    string where the service carries a leaf-list. Both would intersect empty, which reads
+    as a clean bill for config the removal never took off the device.
     """
+    from nso_adapter.core.vlan import parse_vlan_string
+
     if scope == "l2_sap":
         return {
             (str(svc.get("service-name", "")), str(sap.get("sap-id", "")))
             for svc in entry.get("service") or []
             for sap in svc.get("sap") or []
+        }
+    if scope == "switchport" and guard_list.scalar:
+        return {
+            (str(iface.get("interface-name", "")), str(vlan_id))
+            for iface in entry.get(guard_list.path[0]) or []
+            for vlan_id in parse_vlan_string(iface.get("tagged-vlans"))
         }
     path = _READER_LIST_PATHS.get((scope, guard_list.label))
     if path is not None:
@@ -518,11 +430,14 @@ async def _interface_config_residue(client, device, context: dict) -> dict[str, 
     removed = (context.get("removed") or {}).get("address")
     if removed is None:
         return None
-    wire = _RESIDUE_WIRE_NAMES["interface_config"]
+    wire = residue_wire_name("interface_config")
+    if wire is None:  # pragma: no cover - the registry pins interface_config to interface_ip
+        return None
     section = (await _live_family_sections(client, device.nso_device_name, [wire], timeout=_VERIFY_BATCH_TIMEOUT))[wire]
     status = _verifier_section_status(section)
     if status == "error":
-        raise RuntimeError(f"device-state read of {wire!r} returned status=error: {section.get('error-reason')!r}")
+        # The error-reason is the server's own text and can name a community-keyed path.
+        raise RuntimeError(f"device-state read of {wire!r} returned status=error")
     if status == "unknown":  # unsupported — no interface-ip surface on this NED
         return None
     present = {
@@ -562,9 +477,9 @@ async def _residue_after_removal(client, device, scope: str, context: dict) -> t
     """
     if scope == "interface_config":
         return await _interface_config_residue(client, device, context), []
-    wire = _RESIDUE_WIRE_NAMES.get(scope)
-    spec = _guard_specs().get(scope)
-    if wire is None or spec is None:
+    wire = residue_wire_name(scope)
+    guard_lists = section_guard_lists(scope)
+    if wire is None or not guard_lists:
         return None, []
     removed = _removed_context(scope, context)
     if not any(removed.values()):
@@ -581,7 +496,7 @@ async def _residue_after_removal(client, device, scope: str, context: dict) -> t
     # resolve makes its grain unverifiable — it is never folded into "clean".
     keymaps: dict[str, dict[tuple, tuple]] = {}
     unverifiable: list[str] = []
-    for guard_list in spec.lists:
+    for guard_list in guard_lists:
         keys = {_norm_key(k) for k in removed.get(guard_list.label, [])}
         if not keys:
             continue
@@ -597,12 +512,13 @@ async def _residue_after_removal(client, device, scope: str, context: dict) -> t
     section = (await _live_family_sections(client, device.nso_device_name, [wire], timeout=_VERIFY_BATCH_TIMEOUT))[wire]
     status = _verifier_section_status(section)
     if status == "error":
-        raise RuntimeError(f"device-state read of {wire!r} returned status=error: {section.get('error-reason')!r}")
+        # The error-reason is the server's own text and can name a community-keyed path.
+        raise RuntimeError(f"device-state read of {wire!r} returned status=error")
     if status == "unknown":  # unsupported — the NED does not export this section
         return None, unverifiable
     entry = section
     residue: dict[str, list] = {}
-    for guard_list in spec.lists:
+    for guard_list in guard_lists:
         guard_keymap = keymaps.get(guard_list.label)
         if not guard_keymap:
             continue
@@ -633,7 +549,14 @@ async def _record_residue(
     try:
         residue, unverifiable = await _residue_after_removal(client, device, scope, context)
     except Exception as exc:  # noqa: BLE001 — the check must never fail the removal
-        logger.warning("removal.residue_check_error", job_id=job_id, device_id=device_id, scope=scope, error=repr(exc))
+        # Metadata only: any exception from the reader can repeat what the server said.
+        logger.warning(
+            "removal.residue_check_error",
+            job_id=job_id,
+            device_id=device_id,
+            scope=scope,
+            error_type=type(exc).__name__,
+        )
         result["residue_check"] = "error"
         return
 
@@ -658,152 +581,117 @@ async def _record_residue(
         result["residue_check"] = "clean"
 
 
-async def _guarded_apply(client, device, scope: str, context: dict | None, apply_thunk, *, current=_NO_SNAPSHOT):
-    """Run *scope*'s PUT-replace behind the collateral guard (the ra1 lo0 incident).
+def _document_orphans(current: dict, containers: dict[str, dict], allowed: dict[str, dict]) -> dict[str, list]:
+    """Return every live keyed row the document would retract without authority.
 
-    ``apply_thunk(**kwargs)`` must call the scope's apply function with its full row
-    collections, forwarding ``replace``/``dry_run``/``stage``. Guard flow: GET the
-    current service instance; stage the would-be PUT body (no HTTP — the apply
-    builder is the single source of key truth, so the diff is YANG-to-YANG); any
-    current key that is neither re-asserted nor in the trigger's just-removed set
-    is an ORPHAN — block with a native dry-run preview instead of committing.
-    ``context["force"]`` (the actions/force-removal override) skips the guard.
+    Device-wide, because the write is: one PUT makes EVERY omission a retraction, so a
+    removal of one family can flush another family's orphaned rows just as easily as its own.
+    The report is scope-qualified (``<section>/<list>``) — two families both have a ``host``
+    list, and an operator reading the blocked job must know which one is stuck.
+    """
+    from nso_adapter.core.projection import section_registry
+
+    registry = section_registry()
+    orphans: dict[str, list] = {}
+    for section, entry in registry.items():
+        guard_lists = entry.guard_lists
+        container = registry[section].container
+        live = current.get(container) or {}
+        body = containers.get(container) or {}
+        permitted_by_label = allowed.get(section) or {}
+        for guard_list in guard_lists:
+            permitted = {_norm_key(key) for key in permitted_by_label.get(guard_list.label, [])}
+            orphan = sorted(_leaf_keys(live, guard_list) - _leaf_keys(body, guard_list) - permitted)
+            if orphan:
+                orphans[f"{section}/{guard_list.label}"] = [list(key) for key in orphan]
+    return orphans
+
+
+def guard_allowed(generation, *, scope: str | None = None, context: dict | None = None, route_keys=None) -> dict:
+    """Return the keys a deployment may drop, per section and per guarded YANG list.
+
+    Three sources, all authorized before the send: the immutable generation's own
+    scope-qualified authority, the executing removal's just-removed keys, and the static-route
+    keys the frozen plan authorizes — the predecessors an apply's replacement delivers, or the
+    triples a removal's operation plane owns. Scope-qualified because the guard is device-wide
+    and two families both have a ``host`` list.
+    """
+    from nso_adapter.core.static_route_plan import validate_removal_authority
+
+    authority = getattr(generation, "allowed_removal_keys", None)
+    if authority is None:
+        authority = {}
+    validate_removal_authority(authority)
+    allowed: dict[str, dict[str, list]] = {
+        section: {label: list(keys) for label, keys in labels.items()} for section, labels in authority.items()
+    }
+    if scope is not None:
+        for label, keys in _removed_context(scope, context or {}).items():
+            allowed.setdefault(scope, {}).setdefault(label, []).extend(keys)
+    if route_keys:
+        entries = allowed.setdefault("static_route", {}).setdefault("route", [])
+        entries.extend(list(key) for key in sorted(route_keys))
+    return allowed
+
+
+async def guarded_device_write(
+    client,
+    device,
+    containers: dict[str, dict],
+    *,
+    allowed: dict[str, dict],
+    context: dict | None = None,
+    current=_NO_SNAPSHOT,
+    no_networking: bool = False,
+):
+    """PUT the device's document behind the device-wide collateral guard (the ra1 lo0 incident).
+
+    Guard flow: GET the current aggregate instance; compare it against the body about to be
+    sent; any live key that the body neither re-asserts nor is authorized to drop is an
+    ORPHAN — block, naming the orphan keys, instead of committing.
+
+    ``context["force"]`` (the actions/force-removal override) skips the guard, and so does a
+    ``no-networking`` write: nothing can be flushed from a device the commit never reaches.
 
     *current* lets a caller that already read the live instance hand it in, so the
     one-snapshot contract holds (R2 §4.1: the retained entries and the guard must see the
-    SAME read). The default is a sentinel, not ``None``: ``None`` is a valid snapshot
-    meaning "no service instance", so ``if current is None: GET`` would issue a second
-    read on exactly the absent-service case. Anything supplied — ``None`` included —
-    suppresses the internal GET.
+    SAME read). The default is a sentinel, not ``None``: ``None`` is a valid snapshot meaning
+    "no instance", so ``if current is None: GET`` would issue a second read on exactly the
+    absent-service case.
 
-    Returns whatever the committing thunk returned — R2's proof verdict where there is one.
-    A guard that swallowed it would leave the apply unable to tell a proven commit from an
-    unverified one, which is exactly what §4.4 exists to stop.
+    Returns the send's R2 §4.4 proof verdict. A guard that swallowed it would leave the
+    caller unable to tell a proven commit from an unverified one.
     """
+    from nso_adapter.nso.apply import NsoApplyError, apply_device_intent
+
     context = context or {}
+    device_name = device.nso_device_name
     if context.get("force"):
-        logger.warning("removal.force", device_id=device.id, scope=scope)
-        return await apply_thunk(replace=True)
-    if context.get("detach"):
-        # Detach (#106): the replace commits with no-networking, so nothing can be
-        # flushed from the device — the orphan guard (which protects device config
-        # from a real PUT-replace) must stand down, or every un-own on an instance
-        # holding un-adopted siblings blocks forever.
-        return await apply_thunk(replace=True)
-    spec = _guard_specs().get(scope)
-    if current is _NO_SNAPSHOT:
-        current = None
-        if spec is not None:
-            current = await client.get_service_config(spec.service_path, device.nso_device_name)
-    if current:
-        if spec is None:
-            raise ValueError(f"Unknown removal scope {scope!r}")
-        stage: dict[str, list] = {}
-        await apply_thunk(replace=True, stage=stage)
-        staged_entries = next(iter(stage.values()), None) or [{}]
-        entry = staged_entries[0]
-        removed = _removed_context(scope, context)
-        orphans: dict[str, list] = {}
-        for gl in spec.lists:
-            allowed = {_norm_key(k) for k in removed.get(gl.label, [])}
-            orphan = sorted(_leaf_keys(current, gl) - _leaf_keys(entry, gl) - allowed)
-            if orphan:
-                orphans[gl.label] = [list(k) for k in orphan]
-        if orphans:
-            preview = await apply_thunk(replace=True, dry_run=True)
-            raise RemovalBlockedError(orphans, preview)
-    return await apply_thunk(replace=True)
+        logger.warning("removal.force", device_id=device.id, scope=context.get("scope"))
+    elif not no_networking:
+        if current is _NO_SNAPSHOT:
+            state = await client.service_instance_state(device_name)
+            if state.inconclusive:
+                raise NsoApplyError(
+                    "service_snapshot_inconclusive",
+                    "could not certify the live service instance; refusing the device-intent PUT",
+                )
+            current = state.entry
+        if current:
+            orphans = _document_orphans(current, containers, allowed)
+            if orphans:
+                raise RemovalBlockedError(orphans)
+    return await apply_device_intent(client, device_name, containers, no_networking=no_networking)
 
 
-class _ReplacementSection(NamedTuple):
-    document: dict
-    rows: dict[type, list]
-
-
-async def _replacement_section(db: AsyncSession, scope: str, job_id: int | None) -> _ReplacementSection | None:
-    """Hydrate one promoted removal section, or select the established live mode."""
-    from nso_adapter.core.generation import executing_generation
-    from nso_adapter.core.projection import hydrate_section
-
-    if job_id is None:
-        return None
-    generation = await executing_generation(db, job_id)
-    if generation is None:
-        raise RuntimeError(f"removal job {job_id} for scope {scope!r} carries no generation to deploy")
-    # A reissue orders an operation but promotes no projection. It retains the live-store
-    # execution used by force-removal, the sweeper and the static-route reclaimer.
-    if not generation.stream_revisions:
-        return None
-    rows = {
-        model: [row for row in model_rows if getattr(row, "accepted_at", True)]
-        for model, model_rows in hydrate_section(generation.document, scope).items()
-    }
-    return _ReplacementSection(document=generation.document, rows=rows)
-
-
-async def _replacement_rows(db: AsyncSession, device, scope: str, model, job_id: int | None) -> list:
-    """Return the rows the PUT-replace body asserts: the generation's document, or the store.
-
-    A removal is a full-document write too, so the same race applies (#1522 §G1): between the
-    worker committing ``running`` and this read, a successor push can commit, and a
-    live-store body would retract under this generation's identity whatever the successor
-    happens to have removed. A promoted generation therefore uses the stored document.
-    A reissue promotes no projection and retains the established live-store behavior. A job
-    that carries no generation is refused: every producer attaches one, so its absence is a
-    broken chain, and executing the live store would deploy an unauthorized state.
-    """
-    replacement = await _replacement_section(db, scope, job_id)
-    if replacement is not None:
-        return replacement.rows.get(model, [])
-    return await _accepted_rows(db, device.id, model)
-
-
-async def _accepted_rows(db: AsyncSession, device_id: int, model, *extra) -> list:
-    """Return the live-store accepted rows of one model — the else half of a replacement read."""
-    stmt = select(model).where(model.device_id == device_id, model.accepted_at.is_not(None), *extra)
-    return list((await db.execute(stmt)).scalars().all())
-
-
-async def _replace_simple(
-    db: AsyncSession, device, client, scope: str, context: dict | None = None, *, job_id: int | None = None
-) -> None:
-    """PUT-replace a single-model service with its remaining accepted rows."""
-    from nso_adapter.nso import apply as nso_apply
-    from nso_adapter.store import models as store_models
-
-    model_name, apply_name = _SIMPLE_TARGETS[scope]
-    model = getattr(store_models, model_name)
-    apply_fn = getattr(nso_apply, apply_name)
-    rows = await _replacement_rows(db, device, scope, model, job_id)
-    extra: dict = {}
-    if scope in _NED_DIALECT_SCOPES:
-        extra["ned_id"] = device.ned_id
-
-    async def _apply(**kwargs):
-        return await apply_fn(client, device.nso_device_name, rows, **extra, **kwargs)
-
-    await _guarded_apply(client, device, scope, context, _apply)
-
-
-# ── #1396 R2 §4.3/§4.4 — the three static-route removal branches ─────────────
-#
-# Static routes are the one scope whose removal is LIVE-SERVICE-RELATIVE: the body is what
-# the service currently holds minus exactly what this job is authorized to drop, never the
-# store's remaining rows. A store-assertive body forward-deploys every co-edited field of
-# every surviving row, which the ratified policy forbids — and it is also what made a removal
-# block on unrelated service orphans, since a body it never asserted looks like collateral.
+# Static-route carriers retain their settlement classification across the aggregate send.
 
 #: Consumption by supersession: the selected plan claims every key the job could drop.
 SR_SUPERSEDED_EVENT = "static_route.removal_superseded"
 
-#: The keys a live-relative body preserves that no selected intent row claims (§6/OQ-R2-3). With
-#: the guard unreachable on this path, this event is the operator's only remaining signal —
-#: a spec obligation, not a nicety.
-SR_RETAINED_ORPHANS_EVENT = "static_route.removal_retained_orphans"
-
 
 class SrRemoval(NamedTuple):
-    """What :func:`_replace_static_route` did, for the proof and bookkeeping that follow.
+    """The aggregate removal result, for the proof and bookkeeping that follow.
 
     Returned rather than acted on in place: §4.6 requires the consumption, the carrier
     updates and the terminal job status to land in ONE transaction, and that transaction
@@ -821,16 +709,12 @@ class SrRemoval(NamedTuple):
     sent_keys: frozenset
     #: Whether a PUT was actually issued (a 2xx, since a non-2xx raises).
     put_issued: bool
-    #: Whether the pre-PUT read CERTIFIED the service instance absent (a keyed 404).
-    service_absent: bool
     #: The commit's native-verify verdict, or ``None`` when no PUT was sent.
     verify: str | None
     #: ``{intent row id: [store field names]}`` whose wire leaves this body deleted.
     clears: dict[int, tuple[str, ...]]
     #: The creation-time route key for each delivered carrier.
     clear_keys: dict[int, tuple[str, str, str]]
-    #: The retained keys no live row claims — what ``SR_RETAINED_ORPHANS_EVENT`` reported.
-    retained_orphans: tuple
 
 
 def _sr_triple(key) -> tuple[str, str, str]:
@@ -840,306 +724,94 @@ def _sr_triple(key) -> tuple[str, str, str]:
     return tuple("" if p is None else str(p) for p in parts)  # type: ignore[return-value]
 
 
-async def _sr_authorization(db: AsyncSession, device, context: dict, *, job_id: int | None):
-    """Return ``(tombstones, authorized, claimed, rows, reclaimed)`` — §4.3's steps 1 and 2.
-
-    ``authorized`` is what this job may drop: the exact tombstones named by a reissue
-    generation, otherwise its OWN tombstones' ``{triple} ∪ {deployed_key}`` (X6; a NULL
-    ``deployed_key`` contributes nothing), or ``context["removed"]["route"]`` when it has no
-    tombstone carrier — minus every key a live intent row still claims. That subtraction is
-    ownership, not eligibility: another route reclaiming the key means the key is no longer
-    this deletion's to drop.
-    """
-    from nso_adapter.core.static_route_plan import as_triple, triple_of
-    from nso_adapter.store.models import StaticRouteIntent, StaticRouteTombstone
-
-    tombstones = []
-    context_has_tombstones = "tombstone_ids" in context
-    if context_has_tombstones:
-        tombstone_ids = context["tombstone_ids"]
-        if not isinstance(tombstone_ids, list) or not all(
-            isinstance(tombstone_id, int) and not isinstance(tombstone_id, bool) for tombstone_id in tombstone_ids
-        ):
-            raise ValueError("static_route removal context carries invalid tombstone_ids")
-        tombstones = list(
-            (
-                await db.execute(
-                    select(StaticRouteTombstone)
-                    .where(
-                        StaticRouteTombstone.device_id == device.id,
-                        StaticRouteTombstone.id.in_(sorted(set(tombstone_ids))),
-                    )
-                    .order_by(StaticRouteTombstone.id)
-                )
-            )
-            .scalars()
-            .all()
-        )
-    elif job_id is not None:
-        tombstones = list(
-            (
-                await db.execute(
-                    select(StaticRouteTombstone)
-                    .where(StaticRouteTombstone.device_id == device.id, StaticRouteTombstone.job_id == job_id)
-                    .order_by(StaticRouteTombstone.id)
-                )
-            )
-            .scalars()
-            .all()
-        )
-
-    authorized: set[tuple[str, str, str]] = set()
-    for tomb in tombstones:
-        authorized.add((tomb.vrf or "", tomb.prefix or "", tomb.next_hop or ""))
-        deployed = as_triple(tomb.deployed_key)
-        if deployed is not None:
-            authorized.add(deployed)
-    if not tombstones and not context_has_tombstones:
-        for key in (context.get("removed") or {}).get("route") or []:
-            authorized.add(_sr_triple(key))
-
-    rows = list(
-        (
-            await db.execute(
-                select(StaticRouteIntent).where(StaticRouteIntent.device_id == device.id).order_by(StaticRouteIntent.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    claimed: set[tuple[str, str, str]] = set()
-    for row in rows:
-        claimed.add(triple_of(row))
-        deployed = as_triple(row.deployed_key)
-        if deployed is not None:
-            claimed.add(deployed)
-    reclaimed = sorted(authorized & claimed)
-    return tombstones, authorized - claimed, claimed, rows, reclaimed
-
-
-async def _sr_execution_plan(db: AsyncSession, device, context: dict, *, job_id: int | None):
-    """Return a promoted removal plan, or classify a reissue (or an unqueued call) live.
-
-    A QUEUED job that carries no generation is refused, exactly as :func:`_replacement_section`
-    refuses it for every other scope: falling through here would classify against the live
-    store and retract whatever it holds now under a job authorized to assert something else.
-    """
+async def _executing_document(db: AsyncSession, job_id: int | None, scope: str):
+    """Return the generation this removal deploys, or refuse. Every producer attaches one."""
     from nso_adapter.core.generation import executing_generation
-    from nso_adapter.core.static_route_plan import (
-        SrClear,
-        SrRemovalPlan,
-        candidate_clear_fields,
-        clears_suppressed,
-        hydrate_static_route_removal_plan,
-        triple_of,
-    )
 
-    if job_id is not None:
-        generation = await executing_generation(db, job_id)
-        if generation is None:
-            raise RuntimeError(f"removal job {job_id} for scope 'static_route' carries no generation to deploy")
-        if generation.stream_revisions:
-            return hydrate_static_route_removal_plan(generation.document)
-    tombstones, authorized, claimed, rows, reclaimed = await _sr_authorization(db, device, context, job_id=job_id)
-    # Clears re-evaluated at execution under the claim, never from a job-context snapshot: a
-    # clear queued minutes ago can have been re-set, deleted, moved or had its key reclaimed.
-    clears = (
-        ()
-        if clears_suppressed(context)
-        else tuple(SrClear(row.id, triple_of(row), fields) for row in rows if (fields := candidate_clear_fields(row)))
-    )
-    return SrRemovalPlan(
-        frozenset(authorized),
-        frozenset(claimed),
-        tuple(tombstone.id for tombstone in tombstones),
-        clears,
-        tuple(reclaimed),
-    )
+    if job_id is None:
+        raise RuntimeError(f"a {scope} removal needs the generation of the job that carries it")
+    generation = await executing_generation(db, job_id)
+    if generation is None:
+        raise RuntimeError(f"removal job {job_id} for scope {scope!r} carries no generation to deploy")
+    return generation
 
 
-def _sr_body(current: dict, authorized: set, clears) -> tuple[list[dict], dict, dict]:
-    """Build the live-relative body and report the delivered selected clears.
+def _classify_static_route_removal(generation, context: dict) -> SrRemoval:
+    """Read the frozen operation's settlement classification without constructing a body."""
+    from nso_adapter.core.static_route_plan import hydrate_static_route_removal_plan
 
-    ``current − authorized``, then the leaf-level clear overlay: for a surviving entry whose
-    selected plan carries a pending clear, delete exactly the named wire leaves and keep every
-    other leaf at its live value. An absent live entry is a no-op.
-    """
-    from nso_adapter.core.static_route_plan import CLEAR_WIRE_LEAF
-    from nso_adapter.nso.apply import static_route_entry_key
-
-    clears_by_key = {clear.key: clear for clear in clears}
-    entries: list[dict] = []
-    delivered: dict[int, tuple[str, ...]] = {}
-    delivered_keys: dict[int, tuple[str, str, str]] = {}
-    for entry in current.get("route") or []:
-        key = static_route_entry_key(entry)
-        if key in authorized:
-            continue
-        kept = dict(entry)
-        clear = clears_by_key.get(key)
-        if clear is not None:
-            for field in clear.fields:
-                kept.pop(CLEAR_WIRE_LEAF[field], None)
-            delivered[clear.row_id] = clear.fields
-            delivered_keys[clear.row_id] = clear.key
-        entries.append(kept)
-    return entries, delivered, delivered_keys
-
-
-async def _replace_static_route(
-    db: AsyncSession,
-    device,
-    client,
-    context: dict | None = None,
-    *,
-    job_id: int | None = None,
-    reg=None,
-) -> SrRemoval:
-    """Retract static routes with a LIVE-SERVICE-RELATIVE body (§4.3). Three branches.
-
-    **(a) force** — the operator's deliberate flush. Unchanged: the store-assertive
-    :func:`_replace_simple` body with the guard bypassed. Anything else turns a
-    force-removal into a successful no-op, since it carries neither tombstone nor
-    ``removed`` keys (G15).
-
-    **(b) detach** — the ``no-networking`` un-own. Body = ``current − authorized``. A
-    no-networking PUT can never reach the device, so a detach never delivers a clear; the
-    ``pending_clear`` carrier holds it for a later networked retract instead.
-
-    **(c) everything else** — networked. ONE branch, not two: a single push can delete rows
-    AND clear leaves on surviving rows, and neither ``retract`` nor ``delete_origin``
-    survives into the job context (G26), so the resulting job is indistinguishable from a
-    plain delete-origin one. The body is compositional — ``current − authorized``, then, for
-    each surviving entry whose row carries a pending clear, delete exactly the named wire
-    leaves. LEAF-level, never a whole-row store overlay: re-rendering a cleared row from the
-    store would forward-deploy every co-edited field on it (``metric 10→NULL`` **and**
-    ``tag 100→200`` in one push would immediately deploy tag 200).
-
-    Promoted generation creation records the removal classification under the projection lock:
-
-    1. every tombstone owned by THIS job contributes ``{triple} ∪ {deployed_key}`` (X6);
-       a job that owns none falls back to ``context["removed"]["route"]`` (including a
-       fence-shut removal);
-    2. supersession subtracts every key the selected plan claims as its ``triple`` or
-       its ``deployed_key``. A promotion uses the recorded document. A reissue uses current
-       accepted intent;
-    3. nothing left to drop and no clear to deliver ⇒ **no HTTP at all**: the tombstones are
-       consumed by supersession, not by failure.
-
-    A reissue promotes nothing and records no execution plan. It re-derives this classification
-    at execution from its job and tombstone rows, including the durable clear carrier. Only the
-    ``authorized`` half is visible.
-
-    *reg* is threaded but unused HERE on purpose: this function only reads and writes to the
-    device. Every store write this job makes — the tombstone delete, the carrier update and the
-    terminal status — lands in :func:`_finalize_static_route_removal`'s single claim-guarded
-    transaction, which is where §4.7's lock belongs.
-    """
-    from nso_adapter.nso.apply import (
-        _STATIC_ROUTE_SERVICE_PATH,
-        NsoApplyError,
-        apply_static_routes,
-        static_route_entry_key,
-    )
-
-    context = context or {}
     if context.get("force"):
-        await _replace_simple(db, device, client, "static_route", context, job_id=job_id)
-        return SrRemoval("force", frozenset(), (), frozenset(), True, False, None, {}, {}, ())
-
-    plan = await _sr_execution_plan(db, device, context, job_id=job_id)
-    authorized = set(plan.authorized)
-    claimed = set(plan.claimed)
-    reclaimed = plan.reclaimed
-    detach = bool(context.get("detach"))
-    candidate_clears = plan.clears
-    tombstone_ids = plan.tombstone_ids
-
-    if reclaimed:
+        return SrRemoval("force", frozenset(), (), frozenset(), False, None, {}, {})
+    plan = hydrate_static_route_removal_plan(generation.document)
+    if plan.reclaimed:
         logger.warning(
             "static_route.removal_key_reclaimed",
-            device_id=device.id,
-            job_id=job_id,
-            keys=[list(key) for key in reclaimed],
+            device_id=generation.device_id,
+            job_id=generation.job_id,
+            keys=[list(key) for key in plan.reclaimed],
         )
-
-    def _nothing_to_do() -> SrRemoval:
+    branch = "detach" if context.get("detach") else "networked"
+    if not plan.authorized and not plan.clears:
+        branch = "superseded"
         logger.info(
             SR_SUPERSEDED_EVENT,
-            device_id=device.id,
-            job_id=job_id,
-            tombstones=list(tombstone_ids),
-            reclaimed=[list(k) for k in reclaimed],
+            device_id=generation.device_id,
+            job_id=generation.job_id,
+            tombstones=list(plan.tombstone_ids),
+            reclaimed=[list(key) for key in plan.reclaimed],
         )
-        return SrRemoval("superseded", frozenset(), tombstone_ids, frozenset(), False, False, None, {}, {}, ())
-
-    if not authorized and not candidate_clears:
-        return _nothing_to_do()
-
-    state = await client.service_instance_state(_STATIC_ROUTE_SERVICE_PATH, device.nso_device_name)
-    if state.inconclusive:
-        # A body built from "looks empty" would drop every entry it was supposed to retain and
-        # every orphan the guard was supposed to see, and then verify cleanly (G31).
-        raise NsoApplyError(
-            "static_route_snapshot_inconclusive",
-            f"static_route: could not certify the live service instance on {device.nso_device_name!r} "
-            "— refusing to build a removal PUT from an uncertified read",
-            detail={"device": device.nso_device_name},
-        )
-    current = state.entry
-    branch = "detach" if detach else "networked"
-    if not current:
-        # `absent` proves the SERVICE has no instance, never that the device is clean (G9):
-        # a previously detached route can sit unowned on the device. So no PUT — and the
-        # proof still runs, which is also what keeps a retried detach provable at all.
-        return SrRemoval(branch, frozenset(authorized), tombstone_ids, frozenset(), False, True, None, {}, {}, ())
-
-    body_entries, delivered, delivered_keys = _sr_body(current, authorized, candidate_clears)
-    if not authorized and not delivered:
-        # The store-side clear check got us past the pre-read branch, but the live entry it
-        # named is gone (the row's identity moved, or the key was never on the service). The
-        # body would be the snapshot verbatim: a device commit with no authority behind it,
-        # which would also retract anything the service gained since the read.
-        return _nothing_to_do()
-    sent_keys = {static_route_entry_key(entry) for entry in body_entries}
-    retained_orphans = tuple(sorted(sent_keys - claimed))
-    if retained_orphans:
-        logger.warning(
-            SR_RETAINED_ORPHANS_EVENT,
-            device_id=device.id,
-            job_id=job_id,
-            keys=[list(k) for k in retained_orphans],
-        )
-
-    async def _apply(**kwargs):
-        # rows=[] with verbatim extras: the body IS the live service minus what we authorized,
-        # so every surviving leaf keeps its live value — including the ones the store has no
-        # column for.
-        return await apply_static_routes(
-            client=client,
-            device_name=device.nso_device_name,
-            route_intent_rows=[],
-            extra_entries=body_entries,
-            **kwargs,
-        )
-
-    # Under a live-relative body `current − body ≡ authorized`, so the guard degenerates into
-    # an equality assertion that we drop exactly what we authorized — which is why
-    # RemovalBlockedError is unreachable here by construction (§6/OQ-R2-3).
-    guard_context = {**context, "removed": {"route": [list(key) for key in sorted(authorized)]}}
-    verdict = await _guarded_apply(client, device, "static_route", guard_context, _apply, current=current)
     return SrRemoval(
         branch,
-        frozenset(authorized),
-        tombstone_ids,
-        frozenset(sent_keys),
-        True,
+        frozenset(plan.authorized),
+        plan.tombstone_ids,
+        frozenset(),
         False,
-        verdict,
-        delivered,
-        delivered_keys,
-        retained_orphans,
+        None,
+        {clear.row_id: clear.fields for clear in plan.clears},
+        {clear.row_id: clear.key for clear in plan.clears},
     )
+
+
+async def _put_removal_document(db: AsyncSession, device, client, scope: str, context: dict | None, *, job_id):
+    """Build and send the aggregate once, with the frozen operation's settlement proof."""
+    from nso_adapter.core.apply import _refuse_unverifiable_recorded_put, build_device_containers
+    from nso_adapter.core.generation import execution_policy
+
+    generation = await _executing_document(db, job_id, scope)
+    policy = execution_policy(generation)
+    context = policy.context
+    out = _classify_static_route_removal(generation, context) if scope == "static_route" else None
+    if out is not None and out.branch == "superseded":
+        return out
+    if not policy.no_networking:
+        _refuse_unverifiable_recorded_put(generation)
+    body = await build_device_containers(
+        client, device, generation.document, retain_static_routes=policy.retain_static_routes
+    )
+    if body.errors:
+        raise next(iter(body.errors.values()))
+    if out is not None:
+        if body.sent_route_keys is None:
+            raise RuntimeError("static-route removal document has no static-route section")
+        sent_keys = frozenset(body.sent_route_keys)
+        delivered = {row_id: fields for row_id, fields in out.clears.items() if out.clear_keys[row_id] in sent_keys}
+        out = out._replace(
+            sent_keys=sent_keys,
+            clears=delivered,
+            clear_keys={row_id: out.clear_keys[row_id] for row_id in delivered},
+        )
+        if out.branch != "force" and not out.authorized and not delivered:
+            return out._replace(branch="superseded", sent_keys=frozenset())
+    verdict = await guarded_device_write(
+        client,
+        device,
+        body.containers,
+        allowed=guard_allowed(generation, scope=scope, context=context, route_keys=out.authorized if out else None),
+        context=context,
+        current=body.snapshot,
+        no_networking=policy.no_networking,
+    )
+    return out._replace(put_issued=True, verify=verdict) if out is not None else None
 
 
 # ── #1396 R2 §4.4/§4.6 — the removal's proof and its ONE terminal transaction ─
@@ -1158,22 +830,26 @@ def _sr_verify_ok(out: SrRemoval) -> bool:
     return not out.put_issued or out.verify == VERIFY_CONCLUSIVE
 
 
-async def _sr_detach_service_clean(client, device, out: SrRemoval) -> bool:
+async def _sr_service_clean(client, device, out: SrRemoval) -> bool:
     """Post-commit: whether every authorized key is gone from the SERVICE instance (§4.4).
 
-    Certified, never inferred: ``get_service_config`` answers ``None`` both for a keyed 404
+    Certified, never inferred: an uncertifiable read answers ``None`` both for a keyed 404
     and for any 2xx it could not parse (G31), and consuming a carrier on that reading throws
     the deletion record away while the service may still own the key.
-    """
-    from nso_adapter.nso.apply import _STATIC_ROUTE_SERVICE_PATH, static_route_entry_key
 
-    state = await client.service_instance_state(_STATIC_ROUTE_SERVICE_PATH, device.nso_device_name)
-    if state.inconclusive:
+    Taken by the NETWORKED settlement as well as by detach (#1683): authority to omit a key
+    must not outlive retention, so no path may consume a carrier while the live section still
+    holds a key that carrier claims. Without it, ordinary settlement opens exactly the
+    service-present gap the reclaimer is being fixed for.
+    """
+    from nso_adapter.core.static_route_reader import certified_static_route_section
+    from nso_adapter.nso.apply import static_route_entry_key
+
+    section = await certified_static_route_section(client, device)
+    if section.inconclusive:
         logger.warning("static_route.detach_proof_inconclusive", device_id=device.id)
         return False
-    if not state.entry:
-        return True
-    live = {static_route_entry_key(entry) for entry in (state.entry.get("route") or [])}
+    live = {static_route_entry_key(entry) for entry in section.routes}
     return not (live & set(out.authorized))
 
 
@@ -1245,7 +921,14 @@ async def _sr_networked_proof(client, device, out: SrRemoval, result: dict):
     if out.clears:
         result["pending_clear_proven"] = {str(row_id): list(fields) for row_id, fields in sorted(per_field.items())}
     keys_ok = residue is None or residue == "clean"
-    return (keys_ok and clears_ok and _sr_verify_ok(out)), residue == "found", per_field
+    service_clean = not out.authorized or await _sr_service_clean(client, device, out)
+    if not service_clean:
+        result["service_clean"] = False
+    return (
+        (keys_ok and clears_ok and service_clean and _sr_verify_ok(out)),
+        residue == "found",
+        per_field,
+    )
 
 
 async def _sr_consume(db: AsyncSession, device, out: SrRemoval, per_field: dict, result: dict, *, reg) -> None:
@@ -1317,8 +1000,6 @@ async def _finalize_static_route_removal(db, job_id: int, device, client, out: S
     result: dict = {"scope": "static_route", "removal_branch": out.branch}
     if out.authorized:
         result["authorized"] = [list(key) for key in sorted(out.authorized)]
-    if out.retained_orphans:
-        result["retained_orphans"] = [list(key) for key in out.retained_orphans]
 
     per_field: dict[int, tuple[str, ...]] = {}
     residue_found = False
@@ -1330,12 +1011,12 @@ async def _finalize_static_route_removal(db, job_id: int, device, client, out: S
     elif out.branch == "detach":
         result["detach"] = True
         result["residue_check"] = "skipped_detach"
-        service_clean = await _sr_detach_service_clean(client, device, out)
+        service_clean = await _sr_service_clean(client, device, out)
         sync_ok = await _sr_sync_from(client, device, result, job_id=job_id)
         # "PUT 2xx OR the instance is absent": demanding a literal 2xx makes a crash between a
         # committed detach PUT and its bookkeeping commit permanently unprovable — every retry
         # sees no instance and could never satisfy the predicate.
-        proven = service_clean and sync_ok and (out.put_issued or out.service_absent) and _sr_verify_ok(out)
+        proven = service_clean and sync_ok and out.put_issued and _sr_verify_ok(out)
     else:
         proven, residue_found, per_field = await _sr_networked_proof(client, device, out, result)
 
@@ -1419,275 +1100,6 @@ async def _finalize_static_route_removal(db, job_id: int, device, client, out: S
     return write.status is JobStatus.succeeded
 
 
-async def _replace_logging(
-    db: AsyncSession, device, client, context: dict | None = None, *, job_id: int | None = None
-) -> None:
-    """PUT-replace the logging-reconciler with hosts AND the local-levels singleton.
-
-    Bespoke (not routed through :func:`_replace_simple`) because the replace body must
-    re-assert the ACCEPTED local-levels intent alongside the remaining hosts — a
-    host-only body would FASTMAP-retract the owned severities, and on NX a retracted
-    ``console`` leaf DISABLES the destination (default enabled@2), not a benign revert.
-    Only accepted rows ride (never imported/staged intent), like every replace path.
-    """
-    from nso_adapter.nso.apply import apply_logging_config
-    from nso_adapter.store.models import LoggingHostIntent, LoggingLevelsIntent
-
-    replacement = await _replacement_section(db, "logging", job_id)
-    if replacement is not None:
-        document_rows = replacement.rows
-        rows = document_rows.get(LoggingHostIntent, [])
-        level_rows = document_rows.get(LoggingLevelsIntent, [])
-        levels = level_rows[0] if level_rows else None
-    else:
-        rows = await _accepted_rows(db, device.id, LoggingHostIntent)
-        levels = (
-            await db.execute(
-                select(LoggingLevelsIntent).where(
-                    LoggingLevelsIntent.device_id == device.id, LoggingLevelsIntent.accepted_at.is_not(None)
-                )
-            )
-        ).scalar_one_or_none()
-
-    async def _apply(**kwargs):
-        return await apply_logging_config(client, device.nso_device_name, rows, levels_intent_row=levels, **kwargs)
-
-    await _guarded_apply(client, device, "logging", context, _apply)
-
-
-async def _replace_ospf(
-    db: AsyncSession, device, client, context: dict | None = None, *, job_id: int | None = None
-) -> None:
-    from nso_adapter.nso.apply import apply_ospf_config
-    from nso_adapter.store.models import OspfInstanceIntent, OspfInterfaceIntent, RedistributionIntent
-
-    # A PUT-replace re-asserts the FULL desired state, so it must include only accepted
-    # rows — never not-yet-accepted (imported/staged) intent, which would deploy
-    # un-reviewed config to the device (matches _replace_simple / _replace_bgp).
-    replacement = await _replacement_section(db, "ospf", job_id)
-    if replacement is not None:
-        document_rows = replacement.rows
-        insts = document_rows.get(OspfInstanceIntent, [])
-        ifaces = document_rows.get(OspfInterfaceIntent, [])
-        redist = document_rows.get(RedistributionIntent, [])
-    else:
-        insts = await _accepted_rows(db, device.id, OspfInstanceIntent)
-        ifaces = await _accepted_rows(db, device.id, OspfInterfaceIntent)
-        redist = await _accepted_rows(db, device.id, RedistributionIntent, RedistributionIntent.dest_protocol == "ospf")
-
-    async def _apply(**kwargs):
-        return await apply_ospf_config(client, device.nso_device_name, insts, ifaces, redist, **kwargs)
-
-    await _guarded_apply(client, device, "ospf", context, _apply)
-
-
-async def _replace_bgp(
-    db: AsyncSession, device, client, context: dict | None = None, *, job_id: int | None = None
-) -> None:
-    from nso_adapter.nso.apply import apply_bgp_config
-    from nso_adapter.store.models import BgpRouterIntent, RedistributionIntent
-
-    replacement = await _replacement_section(db, "bgp", job_id)
-    if replacement is not None:
-        document_rows = replacement.rows
-        routers = document_rows.get(BgpRouterIntent, [])
-        redist = document_rows.get(RedistributionIntent, [])
-    else:
-        from nso_adapter.core.bgp_load import attach_bgp_relationships
-
-        routers = await _accepted_rows(db, device.id, BgpRouterIntent)
-        await attach_bgp_relationships(db, routers)
-        redist = await _accepted_rows(db, device.id, RedistributionIntent, RedistributionIntent.dest_protocol == "bgp")
-
-    async def _apply(**kwargs):
-        return await apply_bgp_config(client, device.nso_device_name, routers, redist, **kwargs)
-
-    await _guarded_apply(client, device, "bgp", context, _apply)
-
-
-async def _replace_interface_config(
-    db: AsyncSession,
-    device,
-    client,
-    interface_names: list[str],
-    *,
-    job_id: int | None = None,
-) -> None:
-    """Propagate interface attribute/IP removal for each affected interface.
-
-    interface-reconciler is keyed by ``(device, interface-name)``, so each interface is its
-    own service instance. For an interface that still has accepted attr/IP intent, PUT-replace
-    the instance with its full remaining desired state (FASTMAP reverts the dropped address).
-    For an interface with NO remaining accepted intent, DELETE the instance (FASTMAP reverts
-    everything it created there — the operator wants nothing managed).
-    """
-    from nso_adapter.core.apply import _nokia_routed_kind
-    from nso_adapter.core.projection import hydrate_interface_execution
-    from nso_adapter.nso.apply import build_interface_config_entry, delete_interface_config, replace_interface_config
-    from nso_adapter.store.models import DbInterface, InterfaceIntent, InterfaceIpIntent
-
-    replacement = await _replacement_section(db, "interface_config", job_id)
-    if replacement is not None:
-        document_rows = replacement.rows
-        execution = hydrate_interface_execution(replacement.document)
-        interfaces = {iface.name: iface for iface in execution.interfaces.values()}
-        attr_by_iface: dict[int, list] = {}
-        ip_by_iface: dict[int, list] = {}
-        for row in document_rows.get(InterfaceIntent, []):
-            if row.attribute in ("description", "enabled"):
-                attr_by_iface.setdefault(row.interface_id, []).append(row)
-        for row in document_rows.get(InterfaceIpIntent, []):
-            ip_by_iface.setdefault(row.interface_id, []).append(row)
-    else:
-        interfaces = {}
-        attr_by_iface = {}
-        ip_by_iface = {}
-
-    for name in interface_names:
-        iface = interfaces.get(name)
-        if replacement is None:
-            iface = (
-                (
-                    await db.execute(
-                        select(DbInterface).where(DbInterface.device_id == device.id, DbInterface.name == name)
-                    )
-                )
-                .scalars()
-                .first()
-            )
-        if iface is None:
-            await delete_interface_config(client, device.nso_device_name, name)
-            continue
-        if replacement is None:
-            ip_rows = (
-                (
-                    await db.execute(
-                        select(InterfaceIpIntent).where(
-                            InterfaceIpIntent.interface_id == iface.id,
-                            InterfaceIpIntent.accepted_at.is_not(None),
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            attr_rows = (
-                (
-                    await db.execute(
-                        select(InterfaceIntent).where(
-                            InterfaceIntent.interface_id == iface.id,
-                            InterfaceIntent.accepted_at.is_not(None),
-                            InterfaceIntent.attribute.in_(("description", "enabled")),
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
-        else:
-            ip_rows = ip_by_iface.get(iface.id, [])
-            attr_rows = attr_by_iface.get(iface.id, [])
-        if not ip_rows and not attr_rows:
-            await delete_interface_config(client, device.nso_device_name, name)
-            continue
-        routed_kind = _nokia_routed_kind(iface)
-        entry = build_interface_config_entry(
-            device.nso_device_name,
-            name,
-            attr_rows,
-            ip_rows,
-            kind=routed_kind,
-            service=iface.service if routed_kind in ("ies", "vprn") else None,
-            parent_binding=iface.parent_binding,
-            encap_tag=iface.encap_tag,
-        )
-        await replace_interface_config(client, device.nso_device_name, name, entry)
-
-
-async def _replace_isis(
-    db: AsyncSession, device, client, context: dict | None = None, *, job_id: int | None = None
-) -> None:
-    """PUT-replace the isis-reconciler with the device's full remaining accepted intent.
-
-    Bespoke (not a _SIMPLE_TARGET) because apply_isis_interfaces takes several row
-    collections — interfaces, processes, IS-IS redistribution, flex-algos, levels. A
-    PUT-replace re-asserts only the ACCEPTED rows, so a deleted interface OR a cleared
-    owned scalar (metric back to blank, whose leaf a merge-PATCH would never drop) is
-    reverted on the device, while un-owned brownfield IS-IS config stays (reconcile).
-
-    COLLATERAL GUARD (the ra1 lo0 incident): handled by :func:`_guarded_apply` like
-    every PUT-replace scope — anything the service carries beyond the snapshot plus
-    the trigger's just-removed keys blocks with a native dry-run preview.
-    """
-    from nso_adapter.nso.apply import apply_isis_interfaces
-    from nso_adapter.store.models import (
-        IsisFlexAlgoIntent,
-        IsisInterfaceIntent,
-        IsisLevelIntent,
-        IsisProcessIntent,
-        RedistributionIntent,
-    )
-
-    replacement = await _replacement_section(db, "isis", job_id)
-    if replacement is not None:
-        document_rows = replacement.rows
-        ifaces = document_rows.get(IsisInterfaceIntent, [])
-        procs = document_rows.get(IsisProcessIntent, [])
-        flex = document_rows.get(IsisFlexAlgoIntent, [])
-        levels = document_rows.get(IsisLevelIntent, [])
-        redist = document_rows.get(RedistributionIntent, [])
-    else:
-        ifaces = await _accepted_rows(db, device.id, IsisInterfaceIntent)
-        procs = await _accepted_rows(db, device.id, IsisProcessIntent)
-        flex = await _accepted_rows(db, device.id, IsisFlexAlgoIntent)
-        levels = await _accepted_rows(db, device.id, IsisLevelIntent)
-        redist = await _accepted_rows(db, device.id, RedistributionIntent, RedistributionIntent.dest_protocol == "isis")
-
-    async def _apply(**kwargs):
-        return await apply_isis_interfaces(
-            client, device.nso_device_name, ifaces, procs, redist, flex, levels, **kwargs
-        )
-
-    await _guarded_apply(client, device, "isis", context, _apply)
-
-
-async def _replace_snmp(
-    db: AsyncSession, device, client, context: dict | None = None, *, job_id: int | None = None
-) -> None:
-    """PUT-replace the snmp-reconciler with the device's full remaining intent (all collections).
-
-    Bespoke (not a _SIMPLE_TARGET) because apply_snmp_config takes four collections
-    — communities, v3 users, hosts, system-info — not a single model's rows.
-    """
-    from nso_adapter.nso.apply import apply_snmp_config
-    from nso_adapter.store.models import (
-        SnmpCommunityIntent,
-        SnmpHostIntent,
-        SnmpSystemInfoIntent,
-        SnmpV3UserIntent,
-    )
-
-    replacement = await _replacement_section(db, "snmp", job_id)
-    if replacement is not None:
-        document_rows = replacement.rows
-        comms = document_rows.get(SnmpCommunityIntent, [])
-        users = document_rows.get(SnmpV3UserIntent, [])
-        hosts = document_rows.get(SnmpHostIntent, [])
-        sysinfo_rows = document_rows.get(SnmpSystemInfoIntent, [])
-        sysinfo = sysinfo_rows[0] if sysinfo_rows else None
-    else:
-        comms = await _accepted_rows(db, device.id, SnmpCommunityIntent)
-        users = await _accepted_rows(db, device.id, SnmpV3UserIntent)
-        hosts = await _accepted_rows(db, device.id, SnmpHostIntent)
-        sysinfo_rows = await _accepted_rows(db, device.id, SnmpSystemInfoIntent)
-        sysinfo = sysinfo_rows[0] if sysinfo_rows else None
-
-    async def _apply(**kwargs):
-        return await apply_snmp_config(client, device.nso_device_name, comms, users, hosts, sysinfo, **kwargs)
-
-    await _guarded_apply(client, device, "snmp", context, _apply)
-
-
 async def _dispatch_scope(
     db: AsyncSession,
     device,
@@ -1698,42 +1110,20 @@ async def _dispatch_scope(
     job_id: int | None = None,
     reg=None,
 ):
-    """Route a removal to its scope handler.
+    """Deploy one removal: the device's document, with *scope*'s removed rows omitted.
 
-    *job_id* and *reg* are the running job's identity and its live claim registration:
-    a scope whose removal owns durable carriers (R2's static-route branches) needs the
-    job id to tell its OWN tombstones from a sibling's, and a real registered claim to
-    guard the transaction that consumes them. The twelve scopes that own no carrier
-    ignore both.
+    Every family goes the same way now — there is one service and one PUT — so the only
+    branch left is the one scope that owns durable carriers. *job_id* and *reg* are the
+    running job's identity and its live claim registration: the static-route branches need
+    the job id to tell their OWN tombstones from a sibling's, and a real registered claim to
+    guard the transaction that consumes them.
 
     Returns :class:`SrRemoval` for ``static_route`` — what the write did, so the caller can
     prove it before consuming anything — and ``None`` for every other scope.
     """
-    if scope == "static_route":
-        return await _replace_static_route(db, device, client, context, job_id=job_id, reg=reg)
-    if scope == "ospf":
-        await _replace_ospf(db, device, client, context, job_id=job_id)
-    elif scope == "bgp":
-        await _replace_bgp(db, device, client, context, job_id=job_id)
-    elif scope == "snmp":
-        await _replace_snmp(db, device, client, context, job_id=job_id)
-    elif scope == "isis":
-        await _replace_isis(db, device, client, context, job_id=job_id)
-    elif scope == "logging":
-        await _replace_logging(db, device, client, context, job_id=job_id)
-    elif scope == "interface_config":
-        await _replace_interface_config(
-            db,
-            device,
-            client,
-            (context or {}).get("interfaces") or [],
-            job_id=job_id,
-        )
-    elif scope in _SIMPLE_TARGETS:
-        await _replace_simple(db, device, client, scope, context, job_id=job_id)
-    else:
+    if scope not in valid_removal_scopes():
         raise ValueError(f"Unknown removal scope {scope!r}")
-    return None
+    return await _put_removal_document(db, device, client, scope, context, job_id=job_id)
 
 
 def _refuse_force_incompatible(
@@ -1747,7 +1137,7 @@ def _refuse_force_incompatible(
     apply_attempt_id,
     frozen_fragments,
 ) -> None:
-    """Refuse the arguments a reissue cannot honor: it skips the guard and records no plan."""
+    """Refuse the arguments a reissue cannot honor: it promotes nothing and skips the guard."""
     if promotes:
         raise ValueError(f"a force-removal of {scope!r} promotes nothing; got {promotes!r}")
     if marking is not None:
@@ -1766,7 +1156,7 @@ def _refuse_force_incompatible(
         raise ValueError(f"a force-removal of {scope!r} promotes nothing; got frozen fragments to promote")
     if static_route_tombstone_ids:
         raise ValueError(
-            f"a force-removal of {scope!r} records no execution plan; got tombstone ids "
+            f"a force-removal of {scope!r} selects no lifecycle carrier; got tombstone ids "
             f"{list(static_route_tombstone_ids)}"
         )
 
@@ -1861,6 +1251,40 @@ async def _promote_parked_clears(
     await db.flush()
 
 
+async def _pending_clears_discharged_by(
+    db: AsyncSession,
+    device_id: int,
+    scope: str,
+    promotes: tuple[str, ...],
+    *,
+    mode,
+    force: bool,
+) -> tuple[int, ...]:
+    """Return the ids :func:`_settle_pending_clears_at_admission` will delete, in id order.
+
+    Read BEFORE the generation is written so its operation plane can name the carriers it
+    discharges; the same transaction holds the projection lock, so nothing moves in between.
+    """
+    from nso_adapter.core.projection import section_streams
+    from nso_adapter.store.models import GenerationMode, StreamPendingClear
+
+    if force:
+        streams: tuple[str, ...] = section_streams(scope)
+    elif scope != "static_route" and mode is GenerationMode.networked:
+        streams = promotes
+    else:
+        return ()
+    ids = (
+        await db.execute(
+            select(StreamPendingClear.id).where(
+                StreamPendingClear.device_id == device_id,
+                StreamPendingClear.stream.in_(streams),
+            )
+        )
+    ).scalars()
+    return tuple(sorted(ids.all()))
+
+
 async def _settle_pending_clears_at_admission(
     db: AsyncSession,
     device_id: int,
@@ -1936,7 +1360,7 @@ async def enqueue_removal(
     settlement_cohort: int | None = None,
     interfaces: list[str] | None = None,
     removed: dict[str, list] | None = None,
-    allowed_removal_keys: dict[str, list] | None = None,
+    allowed_removal_keys: dict[str, dict[str, list]] | None = None,
     vault_refs: dict[str, str] | None = None,
     force: bool = False,
     retract: bool = False,
@@ -2009,13 +1433,14 @@ async def enqueue_removal(
     from nso_adapter.core.generation import (
         create_generation,
         create_reissue_generation,
+        lock_projection,
         require_attach_to_job,
     )
     from nso_adapter.core.jobs import create_dedicated_job
     from nso_adapter.core.request_flags import STORE_ONLY
     from nso_adapter.store.models import GenerationMode, JobType
 
-    if scope not in VALID_REMOVAL_SCOPES:
+    if scope not in valid_removal_scopes():
         raise ValueError(f"Unknown removal scope {scope!r}")
     if marking is not None and marking not in REMOVAL_MARKINGS:
         raise ValueError(f"Unknown removal marking {marking!r}")
@@ -2053,8 +1478,7 @@ async def enqueue_removal(
     # both. Networking it would strip the un-owned row's config off the device (the #106
     # damage); not networking it leaves the cleared leaf. Safety wins — but the deferred
     # retract is recorded, never silently dropped (intent-integrity). The next push that
-    # carries no un-own retracts it. `_replace_static_route` reads the flag back and builds
-    # a body without the clear, so a NETWORKED job of a mixed request defers it too.
+    # carries no un-own retracts it. The frozen operation records the deferred clear.
     deletes = shrank or bool(context.get("removed"))
     _refuse_unmarked_deletion(scope, marking, deletes=deletes, force=force)
     _refuse_deferred_delete_origin(scope, marking, retract=retract, defer_retract=defer_retract)
@@ -2088,12 +1512,23 @@ async def enqueue_removal(
     mode = GenerationMode.detach if context.get("detach") else GenerationMode.networked
     # The context rides the GENERATION either way, not only the job: a retry of a blocked
     # head has to rebuild a job that commits the same operation, down to the detach flag.
+    #
+    # The projection lock FIRST, and held to commit. The carriers this admission discharges
+    # are selected here and named in the immutable operation plane, while the discharge below
+    # deletes them by STREAM: a store-only clear committing between an unlocked selection and
+    # the creation would be deleted by an operation that never named it, and its obligation
+    # would be gone with no record that anything discharged it.
+    await lock_projection(db, device_id)
+    from nso_adapter.core.static_route_plan import scope_qualified
+
+    discharged_clear_ids = await _pending_clears_discharged_by(db, device_id, scope, promotes, mode=mode, force=force)
     if force:
         generation = await create_reissue_generation(
             db,
             device_id,
             mode=mode,
             removal_context=context,
+            discharged_clear_ids=discharged_clear_ids,
         )
     else:
         generation = await create_generation(
@@ -2103,11 +1538,12 @@ async def enqueue_removal(
             mode=mode,
             allowed_removal_keys=allowed_removal_keys
             if allowed_removal_keys is not None
-            else context.get("removed") or {},
+            else scope_qualified(scope, context.get("removed")),
             document=document,
             removal_context=context,
             settlement_cohort=settlement_cohort,
             static_route_tombstone_ids=static_route_tombstone_ids,
+            discharged_clear_ids=discharged_clear_ids,
             apply_attempt_id=apply_attempt_id,
             frozen_fragments=frozen_fragments,
         )
@@ -2171,7 +1607,7 @@ async def enqueue_static_route_removals(
 
     *removed* maps a marking to the route keys deleted with it, and *tombstones* are the
     carriers written for those keys. Each is stamped with the job that owns ITS marking, so
-    a job's authority is exactly its own rows (``_sr_authorization`` reads tombstones by job).
+    a job's authority is exactly its own rows (its generation selects its tombstones by id).
 
     One job cannot carry both markings. ``detach`` is a job-wide dispatch switch: it decides
     whether the whole PUT-replace commits ``no-networking``, so a mixed job would either
@@ -2253,19 +1689,21 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
         context = row.context or {}
         scope: str | None = None
         try:
+            from nso_adapter.core.generation import executing_generation, execution_policy
+
+            scope = _removal_scope(context)
+            generation = await executing_generation(db, job_id)
+            if generation is None:
+                raise RuntimeError(f"removal job {job_id} carries no generation to deploy")
+            policy = execution_policy(generation)
+            context = policy.context
             scope = _removal_scope(context)
             device = await db.get(Device, device_id)
             if not device:
                 raise ValueError(f"Device {device_id} not found")
-            from nso_adapter.nso import apply as nso_apply_mod
-
             client = get_nso_client(device.nso_instance)
-            detach = bool(context.get("detach"))
-            detach_token = nso_apply_mod.DETACH_REPLACE.set(detach)
-            try:
-                outcome = await _dispatch_scope(db, device, client, scope, context, job_id=job_id, reg=reg)
-            finally:
-                nso_apply_mod.DETACH_REPLACE.reset(detach_token)
+            detach = policy.no_networking
+            outcome = await _dispatch_scope(db, device, client, scope, context, job_id=job_id, reg=reg)
             if isinstance(outcome, SrRemoval) and outcome.branch != "force":
                 # R2 §4.4/§4.6: this write owns durable carriers, so its proof, its
                 # consumption and its terminal status are one transaction of their own.
@@ -2336,7 +1774,6 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
                     "detail": {
                         "scope": scope,
                         "orphans": blocked.orphans,
-                        "preview": blocked.preview,
                         "hint": (
                             "These service rows are not in the remaining intent and were not part of "
                             "this retraction. Re-accept them into intent to keep them, or re-run via "
@@ -2438,6 +1875,39 @@ _PROMOTION_GUARD_FIELDS: dict[str, tuple[tuple[str, str, tuple[str, ...]], ...]]
 }
 
 
+def interface_removal_keys(
+    interfaces: Sequence[str],
+    addresses: Sequence[Sequence[str]],
+    attributes: Sequence[Sequence[str]] = (),
+) -> dict[str, list]:
+    """Return the keys an interface_config removal authorizes, in every grain that reads them.
+
+    ``address`` is the VALUE grain :func:`_interface_config_residue` intersects with the
+    export's ``ip/prefix-length`` strings. The document's own lists key an interface by its
+    name and an address by its host part alone, so the collateral guard's grains are DERIVED
+    from the same triples here rather than captured a second time somewhere else.
+    """
+    from nso_adapter.nso.apply import INTERFACE_ATTRIBUTE_LEAVES
+
+    keys: dict[str, list] = {}
+    for interface, attribute in attributes:
+        if attribute in INTERFACE_ATTRIBUTE_LEAVES:
+            keys.setdefault(attribute, []).append([str(interface)])
+    if addresses:
+        keys["address"] = [list(triple) for triple in addresses]
+    for interface, address, _vrf in addresses:
+        try:
+            version = ipaddress.ip_interface(str(address)).version
+        except ValueError:
+            from nso_adapter.core.generation import ApplyUnexecutable
+
+            raise ApplyUnexecutable({"ip": "invalid_stored_address"}) from None
+        keys.setdefault(f"ipv{version}-address", []).append([str(interface), str(address).rsplit("/", 1)[0]])
+    if interfaces:
+        keys["interface"] = [[str(name)] for name in interfaces]
+    return keys
+
+
 async def _promotion_interface_context(
     db: AsyncSession,
     device_id: int,
@@ -2479,8 +1949,28 @@ async def _promotion_interface_context(
         for row in removed_rows.get("interface_ip_intent", [])
         if row.get("interface_id") in names_by_id
     ]
-    removed = {"address": sorted(set(address_keys))} if address_keys else {}
-    return interfaces, removed
+    # A REPLACEMENT interface keeps rows and so keeps its entry; only a removal may empty one.
+    replaced = {
+        names_by_id[row["interface_id"]]
+        for rows in replacement_rows.values()
+        for row in rows
+        if row.get("interface_id") in names_by_id
+    }
+    emptied = sorted(
+        {
+            names_by_id[row["interface_id"]]
+            for rows in removed_rows.values()
+            for row in rows
+            if row.get("interface_id") in names_by_id
+        }
+        - replaced
+    )
+    attribute_keys = [
+        (names_by_id[row["interface_id"]], row["attribute"])
+        for row in removed_rows.get("interface_intent", [])
+        if row.get("interface_id") in names_by_id
+    ]
+    return interfaces, interface_removal_keys(emptied, sorted(set(address_keys)), sorted(set(attribute_keys)))
 
 
 async def promotion_removal_context(
@@ -2498,7 +1988,7 @@ async def promotion_removal_context(
     :func:`enqueue_removal`. The runner therefore keeps sole ownership of guard, detach,
     residue, carrier, and proof behavior.
     """
-    if scope not in VALID_REMOVAL_SCOPES:  # pragma: no cover - caller validates first
+    if scope not in valid_removal_scopes():  # pragma: no cover - caller validates first
         raise ValueError(f"Unknown removal scope {scope!r}")
 
     removed: dict[str, list] = {}
@@ -2543,10 +2033,10 @@ def removed_map(scope: str, removed) -> dict[str, list]:
             if yang_list:
                 by_list.setdefault(yang_list, []).append(name)
         return by_list
-    spec = _guard_specs().get(scope)
-    if spec is None or len(spec.lists) != 1:
+    guard_lists = section_guard_lists(scope)
+    if len(guard_lists) != 1:
         return {}
-    return {spec.lists[0].label: list(removed)}
+    return {guard_lists[0].label: list(removed)}
 
 
 async def replace_on_removal(
@@ -2580,7 +2070,7 @@ async def replace_on_removal(
     """
     if not removed and not retract:
         return False
-    scope = _SCOPE_BY_MODEL.get(store_model.__name__)
+    scope = _section_by_model().get(store_model.__name__)
     if scope is None:
         logger.error("removal.unknown_model", model=store_model.__name__)
         return False

@@ -476,19 +476,22 @@ async def test_disconnect_posts_disconnect_action():
 # ── service_instance_state — the certified tri-state read (#1396 R2 §4.4) ─────
 #
 # get_service_config returns None for a keyed 404 AND for any 2xx it cannot parse into a
-# recognized non-empty root. That conflation is safe where the read can only OMIT work; it
-# is not safe under a live-relative PUT body, which would silently drop every entry the
-# uncertified read failed to show. These pin that only a 404 certifies an absence.
+# recognized non-empty root. That conflation is safe where the read can only OMIT work; it is
+# not safe for the retained entries of a full-document PUT, which would silently drop every
+# entry the uncertified read failed to show. These pin that only a 404 certifies an absence.
 
-_SR_PATH = "/restconf/data/static-route-reconciler:static-route-config"
-_SR_ROOT = "static-route-reconciler:static-route-config"
-_ENTRY = {"device": "rtr", "route": [{"vrf": "", "prefix": "10.0.0.0/24", "next-hop": "192.0.2.1"}]}
+#: ONE service, so the reader takes no path any more: the aggregate instance of one device.
+_SR_ROOT = "device-intent:device-intent"
+_ENTRY = {
+    "device": "rtr",
+    "static-route": {"route": [{"vrf": "", "prefix": "10.0.0.0/24", "next-hop": "192.0.2.1"}]},
+}
 
 
 async def test_service_instance_state_present_on_a_parsed_instance(patch_client):
     client = _make_client()
     with patch_client(client, 200, {_SR_ROOT: [_ENTRY]}):
-        state = await client.service_instance_state(_SR_PATH, "rtr")
+        state = await client.service_instance_state("rtr")
     assert (state.status, state.entry) == ("present", _ENTRY)
     assert state.present and not state.inconclusive
 
@@ -496,7 +499,7 @@ async def test_service_instance_state_present_on_a_parsed_instance(patch_client)
 async def test_service_instance_state_absent_only_on_a_keyed_404(patch_client):
     client = _make_client()
     with patch_client(client, 404, {"ietf-restconf:errors": {}}):
-        state = await client.service_instance_state(_SR_PATH, "rtr")
+        state = await client.service_instance_state("rtr")
     assert (state.status, state.entry) == ("absent", None)
 
 
@@ -519,7 +522,7 @@ async def test_service_instance_state_is_inconclusive_never_absent(patch_client,
     """
     client = _make_client()
     with patch_client(client, 200, body, raw):
-        state = await client.service_instance_state(_SR_PATH, "rtr")
+        state = await client.service_instance_state("rtr")
     assert state.status == "inconclusive", label
     assert state.entry is None
     assert not state.present
@@ -541,14 +544,14 @@ async def test_the_legacy_reader_reports_these_same_bodies_as_no_instance(patch_
     destructive replace must not be built on."""
     client = _make_client()
     with patch_client(client, 200, body):
-        assert not await client.get_service_config(_SR_PATH, "rtr")
+        assert not await client.get_service_config("rtr")
 
 
 async def test_service_instance_state_accepts_the_short_root_spelling(patch_client):
     """RESTCONF may answer with the module prefix stripped — that is still a real read."""
     client = _make_client()
-    with patch_client(client, 200, {"static-route-config": [_ENTRY]}):
-        state = await client.service_instance_state(_SR_PATH, "rtr")
+    with patch_client(client, 200, {"device-intent": [_ENTRY]}):
+        state = await client.service_instance_state("rtr")
     assert state.status == "present"
 
 
@@ -557,15 +560,15 @@ async def test_service_instance_state_raises_on_a_server_error(patch_client):
     client = _make_client()
     with patch_client(client, 500, {"error": "boom"}):
         with pytest.raises(httpx.HTTPStatusError):
-            await client.service_instance_state(_SR_PATH, "rtr")
+            await client.service_instance_state("rtr")
 
 
 @pytest.mark.parametrize(
     ("body", "label"),
     [
-        ({_SR_ROOT: [_ENTRY, {"device": "other-rtr", "route": []}]}, "two instances"),
-        ({_SR_ROOT: [{"device": "other-rtr", "route": []}]}, "another device's instance"),
-        ({_SR_ROOT: [{"route": []}]}, "an instance with no device key"),
+        ({_SR_ROOT: [_ENTRY, {"device": "other-rtr"}]}, "two instances"),
+        ({_SR_ROOT: [{"device": "other-rtr"}]}, "another device's instance"),
+        ({_SR_ROOT: [{"static-route": {"route": []}}]}, "an instance with no device key"),
     ],
 )
 async def test_service_instance_state_refuses_an_instance_it_did_not_ask_for(patch_client, body, label):
@@ -577,6 +580,6 @@ async def test_service_instance_state_refuses_an_instance_it_did_not_ask_for(pat
     """
     client = _make_client()
     with patch_client(client, 200, body):
-        state = await client.service_instance_state(_SR_PATH, "rtr")
+        state = await client.service_instance_state("rtr")
     assert state.status == "inconclusive", label
     assert state.entry is None

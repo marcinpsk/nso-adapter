@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for nso/apply.py — apply_interface_attribute."""
+"""Tests for nso/apply.py: the wire vocabulary and the one sender.
+
+The per-family senders are gone with the reconcilers. What is left here is the pure
+``encode_*`` vocabulary each family's container is built from, and ``apply_device_intent``,
+which PUTs the whole document as one instance.
+"""
 
 from __future__ import annotations
 
@@ -9,20 +14,28 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+from nso_adapter.core.community_dialect import community_dialect_for
+from nso_adapter.core.projection import InterfaceExecution
 from nso_adapter.nso import apply as apply_mod
 from nso_adapter.nso.apply import (
     NsoApplyError,
+    SectionExecution,
     _device_delta_from_dry_run,
     _ospf_interface_entry,
     _ospf_process_entry,
     _verify_native_or_raise,
-    apply_interface_attribute,
-    apply_interface_ips,
-    apply_static_routes,
-    build_interface_ip_entry,
+    apply_device_intent,
+    build_interface_ip_body,
     build_isis_process_payload,
+    encode_bgp,
+    encode_interface_config,
+    encode_l2_sap,
+    encode_ospf,
+    encode_route_policy,
+    encode_static_route,
+    encode_vlan,
 )
-from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.client import DEVICE_INTENT_ROOT, NsoClient
 from nso_adapter.store.models import (
     BgpRouterIntent,
     IsisFlexAlgoIntent,
@@ -32,6 +45,42 @@ from nso_adapter.store.models import (
     OspfInterfaceIntent,
     RedistributionIntent,
 )
+
+#: What an encoder that reads no NED-conditioned fact is handed.
+_PLAIN = SectionExecution(None, community_dialect_for(None))
+
+
+def _dialect_for(ned_id: str | None) -> SectionExecution:
+    """The frozen context a NED-conditioned encoder reads: the id and its dialect."""
+    return SectionExecution(ned_id, community_dialect_for(ned_id))
+
+
+def _iface(interface_id: int = 1, name: str = "Gi0/0", **kwargs) -> SimpleNamespace:
+    """A stand-in for the DbInterface row the interface proof carries."""
+    fields = {"kind": "physical", "service": "", "vrf": "", "parent_binding": None, "encap_tag": None}
+    return SimpleNamespace(id=interface_id, name=name, **{**fields, **kwargs})
+
+
+def _attr_row(interface_id: int, attribute: str, value) -> SimpleNamespace:
+    return SimpleNamespace(interface_id=interface_id, attribute=attribute, intent_value=value)
+
+
+def _interface_body(attr_rows=(), ip_rows=(), interfaces=None, eligible=None) -> dict:
+    """Encode the ``interface`` container from its two tables plus the frozen proof."""
+    ifaces = {i.id: i for i in (interfaces or [_iface()])}
+    keys = frozenset((r.interface_id, r.attribute) for r in attr_rows) if eligible is None else eligible
+    execution = SectionExecution(None, community_dialect_for(None), InterfaceExecution(ifaces, keys))
+    return encode_interface_config(
+        {"interface_intent": list(attr_rows), "interface_ip_intent": list(ip_rows)}, execution
+    )
+
+
+def _sent_document(client, index: int = 0) -> dict:
+    """The ``list device-intent`` entry the mocked PUT carried."""
+    import json
+
+    call = client._client.return_value.__aenter__.return_value.put.call_args_list[index]
+    return json.loads(call.kwargs["content"])[DEVICE_INTENT_ROOT][0]
 
 
 def _make_nso_client(base="http://nso"):
@@ -73,184 +122,106 @@ def _mock_http_ctx(client, response):
     return _stub_pool(client, http)
 
 
-@pytest.mark.asyncio
-async def test_apply_description_success():
-    """Applies description attribute without raising."""
-    client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(204))
-
-    await apply_interface_attribute(client, "core-rtr-01", "GigabitEthernet0/0", "description", "uplink")
-
-    mock_http = client._client.return_value.__aenter__.return_value
-    # Real PATCH + post-apply native dry-run verify = two calls.
-    assert mock_http.patch.call_count == 2
-    real_call = mock_http.patch.call_args_list[0]
-    (url,) = real_call[0]
-    assert "interface-reconciler" in url
-    assert "dry-run" not in url
-    import json
-
-    payload = json.loads(real_call[1]["content"])
-    entries = payload["interface-reconciler:interface-config"]
-    assert entries[0]["description"] == "uplink"
-    assert entries[0]["device"] == "core-rtr-01"
-    assert entries[0]["interface-name"] == "GigabitEthernet0/0"
+# ── the interface container: description, admin state, addresses in ONE entry ──
 
 
-@pytest.mark.asyncio
-async def test_apply_enabled_true():
-    """enabled='True' string maps to boolean True."""
-    client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(200))
+def test_the_interface_container_carries_a_description():
+    body = _interface_body([_attr_row(1, "description", "uplink")])
 
-    await apply_interface_attribute(client, "rtr", "ge-0/0/0", "enabled", "True")
-
-    mock_http = client._client.return_value.__aenter__.return_value
-    import json
-
-    payload = json.loads(mock_http.patch.call_args[1]["content"])
-    assert payload["interface-reconciler:interface-config"][0]["enabled"] is True
+    assert body == {"interface": [{"interface-name": "Gi0/0", "description": "uplink"}]}
 
 
-@pytest.mark.asyncio
-async def test_apply_enabled_lowercase_true():
-    """Regression: lowercase 'true' (from a JSON-boolean intent push) maps to True.
+@pytest.mark.parametrize("value", ["true", "True"])
+def test_enabled_true_spellings_map_to_the_boolean(value):
+    """The intent value is a string whose case varies by source; both spellings mean up.
 
-    Previously the check was `value == "True"`, so a stored 'true' became False and a
+    The check used to be ``value == "True"``, so a stored 'true' became False and a
     deliberately-enabled interface was silently written as disabled.
     """
-    client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(200))
+    body = _interface_body([_attr_row(1, "enabled", value)])
 
-    await apply_interface_attribute(client, "rtr", "ge-0/0/0", "enabled", "true")
-
-    mock_http = client._client.return_value.__aenter__.return_value
-    import json
-
-    payload = json.loads(mock_http.patch.call_args[1]["content"])
-    assert payload["interface-reconciler:interface-config"][0]["enabled"] is True
+    assert body["interface"][0]["enabled"] is True
 
 
-@pytest.mark.asyncio
-async def test_apply_enabled_false():
-    """enabled != 'True' string maps to boolean False."""
-    client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(201))
+@pytest.mark.parametrize("value", ["false", "False"])
+def test_enabled_false_spellings_map_to_the_boolean(value):
+    body = _interface_body([_attr_row(1, "enabled", value)])
 
-    await apply_interface_attribute(client, "rtr", "ge-0/0/0", "enabled", "False")
-
-    mock_http = client._client.return_value.__aenter__.return_value
-    import json
-
-    payload = json.loads(mock_http.patch.call_args[1]["content"])
-    assert payload["interface-reconciler:interface-config"][0]["enabled"] is False
+    assert body["interface"][0]["enabled"] is False
 
 
-@pytest.mark.asyncio
-async def test_apply_description_none_uses_empty_string():
-    """None description is converted to empty string in the payload."""
-    client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(204))
+def test_a_none_description_is_sent_as_the_empty_string():
+    """A cleared description must reach the device as "", never as a JSON null."""
+    body = _interface_body([_attr_row(1, "description", None)])
 
-    await apply_interface_attribute(client, "rtr", "ge-0/0/0", "description", None)
-
-    mock_http = client._client.return_value.__aenter__.return_value
-    import json
-
-    payload = json.loads(mock_http.patch.call_args[1]["content"])
-    assert payload["interface-reconciler:interface-config"][0]["description"] == ""
+    assert body["interface"][0]["description"] == ""
 
 
-@pytest.mark.asyncio
-async def test_apply_interface_attribute_nokia_routed_context():
-    """A Nokia logical/loopback interface's description carries the base|ies|vprn routed
-    context so the reconciler writes it onto the router/service interface, not the phantom
-    ``configure port <logical-name>``. Without this the per-scope attribute apply drifts a
-    Nokia interface_attribute roundtrip (Finding C-drift)."""
-    client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(204))
+def test_an_ineligible_attribute_never_reaches_the_wire():
+    """Eligibility is FROZEN in the section's proof, so the encoder cannot re-decide it."""
+    rows = [_attr_row(1, "description", "uplink"), _attr_row(1, "enabled", "false")]
 
-    await apply_interface_attribute(
-        client,
-        "ra1",
-        "CRPD-VPN:LO7",
-        "description",
-        "loopback for CRPD-VPN",
-        kind="vprn",
-        service="CRPD-VPN",
-        parent_binding="lag-99",
-        encap_tag="10",
-    )
+    body = _interface_body(rows, eligible=frozenset({(1, "description")}))
 
-    import json
+    assert body["interface"] == [{"interface-name": "Gi0/0", "description": "uplink"}]
 
-    entry = json.loads(client._client.return_value.__aenter__.return_value.patch.call_args_list[0].kwargs["content"])[
-        "interface-reconciler:interface-config"
-    ][0]
+
+def test_an_attribute_with_no_wire_leaf_is_refused_not_dropped():
+    """The managed scope is operator DATA, so the store can hold an attribute this writer has
+    no leaf for. Emitting the entry without it would stamp the row in_sync for a leaf that
+    never reached the device (#26), and under a full-document PUT nothing else would say so.
+    """
+    rows = [_attr_row(1, "description", "uplink"), _attr_row(1, "mtu", "1500")]
+
+    with pytest.raises(NsoApplyError) as exc_info:
+        _interface_body(rows)
+
+    assert exc_info.value.code == "unsupported_attribute"
+    assert exc_info.value.detail == {"interface": "Gi0/0", "attribute": "mtu"}
+
+
+def test_a_corrupt_enabled_value_raises_rather_than_shutting_the_interface():
+    """A malformed `enabled` value must raise, never silently coerce to False."""
+    for bad in (None, "yes"):
+        with pytest.raises(NsoApplyError, match="enabled"):
+            _interface_body([_attr_row(1, "enabled", bad)])
+
+
+def test_the_interface_entry_merges_attributes_and_addresses():
+    """Attributes and addresses ride ONE keyed entry: two entries would collide on the key."""
+    ip = SimpleNamespace(interface_id=1, address="10.0.0.1/24", family="ipv4", secondary=False, vrf="")
+
+    body = _interface_body([_attr_row(1, "description", "uplink")], [ip])
+
+    assert body["interface"] == [
+        {
+            "interface-name": "Gi0/0",
+            "description": "uplink",
+            "ipv4-address": [{"address": "10.0.0.1", "prefix-length": 24, "secondary": False}],
+        }
+    ]
+
+
+def test_the_interface_entry_carries_the_nokia_routed_context():
+    """Nokia routed metadata targets the router/service interface, not the port."""
+    iface = _iface(1, "CRPD-VPN:LO7", kind="logical", service="CRPD-VPN", vrf="CRPD-VPN", parent_binding="lag-99")
+    ip = SimpleNamespace(interface_id=1, address="7.7.7.7/32", family="ipv4", secondary=False, vrf="CRPD-VPN")
+
+    entry = _interface_body([], [ip], interfaces=[iface])["interface"][0]
+
     assert entry["kind"] == "vprn"
     assert entry["service"] == "CRPD-VPN"
     assert entry["parent-binding"] == "lag-99"
-    assert entry["encap-tag"] == "10"
-    assert entry["description"] == "loopback for CRPD-VPN"
+    assert entry["ipv4-address"] == [{"address": "7.7.7.7", "prefix-length": 32, "secondary": False}]
 
 
-@pytest.mark.asyncio
-async def test_apply_interface_attribute_no_kind_omits_routed_fields():
-    """IOS/Junos (no kind) attribute PATCH carries no Nokia routed-interface fields — the
-    existing per-scope behaviour is unchanged when the interface is not a Nokia L3 one."""
-    client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(204))
+def test_a_non_nokia_interface_entry_omits_the_routed_fields():
+    """IOS/Junos interfaces carry no Nokia routed-interface context."""
+    ip = SimpleNamespace(interface_id=1, address="10.0.0.1/24", family="ipv4", secondary=False, vrf="")
 
-    await apply_interface_attribute(client, "rtr", "GigabitEthernet0/0", "enabled", "True")
+    entry = _interface_body([], [ip])["interface"][0]
 
-    import json
-
-    entry = json.loads(client._client.return_value.__aenter__.return_value.patch.call_args_list[0].kwargs["content"])[
-        "interface-reconciler:interface-config"
-    ][0]
-    assert entry["enabled"] is True
-    assert "kind" not in entry and "service" not in entry
-    assert "parent-binding" not in entry and "encap-tag" not in entry
-
-
-@pytest.mark.asyncio
-async def test_apply_unsupported_attribute_raises():
-    """Unsupported attribute raises NsoApplyError immediately (no HTTP call)."""
-    client = _make_nso_client()
-
-    with pytest.raises(NsoApplyError) as exc_info:
-        await apply_interface_attribute(client, "rtr", "ge-0/0/0", "mtu", "1500")
-
-    assert exc_info.value.code == "unsupported_attribute"
-    client._client.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_apply_nso_error_status_raises():
-    """Non-2xx NSO response raises NsoApplyError."""
-    client = _make_nso_client()
-    error_body = {"error": {"code": "locked", "message": "device locked"}}
-    _mock_http_ctx(client, _httpx_response(409, json_data=error_body))
-
-    with pytest.raises(NsoApplyError) as exc_info:
-        await apply_interface_attribute(client, "rtr", "ge-0/0/0", "description", "x")
-
-    assert exc_info.value.code == "nso_patch_failed"
-    assert "409" in exc_info.value.message
-
-
-@pytest.mark.asyncio
-async def test_apply_nso_error_non_json_body():
-    """Non-JSON NSO error body is captured as raw text."""
-    client = _make_nso_client()
-    # A real 500 whose body is non-JSON: resp.json() raises naturally, so the apply error
-    # path must fall back to resp.text (no need to fake the JSON failure).
-    _mock_http_ctx(client, _httpx_response(500))
-
-    with pytest.raises(NsoApplyError) as exc_info:
-        await apply_interface_attribute(client, "rtr", "ge-0/0/0", "description", "x")
-
-    assert "raw" in exc_info.value.detail.get("nso_error", {})
+    assert "kind" not in entry and "parent-binding" not in entry
 
 
 class _SapRow:
@@ -263,29 +234,16 @@ class _SapRow:
         self.inner_tag = inner_tag
 
 
-@pytest.mark.asyncio
-async def test_apply_l2_saps_builds_patch_body():
-    """apply_l2_saps PATCHes the l2-sap-reconciler service with the SAP list."""
-    import json
-
-    from nso_adapter.nso.apply import apply_l2_saps
-
-    client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(204))
-
+def test_the_l2_sap_container_carries_the_sap_list():
+    """The l2-sap container is keyed by (service-name, sap-id) with the tags it owns."""
     rows = [
         _SapRow("TL", "epipe", "lag-60:3999", port="lag-60", outer_tag=3999),
         _SapRow("701", "vpls", "1/1/c31/3:701.10", port="1/1/c31/3", outer_tag=701, inner_tag=10),
     ]
-    await apply_l2_saps(client=client, device_name="ra1", sap_intent_rows=rows)
 
-    mock_http = client._client.return_value.__aenter__.return_value
-    (url,) = mock_http.patch.call_args[0]
-    assert "l2-sap-reconciler" in url
-    payload = json.loads(mock_http.patch.call_args[1]["content"])
-    cfg = payload["l2-sap-reconciler:l2-sap-config"]
-    assert cfg[0]["device"] == "ra1"
-    saps = {s["sap-id"]: s for s in cfg[0]["sap"]}
+    body = encode_l2_sap({"l2_sap_intent": rows}, _PLAIN)
+
+    saps = {s["sap-id"]: s for s in body["sap"]}
     assert saps["lag-60:3999"]["service-type"] == "epipe"
     assert saps["lag-60:3999"]["outer-tag"] == 3999
     assert "inner-tag" not in saps["lag-60:3999"]
@@ -293,16 +251,30 @@ async def test_apply_l2_saps_builds_patch_body():
 
 
 @pytest.mark.asyncio
-async def test_apply_l2_saps_nso_error_raises():
-    """Non-2xx NSO response from the L2 SAP PATCH raises NsoApplyError."""
-    from nso_adapter.nso.apply import apply_l2_saps
-
+async def test_a_rejected_commit_raises_with_the_put_code():
+    """A non-2xx on the document PUT surfaces as a structured error, body attached."""
     client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(409, json_data={"error": {}}))
+    mock_http = AsyncMock()
+    mock_http.put.return_value = _httpx_response(409, json_data={"error": {}})
+    _stub_pool(client, mock_http)
 
     with pytest.raises(NsoApplyError) as exc_info:
-        await apply_l2_saps(client=client, device_name="ra1", sap_intent_rows=[_SapRow("TL", "epipe", "lag-60:1")])
-    assert exc_info.value.code == "nso_patch_failed"
+        await apply_device_intent(client, "ra1", {"l2-sap": {"sap": []}})
+    assert exc_info.value.code == "nso_put_failed"
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_commit_with_a_non_json_body_still_raises():
+    """A plain-text rejection raises a structured error without exposing its body."""
+    client = _make_nso_client()
+    mock_http = AsyncMock()
+    mock_http.put.return_value = _httpx_response(400)
+    _stub_pool(client, mock_http)
+
+    with pytest.raises(NsoApplyError) as exc_info:
+        await apply_device_intent(client, "ra1", {"l2-sap": {"sap": []}})
+    assert exc_info.value.code == "nso_put_failed"
+    assert exc_info.value.detail["nso_error"] == {"raw": "[redacted]"}
 
 
 def test_nso_apply_error_str():
@@ -319,133 +291,57 @@ def test_nso_apply_error_default_detail():
     assert err.detail == {}
 
 
-# ── apply_interface_ips ──────────────────────────────────────────────────────
+# ── build_interface_ip_body (the address half of the interface entry) ────────
 
 
 def _make_ip_row(address: str, family: str = "ipv4", secondary: bool = False, vrf: str = "") -> SimpleNamespace:
-    # A plain record stand-in — apply reads .address/.family/.secondary/.vrf. SimpleNamespace
-    # does not fabricate attributes, so a renamed field surfaces as AttributeError.
+    # A plain record stand-in — the builder reads .address/.family/.secondary/.vrf.
+    # SimpleNamespace does not fabricate attributes, so a renamed field surfaces as AttributeError.
     return SimpleNamespace(address=address, family=family, secondary=secondary, vrf=vrf)
 
 
-@pytest.mark.asyncio
-async def test_apply_interface_ips_ipv4_primary():
-    """Single IPv4 primary address produces correct PATCH body."""
-    client = _make_nso_client()
-    resp = _httpx_response(204)
-    _mock_http_ctx(client, resp)
+def test_interface_ip_body_ipv4_primary():
+    entry = build_interface_ip_body("GigabitEthernet0/1", [_make_ip_row("10.0.0.1/24")])
 
-    row = _make_ip_row("10.0.0.1/24", family="ipv4", secondary=False, vrf="")
-    await apply_interface_ips(client, "rtr-a", "GigabitEthernet0/1", [row])
-
-    import json
-
-    call_kwargs = client._client.return_value.__aenter__.return_value.patch.call_args
-    body = json.loads(call_kwargs.kwargs["content"])
-    entry = body["interface-reconciler:interface-config"][0]
-    assert entry["device"] == "rtr-a"
     assert entry["interface-name"] == "GigabitEthernet0/1"
     assert entry["ipv4-address"] == [{"address": "10.0.0.1", "prefix-length": 24, "secondary": False}]
     assert "vrf" not in entry
 
 
-@pytest.mark.asyncio
-async def test_apply_interface_ips_ipv6():
-    """IPv6 address produces correct PATCH body."""
-    client = _make_nso_client()
-    resp = _httpx_response(204)
-    _mock_http_ctx(client, resp)
+def test_interface_ip_body_ipv6():
+    entry = build_interface_ip_body("GigabitEthernet0/2", [_make_ip_row("2001:db8::1/64", family="ipv6")])
 
-    row = _make_ip_row("2001:db8::1/64", family="ipv6")
-    await apply_interface_ips(client, "rtr-b", "GigabitEthernet0/2", [row])
-
-    import json
-
-    call_kwargs = client._client.return_value.__aenter__.return_value.patch.call_args
-    body = json.loads(call_kwargs.kwargs["content"])
-    entry = body["interface-reconciler:interface-config"][0]
     assert entry["ipv6-address"] == [{"address": "2001:db8::1", "prefix-length": 64}]
     assert "ipv4-address" not in entry
 
 
-@pytest.mark.asyncio
-async def test_apply_interface_ips_sets_vrf():
-    """Non-empty vrf field is included in the PATCH body."""
-    client = _make_nso_client()
-    resp = _httpx_response(204)
-    _mock_http_ctx(client, resp)
+def test_interface_ip_body_sets_vrf():
+    """VRF is an interface-level concept: the first non-empty row value binds the entry."""
+    entry = build_interface_ip_body("GigabitEthernet0/3", [_make_ip_row("10.1.1.1/30", vrf="MGMT")])
 
-    row = _make_ip_row("10.1.1.1/30", family="ipv4", vrf="MGMT")
-    await apply_interface_ips(client, "rtr-c", "GigabitEthernet0/3", [row])
-
-    import json
-
-    call_kwargs = client._client.return_value.__aenter__.return_value.patch.call_args
-    body = json.loads(call_kwargs.kwargs["content"])
-    entry = body["interface-reconciler:interface-config"][0]
     assert entry["vrf"] == "MGMT"
 
 
-@pytest.mark.asyncio
-async def test_apply_interface_ips_nokia_routed_context():
-    """Nokia routed-interface metadata is included in the PATCH so the reconciler
-    targets the router/service interface, not the port."""
-    client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(204))
-
-    row = _make_ip_row("7.7.7.7/32", family="ipv4", vrf="CRPD-VPN")
-    await apply_interface_ips(
-        client,
-        "ra1",
+def test_interface_ip_body_carries_the_nokia_routed_context():
+    entry = build_interface_ip_body(
         "CRPD-VPN:LO7",
-        [row],
+        [_make_ip_row("7.7.7.7/32", vrf="CRPD-VPN")],
         kind="vprn",
         service="CRPD-VPN",
         parent_binding="lag-99",
         encap_tag="10",
     )
 
-    import json
-
-    call_kwargs = client._client.return_value.__aenter__.return_value.patch.call_args
-    entry = json.loads(call_kwargs.kwargs["content"])["interface-reconciler:interface-config"][0]
     assert entry["kind"] == "vprn"
     assert entry["service"] == "CRPD-VPN"
     assert entry["parent-binding"] == "lag-99"
     assert entry["encap-tag"] == "10"
-    assert entry["ipv4-address"] == [{"address": "7.7.7.7", "prefix-length": 32, "secondary": False}]
 
 
-@pytest.mark.asyncio
-async def test_apply_interface_ips_no_kind_omits_routed_fields():
-    """IOS/Junos (no kind) PATCH carries no Nokia routed-interface fields."""
-    client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(204))
+def test_interface_ip_body_without_a_kind_omits_the_routed_fields():
+    entry = build_interface_ip_body("GigabitEthernet0/1", [_make_ip_row("10.0.0.1/24")])
 
-    row = _make_ip_row("10.0.0.1/24")
-    await apply_interface_ips(client, "rtr-a", "GigabitEthernet0/1", [row])
-
-    import json
-
-    entry = json.loads(client._client.return_value.__aenter__.return_value.patch.call_args.kwargs["content"])[
-        "interface-reconciler:interface-config"
-    ][0]
     assert "kind" not in entry and "parent-binding" not in entry
-
-
-@pytest.mark.asyncio
-async def test_apply_interface_ips_nso_error_raises():
-    """Non-2xx response from NSO raises NsoApplyError."""
-    client = _make_nso_client()
-    resp = _httpx_response(500, json_data={"error": {"code": "internal"}})
-    _mock_http_ctx(client, resp)
-
-    row = _make_ip_row("10.2.0.1/24")
-    with pytest.raises(NsoApplyError) as exc_info:
-        await apply_interface_ips(client, "rtr-d", "GigabitEthernet0/4", [row])
-
-    assert exc_info.value.code == "nso_patch_failed"
-    assert "500" in exc_info.value.message
 
 
 # ── Post-apply native dry-run verification (false-success guard) ────────────────
@@ -490,7 +386,7 @@ async def test_verify_raises_on_nonempty_delta():
     with pytest.raises(NsoApplyError) as exc_info:
         await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="static_route")
     assert exc_info.value.code == "verify_mismatch"
-    assert "ip route" in exc_info.value.detail["device_delta"]
+    assert exc_info.value.detail["device_delta"] == "[redacted]"
 
 
 @pytest.mark.asyncio
@@ -518,7 +414,7 @@ async def test_verify_raises_on_conclusive_4xx_rejection():
     _mock_http_ctx(client, _httpx_response(400, json_data=err_body))
     with pytest.raises(NsoApplyError) as exc_info:
         await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="route_policy")
-    assert exc_info.value.detail.get("nso_error") == err_body
+    assert exc_info.value.detail["nso_error"] == {"ietf-restconf:errors": {"error": [{"error-message": "[redacted]"}]}}
 
 
 @pytest.mark.asyncio
@@ -552,43 +448,36 @@ async def test_verify_disabled_by_toggle(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_apply_static_routes_verify_mismatch_raises():
-    """End-to-end: real PATCH succeeds (204) but the verify dry-run shows a delta → raise."""
+async def test_a_committed_document_that_did_not_land_raises_verify_mismatch():
+    """End-to-end: the PUT succeeds (204) but the verify dry-run still shows a delta."""
     client = _make_nso_client()
-    real_resp = _httpx_response(204)
-    dry_resp = _httpx_response(
-        200, json_data={"dry-run-result": {"native": {"device": [{"name": "sw03", "data": "ip route ...\n"}]}}}
-    )
     mock_http = AsyncMock()
-    mock_http.patch.side_effect = [real_resp, dry_resp]
+    mock_http.put.side_effect = [
+        _httpx_response(204),
+        _httpx_response(
+            200, json_data={"dry-run-result": {"native": {"device": [{"name": "sw03", "data": "ip route ...\n"}]}}}
+        ),
+    ]
     _stub_pool(client, mock_http)
 
     row = SimpleNamespace(vrf="", prefix="100.64.0.0/10", next_hop="172.16.0.1", metric=1, permanent=False, tag=None)
+    body = encode_static_route({"static_route_intent": [row]}, _PLAIN)
     with pytest.raises(NsoApplyError) as exc_info:
-        await apply_static_routes(client=client, device_name="sw03", route_intent_rows=[row])
+        await apply_device_intent(client, "sw03", {"static-route": body})
     assert exc_info.value.code == "verify_mismatch"
-    # First call is the real PATCH (no dry-run), second is the verify dry-run.
-    assert "dry-run" not in mock_http.patch.call_args_list[0][0][0]
-    assert "dry-run=native" in mock_http.patch.call_args_list[1][0][0]
+    # First call is the real PUT (no dry-run), second is the verify dry-run, same method.
+    assert "dry-run" not in mock_http.put.call_args_list[0][0][0]
+    assert "dry-run=native" in mock_http.put.call_args_list[1][0][0]
 
 
-@pytest.mark.asyncio
-async def test_apply_bgp_config_uses_correct_yang_keys():
-    """Regression (finding #31): the bgp-reconciler service YANG uses `afi` (not `af`)
-    and `peer-address-family` (not `address-family`) under each peer. Sending the wrong
-    keys caused a live 400 `unknown element: address-family` on rg03's IOS BGP."""
-    import json
+def _bgp_body(routers, redistribution=()):
+    return encode_bgp({"bgp_router_intent": list(routers), "redistribution_intent": list(redistribution)}, _PLAIN)
 
-    from nso_adapter.nso.apply import apply_bgp_config
 
-    client = _make_nso_client()
-    real_resp = _httpx_response(204)
-    # Verify dry-run with no device delta → guard passes.
-    dry_resp = _httpx_response(200, json_data={"dry-run-result": {"native": {"device": []}}})
-    mock_http = AsyncMock()
-    mock_http.patch.side_effect = [real_resp, dry_resp]
-    _stub_pool(client, mock_http)
-
+def test_the_bgp_container_uses_the_yang_key_spellings():
+    """Regression (finding #31): the BGP YANG uses `afi` (not `af`) and
+    `peer-address-family` (not `address-family`) under each peer. Sending the wrong keys
+    caused a live 400 `unknown element: address-family` on rg03's IOS BGP."""
     paf = SimpleNamespace(
         af="ipv4-unicast",
         enabled=True,
@@ -608,18 +497,11 @@ async def test_apply_bgp_config_uses_correct_yang_keys():
         source=None,
         peer_address_families=[paf],
     )
-    scope = SimpleNamespace(
-        vrf="",
-        address_families=[SimpleNamespace(af="ipv4-unicast")],
-        peers=[peer],
-    )
+    scope = SimpleNamespace(vrf="", address_families=[SimpleNamespace(af="ipv4-unicast")], peers=[peer])
     router = SimpleNamespace(asn=65100, router_id=None, scopes=[scope])
 
-    await apply_bgp_config(client=client, device_name="rg03", router_intent_rows=[router])
+    scope_out = _bgp_body([router])["router"][0]["scope"][0]
 
-    payload = json.loads(mock_http.patch.call_args_list[0][1]["content"])
-    router_out = payload["bgp-reconciler:bgp-config"][0]["router"][0]
-    scope_out = router_out["scope"][0]
     # scope-level AF list key is `afi`
     assert scope_out["address-family"][0]["afi"] == "ipv4-unicast"
     assert "af" not in scope_out["address-family"][0]
@@ -629,25 +511,12 @@ async def test_apply_bgp_config_uses_correct_yang_keys():
     assert peer_out["peer-address-family"][0]["afi"] == "ipv4-unicast"
 
 
-@pytest.mark.anyio
-async def test_apply_bgp_config_sends_peer_source():
-    """A peer's `source` (update-source iface / local-address IP) is sent under `peer/source`.
+def test_the_bgp_container_carries_the_peer_source():
+    """A peer's `source` (update-source iface / local-address IP) rides `peer/source`.
 
-    Without it the bgp-reconciler never receives the session source even though the reader
-    exported it and the adapter stored it — the BGP session source was silently un-pushable.
+    Without it the session source was never sent even though the reader exported it and the
+    adapter stored it: the BGP session source was silently un-pushable.
     """
-    import json
-
-    from nso_adapter.nso.apply import apply_bgp_config
-
-    client = _make_nso_client()
-    mock_http = AsyncMock()
-    mock_http.patch.side_effect = [
-        _httpx_response(204),
-        _httpx_response(200, json_data={"dry-run-result": {"native": {"device": []}}}),
-    ]
-    _stub_pool(client, mock_http)
-
     peer = SimpleNamespace(
         peer_address="192.0.2.7",
         enabled=True,
@@ -662,10 +531,8 @@ async def test_apply_bgp_config_sends_peer_source():
     scope = SimpleNamespace(vrf="", address_families=[], peers=[peer])
     router = SimpleNamespace(asn=65100, router_id=None, scopes=[scope])
 
-    await apply_bgp_config(client=client, device_name="rg03", router_intent_rows=[router])
+    peer_out = _bgp_body([router])["router"][0]["scope"][0]["peer"][0]
 
-    payload = json.loads(mock_http.patch.call_args_list[0][1]["content"])
-    peer_out = payload["bgp-reconciler:bgp-config"][0]["router"][0]["scope"][0]["peer"][0]
     assert peer_out["source"] == "Loopback0"
 
 
@@ -839,41 +706,40 @@ def test_build_isis_process_payload_orphan_redistribute_synthesizes_process():
     assert procs[0]["redistribute"] == [{"source-protocol": "connected", "source-ref": ""}]
 
 
-async def test_apply_ospf_config_orphan_redistribute_synthesizes_process():
-    """OSPF: a redistribute row with no eligible process row still lands via a synthesized
+def test_ospf_orphan_redistribute_synthesizes_a_process():
+    """A redistribute row with no eligible process row still lands via a synthesized
     minimal process-config entry (parity with IS-IS)."""
-    from nso_adapter.nso.apply import apply_ospf_config
-
     redist = RedistributionIntent(
         dest_protocol="ospf", dest_ref="1", source_protocol="connected", source_ref="", route_map=None, metric=None
     )
-    stage: dict = {}
-    await apply_ospf_config(_make_nso_client(), "d", [], [], [redist], stage=stage)
-    body = stage["ospf-reconciler:ospf-config"][0]
+
+    body = encode_ospf(
+        {"ospf_instance_intent": [], "ospf_interface_intent": [], "redistribution_intent": [redist]}, _PLAIN
+    )
+
     procs = body["process-config"]
     assert [p["process-id"] for p in procs] == ["1"]
+    assert procs[0]["enabled"] is True
     assert procs[0]["redistribute"] == [{"source-protocol": "connected", "source-ref": ""}]
 
 
-async def test_apply_ospf_config_omits_empty_interface_config():
-    """A process-only OSPF apply must NOT send `interface-config: []` — on a merge/keyed
-    list that empty array can be read as 'replace with empty', over-deleting the device's
-    existing OSPF interfaces (IS-IS omits the list when empty; OSPF must match)."""
-    from nso_adapter.nso.apply import apply_ospf_config
-
+def test_ospf_omits_an_empty_interface_config():
+    """A process-only OSPF body must NOT carry `interface-config: []` — on a keyed list that
+    empty array can be read as 'replace with empty', over-deleting the device's OSPF
+    interfaces (IS-IS omits the list when empty; OSPF must match)."""
     proc = OspfInstanceIntent(process_id="1", vrf="", enabled=True)
-    stage: dict = {}
-    await apply_ospf_config(_make_nso_client(), "d", [proc], [], None, stage=stage)
-    body = stage["ospf-reconciler:ospf-config"][0]
+
+    body = encode_ospf(
+        {"ospf_instance_intent": [proc], "ospf_interface_intent": [], "redistribution_intent": []}, _PLAIN
+    )
+
     assert "interface-config" not in body
     assert body["process-config"][0]["process-id"] == "1"
 
 
-async def test_apply_bgp_config_orphan_redistribute_synthesizes_router():
-    """BGP: a redistribute row whose router/scope/AF is not in this apply still lands via a
+def test_bgp_orphan_redistribute_synthesizes_a_router():
+    """A redistribute row whose router/scope/AF is not in the document still lands via a
     synthesized router→scope→address-family skeleton carrying just the redistribute."""
-    from nso_adapter.nso.apply import apply_bgp_config
-
     redist = RedistributionIntent(
         dest_protocol="bgp",
         dest_ref="65001:default:ipv4-unicast",
@@ -882,9 +748,9 @@ async def test_apply_bgp_config_orphan_redistribute_synthesizes_router():
         route_map=None,
         metric=None,
     )
-    stage: dict = {}
-    await apply_bgp_config(_make_nso_client(), "d", [], [redist], stage=stage)
-    routers = stage["bgp-reconciler:bgp-config"][0]["router"]
+
+    routers = _bgp_body([], [redist])["router"]
+
     assert len(routers) == 1
     assert routers[0]["asn"] == 65001
     scope = routers[0]["scope"][0]
@@ -894,112 +760,55 @@ async def test_apply_bgp_config_orphan_redistribute_synthesizes_router():
     assert af["redistribute"] == [{"source-protocol": "connected", "source-ref": ""}]
 
 
-async def test_apply_bgp_config_asn_asdot_notation():
+def test_bgp_asn_asdot_notation_round_trips():
     """A 4-byte ASN in asdot notation ('1.100') must round-trip to its uint32 value, not
-    crash the whole BGP apply with a bare int() ValueError."""
-    from nso_adapter.nso.apply import apply_bgp_config
+    crash the whole document with a bare int() ValueError."""
+    routers = _bgp_body([BgpRouterIntent(asn="1.100")])["router"]
 
-    router = BgpRouterIntent(asn="1.100")
-    stage: dict = {}
-    await apply_bgp_config(_make_nso_client(), "d", [router], None, stage=stage)
-    routers = stage["bgp-reconciler:bgp-config"][0]["router"]
     assert routers[0]["asn"] == 1 * 65536 + 100
 
 
-async def test_apply_bgp_config_sends_router_id():
+def test_bgp_sends_an_accepted_router_id():
     """An accepted global router-id is emitted as the `router-id` leaf (sibling of asn)."""
-    from nso_adapter.nso.apply import apply_bgp_config
+    router_out = _bgp_body([BgpRouterIntent(asn="65100", router_id="10.255.0.1")])["router"][0]
 
-    router = BgpRouterIntent(asn="65100", router_id="10.255.0.1")
-    stage: dict = {}
-    await apply_bgp_config(_make_nso_client(), "d", [router], None, stage=stage)
-    router_out = stage["bgp-reconciler:bgp-config"][0]["router"][0]
     assert router_out["router-id"] == "10.255.0.1"
 
 
-async def test_apply_bgp_config_omits_router_id_when_unset():
+def test_bgp_omits_the_router_id_when_unset():
     """No accepted router-id → the `router-id` leaf is omitted (never an empty string)."""
-    from nso_adapter.nso.apply import apply_bgp_config
+    router_out = _bgp_body([BgpRouterIntent(asn="65100")])["router"][0]
 
-    router = BgpRouterIntent(asn="65100")  # router_id column defaults to None
-    stage: dict = {}
-    await apply_bgp_config(_make_nso_client(), "d", [router], None, stage=stage)
-    router_out = stage["bgp-reconciler:bgp-config"][0]["router"][0]
     assert "router-id" not in router_out
 
 
-async def test_apply_bgp_config_asn_invalid_raises_clean_error():
+def test_bgp_invalid_asn_raises_a_clean_error():
     """A non-numeric ASN raises a descriptive NsoApplyError, not an opaque ValueError."""
-    from nso_adapter.nso.apply import apply_bgp_config
-
-    router = BgpRouterIntent(asn="not-an-asn")
     with pytest.raises(NsoApplyError, match="ASN"):
-        await apply_bgp_config(_make_nso_client(), "d", [router], None, stage={})
+        _bgp_body([BgpRouterIntent(asn="not-an-asn")])
 
 
-def test_build_interface_ip_entry_rejects_address_without_prefix():
+def test_build_interface_ip_body_rejects_address_without_prefix():
     """An address missing '/prefix' raises a descriptive NsoApplyError (surfaced), not a
     bare ValueError that would abort the whole atomic apply opaquely."""
     row = SimpleNamespace(address="10.0.0.1", family="ipv4", vrf=None, secondary=False)
     with pytest.raises(NsoApplyError, match="prefix"):
-        build_interface_ip_entry("d", "Gi0/0", [row])
+        build_interface_ip_body("Gi0/0", [row])
 
 
-def test_build_interface_ip_entry_rejects_unknown_family():
+def test_build_interface_ip_body_rejects_unknown_family():
     """A row whose family is neither ipv4 nor ipv6 is NOT silently dropped — it raises so
     the address can never be reported in_sync while never emitted."""
     row = SimpleNamespace(address="10.0.0.1/24", family="inet", vrf=None, secondary=False)
     with pytest.raises(NsoApplyError, match="family"):
-        build_interface_ip_entry("d", "Gi0/0", [row])
+        build_interface_ip_body("Gi0/0", [row])
 
 
-def test_build_interface_ip_entry_secondary_none_is_boolean_not_null():
+def test_build_interface_ip_body_secondary_none_is_boolean_not_null():
     """A None `secondary` becomes JSON false, never null (a boolean YANG leaf rejects null)."""
     row = SimpleNamespace(address="10.0.0.1/24", family="ipv4", vrf=None, secondary=None)
-    entry = build_interface_ip_entry("d", "Gi0/0", [row])
+    entry = build_interface_ip_body("Gi0/0", [row])
     assert entry["ipv4-address"][0]["secondary"] is False
-
-
-async def test_apply_interface_attribute_enabled_rejects_garbage():
-    """A malformed `enabled` intent value must raise, never silently coerce to False and
-    shut the interface."""
-    client = _make_nso_client()
-    with pytest.raises(NsoApplyError, match="enabled"):
-        await apply_interface_attribute(client, "d", "Gi0/0", "enabled", None, dry_run=True)
-    with pytest.raises(NsoApplyError, match="enabled"):
-        await apply_interface_attribute(client, "d", "Gi0/0", "enabled", "yes", dry_run=True)
-
-
-async def test_apply_interface_attribute_enabled_accepts_boolean_tokens():
-    """The recognised boolean spellings still round-trip (true/false, True/False, bools)."""
-    client = _make_nso_client()
-    stage_true = await apply_interface_attribute(client, "d", "Gi0/0", "enabled", "true", dry_run=True)  # noqa: F841
-    # dry_run returns the native delta (client stubbed) — the point is it does NOT raise.
-    for good in ("false", "False", "True"):
-        await apply_interface_attribute(client, "d", "Gi0/0", "enabled", good, dry_run=True)
-
-
-async def test_replace_interface_config_uses_two_key_instance_url():
-    """The interface-config PUT-replace targets the compound-key instance
-    (device,interface-name), both segments percent-encoded (#5)."""
-    from nso_adapter.nso.apply import replace_interface_config
-
-    client = _make_nso_client()
-    seen: dict = {}
-
-    class _Recorder(httpx.AsyncBaseTransport):
-        async def handle_async_request(self, request):
-            seen["url"] = str(request.url)
-            return httpx.Response(200, json={"dry-run-result": {"native": {}}}, request=request)
-
-    client._client = lambda timeout=None: httpx.AsyncClient(transport=_Recorder(), base_url="http://nso")
-    entry = {
-        "device": "sw01",
-        "interface-name": "Gi0/0",
-        "ipv4-address": [{"address": "10.0.0.1", "prefix-length": 24}],
-    }
-    await replace_interface_config(client, "sw01", "Gi0/0", entry, dry_run=True)
-    assert "interface-reconciler:interface-config=sw01,Gi0%2F0" in seen["url"]
 
 
 def test_normalize_route_map_entry_collision_is_deterministic():
@@ -1193,92 +1002,50 @@ def test_build_isis_process_payload_emits_frr():
 
 
 @pytest.mark.asyncio
-async def test_replace_service_instance_puts_keyed_instance():
-    """Generic removal primitive: PUT on the keyed service instance with the full body."""
-    import json
-
-    from nso_adapter.nso.apply import replace_service_instance
-
+async def test_the_document_put_targets_the_keyed_instance_with_reconcile():
+    """One instance per device, keyed by name, committed in reconcile mode."""
     client = _make_nso_client()
     mock_http = AsyncMock()
     mock_http.put.return_value = _httpx_response(204)
     _stub_pool(client, mock_http)
 
-    await replace_service_instance(
-        client,
-        "/restconf/data/vlan-reconciler:vlan-config",
-        "vlan-reconciler:vlan-config",
-        "sw3",
-        {"device": "sw3", "vlan": [{"vlan-id": 10}]},
-    )
-    (url,) = mock_http.put.call_args[0]
-    assert url.split("?")[0].endswith("vlan-reconciler:vlan-config=sw3")
+    await apply_device_intent(client, "sw3", {"vlan": encode_vlan({"vlan_intent": []}, _PLAIN)})
+
+    (url,) = mock_http.put.call_args_list[0][0]
+    assert url.split("?")[0].endswith("device-intent:device-intent=sw3")
     assert "reconcile=keep-non-service-config" in url
-    body = json.loads(mock_http.put.call_args[1]["content"])
-    assert body["vlan-reconciler:vlan-config"][0]["vlan"][0]["vlan-id"] == 10
+    mock_http.patch.assert_not_called()  # the document is replaced, never merged
 
 
 @pytest.mark.asyncio
-async def test_apply_vlan_config_replace_puts_remaining_list():
-    """apply_vlan_config(replace=True) PUT-replaces the keyed instance with the full
-    remaining vlan list (a dropped vid is simply absent from the body)."""
-    import json
-
-    from nso_adapter.nso.apply import apply_vlan_config
-
+async def test_a_dropped_row_is_simply_absent_from_the_document():
+    """Removal is by OMISSION: the body carries the remaining list and nothing says 'delete'."""
     client = _make_nso_client()
     mock_http = AsyncMock()
     mock_http.put.return_value = _httpx_response(204)
     _stub_pool(client, mock_http)
 
-    rows = [SimpleNamespace(vlan_id=10, name="keep")]  # 3366 dropped → absent from body
-    await apply_vlan_config(client=client, device_name="sw3", vlan_intent_rows=rows, replace=True)
-    # First PUT is the real replace; the second is the native dry-run verify.
-    (url,) = mock_http.put.call_args_list[0][0]
-    assert url.split("?")[0].endswith("vlan-reconciler:vlan-config=sw3")
-    assert "reconcile=keep-non-service-config" in url
-    body = json.loads(mock_http.put.call_args_list[0][1]["content"])
-    vids = [v["vlan-id"] for v in body["vlan-reconciler:vlan-config"][0]["vlan"]]
+    rows = [SimpleNamespace(vlan_id=10, name="keep")]  # 3366 dropped → absent from the body
+    await apply_device_intent(client, "sw3", {"vlan": encode_vlan({"vlan_intent": rows}, _PLAIN)})
+
+    vids = [v["vlan-id"] for v in _sent_document(client)["vlan"]["vlan"]]
     assert vids == [10]
-    assert "dry-run=native" in mock_http.put.call_args_list[1][0][0]  # verify uses PUT too
-    mock_http.patch.assert_not_called()  # replace must not merge-PATCH
+    assert "dry-run=native" in mock_http.put.call_args_list[1][0][0]  # verify re-issues the PUT
 
 
-@pytest.mark.asyncio
-async def test_apply_static_routes_replace_puts_keyed_instance():
-    """apply_static_routes(replace=True) PUT-replaces instead of merge-PATCH."""
-    import json
-
-    client = _make_nso_client()
-    mock_http = AsyncMock()
-    mock_http.put.return_value = _httpx_response(204)
-    _stub_pool(client, mock_http)
-
-    rows = [SimpleNamespace(vrf="", prefix="10.0.0.0/8", next_hop="1.1.1.1", metric=1, permanent=False, tag=None)]
-    await apply_static_routes(client=client, device_name="sw3", route_intent_rows=rows, replace=True)
-    (url,) = mock_http.put.call_args_list[0][0]
-    assert url.split("?")[0].endswith("static-route-reconciler:static-route-config=sw3")
-    assert "reconcile=keep-non-service-config" in url
-    body = json.loads(mock_http.put.call_args_list[0][1]["content"])
-    assert body["static-route-reconciler:static-route-config"][0]["route"][0]["prefix"] == "10.0.0.0/8"
-    mock_http.patch.assert_not_called()
+def _community_list(name, entries, ned_id, **kwargs):
+    rows = [SimpleNamespace(family="community_list", name=name, entries=entries, **kwargs)]
+    body = encode_route_policy({"route_policy_object_intent": rows}, _dialect_for(ned_id))
+    return body["community-list"][0]
 
 
-@pytest.mark.asyncio
-async def test_apply_route_policy_translates_and_skips_members_per_ned():
-    """On a Nokia (timos) device the canonical community members are translated to
-    the SR OS dialect (incl. an exact ``color:`` → its ``ext:030b:`` hex) and the
-    ones it genuinely can't represent (a regex ``color:``) are dropped from the
-    pushed body — so one bad member can't abort the whole community."""
-    import json
-
-    from nso_adapter.nso.apply import apply_route_policy_config
-
-    client = _make_nso_client()
-    mock_http = AsyncMock()
-    mock_http.patch.return_value = _httpx_response(204)
-    _stub_pool(client, mock_http)
-
+def test_route_policy_translates_and_skips_members_per_ned():
+    """On a Nokia (timos) device the canonical community members are translated to the SR OS
+    dialect (incl. an exact ``color:`` → its ``ext:030b:`` hex) and the ones it genuinely
+    cannot represent (a regex ``color:``) are dropped from the body — so one bad member
+    cannot abort the whole community. The dialect comes from the section's FROZEN context,
+    never from the device row.
+    """
     entries = [
         {"sequence": 10, "action": "permit", "community": "64500:1234"},
         {"sequence": 20, "action": "permit", "community": "64500:.*"},  # digit-domain regex kept
@@ -1288,14 +1055,10 @@ async def test_apply_route_policy_translates_and_skips_members_per_ned():
         {"sequence": 60, "action": "permit", "community": "color:0:12."},  # regex color → dropped
         {"sequence": 70, "action": "permit", "community": "no-export"},
     ]
-    rows = [SimpleNamespace(family="community_list", name="example-comm", entries=entries)]
 
-    await apply_route_policy_config(client=client, device_name="ra1", intent_rows=rows, ned_id="timos-nc-23.10")
+    cl = _community_list("example-comm", entries, "timos-nc-23.10")
 
-    body = json.loads(mock_http.patch.call_args_list[0][1]["content"])
-    cl = body["route-policy-reconciler:route-policy-config"][0]["community-list"][0]
-    members = [e["community"] for e in cl["entry"]]
-    assert members == [
+    assert [e["community"] for e in cl["entry"]] == [
         "64500:1234",
         "64500:.*",
         "target:64500:1234",
@@ -1306,32 +1069,18 @@ async def test_apply_route_policy_translates_and_skips_members_per_ned():
     assert cl["invert-match"] is False
 
 
-@pytest.mark.asyncio
-async def test_apply_route_policy_carries_invert_match_and_amp_large_on_nokia():
-    """An inverted community-list keeps its invert-match flag in the pushed body, a
-    regex large community is rendered in SR OS `&`-separated form, and an exact
-    color: is translated to its ext:030b: hex."""
-    import json
-
-    from nso_adapter.nso.apply import apply_route_policy_config
-
-    client = _make_nso_client()
-    mock_http = AsyncMock()
-    mock_http.patch.return_value = _httpx_response(204)
-    _stub_pool(client, mock_http)
-
+def test_route_policy_carries_invert_match_and_amp_large_on_nokia():
+    """An inverted community-list keeps its invert-match flag, a regex large community is
+    rendered in SR OS `&`-separated form, and an exact color: becomes its ext:030b: hex."""
     entries = [
         {"sequence": 10, "action": "permit", "community": "no-export"},
         {"sequence": 20, "action": "permit", "community": "64500:21000"},
         {"sequence": 30, "action": "permit", "community": "large:64500:.*:[0-4]"},  # regex large → &
         {"sequence": 40, "action": "permit", "community": "color:0:128"},  # exact color → ext:030b hex
     ]
-    rows = [SimpleNamespace(family="community_list", name="SCRUBBER", entries=entries, invert_match=True)]
 
-    await apply_route_policy_config(client=client, device_name="ra1", intent_rows=rows, ned_id="timos-nc-23.10")
+    cl = _community_list("SCRUBBER", entries, "timos-nc-23.10", invert_match=True)
 
-    body = json.loads(mock_http.patch.call_args_list[0][1]["content"])
-    cl = body["route-policy-reconciler:route-policy-config"][0]["community-list"][0]
     assert cl["invert-match"] is True
     assert [e["community"] for e in cl["entry"]] == [
         "no-export",
@@ -1341,32 +1090,17 @@ async def test_apply_route_policy_carries_invert_match_and_amp_large_on_nokia():
     ]
 
 
-@pytest.mark.asyncio
-async def test_apply_route_policy_keeps_all_members_on_identity_ned():
+def test_route_policy_keeps_all_members_on_an_identity_ned():
     """A NED with no dialect override (IOS-XR here) keeps every member verbatim —
     ``color:`` is a valid Cisco extcommunity, so nothing is dropped."""
-    import json
-
-    from nso_adapter.nso.apply import apply_route_policy_config
-
-    client = _make_nso_client()
-    mock_http = AsyncMock()
-    mock_http.patch.return_value = _httpx_response(204)
-    _stub_pool(client, mock_http)
-
     entries = [
         {"sequence": 10, "action": "permit", "community": "color:0:128"},
         {"sequence": 20, "action": "permit", "community": "large:64500:64501:.*"},
     ]
-    rows = [SimpleNamespace(family="community_list", name="example-comm", entries=entries)]
 
-    await apply_route_policy_config(client=client, device_name="rx", intent_rows=rows, ned_id="cisco-iosxr-cli-7.76")
+    cl = _community_list("example-comm", entries, "cisco-iosxr-cli-7.76")
 
-    body = json.loads(mock_http.patch.call_args_list[0][1]["content"])
-    members = [
-        e["community"] for e in body["route-policy-reconciler:route-policy-config"][0]["community-list"][0]["entry"]
-    ]
-    assert members == ["color:0:128", "large:64500:64501:.*"]  # untouched
+    assert [e["community"] for e in cl["entry"]] == ["color:0:128", "large:64500:64501:.*"]  # untouched
 
 
 def test_normalize_route_map_entry_yang_shape_passthrough():
@@ -1404,54 +1138,22 @@ def test_normalize_route_map_entry_legacy_shape():
     }
 
 
-@pytest.mark.asyncio
-async def test_apply_ospf_always_asserts_enabled_delete_guard():
-    """Delete-guard: the OSPF process body ALWAYS carries `enabled`, even when the
-    intent row leaves it None — so a PUT-replace can never drop admin-state and
-    disable OSPF. Default is True; explicit False is preserved."""
-    import json
-
-    from nso_adapter.nso.apply import apply_ospf_config
-
-    client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(204))
-
+def test_ospf_always_asserts_enabled_as_a_delete_guard():
+    """The OSPF process body ALWAYS carries `enabled`, even when the intent row leaves it
+    None, so the document PUT can never drop admin-state and disable OSPF. Default is True;
+    an explicit False is preserved. One body serves apply and removal alike now, so the
+    guard holds on both.
+    """
     rows = [
         SimpleNamespace(process_id="1", router_id="10.0.0.1", vrf="", enabled=None),
         SimpleNamespace(process_id="2", router_id="10.0.0.2", vrf="", enabled=False),
     ]
-    await apply_ospf_config(client=client, device_name="ra1", process_intent_rows=rows, interface_intent_rows=[])
 
-    mock_http = client._client.return_value.__aenter__.return_value
-    payload = json.loads(mock_http.patch.call_args[1]["content"])
-    procs = payload["ospf-reconciler:ospf-config"][0]["process-config"]
-    by_pid = {p["process-id"]: p for p in procs}
+    body = encode_ospf({"ospf_instance_intent": rows, "ospf_interface_intent": [], "redistribution_intent": []}, _PLAIN)
+
+    by_pid = {p["process-id"]: p for p in body["process-config"]}
     assert by_pid["1"]["enabled"] is True  # None → default enable (guard)
     assert by_pid["2"]["enabled"] is False  # explicit disable preserved
-
-
-@pytest.mark.asyncio
-async def test_apply_ospf_replace_body_keeps_enabled():
-    """The same guard holds on the removal path (replace=True PUT-replace) — the
-    body that reverts removed rows still asserts admin-state, so a removal never
-    collaterally disables OSPF."""
-    import json
-
-    from nso_adapter.nso.apply import apply_ospf_config
-
-    client = _make_nso_client()
-    mock_http = AsyncMock()
-    mock_http.put.return_value = _httpx_response(204)
-    _stub_pool(client, mock_http)
-
-    rows = [SimpleNamespace(process_id="1", router_id="10.0.0.1", vrf="", enabled=None)]
-    await apply_ospf_config(
-        client=client, device_name="ra1", process_intent_rows=rows, interface_intent_rows=[], replace=True
-    )
-
-    payload = json.loads(mock_http.put.call_args_list[0][1]["content"])
-    proc = payload["ospf-reconciler:ospf-config"][0]["process-config"][0]
-    assert proc["enabled"] is True
 
 
 # ── reconcile commit option (brownfield adoption) ────────────────────────────
@@ -1493,18 +1195,19 @@ def test_commit_url_no_param_when_disabled(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_apply_real_commit_carries_reconcile_and_dry_run_does_too(monkeypatch):
-    """The real PATCH commits with reconcile; the post-apply verify dry-run carries
-    both dry-run=native and reconcile so the preview matches the commit."""
+async def test_the_real_commit_carries_reconcile_and_the_verify_dry_run_does_too(monkeypatch):
+    """The commit PUTs with reconcile; the post-apply verify dry-run carries both
+    dry-run=native and reconcile so the preview matches the commit."""
     monkeypatch.setattr(apply_mod, "RECONCILE_COMMIT", "keep-non-service-config")
     client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(204))
+    mock_http = AsyncMock()
+    mock_http.put.return_value = _httpx_response(204)
+    _stub_pool(client, mock_http)
 
-    await apply_interface_attribute(client, "core-rtr-01", "Gi0/0", "description", "uplink")
+    await apply_device_intent(client, "core-rtr-01", {"vlan": {"vlan": []}})
 
-    mock_http = client._client.return_value.__aenter__.return_value
-    real_url = mock_http.patch.call_args_list[0][0][0]
-    verify_url = mock_http.patch.call_args_list[1][0][0]
+    real_url = mock_http.put.call_args_list[0][0][0]
+    verify_url = mock_http.put.call_args_list[1][0][0]
     # Real commit: reconcile present, NOT a dry-run.
     assert "reconcile=keep-non-service-config" in real_url
     assert "dry-run" not in real_url
@@ -1513,92 +1216,98 @@ async def test_apply_real_commit_carries_reconcile_and_dry_run_does_too(monkeypa
     assert "reconcile=keep-non-service-config" in verify_url
 
 
-# ── apply_combined (atomic single-transaction multi-module PATCH) ──────────────
+# ── apply_device_intent (one instance, one transaction, one device commit) ─────
 
 
 @pytest.mark.asyncio
-async def test_apply_combined_single_patch_to_data_root():
-    """apply_combined PATCHes /restconf/data ONCE with every module body in one edit —
-    the atomic unit (one NSO transaction → one device commit) — carrying reconcile."""
+async def test_the_sender_puts_every_family_in_one_request():
+    """Every family is a key of ONE instance: one NSO transaction, one device commit, so
+    FASTMAP resolves the cross-family dependencies inside it."""
     import json
 
     client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(204))
+    mock_http = AsyncMock()
+    mock_http.put.return_value = _httpx_response(204)
+    _stub_pool(client, mock_http)
 
-    modules = {
-        "subinterface-reconciler:subif-config": [{"device": "sw01", "interface": [{"interface-name": "ae99.999"}]}],
-        "interface-reconciler:interface-config": [{"device": "sw01", "interface-name": "ae99.999"}],
+    containers = {
+        "subinterface": {"interface": [{"interface-name": "ae99.999"}]},
+        "interface": {"interface": [{"interface-name": "ae99.999"}]},
     }
-    await apply_mod.apply_combined(client, "sw01", modules)
+    await apply_device_intent(client, "sw01", containers)
 
-    mock_http = client._client.return_value.__aenter__.return_value
-    # Exactly one real PATCH (call 0); call 1 is the post-apply verify dry-run.
-    url = mock_http.patch.call_args_list[0][0][0]
-    assert url.endswith("/restconf/data?reconcile=keep-non-service-config")
-    body = json.loads(mock_http.patch.call_args_list[0].kwargs["content"])
-    assert set(body) == {"subinterface-reconciler:subif-config", "interface-reconciler:interface-config"}
+    url = mock_http.put.call_args_list[0][0][0]
+    assert url.split("?")[0].endswith("device-intent:device-intent=sw01")
+    body = json.loads(mock_http.put.call_args_list[0].kwargs["content"])
+    assert set(body[DEVICE_INTENT_ROOT][0]) == {"device", "subinterface", "interface"}
 
 
 @pytest.mark.asyncio
-async def test_apply_combined_cli_dry_run_requests_the_cli_outformat():
+async def test_the_sender_requests_the_cli_outformat_for_a_preview():
     """dry_run="cli" must reach the wire as the cli dry-run query, not the native default."""
     client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(200, json_data={"dry-run-result": {"cli": ""}}))
+    mock_http = AsyncMock()
+    mock_http.put.return_value = _httpx_response(200, json_data={"dry-run-result": {"cli": ""}})
+    _stub_pool(client, mock_http)
 
-    await apply_mod.apply_combined(
-        client, "sw01", {"interface-reconciler:interface-config": [{"device": "sw01"}]}, dry_run="cli"
+    await apply_device_intent(client, "sw01", {"interface": {}}, dry_run="cli")
+
+    url = mock_http.put.call_args_list[0][0][0]
+    assert url == apply_mod._commit_url(
+        f"{client._base}{apply_mod.DEVICE_INTENT_PATH}=sw01",
+        dry_run="cli",
     )
-
-    mock_http = client._client.return_value.__aenter__.return_value
-    url = mock_http.patch.call_args_list[0][0][0]
-    assert url == apply_mod._commit_url(f"{client._base}{apply_mod._DATA_PATH}", dry_run="cli")
 
 
 @pytest.mark.asyncio
-async def test_apply_combined_drops_empty_modules():
-    """A module whose body list is empty is omitted from the combined edit."""
+async def test_an_empty_family_body_reaches_the_wire_unchanged():
+    """An empty container and an absent one both mean "this family owns nothing" (#1522 D2).
+
+    Which families the document carries is the registry walk's decision; a sender that
+    dropped an empty one would no longer transmit the document the generation froze.
+    """
     import json
 
     client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(204))
+    mock_http = AsyncMock()
+    mock_http.put.return_value = _httpx_response(204)
+    _stub_pool(client, mock_http)
 
-    await apply_mod.apply_combined(
-        client,
-        "sw01",
-        {
-            "interface-reconciler:interface-config": [{"device": "sw01"}],
-            "subinterface-reconciler:subif-config": [],
-        },
-    )
-    mock_http = client._client.return_value.__aenter__.return_value
-    body = json.loads(mock_http.patch.call_args_list[0].kwargs["content"])
-    assert set(body) == {"interface-reconciler:interface-config"}
+    await apply_device_intent(client, "sw01", {"interface": {"interface": []}, "subinterface": {}})
+
+    body = json.loads(mock_http.put.call_args_list[0].kwargs["content"])
+    assert body[DEVICE_INTENT_ROOT][0] == {
+        "device": "sw01",
+        "interface": {"interface": []},
+        "subinterface": {},
+    }
 
 
 @pytest.mark.asyncio
-async def test_apply_combined_dry_run_returns_delta(monkeypatch):
-    """dry_run computes the native delta and never commits (no reconcile-only PATCH)."""
+async def test_the_sender_dry_run_returns_the_delta_and_commits_nothing():
     client = _make_nso_client()
-    dry_resp = _httpx_response(
+    mock_http = AsyncMock()
+    mock_http.put.return_value = _httpx_response(
         200, json_data={"dry-run-result": {"native": {"device": [{"name": "sw01", "data": "X"}]}}}
     )
-    _mock_http_ctx(client, dry_resp)
+    _stub_pool(client, mock_http)
 
-    delta = await apply_mod.apply_combined(
-        client, "sw01", {"interface-reconciler:interface-config": [{"device": "sw01"}]}, dry_run=True
-    )
+    delta = await apply_device_intent(client, "sw01", {"interface": {}}, dry_run=True)
+
     assert delta == "X"
-    mock_http = client._client.return_value.__aenter__.return_value
-    assert "dry-run=native" in mock_http.patch.call_args_list[0][0][0]
+    assert all("dry-run=native" in call[0][0] for call in mock_http.put.call_args_list)
 
 
 @pytest.mark.asyncio
-async def test_apply_combined_raises_on_error():
-    """A non-2xx combined commit raises NsoApplyError (all-or-nothing surfaces)."""
+async def test_the_sender_raises_on_a_rejected_document():
+    """A non-2xx commit raises (all-or-nothing surfaces: nothing landed)."""
     client = _make_nso_client()
-    _mock_http_ctx(client, _httpx_response(500))
+    mock_http = AsyncMock()
+    mock_http.put.return_value = _httpx_response(500)
+    _stub_pool(client, mock_http)
+
     with pytest.raises(NsoApplyError):
-        await apply_mod.apply_combined(client, "sw01", {"interface-reconciler:interface-config": [{"device": "sw01"}]})
+        await apply_device_intent(client, "sw01", {"interface": {}})
 
 
 def test_build_subif_interfaces_shapes_rows():
@@ -1613,9 +1322,9 @@ def test_build_subif_interfaces_shapes_rows():
     ]
 
 
-def test_build_interface_ip_entry_ipv4():
+def test_build_interface_ip_body_ipv4():
     rows = [_make_ip_row("198.18.1.1/24", family="ipv4")]
-    entry = apply_mod.build_interface_ip_entry("sw01", "ae99.999", rows)
+    entry = apply_mod.build_interface_ip_body("ae99.999", rows)
     assert entry["interface-name"] == "ae99.999"
     assert entry["ipv4-address"] == [{"address": "198.18.1.1", "prefix-length": 24, "secondary": False}]
 
@@ -1661,47 +1370,18 @@ async def test_native_dry_run_outformat_cli_requests_and_parses():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("scope", "call"),
-    [
-        (
-            "interface_attribute",
-            lambda client: apply_mod.apply_interface_attribute(
-                client=client,
-                device_name="sw03",
-                interface_name="Gi0/1",
-                attribute="description",
-                value="uplink",
-                dry_run="cli",
-            ),
-        ),
-        (
-            "interface_ips",
-            lambda client: apply_mod.apply_interface_ips(
-                client=client,
-                device_name="sw03",
-                interface_name="Gi0/1",
-                ip_intent_rows=[],
-                dry_run="cli",
-            ),
-        ),
-    ],
-)
-async def test_interface_scopes_honour_the_cli_outformat(scope, call):
-    """collect_apply_diff threads dry_run='cli' into EVERY scope, but these two dropped it and
-    always dry-ran native. The preview then handed diff2html — which parses NSO's NED-uniform
-    tree diff — raw device CLI lines for the interface scopes, so those rows of a cli-mode
-    preview rendered blank/mangled while every other scope rendered fine.
-    """
+async def test_the_document_preview_honours_the_cli_outformat():
+    """collect_apply_diff threads dry_run='cli' into the sender, and diff2html parses NSO's
+    NED-uniform tree diff: handing it raw device CLI lines rendered the panel blank."""
     client = _make_nso_client()
     body = {"dry-run-result": {"cli": {"local-node": {"data": "+ description uplink"}}}}
     http = AsyncMock()
-    http.patch.return_value = _httpx_response(200, json_data=body)
+    http.put.return_value = _httpx_response(200, json_data=body)
     _stub_pool(client, http)
 
-    delta = await call(client)
+    delta = await apply_device_intent(client, "sw03", {"interface": {}}, dry_run="cli")
 
-    url = http.patch.await_args.args[0]
-    assert "dry-run=cli" in url, f"{scope} must ask NSO for the NED-uniform tree diff"
+    url = http.put.await_args.args[0]
+    assert "dry-run=cli" in url, "the preview must ask NSO for the NED-uniform tree diff"
     assert "dry-run=native" not in url
-    assert delta == "+ description uplink", f"{scope} must return the parsed cli tree diff"
+    assert delta == "+ description uplink"

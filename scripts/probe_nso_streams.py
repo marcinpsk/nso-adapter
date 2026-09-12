@@ -22,13 +22,14 @@ from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
 
-async def main() -> int:  # noqa: C901
-    base_url = os.environ.get("NSO_URL", "")
-    user = os.environ.get("NSO_USER", "")
-    password = os.environ.get("NSO_PASSWORD", "")
-    host_header: str | None = os.environ.get("NSO_HOST_HEADER") or None
-    duration = float(os.environ.get("PROBE_DURATION", "30"))
+def probe_settings() -> tuple[str, str, str, str | None, float]:
+    """Resolve every setting the probe needs, before the event loop starts.
 
+    Synchronous on purpose: the config fallback reads a file, and a blocking read inside the
+    async body would stall the loop it shares with the SSE reads.
+    """
+    base_url = os.environ.get("NSO_URL", "")
+    host_header: str | None = os.environ.get("NSO_HOST_HEADER") or None
     if not base_url:
         config_file = os.environ.get("CONFIG_FILE", str(Path(__file__).parent.parent / "config.yaml"))
         try:
@@ -41,8 +42,16 @@ async def main() -> int:  # noqa: C901
             host_header = inst.get("host_header") or host_header
         except (FileNotFoundError, IndexError, KeyError) as exc:
             print(f"ERROR: cannot load config from {config_file}: {exc}", file=sys.stderr)
-            return 1
+    return (
+        base_url,
+        os.environ.get("NSO_USER", ""),
+        os.environ.get("NSO_PASSWORD", ""),
+        host_header,
+        float(os.environ.get("PROBE_DURATION", "30")),
+    )
 
+
+async def main(base_url: str, user: str, password: str, host_header: str | None, duration: float) -> int:  # noqa: C901
     if not base_url:
         print(
             "ERROR: set NSO_URL (or CONFIG_FILE pointing to a yaml with nso_instances)",
@@ -126,4 +135,4 @@ async def main() -> int:  # noqa: C901
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    sys.exit(asyncio.run(main(*probe_settings())))

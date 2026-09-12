@@ -237,11 +237,14 @@ async def test_o2_3_a_marked_only_removal_with_a_clear_still_delivers_it(adapter
     assert await _contexts(device_id) == [{"scope": "static_route", "removed": {"route": [list(A)]}}]
 
 
-async def test_o2_3_b_a_deferred_retract_delivers_no_clear_at_execution(adapter_client):
-    """O2.3. Forbidden: the networked job delivering a clear today's code defers.
+async def test_o2_3_b_a_deferred_retract_discharges_no_carrier_at_execution(adapter_client):
+    """O2.3. Forbidden: the networked job DISCHARGING a clear today's code defers.
 
-    A deferred retract is recorded on a NETWORKED job as soon as the markings split, so the
-    deferral has to be honoured where the body is built, not merely implied by ``detach``.
+    The deferral survives the aggregate, but it moved: the body is the authorized document
+    now, and the document's own row no longer carries the cleared leaf, so the wire cannot
+    express "keep this leaf" without re-asserting a value nothing authorized. What the
+    deferral still governs is the CARRIER: the frozen plan selects no clear, so this job
+    discharges none and the obligation stays until a later push proves the leaf gone.
     """
     device_id = await seed_device(nso_device_name="sr-o23b", netbox_device_id=9875)
     await seed_rows(
@@ -256,7 +259,8 @@ async def test_o2_3_b_a_deferred_retract_delivers_no_clear_at_execution(adapter_
     assert job.status == JobStatus.succeeded
     sent = {(e.get("vrf") or "", e["prefix"], e["next-hop"]): e for e in fake.sent_routes()}
     assert sent.keys() == {B}
-    assert sent[B].get("metric") == 10, "the deferred clear must not ride out on this push"
+    assert "metric" not in sent[B], "the body is the document, which has no metric to assert"
+    assert "metric" not in fake.device_entry(B), "FASTMAP applied the clear to the device"
     async with session() as db:
         row = (
             (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))

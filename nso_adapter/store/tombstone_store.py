@@ -42,11 +42,18 @@ async def delete_tombstones(
 
     Deletes only what the caller snapshotted: a tombstone inserted after the snapshot
     survives, because nothing has proven anything about it. The caller owns the commit.
+
+    The device's PROJECTION lock is taken after the claim and before the carrier rows, the
+    one lock order every consumption path shares with document creation: a creator that
+    holds it cannot observe a carrier a concurrent settlement is in the middle of deleting.
     """
+    from nso_adapter.core.generation import lock_projection
+
     await lock_claim(db, ClaimRegistration(device_id, claim_token))
     ordered = sorted(set(ids))
     if not ordered:
         return 0
+    await lock_projection(db, device_id)
     await db.execute(
         select(StaticRouteTombstone.id)
         .where(StaticRouteTombstone.id.in_(ordered))

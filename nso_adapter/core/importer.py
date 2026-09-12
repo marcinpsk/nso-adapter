@@ -192,7 +192,7 @@ async def _run_surfaces(
     return failed
 
 
-def _projectable_spec(name: str) -> FamilySpec[Any] | None:
+def projectable_spec(name: str) -> FamilySpec[Any] | None:
     """Resolve a surface name to its FamilySpec (None for non-spec composites like redistribution).
 
     Lazy imports mirror the surface-list builders below (import cost only when used).
@@ -324,7 +324,7 @@ def _projection_layout(
     """Build the deduplicated wire set and deterministic family-lock order."""
     from nso_adapter.core.redistribution import _REDIST_COMPONENTS
 
-    spec_by_name = {name: _projectable_spec(name) for name, _ in surfaces}
+    spec_by_name = {name: projectable_spec(name) for name, _ in surfaces}
     wire_names = {spec.wire_name for spec in spec_by_name.values() if spec is not None}
     lock_names = {spec.name for spec in spec_by_name.values() if spec is not None}
     if "redistribution" in spec_by_name:
