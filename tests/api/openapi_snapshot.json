@@ -199,7 +199,7 @@
         "type": "object"
       },
       "ApplyDiffOut": {
-        "description": "apply-diff preview \u2014 {scope: native_delta} for scopes with a non-empty change.",
+        "description": "One device_intent native delta, or a preview-unavailable reason, for the executable document.",
         "properties": {
           "device_id": {
             "title": "Device Id",

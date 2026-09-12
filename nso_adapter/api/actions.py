@@ -51,7 +51,7 @@ class JobTriggerOut(BaseModel):
 
 
 class ApplyDiffOut(BaseModel):
-    """apply-diff preview — {scope: native_delta} for scopes with a non-empty change."""
+    """One device_intent native delta, or a preview-unavailable reason, for the executable document."""
 
     device_id: int
     outformat: str
