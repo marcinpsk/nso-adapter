@@ -440,7 +440,7 @@ async def test_a_successor_refuses_an_omission_the_cleanup_never_authorized(adap
     job = await job_row(await run_head(device_id, client))
     assert job.status.value == "failed", job.result
     (blocked,) = {item["error"] for item in job.error["detail"]["items"]}
-    assert "static_route/route" in blocked and extra["prefix"] in blocked, blocked
+    assert blocked == "apply error (removal_blocked_collateral); see the server log"
     assert len(fake.writes) == writes, "a refused document must not commit"
 
 

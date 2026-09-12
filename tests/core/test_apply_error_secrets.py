@@ -10,14 +10,15 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 import structlog
+from sqlalchemy import select
 
 from nso_adapter.core.apply import run_apply
 from nso_adapter.core.community_dialect import community_dialect_for
 from nso_adapter.nso.apply import NsoApplyError, SectionExecution, apply_device_intent, encode_snmp
 from nso_adapter.nso.client import DEVICE_INTENT_ROOT
-from nso_adapter.store.models import Job, JobStatus, OspfInterfaceIntent, SnmpCommunityIntent
+from nso_adapter.store.models import BgpRouterIntent, Job, JobStatus, OspfInterfaceIntent, SnmpCommunityIntent
 from tests._secret_discipline import assert_chain_free_of
-from tests.conftest import seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 from tests.core.test_static_route_put import seed_apply_job
 from tests.nso.test_apply_send import _client_with
 
@@ -205,9 +206,64 @@ async def test_unexpected_commit_exception_keeps_secret_out_of_logs_and_errors(
         stored = await db.get(SnmpCommunityIntent, row.id)
 
     assert stored.last_apply_error["code"] == "internal"
-    assert "RuntimeError" in stored.last_apply_error["message"]
+    assert stored.last_apply_error["message"] == "apply error (internal); see the server log"
     for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error), _log_surface(recorded_logs)):
         assert _SECRET not in surface
+
+
+async def test_typed_commit_failure_keeps_its_message_out_of_logs_and_errors(
+    adapter_client, monkeypatch, recorded_logs
+):
+    device_id, row = await _community()
+
+    async def fail_commit(*args, **kwargs):
+        raise NsoApplyError("nso_error", f"device rejected {_SECRET}", {"stage": "commit"})
+
+    monkeypatch.setattr("nso_adapter.nso.apply.apply_device_intent", fail_commit)
+    client = _client_with(httpx.MockTransport(lambda request: httpx.Response(404)))
+    job = await _run(device_id, client, monkeypatch)
+    async with session() as db:
+        stored = await db.get(SnmpCommunityIntent, row.id)
+
+    assert stored.last_apply_error == {
+        "code": "nso_error",
+        "message": "apply error (nso_error); see the server log",
+        "detail": {"stage": "commit"},
+    }
+    for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error), _log_surface(recorded_logs)):
+        assert _SECRET not in surface
+
+
+async def test_typed_build_failure_keeps_its_message_out_of_logs_and_errors(adapter_client, monkeypatch, recorded_logs):
+    invalid_asn = "placeholder-sensitive-asn"
+    device_id = await seed_device(nso_device_name=_DEVICE)
+    response = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent",
+        json={"routers": [{"asn": invalid_asn}]},
+        headers={"Authorization": f"Bearer {VALID_TOKEN}"} | push_seq(),
+    )
+    assert response.status_code == 200
+
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(404)
+
+    job = await _run(device_id, _client_with(httpx.MockTransport(respond)), monkeypatch)
+    async with session() as db:
+        stored = (
+            (await db.execute(select(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id))).scalars().one()
+        )
+
+    assert stored.last_apply_error == {
+        "code": "invalid_asn",
+        "message": "apply error (invalid_asn); see the server log",
+        "detail": {},
+    }
+    for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error), _log_surface(recorded_logs)):
+        assert invalid_asn not in surface
+    assert not any(request.method == "PUT" for request in requests)
 
 
 async def test_a_non_reference_secret_never_reaches_the_projection_refusal_chain(adapter_client):

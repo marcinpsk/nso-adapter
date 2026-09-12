@@ -237,7 +237,7 @@ async def test_localized_refusal_replaces_previous_errors_on_other_families(adap
     entry = job.result["static_route_results"][0]
     assert entry["outcome"] == "apply_failed"
     assert entry["error"] is not None
-    assert "vlan" in entry["error"]["message"]
+    assert entry["error"]["message"] == "apply error (nso_put_failed); see the server log"
     assert await static_rows(device_id) == [(None, entry["error"])]
 
 

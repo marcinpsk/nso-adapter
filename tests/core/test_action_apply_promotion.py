@@ -1006,7 +1006,7 @@ async def test_failed_static_route_document_send_without_a_live_stamp_reports_th
     assert job.status is JobStatus.failed
     result = job.result["static_route_results"][0]
     assert result["outcome"] == "apply_failed"
-    assert result["error"]["message"] == "NSO device-intent PUT failed with status 400"
+    assert result["error"]["message"] == "apply error (nso_put_failed); see the server log"
 
 
 async def test_reader_compare_miss_without_a_live_stamp_reports_the_route_error(adapter_client):
@@ -3890,5 +3890,5 @@ async def test_localized_refusal_fails_every_transmitted_scope(adapter_client):
         for model in (StaticRouteIntent, VlanIntent):
             row = await db.scalar(sa.select(model).where(model.device_id == device_id))
             assert row.last_apply_error is not None
-            assert "vlan" in row.last_apply_error["message"]
+            assert row.last_apply_error["message"] == "apply error (nso_put_failed); see the server log"
             assert row.last_apply_at is None

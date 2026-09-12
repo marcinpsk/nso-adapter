@@ -1326,13 +1326,14 @@ async def test_run_apply_a_rejected_commit_fails_every_family_it_carried(adapter
         assert job.result["vlan_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
         assert job.error["code"] == "nso_commit_failed"
         items = job.error["detail"]["items"]
-        assert {"type": "static_route", "error": "route rejected"} in items
+        safe_message = "apply error (nso_error); see the server log"
+        assert {"type": "static_route", "error": safe_message} in items
         rows = (
             (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
             .scalars()
             .all()
         )
-        assert rows[0].last_apply_error == {"code": "nso_error", "message": "route rejected", "detail": {"x": 1}}
+        assert rows[0].last_apply_error == {"code": "nso_error", "message": safe_message, "detail": {"x": 1}}
 
 
 async def test_run_apply_unexpected_send_exception_is_recorded_as_internal(adapter_client):
@@ -1364,7 +1365,7 @@ async def test_run_apply_unexpected_send_exception_is_recorded_as_internal(adapt
         assert rows[0].last_apply_error["code"] == "internal"
         assert "kaboom" not in str(rows[0].last_apply_error), "exception text reached the persisted error"
         assert "kaboom" not in str(job.error), "exception text reached the persisted failure items"
-        assert "RuntimeError" in rows[0].last_apply_error["message"]
+        assert rows[0].last_apply_error["message"] == "apply error (internal); see the server log"
 
 
 # The IS-IS sub-collections (process/level/flex) are eligible on their OWN — a per-level
@@ -1409,7 +1410,7 @@ async def test_run_apply_isis_subscope_failure_fails_the_job(adapter_client, mod
         assert job.result["isis_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
         assert job.error["code"] == "nso_commit_failed"
         rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
-        assert rows[0].last_apply_error["message"] == "level rejected"
+        assert rows[0].last_apply_error["message"] == "apply error (nso_error); see the server log"
 
 
 @pytest.mark.parametrize("model_name, kwargs", _ISIS_SUBSCOPE_CASES)
@@ -1741,7 +1742,7 @@ async def test_run_apply_ip_unexpected_exception(adapter_client):
         assert rows[0].last_apply_error["code"] == "internal"
         assert "transport exploded" not in str(rows[0].last_apply_error), "exception text reached the persisted error"
         assert "transport exploded" not in str(job.error), "exception text reached the persisted failure items"
-        assert "RuntimeError" in rows[0].last_apply_error["message"]
+        assert rows[0].last_apply_error["message"] == "apply error (internal); see the server log"
 
 
 # ── one document, one transaction, one commit ─────────────────────────────────

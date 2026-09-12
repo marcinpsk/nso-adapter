@@ -328,8 +328,7 @@ async def test_c2_2_a_service_owned_sibling_blocks_the_replace(adapter_client):
     assert job.status == JobStatus.failed
     assert rec.sr_commits() == [], "nothing may be committed once the guard refuses"
     item = next(i for i in job.error["detail"]["items"] if i["type"] == "static_route")
-    # Scope-qualified: the guard is device-wide, and two families both have a `host` list.
-    assert "static_route/route" in item["error"], "the report must NAME the sibling"
+    assert item["error"] == "apply error (removal_blocked_collateral); see the server log"
 
     async with session() as db:
         from nso_adapter.store.models import StaticRouteIntent
@@ -709,7 +708,7 @@ async def test_a_blocked_replace_reports_the_orphan_it_refused_over(adapter_clie
 
     assert job.status == JobStatus.failed
     item = next(i for i in job.error["detail"]["items"] if i["type"] == "static_route")
-    assert "static_route/route" in item["error"], "the job names the orphan it refused over"
+    assert item["error"] == "apply error (removal_blocked_collateral); see the server log"
     row_error = await _first_row_error(device_id)
     assert row_error["code"] == "removal_blocked_collateral"
     assert row_error["detail"]["orphans"] == {"static_route/route": [list(C)]}

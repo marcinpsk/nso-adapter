@@ -1494,7 +1494,8 @@ async def _finalize_unsent(db, plan: _ApplyPlan, build_errors: dict, *, job_id: 
     outcomes: dict[str, tuple[int, int]] = dict.fromkeys(_result_keys(), (0, 0))
     failures: dict[str, list] = {}
     for section, exc in build_errors.items():
-        error = {"code": exc.code, "message": exc.message, "detail": exc.detail}
+        message = _apply_error_summary(exc)
+        error = {"code": exc.code, "message": message, "detail": exc.detail}
         if section == "interface_config":
             for item in plan.interface.attributes:
                 if item.stamp is not None:
@@ -1503,7 +1504,7 @@ async def _finalize_unsent(db, plan: _ApplyPlan, build_errors: dict, *, job_id: 
                 row.last_apply_error = error
             outcomes["attribute"] = (0, len(plan.interface.attributes))
             outcomes["ip"] = (0, len(plan.interface.ip_rows))
-            failures["attribute"] = [{"error": exc.message}]
+            failures["attribute"] = [{"error": message}]
             continue
         apply_rows = plan.sections[section]
         _reject_transient_stamps(section, apply_rows.stamp)
@@ -1515,7 +1516,7 @@ async def _finalize_unsent(db, plan: _ApplyPlan, build_errors: dict, *, job_id: 
         # Counted against what the body WOULD have carried: a family whose live rows a
         # successor rewrote stamps none of them, and a (0, 0) outcome is a silent success.
         outcomes[key] = (0, len(apply_rows.sent))
-        failures[key] = [{"error": exc.message}]
+        failures[key] = [{"error": message}]
     await _finalize_job(db, job_id, plan.device_id, True, outcomes, failures, reg=reg, document_failed=True)
 
 
@@ -1563,7 +1564,8 @@ async def _commit_document(
             logger.debug("apply.atomic.capability_clear_skipped", job_id=job_id)
         return None, verify, {}, None, ""
 
-    logger.error("apply.atomic_failed", job_id=job_id, device=device_name, error=commit_error.message)
+    message = _apply_error_summary(commit_error)
+    logger.error("apply.atomic_failed", job_id=job_id, device=device_name, error=message)
     device_err = _device_error_message(commit_error)
     # A guard refusal never reached the device, so there is nothing to localise and no
     # capability verdict to draw: the whole unsent document is the failure.
@@ -1575,16 +1577,13 @@ async def _commit_document(
     # match. A generic device rejection is NOT a capability signal: it may be a MISCONFIGURATION
     # (a route-map referencing a prefix-list the push does not carry), not a NED limit, and
     # recording it would be a false "unsupported" verdict. Such failures still fail the job and
-    # stamp last_apply_error, so the operator sees the real device error.
+    # stamp last_apply_error with a stable summary.
     if offenders:
         try:
             await _record_atomic_capability(db, client, device, device_name, offenders, commit_error, rp, device_err)
         except Exception:  # noqa: BLE001 — capability recording is best-effort
             logger.debug("apply.atomic.capability_record_skipped", job_id=job_id)
-    message = commit_error.message
-    if offenders:
-        message = f"{message}; blocked by {', '.join(sorted(offenders))} refusal: {device_err or message}"
-    else:
+    if not offenders:
         offenders = dict.fromkeys(containers, "")
     err = {"code": commit_error.code, "message": message, "detail": commit_error.detail}
     return commit_error, verify, offenders, err, message
