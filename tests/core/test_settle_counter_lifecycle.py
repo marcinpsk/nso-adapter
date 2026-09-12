@@ -369,7 +369,7 @@ async def test_a_failed_allocation_never_takes_a_second_terminal_write(adapter_c
     finally:
         await release_claim(reg)
 
-    assert fake.writes, "the pin no longer models a failure AFTER the device work"
+    assert len(fake.writes) == 1, "the pin no longer models one document sent before the failure"
     assert fake.sent_keys() == {("", "10.6.0.0/24", "10.6.0.1")}
     refresh.assert_not_awaited()
 

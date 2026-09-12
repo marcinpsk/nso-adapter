@@ -86,10 +86,10 @@ class _ProofRecorder(_Recorder):
                     }
                 },
             )
-        if self.reject_route_policy and "route-policy-config" in url and "dry-run=" not in url:
-            self.calls.append(
-                {"method": method, "url": url, "body": json.loads(content) if content else None, "dry_run": False}
-            )
+        body = json.loads(content) if content else None
+        instance = self.instance({"body": body}) or {}
+        if self.reject_route_policy and "route-policy" in instance and "dry-run=" not in url:
+            self.calls.append({"method": method, "url": url, "body": body, "dry_run": False})
             return httpx.Response(
                 400,
                 request=httpx.Request(method.upper(), url),
@@ -103,6 +103,24 @@ class _ProofRecorder(_Recorder):
                 self.dry_run_status, request=httpx.Request(method.upper(), url), json={"errors": "boom"}
             )
         return await super()._handle(method, url, content, headers)
+
+
+async def test_proof_recorder_rejects_route_policy_in_the_aggregate_document():
+    rec = _ProofRecorder("sr-proof")
+    rec.reject_route_policy = True
+    body = {
+        "device-intent:device-intent": [
+            {"device": "sr-proof", "route-policy": {"prefix-list": [{"name": "RP-DENY", "entry": []}]}}
+        ]
+    }
+
+    response = await rec._handle(
+        "put",
+        "http://nso/restconf/data/device-intent:device-intent=sr-proof",
+        json.dumps(body),
+    )
+
+    assert response.status_code == 400
 
 
 def dev_state(*entries, status: str = "ok") -> dict:

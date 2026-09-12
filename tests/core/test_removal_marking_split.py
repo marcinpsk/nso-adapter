@@ -260,6 +260,7 @@ async def test_o2_3_b_a_deferred_retract_discharges_no_carrier_at_execution(adap
     sent = {(e.get("vrf") or "", e["prefix"], e["next-hop"]): e for e in fake.sent_routes()}
     assert sent.keys() == {B}
     assert "metric" not in sent[B], "the body is the document, which has no metric to assert"
+    assert "metric" not in fake.device_entry(B), "FASTMAP applied the clear to the device"
     async with session() as db:
         row = (
             (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
