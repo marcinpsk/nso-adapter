@@ -173,6 +173,8 @@ class _Section(NamedTuple):
     ``l2_service``, ``interface_config`` reads ``interface_ip``, ``lag`` reads
     ``lag_config``. *capability_scopes* and *result_keys* default to the section's own
     name; ``interface_config`` is the one section that records under two of each.
+    *residue_labels* names removal evidence consumed after the write that is not a
+    document list and therefore has no :class:`GuardList` path or key shape.
     """
 
     tables: tuple[_Spec, ...]
@@ -183,6 +185,12 @@ class _Section(NamedTuple):
     guard_lists: tuple[GuardList, ...] = ()
     capability_scopes: tuple[str, ...] = ()
     result_keys: tuple[str, ...] = ()
+    residue_labels: tuple[str, ...] = ()
+
+    @property
+    def removal_authority_labels(self) -> frozenset[str]:
+        """Return every removal key grain a generation may carry for this section."""
+        return frozenset((*self.residue_labels, *(guard_list.label for guard_list in self.guard_lists)))
 
 
 #: Iteration order is the order a device's document is built and its job results are
@@ -412,6 +420,7 @@ _SECTION_REGISTRY: dict[str, _Section] = {
         verify=NO_COMPARISON,
         capability_scopes=("interface_attribute", "interface_ip"),
         result_keys=("attribute", "ip"),
+        residue_labels=("address",),
     ),
 }
 

@@ -302,19 +302,24 @@ def classify_apply_plan(all_rows: list, tombstones: list, *, device_id: int) -> 
 
 
 def validate_removal_authority(value: object) -> None:
-    """Refuse removal authority that does not name its section and guarded list.
+    """Refuse removal authority that does not name its section and key grain.
 
     The scope vocabulary is the section registry. A scope outside it reads as an EMPTY
     authority downstream, because each reader indexes its own section by name, so a
     near-miss spelling would guard nothing while looking populated.
     """
-    from nso_adapter.core.projection import projection_sections
+    from nso_adapter.core.projection import section_registry
 
     if not isinstance(value, dict) or any(not isinstance(labels, dict) for labels in value.values()):
         raise ValueError("allowed_removal_keys must be scope-qualified")
-    unknown = sorted(set(value) - projection_sections())
+    registry = section_registry()
+    unknown = sorted(set(value) - set(registry))
     if unknown:
         raise ValueError(f"unknown removal-authority scope {unknown[0]!r}")
+    for scope, labels in value.items():
+        unknown = sorted(set(labels) - registry[scope].removal_authority_labels)
+        if unknown:
+            raise ValueError(f"unknown removal-authority label {unknown[0]!r} for scope {scope!r}")
 
 
 def _removal_keys(value) -> set[Triple]:

@@ -193,11 +193,12 @@ async def test_a_sweep_rejects_a_carrier_that_cannot_take_its_generation(adapter
 
     monkeypatch.setattr(sweep_mod, "create_dedicated_job", _occupied_carrier)
 
-    with pytest.raises(
-        GenerationCarrierCorruption,
-        match=rf"dedicated carrier {carrier_id} rejected generation \d+",
-    ):
-        await sweep_tombstones()
+    async with session() as db:
+        with pytest.raises(
+            GenerationCarrierCorruption,
+            match=rf"dedicated carrier {carrier_id} rejected generation \d+",
+        ):
+            await sweep_mod.sweep_one_device(device_id, db=db)
 
     async with session() as db:
         generations = (

@@ -1319,3 +1319,4 @@ async def test_partial_address_removal_has_only_address_authority(adapter_client
     assert removal.removal_context["interfaces"] == ["GigabitEthernet0/1"]
     assert not removal.allowed_removal_keys["interface_config"].get("interface")
     assert removal.allowed_removal_keys["interface_config"]["address"] == [["GigabitEthernet0/1", "198.18.0.1/24", ""]]
+    assert removal.allowed_removal_keys["interface_config"]["ipv4-address"] == [["GigabitEthernet0/1", "198.18.0.1"]]

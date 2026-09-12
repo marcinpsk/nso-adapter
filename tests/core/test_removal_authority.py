@@ -113,9 +113,42 @@ def test_guard_refuses_an_authority_scope_that_names_no_section():
         guard_allowed(generation)
 
 
+def test_guard_refuses_an_authority_label_that_names_no_guarded_list():
+    """A known scope with an unknown label also authorizes nothing downstream."""
+    generation = DeploymentGeneration(allowed_removal_keys={"static_route": {"routes": []}})
+    with pytest.raises(ValueError, match="unknown removal-authority label"):
+        guard_allowed(generation)
+
+
+def test_guard_accepts_residue_authority_only_for_its_registered_section():
+    authority = {"interface_config": {"address": [["GigabitEthernet0/1", "198.18.0.1/24", ""]]}}
+    generation = DeploymentGeneration(allowed_removal_keys=authority)
+    assert guard_allowed(generation) == authority
+
+    generation.allowed_removal_keys = {"vlan": {"address": []}}
+    with pytest.raises(ValueError, match="unknown removal-authority label"):
+        guard_allowed(generation)
+
+
+def test_residue_authority_does_not_authorize_a_document_list_omission():
+    from nso_adapter.core.removal import _document_orphans
+
+    live = {
+        "interface": {
+            "interface": [{"interface-name": "GigabitEthernet0/1", "ipv4-address": [{"address": "198.18.0.1"}]}]
+        }
+    }
+    body = {"interface": {"interface": [{"interface-name": "GigabitEthernet0/1", "ipv4-address": []}]}}
+    residue_only = {"interface_config": {"address": [["GigabitEthernet0/1", "198.18.0.1/24", ""]]}}
+    assert _document_orphans(live, body, residue_only) == {
+        "interface_config/ipv4-address": [["GigabitEthernet0/1", "198.18.0.1"]]
+    }
+
+
 def test_guard_accepts_every_scope_the_registry_names():
     """The validation must admit every section a generation can legitimately carry."""
-    from nso_adapter.core.projection import projection_sections
+    from nso_adapter.core.projection import section_registry
 
-    for section in sorted(projection_sections()):
-        guard_allowed(DeploymentGeneration(allowed_removal_keys={section: {"route": []}}))
+    for section, entry in section_registry().items():
+        labels = {label: [] for label in entry.removal_authority_labels}
+        guard_allowed(DeploymentGeneration(allowed_removal_keys={section: labels}))

@@ -462,8 +462,16 @@ async def test_a_clean_commit_clears_the_stale_capability_for_every_family_it_ca
 
 
 @pytest.mark.parametrize("phase", ["commit", "verify"])
-@pytest.mark.parametrize("shape", ["object", "text", "string"])
-async def test_rejected_commit_redacts_secrets_in_logs_and_stored_errors(adapter_client, shape, phase):
+@pytest.mark.parametrize(
+    ("shape", "envelope"),
+    [
+        ("object", "ietf-restconf:errors"),
+        ("object", "errors"),
+        ("text", None),
+        ("string", None),
+    ],
+)
+async def test_rejected_commit_redacts_secrets_in_logs_and_stored_errors(adapter_client, shape, envelope, phase):
     from structlog.testing import capture_logs
 
     from nso_adapter.store.models import OspfInterfaceIntent
@@ -497,7 +505,7 @@ async def test_rejected_commit_redacts_secrets_in_logs_and_stored_errors(adapter
             return httpx.Response(
                 400,
                 json={
-                    "ietf-restconf:errors": {
+                    envelope: {
                         "error": [
                             {
                                 "error-message": message,
