@@ -111,7 +111,7 @@ rounds and keep unsupported binding behavior conservative.
 
 ## Exception-log guard extension
 
-Status: ratified (revision r1)
+Status: ratified (revision r2)
 
 ### Problem
 
