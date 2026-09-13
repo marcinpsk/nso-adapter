@@ -26,6 +26,7 @@ from tests.conftest import seed_device, session
 _URL = "https://nso.invalid/restconf/data/placeholder-mount/placeholder-path"
 _REASON = "Placeholder Reason Phrase"
 _LEAKS = [_URL, "placeholder-mount", "placeholder-path", _REASON]
+_COVERAGE_DOC = Path(__file__).resolve().parents[2] / ".opengrep" / "README.md"
 _IMPORTER = Path(__file__).resolve().parents[2] / "nso_adapter" / "core" / "importer.py"
 _GUARDED_LOG_SINKS = (
     Path(__file__).resolve().parents[2] / "nso_adapter" / "main.py",
@@ -86,6 +87,12 @@ def test_guarded_modules_never_log_raw_exception_text() -> None:
         if _raw_log_exception_renderers(path.read_text(encoding="utf-8"))
     }
     assert violations == {}
+
+
+def test_guarded_modules_are_documented() -> None:
+    coverage = _COVERAGE_DOC.read_text(encoding="utf-8").split("## Coverage", maxsplit=1)[1]
+    for path in (_IMPORTER, *_GUARDED_LOG_SINKS):
+        assert path.name in coverage, f"{path.name} is missing from the OpenGrep coverage documentation"
 
 
 @asynccontextmanager
