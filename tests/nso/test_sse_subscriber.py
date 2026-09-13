@@ -286,11 +286,10 @@ async def test_subscribe_raises_on_http_error():
                 request.method,
                 "https://placeholder.invalid/restconf/streams/NETCONF/json?token=placeholder-secret",
             )
-            response = httpx.Response(503, request=hostile_request)
-            raise httpx.HTTPStatusError(
-                "placeholder-secret-reason",
+            return httpx.Response(
+                503,
                 request=hostile_request,
-                response=response,
+                extensions={"reason_phrase": b"placeholder-secret-reason"},
             )
 
     sub = SSESubscriber("http://nso:8080", ("admin", "secret"))

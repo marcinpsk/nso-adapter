@@ -31,3 +31,24 @@ rules:
       - pattern: api_error(..., "validation_error", str($EXCEPTION), ...)
       - pattern: api_error(..., "validation_error", repr($EXCEPTION), ...)
       - pattern: api_error(..., "validation_error", f"...{$VALUE}...", ...)
+  - id: nso-failure-detail-raw-exception-renderer
+    languages: [python]
+    severity: ERROR
+    message: Return a closed classification instead of rendering exception text.
+    paths:
+      include:
+        - nso_adapter/nso/client.py
+        - review-patterns.py
+    patterns:
+      - pattern-inside: |
+          def $FUNCTION($EXCEPTION):
+            ...
+      - pattern-either:
+          - pattern: return str($EXCEPTION)
+          - pattern: return repr($EXCEPTION)
+          - pattern: return f"...{$EXCEPTION}..."
+          - pattern: return $FORMAT % $EXCEPTION
+          - pattern: return $FORMAT.format($EXCEPTION)
+          - pattern: return format($EXCEPTION)
+          - pattern: return str($EXCEPTION.$ATTRIBUTE)
+          - pattern: return repr($EXCEPTION.$ATTRIBUTE)

@@ -49,6 +49,12 @@ classification contract and complete Python syntax.
 and formatted values in device validation responses. These responses use
 authored text so caller-controlled NSO instance names do not return on the wire.
 
+`nso-failure-detail-raw-exception-renderer` rejects common direct string,
+representation, interpolation, and formatting of the shared formatter
+parameter. The AST regression in `test_importer_failure_sinks.py` is the
+complete guard: it rejects aliases and permits the input only in type checks,
+the exact enum-kind lookup, and numeric HTTP status access.
+
 OpenGrep 1.30.0 partially parses the adapter's PEP 695 type aliases and generic
 functions. It reports each skipped line during a scan and analyzes the rest of
 those files. Keep this limitation visible until the installed parser supports

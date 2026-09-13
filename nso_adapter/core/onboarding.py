@@ -182,8 +182,8 @@ async def onboard_device(
 
     Raises:
         ValueError: if the NSO instance is unknown.
-        LookupError: if netbox_device_id is already onboarded elsewhere, or the NSO node is already
-            linked to a DIFFERENT NetBox device.
+        DeviceIdentityRefused: if the NSO node is already linked to a different NetBox device.
+        LookupError: if netbox_device_id is already onboarded elsewhere.
         ClaimUnavailableError: provision mode only — the device stayed claimed for the whole
             wait budget, so the mapping is refused rather than performed unserialized.
 
@@ -280,9 +280,19 @@ async def onboard_device(
                 )
             )
         ).scalar_one_or_none()
-        if winner is None or winner.netbox_device_id not in (None, netbox_device_id):
+        if winner is None:
             # The conflict was on netbox_device_id instead: another NSO node claimed it.
             claimed = LookupError(f"NetBox device {netbox_device_id} is already onboarded")
+        elif winner.netbox_device_id not in (None, netbox_device_id):
+            logger.warning(
+                "device.onboard_refused",
+                reason="onboarded_elsewhere",
+                nso_instance=nso_instance,
+                nso_device=nso_device_name,
+                linked_netbox_device_id=winner.netbox_device_id,
+                requested_netbox_device_id=netbox_device_id,
+            )
+            claimed = DeviceIdentityRefused(_ONBOARDED_ELSEWHERE, reason="onboarded_elsewhere")
         else:
             logger.info("device.onboard_race_resolved", device_id=winner.id, nso_device=nso_device_name)
             return winner

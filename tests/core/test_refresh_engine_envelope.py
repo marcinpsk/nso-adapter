@@ -229,6 +229,16 @@ async def test_escalation_action_error_keeps_rows(adapter_client):
 
         assert ok is False
         assert await _routes(db, device_id) == ["10.0.0.0/8"]
+        outcome_row = await _latest_outcome(db, device_id)
+        assert outcome_row.read_failures == [
+            {
+                "read_operation": "device_state_read",
+                "component_family": "static-route",
+                "error_type": "RuntimeError",
+                "http_status": None,
+                "failure_code": "heal_action_failed",
+            }
+        ]
 
 
 @pytest.mark.anyio

@@ -9,12 +9,20 @@ and check_sync without hitting a real NSO instance.
 from __future__ import annotations
 
 import json
+from typing import cast
 
 import httpx
 import pytest
 
 from nso_adapter.config import NsoInstanceConfig
-from nso_adapter.nso.client import NsoActionFailedError, NsoClient, NsoReadContractError, failure_detail
+from nso_adapter.nso.client import (
+    NsoActionFailedError,
+    NsoActionFailureKind,
+    NsoClient,
+    NsoExportUnavailableError,
+    NsoReadContractError,
+    failure_detail,
+)
 from nso_adapter.nso.read_outcome import Unavailable, UnavailableReason
 
 
@@ -643,7 +651,20 @@ async def test_the_not_ready_escalation_classifies_a_non_mapping_output(patch_cl
     assert outcome.failure.error_type == "NsoReadContractError"
 
 
-async def test_the_host_key_refusal_names_only_the_failure_kind(patch_client):
+@pytest.mark.parametrize(
+    ("payload", "expected_kind"),
+    [
+        (
+            {"tailf-ncs:output": {"result": "failed", "info": "refused by 203.0.113.9"}},
+            NsoActionFailureKind.host_key_not_stored,
+        ),
+        (
+            {"tailf-ncs:output": {"result": "updated"}},
+            NsoActionFailureKind.host_key_fingerprint_missing,
+        ),
+    ],
+)
+async def test_the_host_key_refusal_names_only_the_failure_kind(patch_client, payload, expected_kind):
     """The failure kind is ours to print; request and action values are not.
 
     ``failure_detail`` repeats an AUTHORED failure verbatim, and what makes that safe is
@@ -651,12 +672,48 @@ async def test_the_host_key_refusal_names_only_the_failure_kind(patch_client):
     """
     client = _make_client()
     requested_device = "requested-device-placeholder-secret"
-    payload = {"tailf-ncs:output": {"result": "failed", "info": "refused by 203.0.113.9"}}
     with patch_client(client, 200, payload):  # noqa: SIM117
         with pytest.raises(NsoActionFailedError) as caught:
             await client.fetch_host_keys(requested_device)
 
     detail = failure_detail(caught.value)
-    assert detail == "NsoActionFailedError('fetch-host-keys did not report a stored key')"
+    assert caught.value.kind is expected_kind
+    assert detail == f"NsoActionFailedError({expected_kind.value!r})"
     assert requested_device not in detail, "the request value must not reach a persistent failure sink"
     assert "refused by" not in detail and "203.0.113.9" not in detail, "the action's own words never travel"
+
+
+@pytest.mark.parametrize("error_type", [NsoReadContractError, NsoExportUnavailableError])
+def test_failure_detail_does_not_preserve_read_exception_messages(error_type):
+    detail = failure_detail(error_type("placeholder-secret caller text"))
+
+    assert detail == error_type.__name__
+    assert "placeholder-secret" not in detail
+
+
+@pytest.mark.parametrize(
+    "counterfeit",
+    [
+        "fetch-host-keys did not report a stored key",
+        type("SecretString", (str,), {})("placeholder-secret"),
+    ],
+)
+def test_action_failure_rejects_counterfeit_kinds(counterfeit):
+    with pytest.raises(TypeError, match="kind must be an NsoActionFailureKind"):
+        NsoActionFailedError(cast(NsoActionFailureKind, counterfeit))
+
+
+def test_action_failure_with_tampered_kind_fails_closed():
+    failure = NsoActionFailedError(NsoActionFailureKind.host_key_not_stored)
+    object.__setattr__(failure, "kind", "placeholder-secret")
+
+    assert failure_detail(failure) == "NsoActionFailedError"
+
+
+def test_action_failure_subclass_has_no_diagnostic_authority():
+    class SecretActionFailure(NsoActionFailedError):
+        pass
+
+    failure = SecretActionFailure(NsoActionFailureKind.host_key_not_stored)
+
+    assert failure_detail(failure) == "SecretActionFailure"

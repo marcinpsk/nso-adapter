@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -205,6 +205,7 @@ async def _escalate_not_ready(device: Device, nso_client: NsoClient, wire_name: 
         failure = read_failure_from_exception(
             exc, operation=ReadOperation.device_state_read, device=name, family=wire_name
         )
+        failure = replace(failure, code=ReadFailureCode.heal_action_failed)
         return Unavailable(UnavailableReason.read_error, failure=failure)
     section = output.get(wire_name)
     if section is None:

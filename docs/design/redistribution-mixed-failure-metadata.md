@@ -48,7 +48,7 @@ Choose the module interface and persistence seam that retain authored read-failu
 
 ### Mechanical guard
 
-The `ReadOutcome` type carries only authored `ReadFailure` values. The central `outcome_store` adapter decomposes that typed value into dedicated nullable columns. Store integration tests cover failure-bearing `Present` and `Unavailable` outcomes, and the mixed redistribution integration test covers the only constructor that combines authoritative data with a component failure.
+The `ReadOutcome` type carries only authored `ReadFailure` values. The central `outcome_store` adapter projects that typed value through the approved whitelist into one nullable `RefreshOutcome.read_failures` JSONB array. Store integration tests cover failure-bearing `Present` and `Unavailable` outcomes, and the mixed redistribution integration test covers the only constructor that combines authoritative data with a component failure.
 
 ### Candidate shapes
 

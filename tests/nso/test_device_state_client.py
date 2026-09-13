@@ -128,8 +128,10 @@ async def test_section_404_with_healthy_container_is_device_absent(patch_client)
 async def test_section_404_with_dead_container_raises_export_unavailable(patch_client):
     client = _make_client()
     with patch_client(client, EnvelopeTransport(device_status=404, container_status=404)):
-        with pytest.raises(NsoExportUnavailableError):
-            await client.get_device_state_section("sw01", "ospf-config")
+        with pytest.raises(NsoExportUnavailableError) as caught:
+            await client.get_device_state_section("placeholder-secret-device", "ospf-config")
+
+    assert "placeholder-secret" not in str(caught.value)
 
 
 async def test_section_5xx_raises(patch_client):
@@ -168,8 +170,10 @@ async def test_doc_404_with_healthy_container_is_device_absent(patch_client):
 async def test_doc_404_with_dead_container_raises_export_unavailable(patch_client):
     client = _make_client()
     with patch_client(client, EnvelopeTransport(device_status=404, container_status=404)):
-        with pytest.raises(NsoExportUnavailableError):
-            await client.get_device_state_doc("sw01")
+        with pytest.raises(NsoExportUnavailableError) as caught:
+            await client.get_device_state_doc("placeholder-secret-device")
+
+    assert "placeholder-secret" not in str(caught.value)
 
 
 # ── run_device_state_read ────────────────────────────────────────────────────────────
@@ -243,8 +247,10 @@ async def test_doc_malformed_200_raises_never_absence(patch_client, body):
     as device absence would clear every pop-policy family downstream."""
     client = _make_client()
     with patch_client(client, EnvelopeTransport(device_body=body)):
-        with pytest.raises(NsoExportUnavailableError):
-            await client.get_device_state_doc("sw01")
+        with pytest.raises(NsoExportUnavailableError) as caught:
+            await client.get_device_state_doc("placeholder-secret-device")
+
+    assert "placeholder-secret" not in str(caught.value)
 
 
 # ── READSEM 1328: run_device_state_read certifies the snapshot before any consumer walks it ──

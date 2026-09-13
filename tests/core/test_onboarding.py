@@ -177,6 +177,33 @@ async def test_onboard_resolves_a_lost_insert_race(adapter_client_with_nso):
         assert len(rows) == 1  # exactly one survivor
 
 
+async def test_onboard_same_identity_race_reports_identity_refusal(adapter_client_with_nso):
+    """The losing request must report that the NSO identity belongs to another link."""
+    from nso_adapter.core.onboarding import DeviceIdentityRefused, onboard_device
+    from tests.conftest import seed_device
+
+    async with session() as db:
+        original_flush = db.flush
+        winner_id = {}
+
+        async def flush_after_a_competing_insert():
+            if not winner_id:
+                winner_id["id"] = await seed_device(
+                    nso_instance="nso-dev",
+                    nso_device_name="raced-identity",
+                    netbox_device_id=192,
+                )
+            db.flush = original_flush
+            await original_flush()
+
+        db.flush = flush_after_a_competing_insert
+        with pytest.raises(DeviceIdentityRefused) as caught:
+            await onboard_device(db, "nso-dev", "raced-identity", 191)
+
+    assert caught.value.reason == "onboarded_elsewhere"
+    assert str(caught.value) == "The NSO device is already onboarded to a different NetBox device"
+
+
 async def test_duplicate_nso_identity_is_rejected_by_the_database(adapter_client_with_nso):
     """The (nso_instance, nso_device_name) uniqueness is enforced in the DB, not just in code.
 

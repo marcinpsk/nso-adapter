@@ -12,6 +12,7 @@ projected one).
 from __future__ import annotations
 
 import ast
+import copy
 from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -28,6 +29,7 @@ _REASON = "Placeholder Reason Phrase"
 _LEAKS = [_URL, "placeholder-mount", "placeholder-path", _REASON]
 _COVERAGE_DOC = Path(__file__).resolve().parents[2] / ".opengrep" / "README.md"
 _IMPORTER = Path(__file__).resolve().parents[2] / "nso_adapter" / "core" / "importer.py"
+_NSO_CLIENT = Path(__file__).resolve().parents[2] / "nso_adapter" / "nso" / "client.py"
 _GUARDED_LOG_SINKS = (
     Path(__file__).resolve().parents[2] / "nso_adapter" / "main.py",
     *(
@@ -93,6 +95,105 @@ def test_guarded_modules_are_documented() -> None:
     coverage = _COVERAGE_DOC.read_text(encoding="utf-8").split("## Coverage", maxsplit=1)[1]
     for path in (_IMPORTER, *_GUARDED_LOG_SINKS):
         assert path.name in coverage, f"{path.name} is missing from the OpenGrep coverage documentation"
+
+
+def _binds_formatter_name(node: ast.AST) -> bool:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return node.name == "failure_detail"
+    if isinstance(node, ast.Name):
+        return node.id == "failure_detail" and isinstance(node.ctx, (ast.Store, ast.Del))
+    if isinstance(node, ast.alias):
+        imported_name = node.asname or node.name.split(".", maxsplit=1)[0]
+        return imported_name == "failure_detail" or node.name == "*"
+    return False
+
+
+def _failure_detail_definition_ast(source: str) -> str:
+    """Return the one effective formatter definition with its docstring normalized."""
+    tree = ast.parse(source)
+    bindings = [node for node in ast.walk(tree) if _binds_formatter_name(node)]
+    if len(bindings) != 1 or bindings[0] not in tree.body or not isinstance(bindings[0], ast.FunctionDef):
+        raise ValueError("failure_detail must have one direct module function binding")
+    formatter = copy.deepcopy(bindings[0])
+    if formatter.body and isinstance(formatter.body[0], ast.Expr) and isinstance(formatter.body[0].value, ast.Constant):
+        formatter.body[0].value.value = "<docstring>"
+    return ast.dump(formatter, include_attributes=False)
+
+
+_APPROVED_FAILURE_DETAIL = '''\
+def failure_detail(exc: BaseException) -> str:
+    """Approved formatter contract."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"{type(exc).__name__} (HTTP {exc.response.status_code})"
+    if type(exc) is NsoActionFailedError:
+        kind = getattr(exc, "kind", None)
+        if type(kind) is NsoActionFailureKind:
+            return f"NsoActionFailedError({kind.value!r})"
+    return type(exc).__name__
+'''
+_APPROVED_FAILURE_DETAIL_AST = _failure_detail_definition_ast(_APPROVED_FAILURE_DETAIL)
+
+
+def test_failure_detail_reads_only_closed_exception_properties() -> None:
+    """Any executable change to the ratified formatter shape requires an explicit review."""
+    actual = _failure_detail_definition_ast(_NSO_CLIENT.read_text(encoding="utf-8"))
+
+    assert actual == _APPROVED_FAILURE_DETAIL_AST
+
+
+@pytest.mark.parametrize(
+    "unsafe_body",
+    [
+        '    alias = exc\n    return "{}".format(alias)\n',
+        """\
+    kind = getattr(exc, "kind", None)
+    if type(kind) is NsoActionFailureKind:
+        pass
+    else:
+        return kind.value
+""",
+        """\
+    kind = getattr(exc, "kind", None)
+    if type(kind) is NsoActionFailureKind:
+        kind = getattr(exc, "request", None)
+        return kind.value
+""",
+    ],
+)
+def test_failure_detail_guard_rejects_unratified_shapes(unsafe_body: str) -> None:
+    candidate = f"def failure_detail(exc):\n{unsafe_body}"
+
+    assert _failure_detail_definition_ast(candidate) != _APPROVED_FAILURE_DETAIL_AST
+
+
+@pytest.mark.parametrize(
+    "rebind",
+    [
+        "\ndef failure_detail(exc):\n    return exc.args[0]\n",
+        "\nfailure_detail = lambda exc: exc.args[0]\n",
+    ],
+)
+def test_failure_detail_guard_rejects_an_alternate_binding(rebind: str) -> None:
+    with pytest.raises(ValueError, match="one direct module function binding"):
+        _failure_detail_definition_ast(_APPROVED_FAILURE_DETAIL + rebind)
+
+
+@pytest.mark.parametrize(
+    "rebind",
+    [
+        "\nif True:\n    def failure_detail(exc):\n        return str(exc)\n",
+        "\ntry:\n    from unsafe_it import *\nexcept ImportError:\n    pass\n",
+    ],
+)
+def test_failure_detail_guard_rejects_a_conditional_binding(rebind: str) -> None:
+    with pytest.raises(ValueError, match="one direct module function binding"):
+        _failure_detail_definition_ast(_APPROVED_FAILURE_DETAIL + rebind)
+
+
+def test_failure_detail_guard_rejects_a_decorator() -> None:
+    decorated = _APPROVED_FAILURE_DETAIL.replace("def failure_detail", "@unsafe\ndef failure_detail", 1)
+
+    assert _failure_detail_definition_ast(decorated) != _APPROVED_FAILURE_DETAIL_AST
 
 
 @asynccontextmanager

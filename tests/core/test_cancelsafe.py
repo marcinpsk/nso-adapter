@@ -43,6 +43,18 @@ async def _fresh_static_route_prefixes(device_id: int) -> list[str]:
         return [r.prefix for r in rows]
 
 
+async def _fresh_redistribution_identities(device_id: int) -> list[tuple[str, str, str, str]]:
+    from nso_adapter.store.models import DeviceRedistribution
+
+    async with session() as db:
+        rows = (
+            (await db.execute(select(DeviceRedistribution).where(DeviceRedistribution.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        return [(row.dest_protocol, row.dest_ref, row.source_protocol, row.source_ref) for row in rows]
+
+
 @pytest.fixture
 async def device_db(adapter_client):
     device_id = await seed_device(nso_device_name="cancel-rtr", netbox_device_id=9301)
@@ -265,7 +277,17 @@ async def test_redistribution_cancel_after_terminal_stage_commits_atomically(dev
     monkeypatch.setattr(redi.outcome_store, "stage_result", stage_then_cancel)
 
     outcomes = {
-        "ospf": Present({"redistribute": []}, Freshness.fresh),
+        "ospf": Present(
+            {
+                "instance": [
+                    {
+                        "process-id": "1",
+                        "redistribute": [{"source-protocol": "static", "source-ref": ""}],
+                    }
+                ]
+            },
+            Freshness.fresh,
+        ),
         "isis": Present({"redistribute": []}, Freshness.fresh),
         "bgp": Present({"redistribute": []}, Freshness.fresh),
     }
@@ -275,6 +297,7 @@ async def test_redistribution_cancel_after_terminal_stage_commits_atomically(dev
     outcome = await _fresh_outcome(device.id, "redistribution")
     assert outcome is not None, "redistribution outcome must commit despite the cancel"
     assert (outcome.result, outcome.succeeded) == ("replaced", True)
+    assert await _fresh_redistribution_identities(device.id) == [("ospf", "1", "static", "")]
 
 
 # ── await_uncancellable contract (codex-pinned semantics) ────────────────────

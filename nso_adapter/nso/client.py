@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import NamedTuple
 from urllib.parse import quote
 
@@ -26,14 +27,25 @@ class NsoExportUnavailableError(RuntimeError):
     """
 
 
+class NsoActionFailureKind(StrEnum):
+    """A closed adapter-authored reason for a failed NSO action."""
+
+    host_key_not_stored = "fetch-host-keys did not report a stored key"
+    host_key_fingerprint_missing = "fetch-host-keys reported a stored key with no fingerprint"
+
+
 class NsoActionFailedError(RuntimeError):
     """An NSO action answered 200 while its output reports the work did not happen.
 
-    The message names the action and the failure KIND, both ours; the action's own
-    ``info``/``error``/``result`` text is never repeated. Distinct from a bare
-    ``RuntimeError`` so a sink can tell an adapter-authored refusal, whose message is
-    the diagnostic, from a third-party failure, whose message is not ours to print.
+    The closed failure kind is adapter-authored. The action's own
+    ``info``/``error``/``result`` text is never repeated.
     """
+
+    def __init__(self, kind: NsoActionFailureKind) -> None:
+        if type(kind) is not NsoActionFailureKind:
+            raise TypeError("kind must be an NsoActionFailureKind")
+        self.kind = kind
+        super().__init__(kind.value)
 
 
 class NsoReadContractError(RuntimeError):
@@ -48,10 +60,6 @@ class NsoReadContractError(RuntimeError):
     """
 
 
-#: The failures whose message the adapter authored, so repeating it repeats only our own words.
-AUTHORED_FAILURES = (NsoActionFailedError, NsoExportUnavailableError, NsoReadContractError)
-
-
 def failure_detail(exc: BaseException) -> str:
     """Classify a failure for a log record, a job step or a response.
 
@@ -59,13 +67,16 @@ def failure_detail(exc: BaseException) -> str:
     redirect, the ``Location`` the server chose; a decode failure quotes the bytes the server
     sent. None of that is ours to print, and every one of these sinks is persisted or served.
     The numeric status stays, because an operator has to tell an auth refusal from an outage,
-    and an authored message stays, because it is ours. Anything else travels as its TYPE: the
-    caller's own context already says which part of the work failed.
+    and a closed action failure kind stays, because the constructor prevents caller text.
+    Anything else travels as its TYPE: the caller's own context already says which part of
+    the work failed.
     """
     if isinstance(exc, httpx.HTTPStatusError):
         return f"{type(exc).__name__} (HTTP {exc.response.status_code})"
-    if isinstance(exc, AUTHORED_FAILURES):
-        return repr(exc)
+    if type(exc) is NsoActionFailedError:
+        kind = getattr(exc, "kind", None)
+        if type(kind) is NsoActionFailureKind:
+            return f"NsoActionFailedError({kind.value!r})"
     return type(exc).__name__
 
 
@@ -384,10 +395,7 @@ class NsoClient:
                 # so the depth-truncation trap does not apply).
                 probe = await c.get(f"{base}?depth=1")
                 if probe.status_code == 404:
-                    raise NsoExportUnavailableError(
-                        f"network-state-export:device-state is not exported by NSO — refusing to "
-                        f"read {device_name!r}'s 404 as 'device absent'."
-                    )
+                    raise NsoExportUnavailableError("network-state-export:device-state is unavailable")
                 probe.raise_for_status()
                 return None
             resp.raise_for_status()
@@ -409,10 +417,7 @@ class NsoClient:
             if resp.status_code == 404:
                 probe = await c.get(f"{base}?depth=1")  # liveness only — see get_device_state_section
                 if probe.status_code == 404:
-                    raise NsoExportUnavailableError(
-                        f"network-state-export:device-state is not exported by NSO — refusing to "
-                        f"read {device_name!r}'s 404 as 'device absent'."
-                    )
+                    raise NsoExportUnavailableError("network-state-export:device-state is unavailable")
                 probe.raise_for_status()
                 return None
             resp.raise_for_status()
@@ -428,9 +433,7 @@ class NsoClient:
                 or not isinstance(entries[0], dict)
                 or entries[0].get("device-name") != device_name
             ):
-                raise NsoExportUnavailableError(
-                    f"device-state GET for {device_name!r} returned 200 with a malformed body"
-                )
+                raise NsoExportUnavailableError("device-state GET returned a malformed body")
             return entries[0]
 
     async def run_device_state_read(
@@ -548,11 +551,11 @@ class NsoClient:
         if result not in ("updated", "unchanged") or not body.get("fingerprint"):
             # The action's info/error/result are the server's own text; name the failure kind.
             kind = (
-                "did not report a stored key"
+                NsoActionFailureKind.host_key_not_stored
                 if result not in ("updated", "unchanged")
-                else "reported a stored key with no fingerprint"
+                else NsoActionFailureKind.host_key_fingerprint_missing
             )
-            raise NsoActionFailedError(f"fetch-host-keys {kind}")
+            raise NsoActionFailedError(kind)
         return out
 
     async def sync_from(self, device_name: str) -> bool:
