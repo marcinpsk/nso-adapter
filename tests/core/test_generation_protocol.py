@@ -54,14 +54,16 @@ class _Recorder:
     async def _handle(self, method: str, url: str, content=None, headers=None):
         return await self.fake.handle(method, url, content, headers)
 
-    @staticmethod
-    def _instance(body) -> dict | None:
+    def _instance(self, body) -> dict | None:
         """The device-intent list entry a request carried, or ``None`` for anything else."""
         entries = (body or {}).get(_DI_ROOT)
         if entries is None:
             return None
         assert isinstance(entries, list) and len(entries) == 1, entries
-        return entries[0]
+        entry = entries[0]
+        assert isinstance(entry, dict) and entry, entry
+        assert entry.get("device") == self.fake.device_name, entry
+        return entry
 
     @property
     def commits(self) -> list[dict]:
@@ -1361,10 +1363,12 @@ async def test_f9_c_a_present_key_still_settles_and_stamps_the_row_it_carried(ad
     assert (await vlan_rows(device_id))[10] == ("after", False)
 
 
-@pytest.mark.parametrize("entries", [[], [{"device": "one"}, {"device": "two"}], {}])
-def test_recorder_refuses_non_singleton_documents(entries):
+@pytest.mark.parametrize(
+    "entries", [[], [{"device": "one"}, {"device": "two"}], {}, [{}], [None], [{"device": "other"}]]
+)
+def test_recorder_refuses_invalid_documents(entries):
     with pytest.raises(AssertionError):
-        _Recorder._instance({_DI_ROOT: entries})
+        _Recorder("uncertified")._instance({_DI_ROOT: entries})
 
 
 @pytest.mark.parametrize(
