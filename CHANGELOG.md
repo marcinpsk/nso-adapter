@@ -2,6 +2,80 @@
 
 <!-- version list -->
 
+## v1.4.0 (2026-09-13)
+
+### Bug Fixes
+
+- **actions**: Reject retired force-removal fields
+  ([`3953392`](https://github.com/marcinpsk/nso-adapter/commit/39533926bc3f46181491871b6823a682a320b7a2))
+
+- **apply**: Classify typed preview failures
+  ([`ce4aa45`](https://github.com/marcinpsk/nso-adapter/commit/ce4aa45e45e9aca726f325201f0f15e75ffe3241))
+
+- **apply**: Enforce certified reads and removal authority
+  ([`29b60a2`](https://github.com/marcinpsk/nso-adapter/commit/29b60a2b459740d4ed0fd84f69c16633bc12c136))
+
+- **apply**: Redact unexpected failure details
+  ([`415f566`](https://github.com/marcinpsk/nso-adapter/commit/415f566ee4f1e6451c4ccee390509eb4673823ee))
+
+- **apply**: Sanitize typed failure summaries
+  ([`c35a3d1`](https://github.com/marcinpsk/nso-adapter/commit/c35a3d197b0dc60e98c346be920e0d5f705044b3))
+
+- **ospf**: Enable synthesized processes
+  ([`2cabc36`](https://github.com/marcinpsk/nso-adapter/commit/2cabc36b41727d483d9aa90e18c1229bd45851e5))
+
+- **projection**: Annotate the registry helper with the type it returns
+  ([`62c9a83`](https://github.com/marcinpsk/nso-adapter/commit/62c9a83954fe5d0a9d567583011a830ea424c74d))
+
+- **projection**: Take both section facts from the registry
+  ([`ae092f4`](https://github.com/marcinpsk/nso-adapter/commit/ae092f409c72c06306ad42059b9fcf5b7d98ae59))
+
+- **removal**: Refuse an authority scope that names no section
+  ([`ba61baf`](https://github.com/marcinpsk/nso-adapter/commit/ba61baf5ac4dc8bab5f5bc53724fe1ad0bb60fec))
+
+- **review**: Harden removal authority and sweep rollback
+  ([`9921ccf`](https://github.com/marcinpsk/nso-adapter/commit/9921ccf626a3db29678f5c2e7752648374fd5d65))
+
+- **review**: Tighten aggregate test contracts
+  ([`89858d5`](https://github.com/marcinpsk/nso-adapter/commit/89858d54aca3f62321bfd5423797aeb8d9569310))
+
+### Documentation
+
+- **api**: Describe aggregate apply preview
+  ([`76fc1b7`](https://github.com/marcinpsk/nso-adapter/commit/76fc1b7229f2d5b14b6b93b6a1062fc9fadaf703))
+
+### Refactoring
+
+- **actions**: Drop the force-removal interfaces field that narrows nothing
+  ([`6627d42`](https://github.com/marcinpsk/nso-adapter/commit/6627d4215bdc0da0c3122f80156b3c8021c659f4))
+
+- **receipt**: Build the authorized table mapping once
+  ([`26456b7`](https://github.com/marcinpsk/nso-adapter/commit/26456b764dd35623d4cd30dbb7edd142b6c04ea9))
+
+- **static-route**: Spell the execution key with its constant
+  ([`be80ec6`](https://github.com/marcinpsk/nso-adapter/commit/be80ec6e250d94f2bd88bb12e3809ae7e17c14d1))
+
+### Testing
+
+- Validate aggregate document device identity
+  ([`dba6b8c`](https://github.com/marcinpsk/nso-adapter/commit/dba6b8ceb2b923278bbbea63886adb6d4e5b6080))
+
+- **apply**: Select the revision the prepare returned
+  ([`872d815`](https://github.com/marcinpsk/nso-adapter/commit/872d815d2370399e9e466bbcc86569eaae84494f))
+
+- **apply**: Strengthen aggregate behavior checks
+  ([`5cd49be`](https://github.com/marcinpsk/nso-adapter/commit/5cd49be38e720f4898db970330c29f59bb677dd3))
+
+- **cutover**: Assert the clean bill the removal actually records
+  ([`bba7925`](https://github.com/marcinpsk/nso-adapter/commit/bba79250162b6534aec50ad01d5fedb6e5e0ac8d))
+
+- **secrets**: Report the index, not the secret, when a record repeats one
+  ([`828f109`](https://github.com/marcinpsk/nso-adapter/commit/828f109b613743500dfaa859bdafb03459aac2a7))
+
+- **snmp**: Assert the removal job reaches a terminal success
+  ([`c91543a`](https://github.com/marcinpsk/nso-adapter/commit/c91543af8e0b31a07857ac2b188b2dfc34250616))
+
+
 ## v1.3.0 (2026-09-09)
 
 ### Chores
