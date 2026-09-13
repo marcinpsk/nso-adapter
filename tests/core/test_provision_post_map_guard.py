@@ -479,7 +479,7 @@ async def test_a_taken_netbox_id_is_refused_and_leaks_no_claim(adapter_client_wi
         result = await _provision(db, name="pg-taken", netbox_device_id=7240, reg=reg, job_id=job_id, refresh=refresh)
 
     mapping = next(step for step in result["steps"] if step["step"] == "adapter_mapping")
-    assert mapping["status"] == "exists"
+    assert mapping == {"step": "adapter_mapping", "status": "exists", "detail": "LookupError"}
     assert result["device_id"] is None
     assert not reg.registered
     assert await _device_by_name("pg-taken") is None
@@ -494,7 +494,7 @@ async def test_a_pair_mapped_elsewhere_is_reported_and_leaks_no_claim(adapter_cl
     Diagnostics must use values snapshotted while the instance was still live.
     An implicit lazy load on an expired instance raises MissingGreenlet and turns a clean
     ``adapter_mapping: exists`` into an internal failure.
-    The step detail contains the authored refusal. The operator log carries the link.
+    The step preserves the stable refusal reason. The operator log carries the link.
     """
     from structlog.testing import capture_logs
 
@@ -514,9 +514,12 @@ async def test_a_pair_mapped_elsewhere_is_reported_and_leaks_no_claim(adapter_cl
             )
 
     mapping = next(step for step in result["steps"] if step["step"] == "adapter_mapping")
-    assert mapping["status"] == "exists"
-    assert "The NSO device is already onboarded to a different NetBox device" in mapping["detail"]
-    assert "7250" not in mapping["detail"]
+    assert mapping == {
+        "step": "adapter_mapping",
+        "status": "exists",
+        "detail": "DeviceIdentityRefused",
+        "reason": "onboarded_elsewhere",
+    }
     record = next(record for record in logs if record["event"] == "device.onboard_refused")
     assert record["linked_netbox_device_id"] == 7250
     assert record["requested_netbox_device_id"] == 7251

@@ -754,8 +754,17 @@ async def _map_and_seed_failover(
             row = await onboard_device(db, nso_instance, device_name, netbox_device_id, reg=reg, job_id=job_id)
             device_id = row.id
             steps.append({"step": "adapter_mapping", "status": "ok"})
+        except DeviceIdentityRefused as exc:
+            steps.append(
+                {
+                    "step": "adapter_mapping",
+                    "status": "exists",
+                    "detail": failure_detail(exc),
+                    "reason": exc.reason,
+                }
+            )
         except LookupError as exc:
-            steps.append({"step": "adapter_mapping", "status": "exists", "detail": repr(exc)})
+            steps.append({"step": "adapter_mapping", "status": "exists", "detail": failure_detail(exc)})
     fo_seed = await _seed_onboarding_failover(db, device_id, address, oob_ip, active_address, reg=reg)
     if fo_seed:
         steps.append(fo_seed)
