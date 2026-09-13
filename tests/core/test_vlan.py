@@ -15,7 +15,7 @@ from nso_adapter.core.vlan import (
     refresh_vlan_database_for_device,
 )
 from nso_adapter.nso.client import NsoExportUnavailableError
-from nso_adapter.store.models import Device, DeviceSwitchport, DeviceVlan
+from nso_adapter.store.models import Device, DeviceSwitchport, DeviceSwitchportTaggedVlan, DeviceVlan
 from tests.conftest import seed_device, session
 
 
@@ -203,14 +203,33 @@ async def test_refresh_switchport_links_vlans(adapter_client):
         await refresh_vlan_database_for_device(db, device, nso)
         sections["switchport"] = {
             "status": "ok",
-            "interface": [{"interface-name": "Gi0/1", "mode": "trunk", "untagged-vlan": 99, "tagged-vlans": "10,20"}],
+            "interface": [
+                {
+                    "interface-name": "Gi0/1",
+                    "mode": "trunk",
+                    "untagged-vlan": 99,
+                    "tagged-vlans": ["10", "10", "20"],
+                }
+            ],
         }
-        await refresh_switchport_for_device(db, device, nso)
+        assert await refresh_switchport_for_device(db, device, nso) is True
 
         sp = (await db.execute(select(DeviceSwitchport).where(DeviceSwitchport.device_id == device.id))).scalars().one()
         assert sp.mode == "trunk"
         uv = await db.get(DeviceVlan, sp.untagged_vlan_id)
         assert uv.vlan_id == 99
+        tagged = (
+            (
+                await db.execute(
+                    select(DeviceVlan.vlan_id)
+                    .join(DeviceSwitchportTaggedVlan, DeviceSwitchportTaggedVlan.vlan_id == DeviceVlan.id)
+                    .where(DeviceSwitchportTaggedVlan.switchport_id == sp.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert sorted(tagged) == [10, 20]
 
 
 @pytest.mark.anyio

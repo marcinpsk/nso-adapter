@@ -25,6 +25,7 @@ def test_local_provider_returns_empty_env_value(monkeypatch):
 def test_local_provider_from_file(tmp_path, monkeypatch):
     secret_file = tmp_path / "token"
     secret_file.write_text("  mytoken  \n")
+    monkeypatch.delenv("MY_TOKEN", raising=False)
     monkeypatch.setenv("MY_TOKEN_FILE", str(secret_file))
     p = LocalSecretsProvider()
     assert p.get("MY_TOKEN") == "mytoken"
@@ -68,6 +69,7 @@ def test_local_provider_classifies_an_unreadable_file_without_the_path(tmp_path,
     The protocol says the provider refuses with a SecretResolutionError that repeats no part
     of the reference, and the path in ``<REFERENCE>_FILE`` is the deployment's own layout.
     """
+    monkeypatch.delenv("MY_TOKEN", raising=False)
     monkeypatch.setenv("MY_TOKEN_FILE", str(tmp_path / "secret-dir"))
     (tmp_path / "secret-dir").mkdir()
 
@@ -83,6 +85,7 @@ def test_local_provider_classifies_undecodable_file_bytes(tmp_path, monkeypatch)
     """A decode failure quotes the bytes it choked on; neither they nor the path travel."""
     secret_file = tmp_path / "binary-token"
     secret_file.write_bytes(b"\xff\xfe secret-bytes")
+    monkeypatch.delenv("MY_TOKEN", raising=False)
     monkeypatch.setenv("MY_TOKEN_FILE", str(secret_file))
 
     with pytest.raises(SecretResolutionError) as caught:
@@ -94,6 +97,7 @@ def test_local_provider_classifies_undecodable_file_bytes(tmp_path, monkeypatch)
 
 def test_local_provider_falls_through_when_the_referenced_file_is_gone(tmp_path, monkeypatch):
     """An absent path is 'unset', not a read failure: the refusal stays the missing-var one."""
+    monkeypatch.delenv("MY_TOKEN", raising=False)
     monkeypatch.setenv("MY_TOKEN_FILE", str(tmp_path / "never-written"))
 
     with pytest.raises(SecretResolutionError) as caught:
@@ -105,6 +109,7 @@ def test_local_provider_falls_through_when_the_referenced_file_is_gone(tmp_path,
 
 def test_resolve_secret_stamps_the_slot_on_an_unreadable_file(tmp_path, monkeypatch):
     """The configured path: the provider classifies, the caller addresses, nothing leaks."""
+    monkeypatch.delenv("NETBOX_TOKEN", raising=False)
     monkeypatch.setenv("NETBOX_TOKEN_FILE", str(tmp_path / "token-dir"))
     (tmp_path / "token-dir").mkdir()
 

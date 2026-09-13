@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import pytest
 
+import tests.credential_discipline as credential_discipline
 from tests.credential_discipline import (
     _counts_by_site,
     load_baseline,
@@ -23,6 +24,10 @@ def test_no_unapproved_credentials_beyond_baseline():
         + "\n".join(f"  {v}" for v in bad)
         + "\nUse neutral placeholders or an inline '# credential-ok: <reason>' comment."
     )
+
+
+def test_no_stale_credential_baseline_allowances():
+    assert credential_discipline.stale_baseline_sites() == {}
 
 
 @pytest.mark.parametrize(
@@ -145,6 +150,32 @@ def test_baseline_allows_existing_but_flags_excess_and_new_scope(tmp_path):
     )
     hits = unapproved(tmp_path, baseline)
     assert [(v.lineno, v.qualname) for v in hits] == [(3, "existing"), (5, "new")]
+
+
+def test_stale_baseline_sites_reports_reduced_and_missing_scopes(tmp_path):
+    path = tmp_path / "test_example.py"
+    path.write_text('def reduced():\n    username = "admin"\n', encoding="utf-8")
+    baseline = {
+        "test_example.py::reduced": 2,
+        "test_removed.py::missing": 1,
+    }
+
+    assert credential_discipline.stale_baseline_sites(tmp_path, baseline) == {
+        "test_example.py::reduced": (2, 1),
+        "test_removed.py::missing": (1, 0),
+    }
+
+
+def test_main_reports_stale_baseline_allowances(monkeypatch, capsys):
+    monkeypatch.setattr(credential_discipline, "unapproved", lambda: [])
+    monkeypatch.setattr(
+        credential_discipline,
+        "stale_baseline_sites",
+        lambda: {"test_example.py::removed": (2, 0)},
+    )
+
+    assert credential_discipline._main([]) == 1
+    assert "test_example.py::removed: stale baseline allowance 2, current count 0" in capsys.readouterr().out
 
 
 def test_baseline_round_trip(tmp_path):

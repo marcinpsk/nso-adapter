@@ -643,19 +643,20 @@ async def test_the_not_ready_escalation_classifies_a_non_mapping_output(patch_cl
     assert outcome.failure.error_type == "NsoReadContractError"
 
 
-async def test_the_host_key_refusal_names_our_device_and_none_of_the_action_text(patch_client):
-    """The identity is ours to print; the action's own result/info/error is not.
+async def test_the_host_key_refusal_names_only_the_failure_kind(patch_client):
+    """The failure kind is ours to print; request and action values are not.
 
     ``failure_detail`` repeats an AUTHORED failure verbatim, and what makes that safe is
-    exactly what the message may hold: the action, the failure kind, and the device we
-    ASKED for — never a value the server chose.
+    exactly what the message may hold: the action and the failure kind only.
     """
     client = _make_client()
+    requested_device = "requested-device-placeholder-secret"
     payload = {"tailf-ncs:output": {"result": "failed", "info": "refused by 203.0.113.9"}}
     with patch_client(client, 200, payload):  # noqa: SIM117
         with pytest.raises(NsoActionFailedError) as caught:
-            await client.fetch_host_keys("core-rtr-01")
+            await client.fetch_host_keys(requested_device)
 
     detail = failure_detail(caught.value)
-    assert "core-rtr-01" in detail, "the device we asked for is the diagnostic"
+    assert detail == "NsoActionFailedError('fetch-host-keys did not report a stored key')"
+    assert requested_device not in detail, "the request value must not reach a persistent failure sink"
     assert "refused by" not in detail and "203.0.113.9" not in detail, "the action's own words never travel"

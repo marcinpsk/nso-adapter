@@ -271,6 +271,20 @@ def unapproved(root: Path = TESTS_ROOT, baseline: dict[str, int] | None = None) 
     return sorted(extra, key=lambda v: (v.path, v.lineno))
 
 
+def stale_baseline_sites(
+    root: Path = TESTS_ROOT,
+    baseline: dict[str, int] | None = None,
+) -> dict[str, tuple[int, int]]:
+    """Return baseline sites whose current count is lower than their allowance."""
+    allowed = load_baseline() if baseline is None else baseline
+    current = _counts_by_site(scan_tree(root))
+    return {
+        site: (budget, current.get(site, 0))
+        for site, budget in sorted(allowed.items())
+        if current.get(site, 0) < budget
+    }
+
+
 def _main(argv: list[str]) -> int:
     if "--update-baseline" in argv:
         counts = _counts_by_site(scan_tree())
@@ -280,8 +294,12 @@ def _main(argv: list[str]) -> int:
     bad = unapproved()
     for v in bad:
         print(str(v))
+    stale = stale_baseline_sites()
+    for site, (budget, current) in stale.items():
+        print(f"{site}: stale baseline allowance {budget}, current count {current}")
     print(f"\n{len(bad)} unapproved credential(s)")
-    return 1 if bad else 0
+    print(f"{len(stale)} stale baseline site(s)")
+    return 1 if bad or stale else 0
 
 
 if __name__ == "__main__":

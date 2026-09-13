@@ -242,7 +242,11 @@ async def refresh_redistribution_from_outcomes(
         # replaced/succeeded). A retained-by-error partition degrades freshness to stale
         # AND keeps the device partial (fn returns False); retained-only-unsupported
         # stays non-failing with the worst freshness among the replaced components.
-        merged: ReadOutcome = Present({}, Freshness.stale if errors else worst_freshness)
+        merged: ReadOutcome = Present.composite(
+            {},
+            Freshness.stale if errors else worst_freshness,
+            (outcomes[proto] for proto, _wire_name, _builder in _REDIST_COMPONENTS),
+        )
         terminal_result, terminal_succeeded = "replaced", True
         composite_ok = not errors
     elif errors:

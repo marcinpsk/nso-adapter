@@ -7,6 +7,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from sqlalchemy import select
 
@@ -594,7 +595,9 @@ async def _latest_outcome(device_id: int):
 
 @pytest.mark.anyio
 async def test_mixed_replaced_and_error_retained_is_degraded_present(adapter_client):
-    """D7: >=1 component replaced + >=1 retained-by-ERROR -> the composite records
+    """D7: one component replaces while two failures retain their partitions.
+
+    The composite records
     (present, stale, replaced, succeeded=True) — the payload IS mirror truth including
     the retained partition — while the fn still returns False (device stays partial).
 
@@ -608,6 +611,13 @@ async def test_mixed_replaced_and_error_retained_is_degraded_present(adapter_cli
             bgp={},
         )
         client._sections["ospf-config"] = {"status": "error", "reason": "boom"}
+        request = httpx.Request("GET", "https://placeholder.invalid/bgp?token=placeholder-secret")
+        response = httpx.Response(503, request=request)
+        client._sections["bgp-config"] = httpx.HTTPStatusError(
+            "placeholder-secret-reason",
+            request=request,
+            response=response,
+        )
 
         ok = await refresh_redistribution_for_device(db, device, client, refresh_source="test")
 
@@ -626,6 +636,23 @@ async def test_mixed_replaced_and_error_retained_is_degraded_present(adapter_cli
         "replaced",
         True,
     ), "mixed replaced+error-retained is degraded-success on the wire, not unavailable"
+    assert outcome.read_failures == [
+        {
+            "read_operation": "section_classify",
+            "component_family": "ospf-config",
+            "error_type": None,
+            "http_status": None,
+            "failure_code": "section_status_error",
+        },
+        {
+            "read_operation": "section_get",
+            "component_family": "bgp-config",
+            "error_type": "HTTPStatusError",
+            "http_status": 503,
+            "failure_code": None,
+        },
+    ]
+    assert "placeholder-secret" not in str(outcome.read_failures)
 
 
 @pytest.mark.anyio

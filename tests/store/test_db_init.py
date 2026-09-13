@@ -144,10 +144,29 @@ def test_db_migrate_survives_a_percent_in_the_password_and_prints_no_credential(
     )
     output = proc.stdout + proc.stderr
 
-    assert "invalid interpolation syntax" not in output, f"the % broke configuration:\n{output}"
-    assert "OperationalError" in output, f"the run never reached the database:\n{output}"
+    assert "invalid interpolation syntax" not in output, "the percent sign broke migration configuration"
+    assert "OperationalError" in output, "the migration runner did not reach the database"
     for leaked in (password, "pw%%40", "placeholder-secret", "placeholder_user"):
-        assert leaked not in output, f"the entrypoint printed the credential {leaked!r}:\n{output}"
+        assert leaked not in output, "the migration runner printed credential material"
+
+
+def test_migration_output_assertions_never_render_captured_output_or_credentials():
+    """A failed secrecy assertion must not publish the captured subprocess output."""
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    target = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "test_db_migrate_survives_a_percent_in_the_password_and_prints_no_credential"
+    )
+    rendered = []
+    for node in ast.walk(target):
+        if isinstance(node, ast.Assert) and node.msg is not None:
+            names = {child.id for child in ast.walk(node.msg) if isinstance(child, ast.Name)}
+            if names & {"output", "password", "leaked"}:
+                rendered.append(node.lineno)
+
+    assert rendered == [], f"unsafe assertion diagnostics at lines {rendered}"
 
 
 def test_db_migrate_and_init_db_share_one_validator():

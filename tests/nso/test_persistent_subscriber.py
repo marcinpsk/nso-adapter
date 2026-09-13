@@ -123,6 +123,13 @@ async def test_persistent_subscriber_retries_after_transport_error(monkeypatch: 
     stop_event = asyncio.Event()
     wait_for_calls: list[float] = []
     attempts = 0
+    request = httpx.Request("GET", "https://placeholder.invalid/stream?token=placeholder-secret")
+    response = httpx.Response(503, request=request)
+    failure = httpx.HTTPStatusError(
+        "placeholder-secret-reason for the requested stream",
+        request=request,
+        response=response,
+    )
 
     async def subscribe_side_effect(
         stream_url: str, on_event: OnEvent, duration: float, idle_read_timeout_s: float | None = 90.0
@@ -134,7 +141,7 @@ async def test_persistent_subscriber_retries_after_transport_error(monkeypatch: 
         # s3-13: the finite idle watchdog is threaded through to subscribe().
         assert idle_read_timeout_s == 90.0
         if attempts == 1:
-            raise httpx.RequestError("boom")
+            raise failure
         stop_event.set()
 
     async def fake_wait_for(awaitable: Awaitable[object], timeout: float) -> object:
@@ -146,10 +153,16 @@ async def test_persistent_subscriber_retries_after_transport_error(monkeypatch: 
     monkeypatch.setattr(module.asyncio, "wait_for", fake_wait_for)
     subscriber.subscribe = AsyncMock(side_effect=subscribe_side_effect)
 
-    await persistent_subscriber(subscriber, STREAM_URL, lambda *_: None, stop_event=stop_event)
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        await persistent_subscriber(subscriber, STREAM_URL, lambda *_: None, stop_event=stop_event)
 
     assert attempts == 2
     assert wait_for_calls == [5.0]
+    record = next(record for record in logs if record["event"] == "sse.reconnect_after_error")
+    assert record["error"] == "HTTPStatusError (HTTP 503)"
+    assert "placeholder-secret" not in str(record)
 
 
 async def test_persistent_subscriber_caps_exponential_backoff(monkeypatch: pytest.MonkeyPatch):

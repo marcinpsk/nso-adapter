@@ -248,34 +248,33 @@ async def test_attrs_cancel_after_phase_one_flush_terminalizes_error(device_db, 
     assert await db.get(Device, device_id) is not None
 
 
-async def test_redistribution_cancel_between_commit_and_terminalize_records_anyway(device_db, monkeypatch):
-    """Redistribution window (redistribution.py tier-2 commit → record_result)."""
+async def test_redistribution_cancel_after_terminal_stage_commits_atomically(device_db, monkeypatch):
+    """Redistribution commits rebuilt rows and the terminal outcome together."""
     from nso_adapter.core import redistribution as redi
     from nso_adapter.nso.read_outcome import Freshness, Present
 
     db, device = device_db
     parent = asyncio.current_task()
-    real = redi.outcome_store.record_result
-    fired = {"n": 0}
+    real = redi.outcome_store.stage_result
 
-    async def cancel_then_record(db_, attempt_id_, **kw):
-        if fired["n"] == 0:
-            fired["n"] = 1
-            parent.cancel()
-        return await real(db_, attempt_id_, **kw)
+    async def stage_then_cancel(db_, outcome_, **kw):
+        selected = await real(db_, outcome_, **kw)
+        parent.cancel()
+        return selected
 
-    monkeypatch.setattr(redi.outcome_store, "record_result", cancel_then_record)
+    monkeypatch.setattr(redi.outcome_store, "stage_result", stage_then_cancel)
 
     outcomes = {
-        "connected": Present({"redistribute": []}, Freshness.fresh),
-        "static": Present({"redistribute": []}, Freshness.fresh),
+        "ospf": Present({"redistribute": []}, Freshness.fresh),
         "isis": Present({"redistribute": []}, Freshness.fresh),
+        "bgp": Present({"redistribute": []}, Freshness.fresh),
     }
     with pytest.raises(asyncio.CancelledError):
         await redi.refresh_redistribution_from_outcomes(db, device, outcomes, refresh_source="poll")
 
     outcome = await _fresh_outcome(device.id, "redistribution")
-    assert outcome is not None, "redistribution outcome must terminalize despite the cancel"
+    assert outcome is not None, "redistribution outcome must commit despite the cancel"
+    assert (outcome.result, outcome.succeeded) == ("replaced", True)
 
 
 # ── await_uncancellable contract (codex-pinned semantics) ────────────────────

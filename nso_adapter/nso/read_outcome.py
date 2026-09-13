@@ -30,6 +30,7 @@ not carry. Classification is therefore a direct mapping, no inference:
 from __future__ import annotations
 
 import enum
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 
 import httpx
@@ -55,6 +56,22 @@ class Present:
 
     data: dict
     freshness: Freshness = Freshness.fresh
+    failures: tuple[ReadFailure, ...] = field(default_factory=tuple, compare=False)
+
+    @classmethod
+    def composite(
+        cls,
+        data: dict,
+        freshness: Freshness,
+        component_outcomes: Iterable[ReadOutcome],
+    ) -> Present:
+        """Build an authoritative composite and retain each failed component classification."""
+        failures = tuple(
+            outcome.failure
+            for outcome in component_outcomes
+            if isinstance(outcome, Unavailable) and outcome.failure is not None
+        )
+        return cls(data, freshness, failures)
 
 
 @dataclass(frozen=True)
@@ -120,6 +137,16 @@ class ReadFailure:
             "device_name": self.device,
             "family": self.family,
             "read_operation": self.operation.value,
+            "error_type": self.error_type,
+            "http_status": self.http_status,
+            "failure_code": self.code.value if self.code is not None else None,
+        }
+
+    def persistence_fields(self) -> dict[str, str | int | None]:
+        """Render the explicit authored subset stored with a read attempt."""
+        return {
+            "read_operation": self.operation.value,
+            "component_family": self.family,
             "error_type": self.error_type,
             "http_status": self.http_status,
             "failure_code": self.code.value if self.code is not None else None,

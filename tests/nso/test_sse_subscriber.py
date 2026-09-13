@@ -155,7 +155,7 @@ class _PostHeaderTimeoutTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         async def _raising_body():
-            raise httpx.ReadTimeout("idle watchdog", request=request)
+            raise httpx.ReadTimeout("placeholder-secret post-header timeout", request=request)
             yield b""  # pragma: no cover - makes this an async generator
 
         return httpx.Response(
@@ -179,13 +179,15 @@ class _PreHeaderTimeoutTransport(httpx.AsyncBaseTransport):
     while ENTERING the stream, before any 200 was accepted."""
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        raise httpx.ReadTimeout("no response headers", request=request)
+        raise httpx.ReadTimeout("placeholder-secret pre-header timeout", request=request)
 
 
 async def test_post_header_idle_raises_sse_idle_timeout():
     """S5a E (codex R1-F10/R2-F10): only a POST-header ReadTimeout is the healthy-but-quiet
     idle watchdog — it must surface as SseIdleTimeout so the reconnect loop can take the
     fast path."""
+    from structlog.testing import capture_logs
+
     from nso_adapter.notifications.sse_subscriber import SseIdleTimeout
 
     sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
@@ -194,15 +196,21 @@ async def test_post_header_idle_raises_sse_idle_timeout():
         transport=_PostHeaderTimeoutTransport(), base_url="http://nso:8080"
     )
     try:
-        with pytest.raises(SseIdleTimeout):
+        with capture_logs() as logs, pytest.raises(SseIdleTimeout, match="idle watchdog"):
             await sub.subscribe(STREAM_URL, lambda raw, parsed: None, duration=5.0, idle_read_timeout_s=0.5)
     finally:
         sub._client = original
+
+    record = next(record for record in logs if record["event"] == "sse_idle_timeout")
+    assert record["error"] == "ReadTimeout"
+    assert "placeholder-secret" not in str(record)
 
 
 async def test_pre_header_read_timeout_stays_a_transport_error():
     """A ReadTimeout with NO headers accepted is an overloaded/hung server, NOT a quiet
     stream — it must stay a plain transport error so the reconnect loop backs off."""
+    from structlog.testing import capture_logs
+
     from nso_adapter.notifications.sse_subscriber import SseIdleTimeout
 
     sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
@@ -211,12 +219,16 @@ async def test_pre_header_read_timeout_stays_a_transport_error():
         transport=_PreHeaderTimeoutTransport(), base_url="http://nso:8080"
     )
     try:
-        with pytest.raises(httpx.ReadTimeout):
+        with capture_logs() as logs, pytest.raises(httpx.ReadTimeout):
             await sub.subscribe(STREAM_URL, lambda raw, parsed: None, duration=5.0, idle_read_timeout_s=0.5)
     except SseIdleTimeout:  # pragma: no cover - the failure mode under test
         raise AssertionError("pre-header ReadTimeout must not classify as idle")
     finally:
         sub._client = original
+
+    record = next(record for record in logs if record["event"] == "sse_subscribe_error")
+    assert record["error"] == "ReadTimeout"
+    assert "placeholder-secret" not in str(record)
 
 
 async def test_subscribe_calls_on_event_for_each_sse_block():
@@ -266,10 +278,35 @@ async def test_subscribe_passes_none_parsed_on_invalid_json():
 
 
 async def test_subscribe_raises_on_http_error():
+    from structlog.testing import capture_logs
+
+    class HostileRequestTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            hostile_request = httpx.Request(
+                request.method,
+                "https://placeholder.invalid/restconf/streams/NETCONF/json?token=placeholder-secret",
+            )
+            response = httpx.Response(503, request=hostile_request)
+            raise httpx.HTTPStatusError(
+                "placeholder-secret-reason",
+                request=hostile_request,
+                response=response,
+            )
+
     sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
-    with patch_subscriber_sse(sub, [], status=403):
-        with pytest.raises(httpx.HTTPStatusError):
+    original = sub._client
+    sub._client = lambda timeout=None: httpx.AsyncClient(
+        transport=HostileRequestTransport(), base_url="http://nso:8080"
+    )
+    try:
+        with capture_logs() as logs, pytest.raises(httpx.HTTPStatusError):
             await sub.subscribe(STREAM_URL, lambda *_: None, duration=5.0)
+    finally:
+        sub._client = original
+
+    record = next(record for record in logs if record["event"] == "sse_subscribe_error")
+    assert record["error"] == "HTTPStatusError (HTTP 503)"
+    assert "placeholder-secret" not in str(record)
 
 
 async def test_subscribe_empty_stream_calls_no_events():

@@ -552,7 +552,7 @@ class NsoClient:
                 if result not in ("updated", "unchanged")
                 else "reported a stored key with no fingerprint"
             )
-            raise NsoActionFailedError(f"fetch-host-keys for {device_name!r} {kind}")
+            raise NsoActionFailedError(f"fetch-host-keys {kind}")
         return out
 
     async def sync_from(self, device_name: str) -> bool:

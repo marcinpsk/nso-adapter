@@ -11,6 +11,8 @@ from collections.abc import Callable
 import httpx
 import structlog
 
+from nso_adapter.nso.client import failure_detail
+
 logger = structlog.get_logger(__name__)
 
 
@@ -123,13 +125,13 @@ class SSESubscriber:
             # S5a E (item 1335): a POST-header ReadTimeout is the idle watchdog firing on
             # an ESTABLISHED-but-quiet stream (NSO sends no keepalives) — healthy, fast
             # reconnect. Pre-header (no 200 accepted: overloaded/hung server) stays a
-            # transport error and backs off. str(ReadTimeout) is often EMPTY — repr
-            # fallback so the error is never logged as ''.
+            # transport error and backs off. Keep server and request text out of the
+            # diagnostic field in both paths.
             if established:
-                logger.info("sse_idle_timeout", stream=stream_url, error=str(exc) or repr(exc))
-                raise SseIdleTimeout(str(exc) or "idle watchdog") from exc
-            logger.warning("sse_subscribe_error", stream=stream_url, error=str(exc) or repr(exc))
+                logger.info("sse_idle_timeout", stream=stream_url, error=failure_detail(exc))
+                raise SseIdleTimeout("idle watchdog") from exc
+            logger.warning("sse_subscribe_error", stream=stream_url, error=failure_detail(exc))
             raise
         except (httpx.HTTPStatusError, httpx.RequestError) as exc:
-            logger.warning("sse_subscribe_error", stream=stream_url, error=str(exc) or repr(exc))
+            logger.warning("sse_subscribe_error", stream=stream_url, error=failure_detail(exc))
             raise

@@ -2953,6 +2953,9 @@ class RefreshOutcome(Base):
         String(32), nullable=True
     )  # export_down|read_error|not_authoritative
     freshness: Mapped[str | None] = mapped_column(String(16), nullable=True)  # fresh | aged
+    read_failures: Mapped[list[dict[str, str | int | None]] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
     # Phase 2 — the terminal materialization result. NULL until phase 2 is recorded.
     result: Mapped[str | None] = mapped_column(

@@ -53,7 +53,7 @@ def parse_vlan_string(raw) -> list[int]:
         # Raised outside the handler: the caught error repeats the entry verbatim.
         if unusable is not None:
             raise unusable
-        return sorted(listed)
+        return sorted(set(listed))
     vlans: set[int] = set()
     for chunk in str(raw).split(","):
         chunk = chunk.strip()

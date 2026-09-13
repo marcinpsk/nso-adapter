@@ -10,6 +10,8 @@ from collections.abc import Callable
 import httpx
 import structlog
 
+from nso_adapter.nso.client import failure_detail
+
 from .sse_subscriber import SseIdleTimeout, SSESubscriber
 
 logger = structlog.get_logger(__name__)
@@ -54,7 +56,7 @@ async def persistent_subscriber(
             logger.warning(
                 "sse.reconnect_after_error",
                 stream_url=stream_url,
-                error=str(exc) or repr(exc),
+                error=failure_detail(exc),
                 next_delay_s=delay,
             )
             try:
