@@ -264,6 +264,16 @@ async def classify_envelope_family_read(
                 exc, operation=ReadOperation.section_get, device=name, family=wire_name
             ),
         )
+    if section is not None and not isinstance(section, dict):
+        return Unavailable(
+            UnavailableReason.read_error,
+            failure=ReadFailure(
+                operation=ReadOperation.section_classify,
+                device=name,
+                family=wire_name,
+                code=ReadFailureCode.section_malformed,
+            ),
+        )
     outcome = classify_envelope_section(section, device=name, family=wire_name)
     if isinstance(outcome, Unavailable) and outcome.reason is UnavailableReason.not_ready:
         logger.info(

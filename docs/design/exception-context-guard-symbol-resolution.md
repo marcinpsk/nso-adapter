@@ -108,3 +108,85 @@ The third adversarial round found no remaining counterexample after receiver
 identity was limited to ordinary instance methods and recognized class methods.
 Implementation must preserve the runtime-backed counterexamples from all three
 rounds and keep unsupported binding behavior conservative.
+
+## Exception-log guard extension
+
+Status: ratified (revision r1)
+
+### Problem
+
+The diagnostic-sink guard rejects direct `str(exc)` and `repr(exc)` rendering,
+but accepts `error=exc`, `error=f"{exc}"`, and `logger.exception`. Each form can
+copy an HTTP reason phrase, URL, response body, secret reference, or other
+provider text to an operator log.
+
+The guard module owns one narrow interface: exception-bearing diagnostic calls
+in the importer and read-outcome bookkeeping use
+`error=failure_detail(exc)` and never use `logger.exception`. Its two adapters
+sit at the pre-commit seam. The Python AST test provides exact structural
+checks and production-file coverage. OpenGrep provides fast local feedback for
+the same forbidden forms. OpenGrep remains a pre-commit check only.
+
+### Evidence
+
+- `tests/core/test_importer_failure_sinks.py::_raw_log_exception_renderers`
+  reports only `str` and `repr` calls below an `error` keyword.
+- `.opengrep/nso-rules.yaml::nso-outcome-raw-exception-renderer` matches the
+  same three direct renderer shapes.
+- Both checks accept the three unsafe forms above today.
+- The guarded production files already render every exception-bearing
+  `error` field through `failure_detail` and contain no `logger.exception`
+  call. Tightening the interface needs no production logging rewrite.
+
+### Selected plan
+
+The operator selected custom OpenGrep in pre-commit. Keep the dual-adapter
+shape because the implementations have different leverage:
+
+1. The AST adapter rejects every `logger.exception` call and every `error`
+   keyword whose value is not exactly one direct `failure_detail(...)` call in
+   the guarded files.
+2. The OpenGrep adapter rejects `logger.exception` and any `error` keyword that
+   is not a direct `failure_detail(...)` call. Its paths include the importer,
+   refresh engine, redistribution bookkeeping, and its own fixture.
+3. The behavior fixtures include direct exception values, f-strings, `str`,
+   `repr`, `logger.exception`, and the accepted `failure_detail` form.
+
+The interface is intentionally syntactic. It does not infer which arbitrary
+expressions contain exception data. In these diagnostic modules, the `error`
+field is reserved for classified exception detail. An authored non-exception
+classification uses separate fields such as `reason`, `failure_code`, and
+`http_status`.
+
+### Alternatives
+
+1. Use OpenGrep alone. This makes its partial parser the only authority. The
+   existing Python syntax check provides an independent executable contract.
+2. Infer exception bindings through `try` and `except` control flow. This would
+   allow unrelated `error` values, but adds lexical and deferred-body rules the
+   selected diagnostic modules do not need. Callers gain no required behavior
+   from that larger interface.
+3. Match only the newly reported forms. This leaves aliases and other
+   expressions open, so the failure class remains possible.
+
+### Acceptance conditions
+
+- The AST fixture reports `error=exc`, `error=f"{exc}"`, direct `str` and
+  `repr`, and `logger.exception`, and accepts `error=failure_detail(exc)`.
+- The OpenGrep fixture proves the same positive and negative forms.
+- `logger.exception(..., error=failure_detail(exc))` is still rejected because
+  the exception method adds raw exception text outside the structured field.
+- Both adapters report no finding in the guarded production files.
+- The OpenGrep hooks remain in `.pre-commit-config.yaml` only. No GitHub Actions
+  or pre-push hook runs them.
+- The adapter PR remains below 100 changed files.
+
+The first increment tightens both adapters and their fixtures without changing
+production logging. It runs the focused AST and OpenGrep tests, then the full
+repository gates.
+
+The adversarial reviewer ratified revision r1 after executing both proposed
+predicates. The AST predicate accepted all 19 guarded production `error`
+fields. OpenGrep 1.30.0 accepted the negative-pattern structure, reported no
+production violation, and kept its documented partial-parser warning. The
+reviewer also confirmed the hooks run only at the pre-commit stage.

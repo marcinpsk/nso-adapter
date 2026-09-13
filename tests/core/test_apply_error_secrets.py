@@ -804,6 +804,7 @@ async def test_an_auth_refusal_and_an_outage_do_not_classify_the_same(adapter_cl
     assert denied["device_name"] == "refresh-401"
     assert outage["device_name"] == "refresh-503"
     assert_records_free_of(await _outcome_rows(denied_id), _HTTP_SECRETS)
+    assert_records_free_of(await _outcome_rows(outage_id), _HTTP_SECRETS)
 
 
 async def test_an_authored_contract_refusal_classifies_apart_from_an_http_failure(adapter_client):

@@ -151,6 +151,28 @@ async def test_error_keeps_rows_and_reports_degraded(adapter_client):
         assert await _routes(db, device_id) == ["10.0.0.0/8"]
 
 
+@pytest.mark.parametrize("section", [["not-a-section"], "not-a-section", 7])
+@pytest.mark.anyio
+async def test_non_mapping_section_is_classified_and_keeps_rows(adapter_client, section):
+    """A malformed served section is a read failure, not a refresh crash."""
+    from structlog.testing import capture_logs
+
+    device_id = await seed_device(nso_device_name="eng-env-malformed", netbox_device_id=9715)
+    await _seed_one_route(device_id)
+    async with _device_session(device_id) as (db, device):
+        with capture_logs() as logs:
+            ok = await run_family_refresh(db, device, _client(section=section), ENV_SPEC)
+
+        assert ok is False
+        assert await _routes(db, device_id) == ["10.0.0.0/8"]
+        outcome_row = await _latest_outcome(db, device_id)
+        assert (outcome_row.read_outcome, outcome_row.read_reason) == ("unavailable", "read_error")
+
+    record = next(record for record in logs if record["event"] == "static_route.refresh.unavailable")
+    assert record["read_operation"] == "section_classify"
+    assert record["failure_code"] == "section_malformed"
+
+
 # ── not-ready escalation (the record-warming path) ──────────────────────────────────
 
 

@@ -3,13 +3,21 @@
 """Positive and negative examples for the custom review checks."""
 
 
-def raw_outcome_errors(logger, exc):
+def raw_outcome_errors(logger, exc, failure_detail):
+    # ruleid: nso-outcome-raw-exception-renderer
+    logger.warning("family.outcome.read_record_failed", error=exc)
+    # ruleid: nso-outcome-raw-exception-renderer
+    logger.warning("family.outcome.read_record_failed", error=f"{exc}")
     # ruleid: nso-outcome-raw-exception-renderer
     logger.warning("family.outcome.read_record_failed", error=repr(exc))
     # ruleid: nso-outcome-raw-exception-renderer
     logger.warning("family.outcome.read_record_failed", error=str(exc))
     # ruleid: nso-outcome-raw-exception-renderer
     logger.warning("family.outcome.read_record_failed", error=str(exc) or repr(exc))
+    # ruleid: nso-outcome-raw-exception-renderer
+    logger.exception("family.outcome.read_record_failed")
+    # ruleid: nso-outcome-raw-exception-renderer
+    logger.exception("family.outcome.read_record_failed", error=failure_detail(exc))
 
 
 def classified_outcome_errors(logger, exc, failure_detail):

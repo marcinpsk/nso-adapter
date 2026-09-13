@@ -36,12 +36,13 @@ for its configuration names and workflow skip conditions.
 
 ## Coverage
 
-`nso-outcome-raw-exception-renderer` rejects direct `str` and `repr` exception
-rendering in the outcome bookkeeping logs in `refresh_engine.py` and
+`nso-outcome-raw-exception-renderer` rejects `logger.exception` and any
+diagnostic `error` field that is not one direct `failure_detail` call. It covers
+the importer and the outcome bookkeeping logs in `refresh_engine.py` and
 `redistribution.py`. These logs must use `failure_detail` so an HTTP exception
 cannot repeat a request URL or server text. The behavioral and AST regressions
 in `tests/core/test_importer_failure_sinks.py` remain authoritative for the
-classification contract and compound expressions.
+classification contract and complete Python syntax.
 
 OpenGrep 1.30.0 partially parses the adapter's PEP 695 type aliases and generic
 functions. It reports each skipped line during a scan and analyzes the rest of

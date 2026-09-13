@@ -34,27 +34,42 @@ _OUTCOME_BOOKKEEPING = tuple(
 
 
 def _raw_log_exception_renderers(source: str) -> list[int]:
-    """Return log-field lines that render an exception with ``str`` or ``repr``."""
+    """Return log calls that do not use the one classified exception shape."""
     violations: list[int] = []
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
             continue
         if not isinstance(node.func.value, ast.Name) or node.func.value.id != "logger":
             continue
+        if node.func.attr == "exception":
+            violations.append(node.lineno)
+            continue
         for keyword in node.keywords:
             if keyword.arg != "error":
                 continue
-            if any(
-                isinstance(part, ast.Call) and isinstance(part.func, ast.Name) and part.func.id in {"str", "repr"}
-                for part in ast.walk(keyword.value)
+            value = keyword.value
+            if not (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id == "failure_detail"
+                and len(value.args) == 1
+                and not value.keywords
             ):
                 violations.append(keyword.value.lineno)
     return violations
 
 
-def test_raw_exception_log_guard_detects_str_and_repr() -> None:
-    source = 'logger.warning("event", error=str(exc) or repr(exc))\n'
-    assert _raw_log_exception_renderers(source) == [1]
+def test_raw_exception_log_guard_rejects_every_unsanitized_form() -> None:
+    source = """\
+logger.warning("event", error=exc)
+logger.warning("event", error=f"{exc}")
+logger.warning("event", error=str(exc))
+logger.warning("event", error=repr(exc))
+logger.exception("event")
+logger.exception("event", error=failure_detail(exc))
+logger.warning("event", error=failure_detail(exc))
+"""
+    assert _raw_log_exception_renderers(source) == [1, 2, 3, 4, 5, 6]
 
 
 def test_importer_never_logs_raw_exception_text() -> None:
