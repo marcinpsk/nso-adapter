@@ -23,3 +23,14 @@ def raw_outcome_errors(logger, exc, failure_detail):
 def classified_outcome_errors(logger, exc, failure_detail):
     # ok: nso-outcome-raw-exception-renderer
     logger.warning("family.outcome.read_record_failed", error=failure_detail(exc))
+
+
+def validation_error_messages(api_error, exc):
+    # ruleid: nso-api-validation-error-raw-exception-renderer
+    api_error(422, "validation_error", str(exc))
+    # ruleid: nso-api-validation-error-raw-exception-renderer
+    api_error(422, "validation_error", repr(exc))
+    # ruleid: nso-api-validation-error-raw-exception-renderer
+    api_error(422, "validation_error", f"Invalid request: {exc}")
+    # ok: nso-api-validation-error-raw-exception-renderer
+    api_error(422, "validation_error", "The request is invalid")

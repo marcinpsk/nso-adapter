@@ -133,7 +133,10 @@ async def test_onboard_unknown_instance_returns_422(adapter_client):
         headers=AUTH,
     )
     assert resp.status_code == 422
-    assert resp.json()["error"]["code"] == "validation_error"
+    error = resp.json()["error"]
+    assert error["code"] == "validation_error"
+    assert error["message"] == "The requested NSO instance is not configured"
+    assert "nonexistent-nso" not in resp.text
 
 
 async def test_onboard_requires_auth(adapter_client):
@@ -206,7 +209,10 @@ async def test_rekey_device_unknown_instance_returns_422(adapter_client):
         headers=AUTH,
     )
     assert resp.status_code == 422
-    assert resp.json()["error"]["code"] == "validation_error"
+    error = resp.json()["error"]
+    assert error["code"] == "validation_error"
+    assert error["message"] == "The requested NSO instance is not configured"
+    assert "nonexistent-nso" not in resp.text
 
 
 async def test_rekey_requires_auth(adapter_client):

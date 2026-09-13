@@ -17,3 +17,15 @@ rules:
           - pattern: logger.$LEVEL(..., error=$ERROR, ...)
           - pattern-not: logger.$LEVEL(..., error=failure_detail($EXCEPTION), ...)
       - pattern: logger.exception(...)
+  - id: nso-api-validation-error-raw-exception-renderer
+    languages: [python]
+    severity: ERROR
+    message: Use an authored validation message instead of rendering request or exception data.
+    paths:
+      include:
+        - nso_adapter/api/devices.py
+        - review-patterns.py
+    pattern-either:
+      - pattern: api_error(..., "validation_error", str($EXCEPTION), ...)
+      - pattern: api_error(..., "validation_error", repr($EXCEPTION), ...)
+      - pattern: api_error(..., "validation_error", f"...{$VALUE}...", ...)

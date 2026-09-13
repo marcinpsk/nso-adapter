@@ -421,6 +421,9 @@ class DeviceCreate(BaseModel):
     netbox_device_id: int
 
 
+_UNKNOWN_NSO_INSTANCE_MESSAGE = "The requested NSO instance is not configured"
+
+
 @router.post(
     "",
     status_code=201,
@@ -442,8 +445,8 @@ async def onboard_device(body: DeviceCreate, db: AsyncSession = Depends(get_db))
     except LookupError as exc:
         # Built in the handler, raised after it: a raise inside attaches the caught exception.
         refused = api_error(409, "conflict", str(exc))
-    except ValueError as exc:
-        refused = api_error(422, "validation_error", str(exc))
+    except ValueError:
+        refused = api_error(422, "validation_error", _UNKNOWN_NSO_INSTANCE_MESSAGE)
     if refused is not None:
         raise refused
     return _device_out(device)
@@ -485,7 +488,7 @@ async def provision_device(body: DeviceProvision, db: AsyncSession = Depends(get
 
     known = {inst.name for inst in get_config().nso_instances}
     if body.nso_instance not in known:
-        raise api_error(422, "validation_error", f"NSO instance {body.nso_instance!r} not found in config")
+        raise api_error(422, "validation_error", _UNKNOWN_NSO_INSTANCE_MESSAGE)
 
     params = {
         "nso_instance": body.nso_instance,
@@ -771,8 +774,8 @@ async def rekey_device(device_id: int, body: DevicePatch, db: AsyncSession = Dep
         refused = api_error(409, "conflict", str(exc), {"reason": exc.reason})
     except LookupError as exc:
         refused = api_error(409, "conflict", str(exc))
-    except ValueError as exc:
-        refused = api_error(422, "validation_error", str(exc))
+    except ValueError:
+        refused = api_error(422, "validation_error", _UNKNOWN_NSO_INSTANCE_MESSAGE)
     if refused is not None:
         raise refused
     return _device_out(device)

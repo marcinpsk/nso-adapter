@@ -44,6 +44,10 @@ so an HTTP exception cannot repeat a request URL or server text. The behavioral
 and AST regressions in `tests/core/test_importer_failure_sinks.py` remain
 authoritative for the classification contract and complete Python syntax.
 
+`nso-api-validation-error-raw-exception-renderer` rejects exception rendering
+and formatted values in device validation responses. These responses use
+authored text so caller-controlled NSO instance names do not return on the wire.
+
 OpenGrep 1.30.0 partially parses the adapter's PEP 695 type aliases and generic
 functions. It reports each skipped line during a scan and analyzes the rest of
 those files. Keep this limitation visible until the installed parser supports
