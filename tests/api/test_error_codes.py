@@ -300,3 +300,34 @@ def test_version_single_source_matches_pyproject():
 
     pyproject = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text())
     assert pyproject["project"]["version"] == __version__
+
+
+def test_secret_maps_are_registered_for_loc_redaction():
+    """Every ``dict[str, SecretStr]`` request field must be in ``DYNAMIC_KEY_LOCATIONS``.
+
+    Pydantic reports a failing map entry at ``("body", <field>, <key>)``, and the key is a
+    name the caller chose. A new secret map added without registering it would put that key
+    straight into the 422, so the set is derived here from the app's own models.
+    """
+    import importlib
+    import pkgutil
+
+    from pydantic import SecretStr
+
+    import nso_adapter.api
+    from nso_adapter.api.errors import DYNAMIC_KEY_LOCATIONS
+
+    found: set[tuple[str, ...]] = set()
+    for module in pkgutil.iter_modules(nso_adapter.api.__path__):
+        for member in vars(importlib.import_module(f"nso_adapter.api.{module.name}")).values():
+            if not (isinstance(member, type) and issubclass(member, BaseModel)):
+                continue
+            for name, field in member.model_fields.items():
+                if field.annotation == dict[str, SecretStr]:
+                    found.add(("body", name))
+
+    assert found, "no secret map was found at all — the introspection stopped matching"
+    assert found <= DYNAMIC_KEY_LOCATIONS, (
+        "a request field keyed by a caller-chosen name is not registered for loc redaction: "
+        f"{sorted(found - DYNAMIC_KEY_LOCATIONS)}"
+    )

@@ -16,6 +16,7 @@ import json
 import threading
 import types
 from unittest.mock import AsyncMock, patch
+from uuid import UUID
 
 import httpx
 import pytest
@@ -190,7 +191,7 @@ async def test_a_slow_vault_write_does_not_stall_the_event_loop(vault_client):
 
 
 @pytest.mark.anyio
-async def test_set_secret_writes_vault_and_returns_hashes(vault_client):
+async def test_set_secret_writes_vault_and_reports_the_version(vault_client):
     client, store, _ = vault_client
     resp = await client.post(
         "/api/v1/secrets",
@@ -200,12 +201,12 @@ async def test_set_secret_writes_vault_and_returns_hashes(vault_client):
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["vault_ref"] == "network/netbox/snmp/v3/monitor"
     assert body["version"] == 1
-    assert body["hashes"] == {"auth": _h("hunter2"), "priv": _h("hunter3")}
+    assert body["operation_id"], "the answer must still be joinable to its log record"
     assert store["netbox/snmp/v3/monitor"] == {"auth": "hunter2", "priv": "hunter3"}
-    # the response never carries the values
-    assert "hunter2" not in resp.text and "hunter3" not in resp.text
+    # the response never carries the values, the ref, or the field names the caller chose
+    for echoed in ("hunter2", "hunter3", "network/netbox/snmp/v3/monitor", "auth", "priv"):
+        assert echoed not in resp.text
 
 
 @pytest.mark.anyio
@@ -217,8 +218,10 @@ async def test_set_secret_keyed_ref_writes_that_field(vault_client):
     )
 
     assert resp.status_code == 200
-    assert resp.json()["hashes"] == {"community": _h("s3cr3t-comm")}
+    assert resp.json()["version"] == 1
     assert store["netbox/snmp/community/abc123"] == {"community": "s3cr3t-comm"}
+    for echoed in ("s3cr3t-comm", ref, "abc123", "community"):
+        assert echoed not in resp.text
 
 
 @pytest.mark.anyio
@@ -226,13 +229,15 @@ async def test_set_secret_keyed_ref_rejects_other_fields(vault_client):
     client, _, _ = vault_client
     resp = await client.post(
         "/api/v1/secrets",
-        json={"vault_ref": "network/p#community", "values": {"other": "v"}},
+        json={"vault_ref": "network/p#community", "values": {"other": "placeholder-secret-value"}},
         headers=AUTH,
     )
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "invalid_vault_ref"
-    assert "v" == "v" and "other" in resp.text  # field NAME may appear...
-    assert "s3cr3t" not in resp.text  # ...values never
+    # Both halves of the mismatch are the caller's own strings: the refusal states the rule.
+    for echoed in ("other", "network/p#community", "placeholder-secret-value"):
+        assert echoed not in resp.text
+    assert "exactly that one field" in resp.json()["error"]["message"]
 
 
 @pytest.mark.anyio
@@ -413,13 +418,14 @@ async def test_harvest_community_ios_happy_path(vault_client):
 
     assert resp.status_code == 200
     body = resp.json()
+    assert body.pop("operation_id"), "the answer must still be joinable to its log record"
     assert body == {
-        "vault_ref": ref,
         "secret_hash": target_hash,
         "version": 1,
         "access": "RO",
         "acl": "20",
     }
+    assert ref not in resp.text, "the harvest answered with the caller's own reference"
     assert store[f"netbox/snmp/community/{target_hash}"] == {"community": "s3cr3t-comm"}
     assert "s3cr3t-comm" not in resp.text
     # the GET was the targeted per-NED community subtree, not the full device config
@@ -441,6 +447,56 @@ async def test_harvest_community_not_found_404_with_sync_hint(vault_client):
     assert resp.status_code == 404
     err = resp.json()["error"]
     assert err["code"] == "community_not_found"
+    assert "sync-from" in err["message"]
+
+
+@pytest.mark.anyio
+async def test_a_harvest_hash_THAT_IS_NOT_A_FINGERPRINT_is_refused_at_the_boundary(vault_client):
+    """``community_hash`` took any string, and the missing-community 404 echoed it back.
+
+    A caller that pastes the community itself into the field would read its own secret out
+    of the refusal body and out of whatever recorded that answer. The field is a sha256[:16]
+    fingerprint, so the boundary refuses anything else and nothing of the value travels."""
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
+    client, _, _ = vault_client
+    device_id = await _seed_harvest_device("cisco-ios-cli-6.77")
+    _wire_nso_transport(_NsoTransport({"tailf-ned-cisco-ios:community": [{"name": "other", "RO": [None]}]}))
+
+    with capture_logs() as logs:
+        resp = await client.post(
+            f"/api/v1/devices/{device_id}/secrets/harvest-community",
+            json={"community_hash": "placeholder-secret-pasted-here", "vault_ref": "network/p#community"},
+            headers=AUTH,
+        )
+
+    assert resp.status_code == 422, "a value that is not a fingerprint is not a request we can serve"
+    assert "placeholder-secret-pasted-here" not in resp.text, "the refusal repeats the caller's own value"
+    assert_records_free_of(logs, ["placeholder-secret-pasted-here"])
+
+
+@pytest.mark.anyio
+async def test_a_missing_community_404_repeats_no_part_of_the_request(vault_client):
+    """The refusal states WHICH device could not serve it; the caller holds what it sent."""
+    client, _, _ = vault_client
+    device_id = await _seed_harvest_device("cisco-ios-cli-6.77")
+    _wire_nso_transport(_NsoTransport({"tailf-ned-cisco-ios:community": [{"name": "other", "RO": [None]}]}))
+
+    asked = _h("placeholder-absent-community")
+    resp = await client.post(
+        f"/api/v1/devices/{device_id}/secrets/harvest-community",
+        json={"community_hash": asked, "vault_ref": "network/p#community"},
+        headers=AUTH,
+    )
+
+    assert resp.status_code == 404
+    err = resp.json()["error"]
+    assert err["code"] == "community_not_found"
+    assert asked not in resp.text, "the refusal echoes the submitted value"
+    assert "harvest-dev" not in resp.text, "the refusal repeats the device's name in NSO"
+    assert f"device {device_id}" in err["message"], "the operator must still learn WHICH device could not serve it"
     assert "sync-from" in err["message"]
 
 
@@ -468,3 +524,293 @@ async def test_harvest_community_unknown_device_404(vault_client):
         headers=AUTH,
     )
     assert resp.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_a_vault_failure_puts_no_reference_or_provider_text_in_the_502(vault_client, monkeypatch):
+    """The 502 names the failure TYPE and nothing the provider or the ref said.
+
+    hvac fails with the request URL in the message and a decode failure can repeat the
+    payload, and the ref itself names a Vault mount, path and key. Both went into the
+    response body, and the provider's exception stayed reachable on the raised error.
+    """
+    from nso_adapter.api.errors import ApiError
+    from nso_adapter.api.secrets import _vault_op
+    from tests._secret_discipline import assert_chain_free_of
+
+    client, _store, kv = vault_client
+    ref = "placeholder-mount/placeholder-path#placeholder-key"
+    leaked = [ref, "placeholder-mount", "placeholder-path", "placeholder-key", "placeholder-secret"]
+
+    def boom(**_kwargs):
+        raise RuntimeError(f"vault: read of {ref} failed holding placeholder-secret")
+
+    monkeypatch.setattr(kv, "read_secret_version", boom)
+
+    resp = await client.post("/api/v1/secrets/verify", json={"vault_ref": ref}, headers=AUTH)
+
+    assert resp.status_code == 502
+    for secret in leaked:
+        assert secret not in resp.text, "the 502 body repeats the reference or the provider's text"
+    message = resp.json()["error"]["message"]
+    assert resp.json()["error"]["code"] == "vault_error"
+    assert "RuntimeError" in message, "the failure type is the half the operator needs"
+
+    # The same failure through the real helper: `from None` would leave the provider's
+    # exception on __context__, where a formatted traceback still prints it.
+    with pytest.raises(ApiError) as caught:
+        await _vault_op(boom)
+    assert_chain_free_of(caught.value, leaked)
+
+
+# ── no reference component is a log field or a response field ────────────────
+
+_REF_MOUNT = "network"
+_REF_KEY = "placeholder-key"
+_REF_PATH = "placeholder-path/placeholder-leaf"
+_REF = f"{_REF_MOUNT}/{_REF_PATH}#{_REF_KEY}"
+#: Every component of the reference, plus the plaintext. The caller chose all of them, so a
+#: caller that pastes a secret into any of them would read it back out of the answer or out
+#: of whatever recorded the answer. Round 2 allowed the mount and the key; both leak.
+_REF_LOCATORS = [_REF, _REF_PATH, _REF_MOUNT, _REF_KEY, "placeholder-path", "placeholder-leaf", "placeholder-secret"]
+
+
+@pytest.mark.anyio
+async def test_a_SUCCESSFUL_set_echoes_no_REFERENCE_COMPONENT_anywhere(vault_client):
+    """The success path still logged the mount and the field names and returned the whole ref.
+
+    A ref names a Vault mount, a path and a key, and the caller chose all three. Whoever reads
+    the adapter log, or the answer, then knows exactly where every secret the adapter writes
+    lives — and a caller that pastes a secret into the ref reads it straight back.
+    """
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
+    client, store, _ = vault_client
+    with capture_logs() as logs:
+        resp = await client.post(
+            "/api/v1/secrets",
+            json={"vault_ref": _REF, "values": {_REF_KEY: "placeholder-secret"}},
+            headers=AUTH,
+        )
+
+    assert resp.status_code == 200
+    assert store[_REF_PATH] == {_REF_KEY: "placeholder-secret"}, "the write must still land"
+    written = [record for record in logs if record["event"] == "secrets.set"]
+    assert written, "the write was not reported at all"
+    assert_records_free_of(logs, _REF_LOCATORS)
+    for echoed in _REF_LOCATORS:
+        assert echoed not in resp.text, "the answer repeats a component of the caller's reference"
+    assert written[0]["version"] == 1
+    assert written[0]["operation_id"] == resp.json()["operation_id"], "the record must join to the answer"
+
+
+@pytest.mark.anyio
+async def test_a_SUCCESSFUL_harvest_echoes_no_REFERENCE_COMPONENT_anywhere(vault_client):
+    """Same sinks on the harvest side, where the ref points at an adopted community."""
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
+    client, store, _ = vault_client
+    device_id = await _seed_harvest_device("cisco-ios-cli-6.77")
+    _wire_nso_transport(
+        _NsoTransport({"tailf-ned-cisco-ios:community": [{"name": "placeholder-secret", "RO": [None]}]})
+    )
+
+    target_hash = _h("placeholder-secret")
+    with capture_logs() as logs:
+        resp = await client.post(
+            f"/api/v1/devices/{device_id}/secrets/harvest-community",
+            json={"community_hash": target_hash, "vault_ref": _REF},
+            headers=AUTH,
+        )
+
+    assert resp.status_code == 200
+    assert store[_REF_PATH] == {_REF_KEY: "placeholder-secret"}, "the harvest must still land"
+    harvested = [record for record in logs if record["event"] == "secrets.harvest_community"]
+    assert harvested, "the harvest was not reported at all"
+    assert_records_free_of(logs, _REF_LOCATORS)
+    for echoed in _REF_LOCATORS:
+        assert echoed not in resp.text, "the answer repeats a component of the caller's reference"
+    assert harvested[0]["device_id"] == device_id, "the adapter's own device id, never the name in NSO"
+    assert_records_free_of(logs, ["harvest-dev"])
+    assert harvested[0]["community_hash"] == target_hash
+    assert harvested[0]["operation_id"] == resp.json()["operation_id"], "the record must join to the answer"
+
+
+@pytest.mark.anyio
+async def test_the_operation_id_is_a_WHOLE_uuid_so_two_operations_cannot_share_one(vault_client):
+    """The id was minted as ``uuid4().hex[:12]``: 48 bits, ~1% collision at 2.4M operations.
+
+    The id exists only to join one answer to its own log record, so a collision joins an
+    answer to a DIFFERENT operation's record: the one thing the handle promises. Nothing
+    constrains its width (the three response schemas type it as a plain string), so the
+    whole value costs nothing.
+    """
+    from structlog.testing import capture_logs
+
+    client, _, _ = vault_client
+    seen: set[str] = set()
+    for _ in range(3):
+        with capture_logs() as logs:
+            resp = await client.post(
+                "/api/v1/secrets",
+                json={"vault_ref": _REF, "values": {_REF_KEY: "placeholder-secret"}},
+                headers=AUTH,
+            )
+        assert resp.status_code == 200
+        answered = resp.json()["operation_id"]
+        minted = UUID(answered)  # a truncated hex string does not parse
+        assert minted.version == 4, "the handle must stay a random uuid4"
+        assert answered == minted.hex, "the answer must carry the whole value, unseparated"
+        written = [record for record in logs if record["event"] == "secrets.set"]
+        assert written[0]["operation_id"] == answered, "the record must still join to the answer"
+        seen.add(answered)
+
+    assert len(seen) == 3, "every operation must get its own handle"
+
+
+@pytest.mark.anyio
+async def test_the_secrets_write_description_promises_exactly_what_it_answers(vault_client):
+    """The write's description still promised "version + fingerprints".
+
+    SecretWriteOut carries neither field names nor hashes: it answers the operation_id and
+    the KV v2 version. The stale promise reached the live OpenAPI document and the committed
+    snapshot, so a client author reads a contract the adapter does not serve."""
+    from nso_adapter.api.secrets import SecretWriteOut
+
+    client, _, _ = vault_client
+    resp = await client.post(
+        "/api/v1/secrets", json={"vault_ref": _REF, "values": {_REF_KEY: "placeholder-secret"}}, headers=AUTH
+    )
+
+    assert resp.status_code == 200
+    answered = set(resp.json())
+    assert answered == set(SecretWriteOut.model_fields), "the answer must be the declared model"
+
+    description = create_app().openapi()["paths"]["/api/v1/secrets"]["post"]["description"]
+    assert "fingerprint" not in description.lower(), (
+        "the description promises a fingerprint the write does not answer; it answers " + ", ".join(sorted(answered))
+    )
+
+
+@pytest.mark.anyio
+async def test_a_SUCCESSFUL_verify_echoes_no_REFERENCE_COMPONENT_anywhere(vault_client):
+    """The verify echoed the submitted ref too; what VAULT holds is not a caller echo."""
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
+    client, store, _ = vault_client
+    store[_REF_PATH] = {_REF_KEY: "placeholder-secret"}
+
+    with capture_logs() as logs:
+        resp = await client.post("/api/v1/secrets/verify", json={"vault_ref": _REF}, headers=AUTH)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["exists"] is True
+    assert body["hashes"] == {_REF_KEY: _h("placeholder-secret")}, "what Vault holds is the point of the verify"
+    assert_records_free_of(logs, _REF_LOCATORS)
+    for echoed in (_REF, _REF_PATH, _REF_MOUNT, "placeholder-path", "placeholder-leaf", "placeholder-secret"):
+        assert echoed not in resp.text, "the answer repeats a component of the caller's reference"
+    verified = [record for record in logs if record["event"] == "secrets.verify"]
+    assert verified, "the verify was not reported at all"
+    assert verified[0]["operation_id"] == body["operation_id"], "the record must join to the answer"
+
+
+@pytest.mark.anyio
+async def test_an_INVALID_values_ENTRY_keeps_the_callers_key_out_of_the_422(vault_client):
+    """Pydantic reports a bad map entry at ``("body", "values", <key>)``.
+
+    The key is the caller's own string. A caller that named the entry after the secret read
+    it straight back out of the validation location.
+    """
+    client, _store, _ = vault_client
+
+    resp = await client.post(
+        "/api/v1/secrets",
+        json={"vault_ref": _REF, "values": {"placeholder-secret": {"nested": 1}}},
+        headers=AUTH,
+    )
+
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_error"
+    assert "placeholder-secret" not in resp.text, "the 422 location repeats the caller's map key"
+    locations = [error["loc"] for error in resp.json()["error"]["detail"]["errors"]]
+    assert ["body", "values", "[redacted]"] in locations, "the operator must still learn WHERE it broke"
+
+
+# ── a malformed reference is never echoed back ───────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_a_MALFORMED_ref_is_answered_with_the_broken_RULE_not_the_input(vault_client):
+    """The 400 named the rule AND repeated the caller's own text, secret included.
+
+    ``vault_ref`` is a free-form string on the wire. A caller that pastes a community or a
+    password into it had that value written straight back into the error body, and the
+    parser exception stayed on ``__cause__`` where a formatted traceback still prints it.
+    """
+    from nso_adapter.api.errors import ApiError
+    from nso_adapter.api.secrets import _parse_ref
+    from tests._secret_discipline import assert_chain_free_of, exception_chain
+
+    client, _store, _ = vault_client
+    malformed = "network/placeholder-path placeholder-secret#placeholder-key"
+
+    resp = await client.post("/api/v1/secrets", json={"vault_ref": malformed, "values": {"a": "b"}}, headers=AUTH)
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_vault_ref"
+    for echoed in (malformed, "placeholder-path", "placeholder-secret"):
+        assert echoed not in resp.text, "the 400 body repeats the caller's own reference"
+    assert "whitespace" in resp.json()["error"]["message"], "the caller must still learn WHAT is malformed"
+
+    # The same input through the real helper: `from exc` kept the parser exception, whose
+    # own text repeats the reference verbatim.
+    with pytest.raises(ApiError) as caught:
+        _parse_ref(malformed)
+    assert_chain_free_of(caught.value, [malformed, "placeholder-path", "placeholder-secret"])
+    assert exception_chain(caught.value) == [caught.value], "the parser exception is still attached"
+
+
+@pytest.mark.anyio
+async def test_an_UNREGISTERED_instance_answers_502_with_nothing_attached(vault_client, monkeypatch):
+    """The 502 uses fixed text and is raised after the handler with no attached exception."""
+    from nso_adapter.api import secrets as secrets_api
+    from nso_adapter.api.errors import ApiError, api_error
+    from nso_adapter.store.models import Device
+    from tests._secret_discipline import exception_chain
+
+    client, _store, _ = vault_client
+    device_id = await _seed_harvest_device("cisco-ios-cli-6.77")
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        device.nso_instance = "nso-not-registered"
+        await db.commit()
+
+    built: list[ApiError] = []
+
+    def _spy(*args, **kwargs):
+        error = api_error(*args, **kwargs)
+        built.append(error)
+        return error
+
+    monkeypatch.setattr(secrets_api, "api_error", _spy)
+
+    resp = await client.post(
+        f"/api/v1/devices/{device_id}/secrets/harvest-community",
+        json={"community_hash": _h("x"), "vault_ref": "network/p#community"},
+        headers=AUTH,
+    )
+
+    assert resp.status_code == 502
+    assert resp.json()["error"]["code"] == "nso_unavailable"
+    assert resp.json()["error"]["message"] == "No NSO client is registered"
+    assert "nso-not-registered" not in resp.text
+    assert built, "the refusal never went through api_error"
+    refusal = built[-1]
+    assert exception_chain(refusal) == [refusal], "the registry exception is still attached to the 502"

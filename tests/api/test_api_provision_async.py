@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from sqlalchemy import select
 
 from nso_adapter.nso.client import NsoClient
@@ -151,3 +152,70 @@ async def test_worker_provision_job_records_blocking_step_failure(adapter_client
         assert job.status == JobStatus.succeeded
         assert job.result["ok"] is False
         assert {s["step"]: s["status"] for s in job.result["steps"]}["create"] == "failed"
+
+
+# ── the step detail carries no server bytes (#1698) ─────────────────────────
+
+#: What a proxy or a NED can put in a host-key answer. Not UTF-8, so the parse raises.
+_SERVER_BYTES = b"\xffplaceholder-server-secret"
+
+
+def _provision_transport(host_key_answer: httpx.Response) -> httpx.MockTransport:
+    """Real NSO wire: the node is created and unlocked, then the host-key action answers
+    *host_key_answer*. Every call is one factory, because httpx reads the body once."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/ssh/fetch-host-keys"):
+            return httpx.Response(host_key_answer.status_code, content=host_key_answer.content)
+        if request.method == "GET":
+            return httpx.Response(404)  # device_exists → the create branch
+        return httpx.Response(204)  # create (PUT) and admin-state (PATCH)
+
+    return httpx.MockTransport(handle)
+
+
+async def _drain_provision(client_http, device_name: str, transport: httpx.MockTransport) -> Job:
+    """Enqueue a provision over the real API and run the real runner against *transport*."""
+    from nso_adapter.core.importer import get_nso_client
+    from nso_adapter.core.jobs import _JOB_RUNNERS
+
+    resp = await client_http.post(
+        "/api/v1/devices/provision", json={**_PROVISION_BODY, "device_name": device_name}, headers=AUTH
+    )
+    job_id = int(resp.json()["job_id"])
+    nso = get_nso_client("nso-dev")  # the REAL client the lifespan registered
+    nso._client = lambda timeout=None: httpx.AsyncClient(transport=transport, base_url="http://nso-dev:8080")
+    with patch("nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()):
+        await start_job(job_id)
+        await _JOB_RUNNERS[JobType.provision](job_id, None)
+    async with session() as db:
+        return await db.get(Job, job_id)
+
+
+async def test_provision_step_detail_carries_no_bytes_from_the_host_key_answer(adapter_client_with_nso):
+    """A malformed host-key body raises UnicodeDecodeError, whose repr COPIES the server's
+    bytes. That repr reached the step detail, so it landed in the persisted job result and
+    in every answer that serves it. The step must carry the classification alone."""
+    transport = _provision_transport(httpx.Response(200, content=_SERVER_BYTES))
+    job = await _drain_provision(adapter_client_with_nso, "badkey-rtr", transport)
+
+    assert job.status == JobStatus.succeeded
+    assert job.result["ok"] is False
+    step = next(s for s in job.result["steps"] if s["step"] == "fetch_host_keys")
+    assert step["status"] == "failed"
+    assert "placeholder-server-secret" not in repr(job.result), "the job result repeats the server's bytes"
+    assert step["detail"] == "UnicodeDecodeError", "the step must still name WHAT failed"
+
+
+async def test_provision_step_detail_keeps_the_ADAPTER_AUTHORED_host_key_refusal(adapter_client_with_nso):
+    """The other half of the inversion: our own refusal IS the diagnostic and must survive.
+
+    NSO answers 200 with ``result: failed``; the client refuses it with a message the adapter
+    wrote, which names the action and the failure kind and repeats nothing the action said."""
+    answer = httpx.Response(200, json={"tailf-ncs:output": {"result": "failed", "info": "placeholder-server-secret"}})
+    job = await _drain_provision(adapter_client_with_nso, "nokey-rtr", _provision_transport(answer))
+
+    assert job.result["ok"] is False
+    step = next(s for s in job.result["steps"] if s["step"] == "fetch_host_keys")
+    assert "did not report a stored key" in step["detail"], "the authored refusal is the diagnostic"
+    assert "placeholder-server-secret" not in repr(job.result), "the action's own text must not travel"

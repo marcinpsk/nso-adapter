@@ -36,12 +36,24 @@ def _now():
 def parse_vlan_string(raw) -> list[int]:
     """Expand the NSO 'tagged-vlans' string ('805,1518-1519,3629') into a sorted int list.
 
-    Also tolerates a list (legacy/test) — returns it as ints.
+    Also tolerates a list (legacy/test) — returns it as ints. An entry that is not a vlan id
+    is refused by field and TYPE: the values are device-served and reach the refresh log.
     """
     if not raw:
         return []
     if isinstance(raw, (list, tuple)):
-        return sorted(int(v) for v in raw)
+        listed: list[int] = []
+        unusable = None
+        for value in raw:
+            try:
+                listed.append(int(value))
+            except (TypeError, ValueError):
+                unusable = ValueError(f"a tagged-vlans entry is not a vlan id (type {type(value).__name__})")
+                break
+        # Raised outside the handler: the caught error repeats the entry verbatim.
+        if unusable is not None:
+            raise unusable
+        return sorted(listed)
     vlans: set[int] = set()
     for chunk in str(raw).split(","):
         chunk = chunk.strip()
@@ -82,13 +94,19 @@ async def _upsert_vlans(
     now = _now()
     for item in vlans:
         raw_vlan_id = item.get("vlan-id", item.get("vlan_id"))
+        unusable = None
         try:
             vid = int(raw_vlan_id)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             # A skipped item would vanish from `seen` and the prune below would delete its
             # existing row — reject the whole refresh instead (the engine's savepoint keeps
             # the last-known rows and records the failure).
-            raise ValueError(f"vlan-database item without a usable vlan id for device {device.id}: {item!r}") from None
+            unusable = ValueError(
+                f"a vlan-database item for device {device.id} carries a vlan-id of type "
+                f"{type(raw_vlan_id).__name__}, not an integer"
+            )
+        if unusable is not None:
+            raise unusable
         seen.add(vid)
         row = existing.get(vid) or DeviceVlan(device_id=device.id, vlan_id=vid)
         row.name = item.get("name") or ""
@@ -163,7 +181,21 @@ async def _upsert_switchports(
         row = existing.get(name) or DeviceSwitchport(device_id=device.id, interface_name=name)
         row.mode = item.get("mode") or ""
         untagged = item.get("untagged-vlan", item.get("untagged_vlan"))
-        uv = vlan_by_vid.get(int(untagged)) if untagged is not None else None
+        uv = None
+        if untagged is not None:
+            unusable = None
+            try:
+                untagged_vid = int(untagged)
+            except (TypeError, ValueError):
+                # The value is the device's own; name the field and what arrived, not the leaf.
+                unusable = ValueError(
+                    f"a switchport item for device {device.id} carries an untagged-vlan that is "
+                    f"not a vlan id (type {type(untagged).__name__})"
+                )
+            # Raised outside the handler: the caught error repeats the value verbatim.
+            if unusable is not None:
+                raise unusable
+            uv = vlan_by_vid.get(untagged_vid)
         row.untagged_vlan_id = uv.id if uv is not None else None
         row.last_refreshed_at = now
         row.refresh_source = refresh_source

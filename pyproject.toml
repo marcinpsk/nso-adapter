@@ -125,6 +125,7 @@ exclude_also = [
 
 [tool.ruff]
 line-length = 120
+extend-exclude = [".opengrep/tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "D", "C901", "I", "RET", "UP", "DTZ", "ASYNC"]

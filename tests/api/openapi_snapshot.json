@@ -2746,12 +2746,12 @@
             ],
             "title": "Acl"
           },
-          "secret_hash": {
-            "title": "Secret Hash",
+          "operation_id": {
+            "title": "Operation Id",
             "type": "string"
           },
-          "vault_ref": {
-            "title": "Vault Ref",
+          "secret_hash": {
+            "title": "Secret Hash",
             "type": "string"
           },
           "version": {
@@ -2760,7 +2760,7 @@
           }
         },
         "required": [
-          "vault_ref",
+          "operation_id",
           "secret_hash",
           "version",
           "access",
@@ -2772,6 +2772,7 @@
       "HarvestCommunityRequest": {
         "properties": {
           "community_hash": {
+            "pattern": "^[0-9a-f]{16}$",
             "title": "Community Hash",
             "type": "string"
           },
@@ -7532,8 +7533,8 @@
             "title": "Hashes",
             "type": "object"
           },
-          "vault_ref": {
-            "title": "Vault Ref",
+          "operation_id": {
+            "title": "Operation Id",
             "type": "string"
           },
           "version": {
@@ -7549,7 +7550,7 @@
           }
         },
         "required": [
-          "vault_ref",
+          "operation_id",
           "exists",
           "fields",
           "hashes",
@@ -7573,15 +7574,8 @@
       },
       "SecretWriteOut": {
         "properties": {
-          "hashes": {
-            "additionalProperties": {
-              "type": "string"
-            },
-            "title": "Hashes",
-            "type": "object"
-          },
-          "vault_ref": {
-            "title": "Vault Ref",
+          "operation_id": {
+            "title": "Operation Id",
             "type": "string"
           },
           "version": {
@@ -7590,9 +7584,8 @@
           }
         },
         "required": [
-          "vault_ref",
-          "version",
-          "hashes"
+          "operation_id",
+          "version"
         ],
         "title": "SecretWriteOut",
         "type": "object"
@@ -15465,7 +15458,7 @@
     },
     "/api/v1/secrets": {
       "post": {
-        "description": "Merge-write secret fields at the ref's Vault path; return version + fingerprints.",
+        "description": "Merge-write secret fields at the ref's Vault path; return the new KV v2 version.",
         "operationId": "set_secret_api_v1_secrets_post",
         "requestBody": {
           "content": {

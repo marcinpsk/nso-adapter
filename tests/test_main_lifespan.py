@@ -17,6 +17,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from nso_adapter.main import (
@@ -30,6 +31,33 @@ from nso_adapter.main import (
     _start_sse_streams,
 )
 from tests.conftest import session
+
+_SSE_FAILURE_URL = "https://nso.invalid/restconf/data/placeholder-sse"
+_SSE_FAILURE_REASON = "Placeholder SSE Failure"
+
+
+def _sse_httpx_failure() -> httpx.HTTPStatusError:
+    """Return a real httpx error whose message contains server-authored text."""
+    request = httpx.Request("GET", _SSE_FAILURE_URL)
+    response = httpx.Response(
+        503,
+        request=request,
+        extensions={"reason_phrase": _SSE_FAILURE_REASON.encode("ascii")},
+        text="placeholder body",
+    )
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        return exc
+    raise AssertionError("raise_for_status did not raise on 503")
+
+
+def _assert_sse_failure_classified(logs: list[dict], event: str) -> None:
+    record = next(item for item in logs if item["event"] == event)
+    detail = record["error"]
+    assert _SSE_FAILURE_URL not in detail
+    assert _SSE_FAILURE_REASON not in detail
+    assert detail == "HTTPStatusError (HTTP 503)"
 
 
 def _scheduler(**flags):
@@ -192,20 +220,24 @@ async def test_coalescer_consumes_dirty_edge_after_a_failing_refresh(adapter_cli
         attempts.append(1)
         if len(attempts) == 1:
             await gate.wait()
-            raise RuntimeError("refresh A boom")
+            raise _sse_httpx_failure()
         return [], None
 
     monkeypatch.setattr("nso_adapter.core.importer.refresh_all_surfaces_for_device", flaky_refresh)
 
     tasks: set[asyncio.Task] = set()
     coalescer = main_mod._DeviceRefreshCoalescer({"nso-dev": object()}, tasks, tasks.discard)
-    coalescer.trigger(device_id, "nso-dev", None)
-    await asyncio.sleep(0.02)
-    coalescer.trigger(device_id, "nso-dev", None)  # B lands while A is mid-flight
-    gate.set()  # A now fails
-    await _drain_coalescer(tasks)
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        coalescer.trigger(device_id, "nso-dev", None)
+        await asyncio.sleep(0.02)
+        coalescer.trigger(device_id, "nso-dev", None)  # B lands while A is mid-flight
+        gate.set()  # A now fails
+        await _drain_coalescer(tasks)
 
     assert len(attempts) == 2, "the dirty edge must rerun despite A's failure"
+    _assert_sse_failure_classified(logs, "sse.coalesced_refresh_failed")
 
 
 async def test_coalescer_notifies_once_per_completed_refresh(adapter_client, monkeypatch):
@@ -226,16 +258,20 @@ async def test_coalescer_notifies_once_per_completed_refresh(adapter_client, mon
     class _NB:
         async def notify_sync_complete(self, nb_id):
             notified.append(nb_id)
-            raise RuntimeError("plugin down")  # must be swallowed
+            raise _sse_httpx_failure()  # must be swallowed
 
     monkeypatch.setattr(imp, "_netbox_client", _NB())
 
     tasks: set[asyncio.Task] = set()
     coalescer = main_mod._DeviceRefreshCoalescer({"nso-dev": object()}, tasks, tasks.discard)
-    coalescer.trigger(device_id, "nso-dev", 8806)
-    await _drain_coalescer(tasks)
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        coalescer.trigger(device_id, "nso-dev", 8806)
+        await _drain_coalescer(tasks)
 
     assert notified == [8806]
+    _assert_sse_failure_classified(logs, "sse.notify_failed")
 
 
 async def test_coalescer_child_is_shutdown_cancellable(adapter_client, monkeypatch):
@@ -317,7 +353,7 @@ async def test_sse_handler_dispatches_parsed_frame(monkeypatch):
 
 async def test_sse_handler_logs_and_does_not_leak_failed_dispatch(monkeypatch):
     async def boom_dispatch(cfg, parsed, db, clients, coalescer):
-        raise RuntimeError("dispatch boom")
+        raise _sse_httpx_failure()
 
     monkeypatch.setattr("nso_adapter.main._dispatch_netconf_change", boom_dispatch)
 
@@ -329,11 +365,15 @@ async def test_sse_handler_logs_and_does_not_leak_failed_dispatch(monkeypatch):
     dispatch_tasks: set[asyncio.Task] = set()
     handler = _make_sse_event_handler(SimpleNamespace(scheduler=_scheduler()), {"i": object()}, dispatch_tasks)
 
-    handler("raw-frame", {"k": 1})
-    await asyncio.gather(*list(dispatch_tasks), return_exceptions=True)
-    for _ in range(3):
-        await asyncio.sleep(0)  # let the done-callback run
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        handler("raw-frame", {"k": 1})
+        await asyncio.gather(*list(dispatch_tasks), return_exceptions=True)
+        for _ in range(3):
+            await asyncio.sleep(0)  # let the done-callback run
     assert dispatch_tasks == set()  # failed task discarded, not leaked
+    _assert_sse_failure_classified(logs, "sse.dispatch_failed")
 
 
 # --------------------------------------------------------------------------- #
@@ -652,6 +692,42 @@ async def test_init_database_never_materializes_schema(monkeypatch, unmigrated_p
         assert after == set(), f"the lifespan materialised schema: {sorted(after)}"
     finally:
         await engine.dispose()
+
+
+async def test_db_ready_record_carries_no_database_credential(monkeypatch):
+    """Startup logged ``cfg.database_url`` verbatim, so a PostgreSQL URL carrying a password
+    wrote that credential into the db.ready record and into every sink that kept it.
+
+    Runs the REAL bind: create_async_engine does not connect, so the URL travels no further
+    than the record under test. The readiness fact the operator needs is the store
+    incarnation, which is the adapter's own."""
+    from structlog.testing import capture_logs
+
+    from nso_adapter.store import db as store_db
+    from nso_adapter.store import meta as store_meta
+    from tests._secret_discipline import assert_records_free_of
+
+    url = "postgresql+asyncpg://placeholder-user:placeholder-db-password@placeholder-db.internal:5432/nsoadp"
+    incarnation = "00000000-0000-0000-0000-0000000000ab"
+
+    async def _fake_ensure():
+        # The mint needs a primed session this isolated test never sets up.
+        return (incarnation, None)
+
+    monkeypatch.setattr(store_meta, "ensure_store_meta", _fake_ensure)
+    try:
+        with capture_logs() as logs:
+            await _init_database(SimpleNamespace(database_url=url))
+    finally:
+        bound = store_db.get_engine()
+        if bound is not None:
+            await bound.dispose()
+        store_db._engine = None
+        store_db._session_factory = None
+
+    assert_records_free_of(logs, ["placeholder-db-password", "placeholder-user", url])
+    record = next(r for r in logs if r["event"] == "db.ready")
+    assert record["incarnation"] == incarnation, "readiness must still say WHICH store is bound"
 
 
 # --------------------------------------------------------------------------- #

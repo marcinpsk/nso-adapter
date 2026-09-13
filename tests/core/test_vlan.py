@@ -82,10 +82,112 @@ async def test_refresh_vlan_database_rejects_a_malformed_item_and_keeps_rows(ada
         await refresh_vlan_database_for_device(db, device, nso)
 
         sections["vlan-database"] = {"status": "ok", "vlan": [{"vlan-id": 10, "name": "MGMT"}, {"name": "NO-ID"}]}
-        with pytest.raises(ValueError, match="vlan-database item without a usable vlan id"):
+        with pytest.raises(ValueError, match="carries a vlan-id of type NoneType"):
             await refresh_vlan_database_for_device(db, device, nso)
         rows = (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device.id))).scalars().all()
         assert {r.vlan_id for r in rows} == {10, 20}, "a malformed item must never prune its siblings"
+
+
+@pytest.mark.anyio
+async def test_a_malformed_item_is_named_by_its_FIELD_and_never_repeated_verbatim(adapter_client):
+    """The refusal interpolated the whole wire item, which is device-derived server data.
+
+    A vlan-database entry carries whatever the export put in it. Repeating it verbatim
+    carries that content into every surface that records the refusal. The field name and
+    the received type say what is wrong and carry no payload.
+    """
+    from tests._secret_discipline import assert_chain_free_of
+
+    device_id = await seed_device(nso_device_name="vsw-sink", netbox_device_id=1309)
+    async with _device_session(device_id) as (db, device):
+        nso = AsyncMock()
+        sections = _serve_sections(nso)
+        sections["vlan-database"] = {
+            "status": "ok",
+            "vlan": [{"name": "NO-ID", "description": "placeholder-server-text"}],
+        }
+        with pytest.raises(ValueError) as caught:
+            await refresh_vlan_database_for_device(db, device, nso)
+
+    message = str(caught.value)
+    for repeated in ("placeholder-server-text", "NO-ID"):
+        assert repeated not in message, "the refusal repeats the wire item verbatim"
+    assert "vlan-id" in message, "the diagnostic must still name the field"
+    assert "NoneType" in message, "the diagnostic must still name the received type"
+    assert_chain_free_of(caught.value, ["placeholder-server-text"])
+
+
+#: What a NED can put in a switchport leaf the reader then converts.
+_UNTAGGED_TEXT = "placeholder-untagged-secret"
+_TAGGED_TEXT = "placeholder-tagged-secret"
+
+
+async def _switchport_surface_failure(device_id: int, interface: dict) -> tuple[BaseException, list]:
+    """Run the REAL switchport surface through the real fan-out; return (raised, records)."""
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.importer import _run_surfaces
+
+    async with _device_session(device_id) as (db, device):
+        nso = AsyncMock()
+        sections = _serve_sections(nso)
+        sections["vlan-database"] = {"status": "ok", "vlan": [{"vlan-id": 10, "name": "MGMT"}]}
+        await refresh_vlan_database_for_device(db, device, nso)
+
+        sections["switchport"] = {"status": "ok", "interface": [interface]}
+        with pytest.raises(Exception) as caught:  # noqa: B017 — the raise IS what is under test
+            await refresh_switchport_for_device(db, device, nso)
+
+        with capture_logs() as logs:
+            failed = await _run_surfaces(db, device, nso, [("switchport", refresh_switchport_for_device)], "poll")
+    assert failed == ["switchport"], "the surface must still be reported as failed"
+    return caught.value, logs
+
+
+@pytest.mark.anyio
+async def test_a_malformed_UNTAGGED_VLAN_is_named_by_its_field_and_never_repeated(adapter_client):
+    """``int(untagged)`` put the device's own leaf into the ValueError, and the fan-out logs it.
+
+    ``sync.surface_refresh_failed`` records the exception repr, so whatever the NED emitted in
+    ``untagged-vlan`` reached the operator log through it.
+    """
+    from tests._secret_discipline import assert_chain_free_of, assert_records_free_of
+
+    device_id = await seed_device(nso_device_name="vsw-untagged-sink", netbox_device_id=1311)
+    raised, logs = await _switchport_surface_failure(
+        device_id,
+        {"interface-name": "Gi0/1", "mode": "access", "untagged-vlan": _UNTAGGED_TEXT},
+    )
+
+    message = str(raised)
+    assert _UNTAGGED_TEXT not in message, "the refusal repeats the device's own leaf"
+    assert "untagged-vlan" in message, "the diagnostic must still name the field"
+    assert "type str" in message, "the diagnostic must still name the received type"
+    assert_chain_free_of(raised, [_UNTAGGED_TEXT])
+    reported = [record for record in logs if record["event"] == "sync.surface_refresh_failed"]
+    assert reported, "the failed surface was not reported at all"
+    assert_records_free_of(logs, [_UNTAGGED_TEXT])
+
+
+@pytest.mark.anyio
+async def test_a_malformed_TAGGED_VLAN_entry_is_named_by_its_field_and_never_repeated(adapter_client):
+    """The tagged-list conversion had the same shape, and removal.py reads it too."""
+    from tests._secret_discipline import assert_chain_free_of, assert_records_free_of
+
+    device_id = await seed_device(nso_device_name="vsw-tagged-sink", netbox_device_id=1312)
+    raised, logs = await _switchport_surface_failure(
+        device_id,
+        {"interface-name": "Gi0/2", "mode": "trunk", "tagged-vlans": ["10", _TAGGED_TEXT]},
+    )
+
+    message = str(raised)
+    assert _TAGGED_TEXT not in message, "the refusal repeats the device's own leaf"
+    assert "tagged-vlans" in message, "the diagnostic must still name the field"
+    assert "type str" in message, "the diagnostic must still name the received type"
+    assert_chain_free_of(raised, [_TAGGED_TEXT])
+    reported = [record for record in logs if record["event"] == "sync.surface_refresh_failed"]
+    assert reported, "the failed surface was not reported at all"
+    assert_records_free_of(logs, [_TAGGED_TEXT])
 
 
 @pytest.mark.anyio

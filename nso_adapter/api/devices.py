@@ -430,14 +430,22 @@ class DeviceCreate(BaseModel):
     responses={**RESP_401, **RESP_409, **RESP_422_VALIDATION},
 )
 async def onboard_device(body: DeviceCreate, db: AsyncSession = Depends(get_db)):
+    from nso_adapter.core.onboarding import DeviceIdentityRefused
     from nso_adapter.core.onboarding import onboard_device as _onboard
 
+    refused = None
     try:
         device = await _onboard(db, body.nso_instance, body.nso_device_name, body.netbox_device_id)
+    except DeviceIdentityRefused as exc:
+        # Authored text: the link that refuses the request is server-side state, and it is logged.
+        refused = api_error(409, "conflict", str(exc), {"reason": exc.reason})
     except LookupError as exc:
-        raise api_error(409, "conflict", str(exc))
+        # Built in the handler, raised after it: a raise inside attaches the caught exception.
+        refused = api_error(409, "conflict", str(exc))
     except ValueError as exc:
-        raise api_error(422, "validation_error", str(exc))
+        refused = api_error(422, "validation_error", str(exc))
+    if refused is not None:
+        raise refused
     return _device_out(device)
 
 
@@ -747,6 +755,7 @@ class DevicePatch(BaseModel):
     responses={**RESP_401, **RESP_404_DEVICE, **RESP_409, **RESP_422_VALIDATION},
 )
 async def rekey_device(device_id: int, body: DevicePatch, db: AsyncSession = Depends(get_db)):
+    from nso_adapter.core.onboarding import DeviceIdentityRefused
     from nso_adapter.core.onboarding import rekey_device as _rekey
 
     device = await db.get(Device, device_id)
@@ -754,12 +763,18 @@ async def rekey_device(device_id: int, body: DevicePatch, db: AsyncSession = Dep
         raise api_error(404, "not_found", "Device not found")
     if body.nso_instance is None and body.nso_device_name is None:
         return _device_out(device)
+    refused = None
     try:
         device = await _rekey(db, device, body.nso_instance, body.nso_device_name)
+    except DeviceIdentityRefused as exc:
+        # A patch may name only the instance, so the refused identity is half the stored row.
+        refused = api_error(409, "conflict", str(exc), {"reason": exc.reason})
     except LookupError as exc:
-        raise api_error(409, "conflict", str(exc))
+        refused = api_error(409, "conflict", str(exc))
     except ValueError as exc:
-        raise api_error(422, "validation_error", str(exc))
+        refused = api_error(422, "validation_error", str(exc))
+    if refused is not None:
+        raise refused
     return _device_out(device)
 
 
@@ -776,14 +791,17 @@ async def offboard_device(device_id: int, db: AsyncSession = Depends(get_db)):
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
+    busy = None
     try:
         await _offboard(db, device)
     except ClaimUnavailableError:
         # Something is working on this device. Tearing it down from under a runner is the
         # one thing the claim exists to prevent; the operator retries.
-        raise api_error(
+        busy = api_error(
             409,
             "conflict",
             "The device is busy with another operation; retry",
             {"reason": "device_claimed"},
-        ) from None
+        )
+    if busy is not None:
+        raise busy

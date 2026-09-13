@@ -552,7 +552,8 @@ async def _freeze(db: AsyncSession, device, stream: str, tables: dict[str, list[
             detail=str(exc),
             exc_info=True,
         )
-        raise ApplyUnexecutable({"interface_config": "interface_attribute_eligibility_unresolved"}) from None
+        unexecutable = ApplyUnexecutable({"interface_config": "interface_attribute_eligibility_unresolved"})
+    raise unexecutable
 
 
 async def refresh_consumed_carriers(
@@ -994,6 +995,7 @@ async def _enqueue_action_removal_links(
     union = dict(removal_authority)
     for link in links:
         scope = stream_section(link.stream)
+        unresolved = None
         try:
             context = await promotion_removal_context(
                 db,
@@ -1003,7 +1005,9 @@ async def _enqueue_action_removal_links(
                 replacement_rows=link.replacement,
             )
         except PromotionInterfaceUnresolved:
-            raise ApplyUnexecutable({link.stream: "unresolved_interface_identity"}) from None
+            unresolved = ApplyUnexecutable({link.stream: "unresolved_interface_identity"})
+        if unresolved is not None:
+            raise unresolved
         if scope == "interface_config" and not context.interfaces:
             raise ApplyUnexecutable({link.stream: "no_executable_interface"})
         if scope in CLAIM_LESS_SECTIONS and link.mode is GenerationMode.networked:
