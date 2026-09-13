@@ -210,6 +210,52 @@ async def test_onboard_adopts_an_unlinked_lost_insert_winner(adapter_client_with
         assert rows[0].netbox_device_id == 190
 
 
+async def test_onboard_reports_a_late_netbox_conflict_after_losing_the_insert(adapter_client_with_nso):
+    """A target claimed after the adoption pre-check must retain the public conflict contract."""
+    from nso_adapter.core.onboarding import onboard_device
+    from tests.conftest import seed_device
+
+    async with session() as db:
+        original_flush = db.flush
+        original_commit = db.commit
+        winner_id = {}
+        owner_id = {}
+
+        async def flush_after_an_unlinked_competing_insert():
+            if not winner_id:
+                winner_id["id"] = await seed_device(
+                    nso_instance="nso-dev",
+                    nso_device_name="late-conflict-winner",
+                    netbox_device_id=None,
+                )
+            db.flush = original_flush
+            await original_flush()
+
+        async def commit_after_the_target_is_claimed():
+            if not owner_id:
+                owner_id["id"] = await seed_device(
+                    nso_instance="nso-dev",
+                    nso_device_name="late-conflict-owner",
+                    netbox_device_id=193,
+                )
+            db.commit = original_commit
+            await original_commit()
+
+        db.flush = flush_after_an_unlinked_competing_insert
+        db.commit = commit_after_the_target_is_claimed
+        with pytest.raises(LookupError, match="NetBox device 193 is already onboarded") as caught:
+            await onboard_device(db, "nso-dev", "late-conflict-winner", 193)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+    async with session() as db:
+        winner = await db.get(Device, winner_id["id"])
+        owner = await db.get(Device, owner_id["id"])
+        assert winner is not None and winner.netbox_device_id is None
+        assert owner is not None and owner.netbox_device_id == 193
+
+
 async def test_onboard_same_identity_race_reports_identity_refusal(adapter_client_with_nso):
     """The losing request must report that the NSO identity belongs to another link."""
     from nso_adapter.core.onboarding import DeviceIdentityRefused, onboard_device

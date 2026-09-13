@@ -160,6 +160,78 @@ async def _once_with_retry(action, *, backoff: float = _ONBOARD_RETRY_BACKOFF_SE
     return result
 
 
+async def _commit_lost_insert_adoption(
+    db: AsyncSession,
+    winner: Device,
+    nso_device_name: str,
+    netbox_device_id: int,
+) -> Device | LookupError:
+    """Commit a lost-insert adoption or report a late NetBox ownership conflict."""
+    ownership_conflict = False
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        ownership_conflict = True
+
+    if ownership_conflict:
+        return LookupError(f"NetBox device {netbox_device_id} is already onboarded")
+
+    await db.refresh(winner)
+    logger.info(
+        "device.onboard_race_resolved",
+        device_id=winner.id,
+        nso_device=nso_device_name,
+        adopted=True,
+    )
+    return winner
+
+
+async def _resolve_lost_insert(
+    db: AsyncSession,
+    nso_instance: str,
+    nso_device_name: str,
+    netbox_device_id: int,
+) -> Device | LookupError:
+    """Resolve the database winner without raising inside the failed insert handler."""
+    winner = (
+        await db.execute(
+            select(Device)
+            .where(
+                Device.nso_instance == nso_instance,
+                Device.nso_device_name == nso_device_name,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if winner is None:
+        return LookupError(f"NetBox device {netbox_device_id} is already onboarded")
+    if winner.netbox_device_id is None:
+        dup_nb = await db.scalar(
+            select(Device.id).where(
+                Device.netbox_device_id == netbox_device_id,
+                Device.id != winner.id,
+            )
+        )
+        if dup_nb is not None:
+            return LookupError(f"NetBox device {netbox_device_id} is already onboarded")
+        winner.netbox_device_id = netbox_device_id
+        winner.mapping_status = MappingStatus.mapped
+        return await _commit_lost_insert_adoption(db, winner, nso_device_name, netbox_device_id)
+    if winner.netbox_device_id != netbox_device_id:
+        logger.warning(
+            "device.onboard_refused",
+            reason="onboarded_elsewhere",
+            nso_instance=nso_instance,
+            nso_device=nso_device_name,
+            linked_netbox_device_id=winner.netbox_device_id,
+            requested_netbox_device_id=netbox_device_id,
+        )
+        return DeviceIdentityRefused(_ONBOARDED_ELSEWHERE, reason="onboarded_elsewhere")
+    logger.info("device.onboard_race_resolved", device_id=winner.id, nso_device=nso_device_name)
+    return winner
+
+
 async def onboard_device(
     db: AsyncSession,
     nso_instance: str,
@@ -258,7 +330,7 @@ async def onboard_device(
         mapping_status=MappingStatus.mapped,
     )
     db.add(device)
-    claimed = None
+    recovered: Device | LookupError | None = None
     try:
         # The settle counter is created WITH the device, in this same transaction: a terminal
         # write may never create it (Appendix S §3.3), so every insert site owes one.
@@ -272,55 +344,11 @@ async def onboard_device(
         # decide. Re-read the winner under a row lock and finish any missing link. A duplicate
         # row here would be permanent (the scope reconcile keeps every row it sees).
         await db.rollback()
-        winner = (
-            await db.execute(
-                select(Device)
-                .where(
-                    Device.nso_instance == nso_instance,
-                    Device.nso_device_name == nso_device_name,
-                )
-                .with_for_update()
-            )
-        ).scalar_one_or_none()
-        if winner is None:
-            # The conflict was on netbox_device_id instead: another NSO node claimed it.
-            claimed = LookupError(f"NetBox device {netbox_device_id} is already onboarded")
-        elif winner.netbox_device_id is None:
-            dup_nb = await db.scalar(
-                select(Device.id).where(
-                    Device.netbox_device_id == netbox_device_id,
-                    Device.id != winner.id,
-                )
-            )
-            if dup_nb is not None:
-                claimed = LookupError(f"NetBox device {netbox_device_id} is already onboarded")
-            else:
-                winner.netbox_device_id = netbox_device_id
-                winner.mapping_status = MappingStatus.mapped
-                await db.commit()
-                await db.refresh(winner)
-                logger.info(
-                    "device.onboard_race_resolved",
-                    device_id=winner.id,
-                    nso_device=nso_device_name,
-                    adopted=True,
-                )
-                return winner
-        elif winner.netbox_device_id != netbox_device_id:
-            logger.warning(
-                "device.onboard_refused",
-                reason="onboarded_elsewhere",
-                nso_instance=nso_instance,
-                nso_device=nso_device_name,
-                linked_netbox_device_id=winner.netbox_device_id,
-                requested_netbox_device_id=netbox_device_id,
-            )
-            claimed = DeviceIdentityRefused(_ONBOARDED_ELSEWHERE, reason="onboarded_elsewhere")
-        else:
-            logger.info("device.onboard_race_resolved", device_id=winner.id, nso_device=nso_device_name)
-            return winner
-    if claimed is not None:
-        raise claimed
+        recovered = await _resolve_lost_insert(db, nso_instance, nso_device_name, netbox_device_id)
+    if isinstance(recovered, LookupError):
+        raise recovered
+    if recovered is not None:
+        return recovered
     await db.refresh(device)
     logger.info("device.onboarded", device_id=device.id, nso_device=nso_device_name)
     return device
