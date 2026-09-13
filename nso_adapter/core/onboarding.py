@@ -269,21 +269,44 @@ async def onboard_device(
         # Lost a race with a concurrent onboard of the same device. The checks above are
         # select-then-insert, so both callers can find nothing and both insert; the DB
         # constraints (uq_device_nso_identity / uq_device_netbox_device_id) are what actually
-        # decide. Re-read the winner and return it — onboarding is idempotent by contract, and
-        # a duplicate row here would be permanent (the scope reconcile keeps every row it sees).
+        # decide. Re-read the winner under a row lock and finish any missing link. A duplicate
+        # row here would be permanent (the scope reconcile keeps every row it sees).
         await db.rollback()
         winner = (
             await db.execute(
-                select(Device).where(
+                select(Device)
+                .where(
                     Device.nso_instance == nso_instance,
                     Device.nso_device_name == nso_device_name,
                 )
+                .with_for_update()
             )
         ).scalar_one_or_none()
         if winner is None:
             # The conflict was on netbox_device_id instead: another NSO node claimed it.
             claimed = LookupError(f"NetBox device {netbox_device_id} is already onboarded")
-        elif winner.netbox_device_id not in (None, netbox_device_id):
+        elif winner.netbox_device_id is None:
+            dup_nb = await db.scalar(
+                select(Device.id).where(
+                    Device.netbox_device_id == netbox_device_id,
+                    Device.id != winner.id,
+                )
+            )
+            if dup_nb is not None:
+                claimed = LookupError(f"NetBox device {netbox_device_id} is already onboarded")
+            else:
+                winner.netbox_device_id = netbox_device_id
+                winner.mapping_status = MappingStatus.mapped
+                await db.commit()
+                await db.refresh(winner)
+                logger.info(
+                    "device.onboard_race_resolved",
+                    device_id=winner.id,
+                    nso_device=nso_device_name,
+                    adopted=True,
+                )
+                return winner
+        elif winner.netbox_device_id != netbox_device_id:
             logger.warning(
                 "device.onboard_refused",
                 reason="onboarded_elsewhere",

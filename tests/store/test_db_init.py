@@ -144,10 +144,13 @@ def test_db_migrate_survives_a_percent_in_the_password_and_prints_no_credential(
     )
     output = proc.stdout + proc.stderr
 
-    assert "invalid interpolation syntax" not in output, "the percent sign broke migration configuration"
-    assert "OperationalError" in output, "the migration runner did not reach the database"
+    if "invalid interpolation syntax" in output:
+        raise AssertionError("the percent sign broke migration configuration")
+    if "OperationalError" not in output:
+        raise AssertionError("the migration runner did not reach the database")
     for leaked in (password, "pw%%40", "placeholder-secret", "placeholder_user"):
-        assert leaked not in output, "the migration runner printed credential material"
+        if leaked in output:
+            raise AssertionError("the migration runner printed credential material")
 
 
 def test_migration_output_assertions_never_render_captured_output_or_credentials():
@@ -161,8 +164,8 @@ def test_migration_output_assertions_never_render_captured_output_or_credentials
     )
     rendered = []
     for node in ast.walk(target):
-        if isinstance(node, ast.Assert) and node.msg is not None:
-            names = {child.id for child in ast.walk(node.msg) if isinstance(child, ast.Name)}
+        if isinstance(node, ast.Assert):
+            names = {child.id for child in ast.walk(node) if isinstance(child, ast.Name)}
             if names & {"output", "password", "leaked"}:
                 rendered.append(node.lineno)
 

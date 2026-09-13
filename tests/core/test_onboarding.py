@@ -177,6 +177,39 @@ async def test_onboard_resolves_a_lost_insert_race(adapter_client_with_nso):
         assert len(rows) == 1  # exactly one survivor
 
 
+async def test_onboard_adopts_an_unlinked_lost_insert_winner(adapter_client_with_nso):
+    """The losing insert must complete the requested link on an unlinked winner."""
+    from nso_adapter.core.onboarding import onboard_device
+    from nso_adapter.store.models import MappingStatus
+    from tests.conftest import seed_device
+
+    async with session() as db:
+        original_flush = db.flush
+        winner_id = {}
+
+        async def flush_after_an_unlinked_competing_insert():
+            if not winner_id:
+                winner_id["id"] = await seed_device(
+                    nso_instance="nso-dev",
+                    nso_device_name="raced-unlinked",
+                    netbox_device_id=None,
+                )
+            db.flush = original_flush
+            await original_flush()
+
+        db.flush = flush_after_an_unlinked_competing_insert
+        device = await onboard_device(db, "nso-dev", "raced-unlinked", 190)
+
+        assert device.id == winner_id["id"]
+        assert device.netbox_device_id == 190
+        assert device.mapping_status is MappingStatus.mapped
+
+    async with session() as db:
+        rows = (await db.execute(select(Device).where(Device.nso_device_name == "raced-unlinked"))).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].netbox_device_id == 190
+
+
 async def test_onboard_same_identity_race_reports_identity_refusal(adapter_client_with_nso):
     """The losing request must report that the NSO identity belongs to another link."""
     from nso_adapter.core.onboarding import DeviceIdentityRefused, onboard_device
