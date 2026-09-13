@@ -71,7 +71,7 @@ from nso_adapter.core.scheduler import start_scheduler, stop_scheduler
 from nso_adapter.core.worker import start_workers, stop_workers
 from nso_adapter.notifications.persistent_subscriber import persistent_subscriber
 from nso_adapter.notifications.sse_subscriber import SSESubscriber
-from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.client import NsoClient, failure_detail
 from nso_adapter.secrets import make_provider, resolve_secret
 from nso_adapter.store.db import get_engine, init_db, session
 
@@ -257,7 +257,7 @@ class _DeviceRefreshCoalescer:
                 except asyncio.CancelledError:
                     raise  # shutdown: no respawn, no dirty consumption
                 except Exception as exc:  # noqa: BLE001 — fallthrough: the dirty check still runs
-                    logger.warning("sse.coalesced_refresh_failed", device_id=device_id, error=repr(exc))
+                    logger.warning("sse.coalesced_refresh_failed", device_id=device_id, error=failure_detail(exc))
                 if st["dirty"]:  # synchronous check-and-transition — no awaits between
                     st["dirty"] = False
                     continue
@@ -284,9 +284,7 @@ class _DeviceRefreshCoalescer:
             try:
                 await nb_client.notify_sync_complete(netbox_device_id)
             except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "sse.notify_failed", netbox_device_id=netbox_device_id, error=str(exc) or type(exc).__name__
-                )
+                logger.warning("sse.notify_failed", netbox_device_id=netbox_device_id, error=failure_detail(exc))
 
 
 async def _dispatch_netconf_change(
@@ -335,8 +333,11 @@ def _make_sse_event_handler(
 
     def _on_done(task: asyncio.Task) -> None:
         dispatch_tasks.discard(task)
-        if not task.cancelled() and task.exception() is not None:
-            logger.warning("sse.dispatch_failed", error=repr(task.exception()))
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning("sse.dispatch_failed", error=failure_detail(exc))
 
     if coalescer is None:
         coalescer = _DeviceRefreshCoalescer(clients, dispatch_tasks, _on_done)

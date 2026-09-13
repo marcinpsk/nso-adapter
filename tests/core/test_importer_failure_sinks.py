@@ -27,9 +27,12 @@ _URL = "https://nso.invalid/restconf/data/placeholder-mount/placeholder-path"
 _REASON = "Placeholder Reason Phrase"
 _LEAKS = [_URL, "placeholder-mount", "placeholder-path", _REASON]
 _IMPORTER = Path(__file__).resolve().parents[2] / "nso_adapter" / "core" / "importer.py"
-_OUTCOME_BOOKKEEPING = tuple(
-    Path(__file__).resolve().parents[2] / "nso_adapter" / "core" / name
-    for name in ("refresh_engine.py", "redistribution.py")
+_GUARDED_LOG_SINKS = (
+    Path(__file__).resolve().parents[2] / "nso_adapter" / "main.py",
+    *(
+        Path(__file__).resolve().parents[2] / "nso_adapter" / "core" / name
+        for name in ("refresh_engine.py", "redistribution.py")
+    ),
 )
 
 
@@ -76,10 +79,10 @@ def test_importer_never_logs_raw_exception_text() -> None:
     assert _raw_log_exception_renderers(_IMPORTER.read_text(encoding="utf-8")) == []
 
 
-def test_outcome_bookkeeping_never_logs_raw_exception_text() -> None:
+def test_guarded_modules_never_log_raw_exception_text() -> None:
     violations = {
         path.name: _raw_log_exception_renderers(path.read_text(encoding="utf-8"))
-        for path in _OUTCOME_BOOKKEEPING
+        for path in _GUARDED_LOG_SINKS
         if _raw_log_exception_renderers(path.read_text(encoding="utf-8"))
     }
     assert violations == {}

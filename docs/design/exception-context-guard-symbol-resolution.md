@@ -148,7 +148,8 @@ shape because the implementations have different leverage:
    the guarded files.
 2. The OpenGrep adapter rejects `logger.exception` and any `error` keyword that
    is not a direct `failure_detail(...)` call. Its paths include the importer,
-   refresh engine, redistribution bookkeeping, and its own fixture.
+   refresh engine, redistribution bookkeeping, application entry point, and its
+   own fixture.
 3. The behavior fixtures include direct exception values, f-strings, `str`,
    `repr`, `logger.exception`, and the accepted `failure_detail` form.
 
@@ -181,12 +182,21 @@ classification uses separate fields such as `reason`, `failure_code`, and
   or pre-push hook runs them.
 - The adapter PR remains below 100 changed files.
 
-The first increment tightens both adapters and their fixtures without changing
-production logging. It runs the focused AST and OpenGrep tests, then the full
-repository gates.
+The first increment tightened both adapters and their fixtures without changing
+production logging. A later live review found three raw exception sinks in the
+application entry point's SSE background work. The second increment adds the
+whole `nso_adapter/main.py` module to both guard adapters, classifies all three
+sinks with `failure_detail`, and exercises them with real `httpx` errors. Other
+modules remain outside this file-based interface until their failure contracts
+receive separate behavioral analysis.
 
 The adversarial reviewer ratified revision r1 after executing both proposed
 predicates. The AST predicate accepted all 19 guarded production `error`
 fields. OpenGrep 1.30.0 accepted the negative-pattern structure, reported no
 production violation, and kept its documented partial-parser warning. The
 reviewer also confirmed the hooks run only at the pre-commit stage.
+
+The adversarial reviewer ratified revision r2 after checking the three SSE paths.
+The extension preserves cancellation, dirty-refresh retries, notification
+handling, and dispatch cleanup. Its tests require the exact classified type and
+status while excluding the request URL and server reason phrase.
