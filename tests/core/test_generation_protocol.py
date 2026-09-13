@@ -128,7 +128,11 @@ def recorded_client(
     cm.__aexit__.return_value = False
     client.get_service_config = AsyncMock(return_value=None)
     if device_state is None:
-        client.run_device_state_read = AsyncMock(side_effect=lambda *_a, **_kw: {"static-route": rec.fake.section()})
+
+        async def _default_state(_device_name, wires, **_kwargs):
+            return {wire: rec.fake.section() if wire == "static-route" else {"status": "unsupported"} for wire in wires}
+
+        client.run_device_state_read = AsyncMock(side_effect=_default_state)
     else:
 
         async def _state(_device_name, wires, **_kwargs):

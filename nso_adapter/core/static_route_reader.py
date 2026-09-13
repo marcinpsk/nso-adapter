@@ -38,7 +38,8 @@ class CertifiedSection(NamedTuple):
 
     *instance* is the whole certified instance the same read saw, so the sender's collateral
     guard and the retained entries come from ONE read (#1396 R2 §4.1) instead of two that can
-    disagree. It is ``None`` for a certified absence and for an uncertifiable read alike.
+    disagree. It is ``None`` for an uncertifiable read and for a certified absence with no
+    service instance. A certified absence from an empty container still carries that instance.
     """
 
     status: str

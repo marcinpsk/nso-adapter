@@ -397,7 +397,7 @@ async def test_the_reclaimer_reissues_rather_than_consuming_when_the_service_sti
     job = (await _jobs(device_id))[reissued.id]
     assert job.status is JobStatus.succeeded
     assert job.result["removal_branch"] == "networked"
-    assert job.result.get("service_clean") is not False, "consumption requires a CERTIFIED clean service"
+    assert "service_clean" not in job.result, "consumption requires a CERTIFIED clean service"
     assert await tombstone_ids(device_id) == [sibling], "the carrier survived a proven cleanup"
     assert await _generation_statuses(device_id) == [GenerationStatus.settled]
 
