@@ -530,10 +530,8 @@ async def test_clearing_retained_redistribution_retracts_only_that_leaf(adapter_
 
     nso_client, recorder = recorded_client(device_name)
     assert await run_head(device_id, nso_client) == jobs[0].id
-    calls = [call for call in recorder.commits if "bgp-reconciler:bgp-config" in (call["body"] or {})]
-    assert len(calls) == 1
-    assert calls[0]["method"] == "put"
-    sent = calls[0]["body"]["bgp-reconciler:bgp-config"][0]
+    assert [call["method"] for call in recorder.commits] == ["put"], "one document, one PUT"
+    sent = recorder.container("bgp")
     redistribution = sent["router"][0]["scope"][0]["address-family"][0]["redistribute"]
     expected = {"source-protocol": "ospf", "source-ref": "1"}
     if field == "route_map":

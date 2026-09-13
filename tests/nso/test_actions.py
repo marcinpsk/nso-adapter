@@ -280,3 +280,26 @@ async def test_probe_reachable_passes_probe_timeout():
     await probe_reachable(client, "rtr", timeout=7.5)
 
     assert client._client.call_args.kwargs["timeout"] == 7.5
+
+
+@pytest.mark.asyncio
+async def test_capability_probe_uses_the_aggregate_packages_action_module():
+    import json
+
+    from nso_adapter.nso.actions import capability_probe
+
+    requests = []
+    verdict = {"ned-id": "example-cli", "element": [{"scope": "route_policy", "status": "supported"}]}
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json={"route-policy-capability:output": verdict})
+
+    client = _make_nso_client()
+    client._client.side_effect = lambda timeout=None: httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    result = await capability_probe(client, "probe-device")
+    assert len(requests) == 1
+    assert requests[0].method == "POST"
+    assert str(requests[0].url) == "http://nso/restconf/data/route-policy-capability:route-policy-capability/probe"
+    assert json.loads(requests[0].content) == {"route-policy-capability:input": {"device": "probe-device"}}
+    assert result == verdict

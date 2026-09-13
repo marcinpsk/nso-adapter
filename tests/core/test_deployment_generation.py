@@ -27,8 +27,9 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.core.removal_helpers import authorize_static_route
 from tests.core.test_generation_protocol import (
-    _VLAN_ROOT,
+    _VLAN_CONTAINER,
     put_snmp,
     put_vlans,
     recorded_client,
@@ -228,7 +229,7 @@ async def _finish(device_id: int, status) -> int | None:
     client, rec = recorded_client(_names[device_id], fail_vlan=failing)
     job_id = await run_head(device_id, client)
     if failing:
-        assert rec.bodies(_VLAN_ROOT), "the injected vlan rejection never fired"
+        assert rec.bodies(_VLAN_CONTAINER), "the injected vlan rejection never fired"
     if job_id is not None:
         actual = await _job_status(job_id)
         assert actual is status, f"the head reached {actual}, not the {status} this case needs"
@@ -2197,6 +2198,9 @@ async def test_f6_a_a_reissue_certifies_no_section_revision(adapter_client):
             )
         )
         await db.commit()
+    # The deletion that wrote this carrier promoted the stream too, so its reissue has an
+    # authorized static-route fragment to compose.
+    await authorize_static_route(device_id)
     assert await sweep_tombstones() == 1
 
     reissue = (await _generations(device_id))[-1]

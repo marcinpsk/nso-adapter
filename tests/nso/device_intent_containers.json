@@ -1,0 +1,20 @@
+{
+  "containers": [
+    "bfd",
+    "bgp",
+    "interface",
+    "isis",
+    "l2-sap",
+    "lag",
+    "logging",
+    "mtu",
+    "ospf",
+    "route-policy",
+    "snmp",
+    "static-route",
+    "subinterface",
+    "svi",
+    "switchport",
+    "vlan"
+  ]
+}

@@ -285,15 +285,21 @@ async def test_put_route_policy_intent_auto_apply_creates_generation(adapter_cli
         running.run_attempt = 1
         await db.commit()
 
-    nso_client = AsyncMock()
+    from nso_adapter.nso.client import NsoClient, ServiceInstanceState
+
+    nso_client = AsyncMock(spec=NsoClient)
     nso_client.get_device_state_doc.return_value = None
+    # The device-wide collateral guard reads the live aggregate instance before every send;
+    # A keyed 404 certifies that an unwritten device has no instance.
+    nso_client.service_instance_state.return_value = ServiceInstanceState("absent", None)
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=nso_client),
-        patch("nso_adapter.nso.apply.apply_route_policy_config", new_callable=AsyncMock) as apply_route_policy,
+        patch("nso_adapter.nso.apply.apply_device_intent", new_callable=AsyncMock) as send,
     ):
         await run_apply(job_id=job.id, device_id=device_id, force=True)
 
-    apply_route_policy.assert_awaited_once()
+    send.assert_awaited_once()
+    assert "route-policy" in send.await_args.args[2], "the document must carry the family it authorized"
     async with session() as db:
         completed = await db.get(Job, job.id)
     assert completed.status is JobStatus.succeeded

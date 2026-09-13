@@ -79,17 +79,17 @@ class _ProofRecorder(_Recorder):
                 200,
                 request=httpx.Request(method.upper(), url),
                 json={
-                    "route-policy-reconciler:output": {
+                    "route-policy-capability:output": {
                         "ned-id": "vendor-cli-1.0",
                         "sw-version": "1.0.0",
                         "element": [],
                     }
                 },
             )
-        if self.reject_route_policy and "route-policy-config" in url and "dry-run=" not in url:
-            self.calls.append(
-                {"method": method, "url": url, "body": json.loads(content) if content else None, "dry_run": False}
-            )
+        body = json.loads(content) if content else None
+        instance = self.instance({"body": body}) or {}
+        if self.reject_route_policy and "route-policy" in instance and "dry-run=" not in url:
+            self.calls.append({"method": method, "url": url, "body": body, "dry_run": False})
             return httpx.Response(
                 400,
                 request=httpx.Request(method.upper(), url),
@@ -103,6 +103,24 @@ class _ProofRecorder(_Recorder):
                 self.dry_run_status, request=httpx.Request(method.upper(), url), json={"errors": "boom"}
             )
         return await super()._handle(method, url, content, headers)
+
+
+async def test_proof_recorder_rejects_route_policy_in_the_aggregate_document():
+    rec = _ProofRecorder("sr-proof")
+    rec.reject_route_policy = True
+    body = {
+        "device-intent:device-intent": [
+            {"device": "sr-proof", "route-policy": {"prefix-list": [{"name": "RP-DENY", "entry": []}]}}
+        ]
+    }
+
+    response = await rec._handle(
+        "put",
+        "http://nso/restconf/data/device-intent:device-intent=sr-proof",
+        json.dumps(body),
+    )
+
+    assert response.status_code == 400
 
 
 def dev_state(*entries, status: str = "ok") -> dict:
@@ -217,38 +235,7 @@ async def test_c3_2_a_merge_patch_records_a_deployment_only_when_proven(
     job = await run_the_apply(device_id, client)
 
     assert job.status == JobStatus.succeeded, job.error
-    assert [c["method"] for c in rec.sr_commits()] == ["patch"], "no replacement is open — this stays a merge"
-    assert await deployed_keys(device_id) == {B: expected_key}
-    assert outcomes(job) == {B: expected_outcome}
-
-
-@pytest.mark.parametrize(
-    ("dry_run_status", "expected_key", "expected_outcome"),
-    [(500, None, "unproven"), (200, list(B), "in_sync")],
-    ids=["inconclusive-verify", "conclusive-verify"],
-)
-async def test_c3_2b_atomic_mode_bootstraps_only_on_a_conclusive_combined_verify(
-    adapter_client, monkeypatch, dry_run_status, expected_key, expected_outcome
-):
-    """C3.2b — ATOMIC mode, never-applied row, no replacement open.
-
-    Stated as a merge-mode setup on purpose: §4.9 excludes a PUT-mode plan from
-    ``apply_combined`` entirely, so a replacement setup would not exercise this path at all.
-    The send happens INSIDE ``apply_combined``, which used to discard its verify verdict
-    (G39) — so atomic mode could either CAS a never-proven row or never bootstrap at all.
-    An inconclusive verdict must not fail the job either (§6/OQ-R2-1).
-    """
-    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
-    device_id = await seed_device(nso_device_name="sr-proof", netbox_device_id=7303)
-    await seed_rows(device_id, [{"triple": B, "route_id": 7}])
-    client, rec = proof_client("sr-proof", state=absent(), section=dev_state(wire(B)), dry_run_status=dry_run_status)
-
-    job = await run_the_apply(device_id, client)
-
-    assert job.status == JobStatus.succeeded, job.error
-    assert [c["url"].split("?")[0] for c in rec.commits] == ["http://nso/restconf/data"], (
-        "the atomic path commits ONE combined PATCH — the send is inside apply_combined"
-    )
+    assert [c["method"] for c in rec.sr_commits()] == ["put"], "one document, one PUT, replacement or not"
     assert await deployed_keys(device_id) == {B: expected_key}
     assert outcomes(job) == {B: expected_outcome}
 
@@ -331,33 +318,6 @@ async def test_c3_4_an_inconclusive_signal_consumes_nothing_and_still_succeeds(a
 
     assert job.status == JobStatus.succeeded, job.error
     assert await deployed_keys(device_id) == {B: seed_key}, "nothing may be recorded as deployed"
-    assert outcomes(job) == {B: "unproven"}
-
-
-@pytest.mark.parametrize("signal", ["native_inconclusive", "native_disabled", "rc_unknown", "rc_error"])
-async def test_c3_4_atomic_an_inconclusive_signal_consumes_nothing_and_still_succeeds(
-    adapter_client, monkeypatch, signal
-):
-    """C3.4, ATOMIC path — the same rule on the other apply implementation.
-
-    Only the four merge-shaped signals apply: staging is merge-PATCH only and ignores
-    ``replace`` (G4), so an atomic pass never consumes a predecessor key and therefore never
-    owes a residue read. ``_run_atomic_apply`` is a separate early return with its own
-    finalization, so a fix wired only into the per-scope loop passes every pin above and
-    still reports a bare green here.
-    """
-    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
-    kwargs, seed_key, verify_off = _signal_setup(signal)
-    if verify_off:
-        monkeypatch.setattr("nso_adapter.nso.apply.VERIFY_AFTER_APPLY", False)
-    device_id = await seed_device(nso_device_name="sr-proof", netbox_device_id=7306)
-    await seed_rows(device_id, [{"triple": B, "route_id": 7, "deployed_key": seed_key}])
-    client, _rec = proof_client("sr-proof", **kwargs)
-
-    job = await run_the_apply(device_id, client)
-
-    assert job.status == JobStatus.succeeded, job.error
-    assert await deployed_keys(device_id) == {B: seed_key}
     assert outcomes(job) == {B: "unproven"}
 
 
@@ -930,12 +890,13 @@ async def test_a_revoked_claim_stops_the_bookkeeping_transaction(adapter_client)
 # ── C2.7 / C2.10 — the `unproven` halves A2 reassigned to C3 ─────────────────
 
 
-async def test_c2_7_a_verify_disabled_apply_closes_nothing_and_reports_unproven(adapter_client, monkeypatch):
+async def test_c2_7_a_verify_disabled_apply_refuses_the_replacement_and_closes_nothing(adapter_client, monkeypatch):
     """C2.7 (unproven half) — verification off, replacement open.
 
-    ``build_plan`` refuses the PUT, so the merge that follows leaves ``A`` on the device.
-    CASing ``deployed_key := B`` there closes the replacement permanently over a route that
-    is still live — the one outcome worse than not delivering it at all.
+    There is no weaker transport to fall back to: one document IS the replace. So the worker
+    refuses the job outright rather than sending a destructive write it could never prove,
+    and nothing at all reaches the device. CASing ``deployed_key := B`` on an unprovable send
+    would close the replacement permanently over a route that is still live.
     """
     monkeypatch.setattr("nso_adapter.nso.apply.VERIFY_AFTER_APPLY", False)
     device_id = await seed_device(nso_device_name="sr-proof", netbox_device_id=7319)
@@ -944,55 +905,46 @@ async def test_c2_7_a_verify_disabled_apply_closes_nothing_and_reports_unproven(
 
     job = await run_the_apply(device_id, client)
 
-    assert job.status == JobStatus.succeeded, job.error
-    assert [c["method"] for c in rec.sr_commits()] == ["patch"]
+    assert job.status == JobStatus.failed
+    assert job.error["code"] == "static_route_put_verify_disabled"
+    assert rec.sr_commits() == [], "an unprovable replacement is not sent at all"
     assert await deployed_keys(device_id) == {B: list(A)}, "the replacement stays OPEN"
-    assert outcomes(job) == {B: "unproven"}
 
 
-@pytest.mark.parametrize("atomic", [False, True], ids=["per-scope", "atomic"])
-async def test_a_merge_never_closes_a_replacement_even_with_a_conclusive_proof(adapter_client, monkeypatch, atomic):
-    """C2.7's rule with verification ON — the fence-shut half, and the only discriminating one.
+async def test_a_surviving_predecessor_never_closes_a_replacement_even_when_proven(adapter_client):
+    """C2.7's rule with verification ON, and the only discriminating setup for it.
 
     With verification off the row is unproven anyway, so that setup cannot tell a correct
-    implementation from one that CASes every proven row. Here the proof IS conclusive and
-    the key IS present: the merge added ``B`` and left ``A`` on the device, and recording
-    ``deployed_key := B`` would close the replacement over a route that is still live, with
-    nothing left pointing at it. Driven on both apply implementations, since staging is
-    merge-PATCH only and ignores ``replace`` (G4).
+    implementation from one that CASes every proven row. Here the commit IS proven and ``B``
+    IS present, and ``A`` survived on the device: recording ``deployed_key := B`` would close
+    the replacement over a route that is still live, with nothing left pointing at it. The
+    residue check is what catches it now that every send is a full replace.
     """
-    if atomic:
-        monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await seed_device(nso_device_name="sr-proof", netbox_device_id=7326)
     await seed_rows(
         device_id,
         [
             {"triple": B, "route_id": 7, "deployed_key": list(A)},
-            {"triple": C, "route_id": None},  # the shut fence: nothing may claim a replacement
+            {"triple": C, "route_id": None},  # a row no NetBox route pk correlates
         ],
     )
-    client, rec = proof_client("sr-proof", state=absent(), section=dev_state(wire(A), wire(B), wire(C)))
+    client, _rec = proof_client("sr-proof", state=absent(), section=dev_state(wire(A), wire(B), wire(C)))
 
     job = await run_the_apply(device_id, client)
 
-    assert job.status == JobStatus.succeeded, job.error
-    if not atomic:
-        assert [c["method"] for c in rec.sr_commits()] == ["patch"], "a shut fence forbids the replace"
-    assert await deployed_keys(device_id) == {B: list(A), C: list(C)}, "the replacement stays OPEN"
-    assert outcomes(job) == {B: "unproven", C: "in_sync"}
+    assert job.status == JobStatus.failed, "the predecessor survived, so the retraction failed"
+    # One transaction, one verdict: the residue failure fails the family, so neither row
+    # records a deployment. B's replacement is what must stay open.
+    assert await deployed_keys(device_id) == {B: list(A), C: None}
 
 
-@pytest.mark.parametrize("atomic", [False, True], ids=["per-scope", "atomic"])
-async def test_c2_10_a_row_owing_a_clear_is_unproven_on_both_paths(adapter_client, monkeypatch, atomic):
-    """C2.10 (unproven half) — a merge-PATCH apply cannot deliver a recorded clear.
+async def test_c2_10_a_row_whose_cleared_leaf_is_still_live_is_unproven(adapter_client):
+    """C2.10 (unproven half) — the leaf is still on the device, so the row is not in sync.
 
-    The renderer omits the leaf and the merge never drops one, so the device keeps the old
-    value while reader-compare — which checks the route KEY only — is fully satisfied.
-    Reporting ``in_sync`` here is precisely the certified false green the carrier exists to
-    prevent, and the atomic path is a separate early return that must not be missed.
+    The body omits the cleared leaf, but reader-compare checks the route KEY only, so the
+    device keeping the old value is invisible to it. Reporting ``in_sync`` here is precisely
+    the certified false green the carrier exists to prevent.
     """
-    if atomic:
-        monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await seed_device(nso_device_name="sr-proof", netbox_device_id=7320)
     await seed_rows(
         device_id,
@@ -1005,7 +957,9 @@ async def test_c2_10_a_row_owing_a_clear_is_unproven_on_both_paths(adapter_clien
     assert job.status == JobStatus.succeeded, job.error
     assert outcomes(job) == {B: "unproven"}
     assert await carriers(device_id) == {B: {"authorized": ["metric"], "store_only": []}}
-    assert len(await removal_contexts(device_id)) == 1, "exactly one networked retract is queued"
+    # No retract is queued any more: a merge could not drop a leaf, but the next document
+    # omits it again, so the carrier waits for proof rather than for a job of its own.
+    assert await removal_contexts(device_id) == []
 
 
 # ── C2.11 (apply side) — per-FIELD evidence, never key-grain, never falsiness ─

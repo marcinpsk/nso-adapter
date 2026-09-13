@@ -18,6 +18,7 @@ operator finding out only when it silently didn't land. Three sources feed the m
 from __future__ import annotations
 
 import re
+from functools import cache
 from typing import Any
 
 import structlog
@@ -298,6 +299,21 @@ def _community_kind(member: str) -> str:
     return "regex" if any(c in _REGEX_META for c in member_str) else "standard"
 
 
+#: Community-list COMMAND identifier → the member kind that list carries. A rejection names a
+#: list, not a member, and no identifier here holds a regex metacharacter, so _community_kind
+#: reads them all as "standard". One identifier per form: the identifier is what states the kind.
+_COMMAND_COMMUNITY_KINDS = {
+    "ip community-list standard": "standard",
+    "ip community-list expanded": "regex",
+    "ip large-community-list": "large",
+}
+
+
+def _row_community_kind(name: str) -> str:
+    """Kind of a ``community`` capability row, whether it names a member or a list command."""
+    return _COMMAND_COMMUNITY_KINDS.get(str(name).strip()) or _community_kind(name)
+
+
 def _index_rows(rows: Any) -> tuple[dict[str, tuple[str, str]], dict[tuple[str, str], tuple[str, str]]]:
     """Build (community kind→(status,detail), construct (scope,name)→(status,detail)) maps.
 
@@ -307,7 +323,7 @@ def _index_rows(rows: Any) -> tuple[dict[str, tuple[str, str]], dict[tuple[str, 
     construct: dict[tuple[str, str], tuple[str, str]] = {}
     for r in rows:
         if r.scope == "community":
-            k = _community_kind(r.name)
+            k = _row_community_kind(r.name)
             cur = kind.get(k)
             if cur is None or _RANK.get(r.status, 0) > _RANK.get(cur[0], 0):
                 kind[k] = (r.status, r.detail)
@@ -422,7 +438,8 @@ _REJECTION_CONSTRUCTS = (
     ("rm-match", "match local-preference", "match local-preference"),
     ("rm-match", "match length", "match length"),
     ("rm-match", "match as-path", "match as-path"),
-    ("community", "ip large-community-list", "ip large-community-list"),
+    # Longest first: "ip community-list standard" must win over any shorter community prefix.
+    *(("community", name, name) for name in sorted(_COMMAND_COMMUNITY_KINDS, key=len, reverse=True)),
 )
 
 
@@ -434,7 +451,7 @@ _REJECTION_CONSTRUCTS = (
 #     the same format parse_rejected_construct greps for route-policy.
 # Path tokens map a model node → scope; command prefixes map a CLI line → scope. vrf/kind/
 # service/parent-binding/encap-tag ride the IP half of the merged module (see
-# build_interface_ip_entry), so they attribute to interface_ip.
+# build_interface_ip_body), so they attribute to interface_ip.
 _IFACE_PATH_CONSTRUCTS: tuple[tuple[str, str, str], ...] = (
     ("interface_ip", "ipv4-address", "ipv4-address"),
     ("interface_ip", "ipv6-address", "ipv6-address"),
@@ -501,6 +518,34 @@ def parse_rejected_construct(message: str):
         return "rm-set", " ".join(cmd.split()[:3])
     if low.startswith("match "):
         return "rm-match", " ".join(cmd.split()[:3])
-    if "community-list" in low:
-        return "community", " ".join(cmd.split()[:3])
     return None, None
+
+
+@cache
+def _rejection_command_allowlist() -> tuple[str, ...]:
+    """Every command identifier a redacted rejection may keep, longest first.
+
+    The union of what the two rejection parsers match on and what preflight can look up, so a
+    kept name always resolves to a matrix row. Longest first, because ``set extcommunity
+    color`` must win over ``set extcommunity``.
+    """
+    names = {prefix for _scope, _name, prefix in (*_REJECTION_CONSTRUCTS, *_IFACE_CMD_CONSTRUCTS)}
+    for mapping in (_SET_KEY_CONSTRUCTS, _MATCH_KEY_CONSTRUCTS):
+        names.update(name for candidates in mapping.values() for name in candidates)
+    return tuple(sorted(names, key=len, reverse=True))
+
+
+def allowlisted_rejection_fragment(message: str) -> str:
+    """Return the construct identifier *message* names, rebuilt from the allowlist, else ``""``.
+
+    A device rejection is opaque text that can carry a community or an auth key, so the error
+    sanitizer drops it. Attribution consumes only the construct, so what this returns is a
+    LITERAL from the tables above and never a slice of the server's own text. The order
+    mirrors both parsers: a message that names a command is attributed by command alone.
+    """
+    match = re.search(r"command:\s*(.+)", message or "")
+    if match:
+        cmd = match.group(1).strip().lower()
+        return next((f"command: {name}" for name in _rejection_command_allowlist() if cmd.startswith(name)), "")
+    low = (message or "").lower()
+    return next((token for _scope, _name, token in _IFACE_PATH_CONSTRUCTS if token in low), "")

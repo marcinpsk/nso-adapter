@@ -8,6 +8,7 @@ import sqlalchemy as sa
 
 from nso_adapter.core.request_flags import AUTHORIZED_PROVENANCE, STORE_ONLY_PROVENANCE
 from tests.conftest import VALID_TOKEN, note_projection_write, push_seq, seed_device, session
+from tests.core.removal_helpers import authorize_stream
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -288,6 +289,10 @@ async def test_force_removal_discharges_all_pending_streams_in_the_scope(adapter
             ]
         )
         await db.commit()
+    # The flush re-deploys AUTHORIZED state, so the family has to have some: with no section
+    # in the composed document the operation plane has nowhere to name these carriers, and
+    # creation refuses rather than discharging what it could not record.
+    await authorize_stream(device_id, "isis")
 
     response = await adapter_client.post(
         f"/api/v1/devices/{device_id}/actions/force-removal",

@@ -1,0 +1,464 @@
+{
+  "bfd": {
+    "interface": [
+      {
+        "interface-name": "GigabitEthernet0/0",
+        "micro-bfd": true,
+        "min-rx": 300,
+        "min-tx": 300,
+        "multiplier": 3
+      },
+      {
+        "interface-name": "GigabitEthernet0/1",
+        "micro-bfd": false
+      }
+    ]
+  },
+  "bgp": {
+    "router": [
+      {
+        "asn": 65100,
+        "router-id": "192.0.2.1",
+        "scope": [
+          {
+            "address-family": [
+              {
+                "afi": "ipv4-unicast",
+                "redistribute": [
+                  {
+                    "route-map": "RM-STATIC",
+                    "source-protocol": "static",
+                    "source-ref": ""
+                  }
+                ]
+              }
+            ],
+            "peer": [
+              {
+                "enabled": true,
+                "peer-address": "192.0.2.2",
+                "peer-address-family": [
+                  {
+                    "afi": "ipv4-unicast",
+                    "enabled": true,
+                    "prefixlist-out": "PL-OUT",
+                    "routemap-in": "RM-IN"
+                  }
+                ],
+                "peer-group": "SPINE",
+                "remote-as": "65200",
+                "source": "Loopback0",
+                "ttl": 2
+              }
+            ],
+            "vrf": ""
+          }
+        ]
+      }
+    ]
+  },
+  "interface_config": {
+    "interface": [
+      {
+        "description": "uplink",
+        "enabled": true,
+        "interface-name": "GigabitEthernet0/0"
+      },
+      {
+        "description": "",
+        "encap-tag": "100",
+        "interface-name": "1/1/1:100",
+        "ipv4-address": [
+          {
+            "address": "198.18.3.1",
+            "prefix-length": 30,
+            "secondary": false
+          }
+        ],
+        "ipv6-address": [
+          {
+            "address": "2001:db8::1",
+            "prefix-length": 64
+          }
+        ],
+        "kind": "vprn",
+        "parent-binding": "1/1/1",
+        "service": "VPRN-A",
+        "vrf": "VPRN-A"
+      }
+    ]
+  },
+  "interface_mtu": {
+    "interface": [
+      {
+        "interface-name": "GigabitEthernet0/0",
+        "ip-mtu": 8986,
+        "mpls-mtu": 9000,
+        "mtu": 9000
+      },
+      {
+        "interface-name": "GigabitEthernet0/1"
+      }
+    ]
+  },
+  "isis": {
+    "interface-config": [
+      {
+        "af": "ipv4-unicast",
+        "bfd-enabled": true,
+        "circuit-type": "level-2-only",
+        "frr-enabled": true,
+        "frr-protection": "node",
+        "interface-name": "GigabitEthernet0/0",
+        "metric": 100,
+        "network-type": "point-to-point",
+        "passive": false,
+        "process-tag": "CORE"
+      },
+      {
+        "af": "ipv6-unicast",
+        "interface-name": "Loopback0",
+        "passive": true,
+        "process-tag": "CORE"
+      }
+    ],
+    "process-config": [
+      {
+        "area-auth-key": "area-key",
+        "area-auth-type": "md5",
+        "fast-reroute": "ti-lfa",
+        "is-type": "level-2-only",
+        "level": [
+          {
+            "disabled": false,
+            "labeled-preference": 100,
+            "level": 2,
+            "wide-metrics-only": true
+          }
+        ],
+        "metric-style": "wide",
+        "microloop-avoidance": true,
+        "net": "49.0001.0000.0000.0001.00",
+        "overload-bit": false,
+        "process-tag": "CORE",
+        "redistribute": [
+          {
+            "metric": 20,
+            "metric-type": "external",
+            "route-map": "RM-CONN",
+            "source-protocol": "connected",
+            "source-ref": ""
+          }
+        ]
+      },
+      {
+        "process-tag": "EDGE"
+      },
+      {
+        "flex-algo": [
+          {
+            "admin-group-exclude": "RED",
+            "algo-id": 128,
+            "metric-type": "delay",
+            "priority": 100
+          }
+        ],
+        "process-tag": "ORPHAN"
+      }
+    ]
+  },
+  "l2_sap": {
+    "sap": [
+      {
+        "inner-tag": 200,
+        "outer-tag": 100,
+        "port": "1/1/1",
+        "sap-id": "1/1/1:100",
+        "service-name": "epipe-1",
+        "service-type": "epipe"
+      },
+      {
+        "sap-id": "1/1/2",
+        "service-name": "vpls-1",
+        "service-type": "vpls"
+      }
+    ]
+  },
+  "lag": {
+    "bundle": [
+      {
+        "lag-id": 1,
+        "member": [
+          {
+            "interface-name": "GigabitEthernet0/1",
+            "mode": "active",
+            "port-priority": 32
+          },
+          {
+            "interface-name": "GigabitEthernet0/2"
+          }
+        ],
+        "min-links": 2,
+        "name": "Port-channel1",
+        "timer": "fast"
+      },
+      {
+        "name": "Port-channel2"
+      }
+    ]
+  },
+  "logging": {
+    "host": [
+      {
+        "address": "198.51.100.20",
+        "facility": "local7",
+        "port": 1514,
+        "severity": "informational",
+        "source": "Loopback0",
+        "transport": "tcp",
+        "vrf": "MGMT"
+      },
+      {
+        "address": "198.51.100.21"
+      }
+    ],
+    "local-levels": {
+      "console-severity": "warnings",
+      "module-severity": "errors"
+    }
+  },
+  "ospf": {
+    "interface-config": [
+      {
+        "area-id": "0",
+        "auth-key": "ospf-key",
+        "auth-type": "md5",
+        "cost": 100,
+        "interface-name": "GigabitEthernet0/0",
+        "network-type": "point-to-point",
+        "passive": false,
+        "priority": 10,
+        "process-id": "1"
+      },
+      {
+        "area-id": "0",
+        "interface-name": "Loopback0",
+        "passive": true,
+        "process-id": "1"
+      }
+    ],
+    "process-config": [
+      {
+        "enabled": true,
+        "process-id": "1",
+        "router-id": "192.0.2.1"
+      },
+      {
+        "enabled": false,
+        "process-id": "2",
+        "vrf": "RED"
+      },
+      {
+        "enabled": true,
+        "process-id": "9",
+        "redistribute": [
+          {
+            "metric": 5,
+            "source-protocol": "connected",
+            "source-ref": ""
+          }
+        ]
+      }
+    ]
+  },
+  "route_policy": {
+    "as-path": [
+      {
+        "entry": [
+          {
+            "action": "permit",
+            "regex": "^65200_",
+            "sequence": 10
+          }
+        ],
+        "name": "AP-1"
+      }
+    ],
+    "community-list": [
+      {
+        "entry": [
+          {
+            "community": "64512:1:2"
+          },
+          {
+            "community": "64512:100"
+          }
+        ],
+        "invert-match": true,
+        "name": "CL-LARGE"
+      },
+      {
+        "entry": [],
+        "invert-match": false,
+        "name": "CL-BANDWIDTH"
+      }
+    ],
+    "prefix-list": [
+      {
+        "entry": [
+          {
+            "action": "permit",
+            "prefix": "198.18.0.0/24",
+            "sequence": 10
+          }
+        ],
+        "name": "PL-OUT"
+      }
+    ],
+    "route-map": [
+      {
+        "entry": [
+          {
+            "action": "permit",
+            "match-prefix-lists": [
+              "PL-OUT"
+            ],
+            "sequence": 10
+          }
+        ],
+        "name": "RM-IN"
+      }
+    ]
+  },
+  "snmp": {
+    "community": [
+      {
+        "access": "ro",
+        "acl": "SNMP-ACL",
+        "name": "ro-community",
+        "vault-key": "ro",
+        "vault-mount": "secret",
+        "vault-path": "nso/snmp"
+      },
+      {
+        "access": "rw",
+        "name": "rw-community",
+        "vault-key": "rw",
+        "vault-mount": "secret",
+        "vault-path": "nso/snmp"
+      }
+    ],
+    "contact": "noc@example.net",
+    "host": [
+      {
+        "address": "198.51.100.10",
+        "community-or-user": "ro-community",
+        "notify-type": "traps",
+        "port": 1162,
+        "version": "v2c"
+      },
+      {
+        "address": "198.51.100.11",
+        "notify-type": "informs",
+        "version": "v3"
+      }
+    ],
+    "location": "rack-7",
+    "v3-user": [
+      {
+        "auth-protocol": "sha",
+        "auth-vault-key": "auth",
+        "auth-vault-mount": "secret",
+        "auth-vault-path": "nso/snmp",
+        "group": "ops-group",
+        "priv-protocol": "aes",
+        "priv-vault-key": "priv",
+        "priv-vault-mount": "secret",
+        "priv-vault-path": "nso/snmp",
+        "username": "ops"
+      },
+      {
+        "username": "viewer"
+      }
+    ]
+  },
+  "static_route": {
+    "route": [
+      {
+        "metric": 10,
+        "next-hop": "198.18.1.1",
+        "permanent": true,
+        "prefix": "198.18.0.0/24",
+        "tag": 101,
+        "vrf": ""
+      },
+      {
+        "interface-next-hop": "GigabitEthernet0/0",
+        "next-hop": "",
+        "next-hop-vrf": "BLUE",
+        "prefix": "198.18.2.0/24",
+        "vrf": "RED"
+      }
+    ]
+  },
+  "subinterface": {
+    "interface": [
+      {
+        "dot1q-vlan": 100,
+        "interface-name": "GigabitEthernet0/0.100",
+        "parent-interface": "GigabitEthernet0/0",
+        "type": "dot1q",
+        "vrf": "RED"
+      },
+      {
+        "dot1q-vlan": 200,
+        "interface-name": "GigabitEthernet0/0.200",
+        "parent-interface": "GigabitEthernet0/0",
+        "type": "dot1q"
+      }
+    ]
+  },
+  "svi": {
+    "interface": [
+      {
+        "interface-name": "Vlan10",
+        "type": "irb",
+        "vlan-id": 10,
+        "vrf": "RED"
+      },
+      {
+        "interface-name": "Vlan20",
+        "type": "svi",
+        "vlan-id": 20
+      }
+    ]
+  },
+  "switchport": {
+    "interface": [
+      {
+        "interface-name": "GigabitEthernet0/3",
+        "mode": "trunk",
+        "tagged-vlan": [
+          10,
+          20
+        ]
+      },
+      {
+        "interface-name": "GigabitEthernet0/4",
+        "mode": "access",
+        "untagged-vlan": 10
+      }
+    ]
+  },
+  "vlan": {
+    "vlan": [
+      {
+        "name": "users",
+        "vlan-id": 10
+      },
+      {
+        "vlan-id": 20
+      }
+    ]
+  }
+}

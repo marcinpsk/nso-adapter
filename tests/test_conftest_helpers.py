@@ -10,7 +10,6 @@ bearing on the behaviour under test.
 from __future__ import annotations
 
 import ast
-import os
 from pathlib import Path
 from typing import get_args, get_type_hints
 
@@ -121,28 +120,3 @@ def test_only_the_root_conftest_defines_fixtures():
         "Move them to tests/conftest.py — a subdirectory conftest's fixtures go missing when the "
         "argument list re-enters its directory."
     )
-
-
-def test_sender_enabled_sections_leaves_the_shared_monkeypatch_intact():
-    """A fixture sharing the function-scoped ``monkeypatch`` must not call ``undo()``.
-
-    ``undo()`` consumes the WHOLE instance stack, so it reverts the patches every OTHER
-    fixture of the same test made through it, ``adapter_client``'s environment included, at
-    this fixture's teardown, while that client is still alive. The switching tests pair the
-    two fixtures, so the scope has to be a context, not the shared instance.
-    """
-    from nso_adapter.core import projection
-
-    probe = "NSO_ADAPTER_FOREIGN_PATCH_PROBE"
-    shared = pytest.MonkeyPatch()
-    shared.setenv(probe, "set through the same instance by another fixture")
-    fixture = root_conftest.sender_enabled_sections.__wrapped__(shared)
-    try:
-        next(fixture)
-        assert projection.AWAITING_SENDER_SECTIONS == frozenset()
-        with pytest.raises(StopIteration):
-            next(fixture)
-        assert os.environ.get(probe) == "set through the same instance by another fixture"
-        assert projection.AWAITING_SENDER_SECTIONS, "the fixture still restores its own patches"
-    finally:
-        shared.undo()

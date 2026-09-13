@@ -18,6 +18,7 @@ assertion about a call graph.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -28,12 +29,15 @@ from sqlalchemy import func, select
 from nso_adapter.core.claim import acquire_claim, release_claim
 from nso_adapter.store.models import Job, JobStatus, StaticRouteIntent, StaticRouteTombstone
 from tests.conftest import seed_device, session, start_job
-from tests.core.removal_helpers import seed_removal_job
+from tests.core.removal_helpers import seed_removal_job, seed_tomb
 from tests.core.test_static_route_put import A, B, C, D, seed_apply_job, seed_rows, wire
 
 pytestmark = pytest.mark.anyio
 
-_SR_ROOT = "static-route-reconciler:static-route-config"
+#: The one service every family now writes: ``list device-intent[device]``.
+_SR_ROOT = "device-intent:device-intent"
+#: The container the static-route family occupies inside that instance.
+_SR_CONTAINER = "static-route"
 _NOW = datetime(2026, 6, 1, tzinfo=UTC)
 
 
@@ -64,6 +68,10 @@ class SrFake:
         self.section_status = section_status
         self.dry_run_status = dry_run_status
         self.calls: list[dict] = []
+        self.reads: list[dict] = []
+        self.instance = {"device": device_name}
+        self.put_outcome = "success"
+        self.reject_containers: set[str] = set()
 
     # ── reads ──
     def state(self):
@@ -73,7 +81,8 @@ class SrFake:
             return ServiceInstanceState("inconclusive", None)
         if self.service_status == "absent" or self.service is None:
             return ServiceInstanceState("absent", None)
-        return ServiceInstanceState("present", {"device": self.device_name, "route": [dict(e) for e in self.service]})
+        entry = {**deepcopy(self.instance), _SR_CONTAINER: {"route": deepcopy(self.service)}}
+        return ServiceInstanceState("present", entry)
 
     def section(self) -> dict:
         if self.section_status != "ok":
@@ -85,8 +94,19 @@ class SrFake:
         body = json.loads(content) if content else None
         dry = "dry-run=" in url
         no_net = "no-networking" in url
-        self.calls.append({"method": method, "url": url, "body": body, "dry_run": dry, "no_networking": no_net})
         request = httpx.Request(method.upper(), url)
+        if method == "get":
+            state = (
+                self.state()
+                if request.url.path == f"/restconf/data/device-intent:device-intent={self.device_name}"
+                else None
+            )
+            self.reads.append({"url": url, "state": deepcopy(state)})
+            if state is None or state.status == "absent":
+                return httpx.Response(404, request=request, json={})
+            payload = {_SR_ROOT: [state.entry]} if state.status == "present" else {}
+            return httpx.Response(200, request=request, json=payload)
+        self.calls.append({"method": method, "url": url, "body": body, "dry_run": dry, "no_networking": no_net})
         if dry:
             if self.dry_run_status != 200:
                 return httpx.Response(self.dry_run_status, request=request, json={"errors": "boom"})
@@ -96,7 +116,12 @@ class SrFake:
                 json={"dry-run-result": {"native": {"device": [{"name": self.device_name, "data": ""}]}}},
             )
         if body and _SR_ROOT in body:
-            routes = [dict(e) for e in (body[_SR_ROOT][0].get("route") or [])]
+            if self.put_outcome == "reject" or self.reject_containers.intersection(body[_SR_ROOT][0]):
+                return httpx.Response(400, request=request, json={"errors": "commit rejected"})
+            if self.put_outcome == "lost_before_commit":
+                raise httpx.ReadError("response lost before commit", request=request)
+            self.instance = deepcopy(body[_SR_ROOT][0])
+            routes = [dict(e) for e in ((body[_SR_ROOT][0].get(_SR_CONTAINER) or {}).get("route") or [])]
             owned = {key_of(e) for e in (self.service or [])}
             new = {key_of(e) for e in routes}
             if not no_net:
@@ -108,6 +133,8 @@ class SrFake:
                 self.device = list(by_key.values())
             self.service = routes
             self.service_status = "present"
+            if self.put_outcome == "lost_after_commit":
+                raise httpx.ReadError("response lost after commit", request=request)
         return httpx.Response(204, request=request, text="")
 
     # ── views ──
@@ -116,7 +143,11 @@ class SrFake:
         return [c for c in self.calls if not c["dry_run"] and c["body"] and _SR_ROOT in c["body"]]
 
     def sent_routes(self, index: int = -1) -> list[dict]:
-        return self.writes[index]["body"][_SR_ROOT][0]["route"]
+        return (self.writes[index]["body"][_SR_ROOT][0].get(_SR_CONTAINER) or {}).get("route") or []
+
+    def sent_containers(self, index: int = -1) -> set[str]:
+        """Every family the transmitted document carried — omission is retraction now."""
+        return set(self.writes[index]["body"][_SR_ROOT][0]) - {"device"}
 
     def sent_keys(self, index: int = -1) -> set[tuple[str, str, str]]:
         return {key_of(e) for e in self.sent_routes(index)}
@@ -153,7 +184,11 @@ def sr_client(fake: SrFake):
     cm = client._client.return_value
     cm.__aenter__.return_value = http
     cm.__aexit__.return_value = False
-    client.service_instance_state = AsyncMock(side_effect=lambda _path, _device: fake.state())
+
+    async def _service_state(device):
+        return await NsoClient.service_instance_state(client, device)
+
+    client.service_instance_state = AsyncMock(side_effect=_service_state)
     # Deliberately clean-looking: a path that wrongly falls back to the UNCERTIFIED reader is
     # caught by the assertions rather than hidden by it.
     client.get_service_config = AsyncMock(return_value=None)
@@ -164,32 +199,6 @@ def sr_client(fake: SrFake):
 
 
 # ── seeding / running ────────────────────────────────────────────────────────
-
-
-async def seed_tomb(
-    device_id: int,
-    triple,
-    *,
-    job_id: int | None = None,
-    route_id: int = 99,
-    deployed_key=None,
-    marking: str = "delete_origin",
-) -> int:
-    vrf, prefix, next_hop = triple
-    async with session() as db:
-        tomb = StaticRouteTombstone(
-            device_id=device_id,
-            route_id=route_id,
-            vrf=vrf,
-            prefix=prefix,
-            next_hop=next_hop,
-            deployed_key=deployed_key,
-            marking=marking,
-            job_id=job_id,
-        )
-        db.add(tomb)
-        await db.commit()
-        return tomb.id
 
 
 async def run_removal_job(device_id: int, job_id: int, client, *, reg=None, sync_from=None) -> Job:
@@ -273,47 +282,118 @@ async def deployed(device_id: int) -> dict[tuple, list | None]:
         return {(r.vrf, r.prefix, r.next_hop): r.deployed_key for r in rows}
 
 
-# ── C4.1/C4.2 — the body is live-relative, never store-assertive ─────────────
+async def synthetic_section(device_id: int, *, authorized_keys) -> dict:
+    """A complete static-route section for a hand-built generation.
+
+    Built on the device's OWN authorized fragment rather than an empty one: the sender
+    transmits every document whole, so a section carrying only an operation plane would both
+    fail to hydrate its apply plan and omit the rows the device still owns.
+    """
+    from nso_adapter.store.models import DeviceProjectionStream
+
+    async with session() as db:
+        row = await db.scalar(
+            select(DeviceProjectionStream).where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == "static_route",
+            )
+        )
+        fragment = dict(row.authorized_document)
+    execution = dict(fragment["_execution"])
+    execution["operation"] = {
+        "pending_clear_ids": [],
+        "tombstone_ids": [],
+        "removal": {
+            "authorized_removal_keys": [list(key) for key in authorized_keys],
+            "claimed_keys": [],
+            "tombstone_ids": [],
+            "candidate_clears": [],
+            "reclaimed_keys": [],
+        },
+    }
+    return {**fragment, "_execution": execution}
 
 
-async def test_c4_1_body_is_the_live_service_minus_the_authorized_key(adapter_client):
-    """C4.1 — a store-assertive body would carry the EDITED row's new triple and drop B/C.
+async def seed_owned(device_id: int, triples, *, first_route_id: int = 40) -> None:
+    """Own the live entries the document must keep re-asserting.
 
-    Forbidden: the edited row's new triple in the body. Discriminating: the body is exactly
-    the live service minus ``A``, with ``B`` and ``C`` verbatim — including the leaf the store
-    has no column for.
+    The aggregate instance holds exactly what the adapter's own documents put there, so a
+    live entry with no row behind it is collateral: the device-wide guard blocks a body that
+    would drop it. Every case wanting a surviving sibling therefore owns it in the store,
+    which is what a real device looks like.
+    """
+    await seed_rows(
+        device_id,
+        [{"triple": triple, "route_id": first_route_id + index} for index, triple in enumerate(triples)],
+    )
+
+
+# ── C4.1/C4.2 — the body is the DOCUMENT, never the live service ─────────────
+
+
+async def test_c4_1_the_body_is_the_document_with_the_authorized_key_omitted(adapter_client):
+    """C4.1 — removal is by OMISSION from the document the generation froze.
+
+    The old live-relative body was ``current - authorized`` and preserved whatever the
+    service happened to hold. One document replaces the whole family, so what survives is
+    what the document RENDERS: the authorized key is simply not in it, and the siblings are
+    re-asserted at their authorized values rather than copied off the wire.
     """
     device_id = await seed_device(nso_device_name="sr-c41", netbox_device_id=7401)
-    # An unrelated EDITED row: its store triple is D, and it was last deployed as B.
-    await seed_rows(device_id, [{"triple": D, "route_id": 2, "deployed_key": list(B)}])
-    fake = SrFake(
-        "sr-c41",
-        service=[wire(A), wire(B, **{"nso-only-leaf": "keep"}), wire(C, metric=7)],
-    )
-    job_id = await seed_removal_job(device_id, {"removed": {"route": [list(A)]}})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    await seed_owned(device_id, [B, C])
+    fake = SrFake("sr-c41", service=[wire(A), wire(B), wire(C)])
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {"removed": {"route": [list(A)]}}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
     assert job.status == JobStatus.succeeded
-    assert fake.sent_keys() == {B, C}, "the body must be the live service minus A"
-    assert D not in fake.sent_keys(), "an unrelated edited row's new triple must not be forward-deployed"
-    sent = {key_of(e): e for e in fake.sent_routes()}
-    assert sent[B] == wire(B, **{"nso-only-leaf": "keep"})
-    assert sent[C] == wire(C, metric=7)
+    assert fake.sent_keys() == {B, C}, "the body is the document, minus the key it authorized"
+    assert fake.device_keys == {B, C}
+    assert fake.sent_containers() == {"static-route"}, "one document, and it carries the family it owns"
 
 
-async def test_c4_2_a_never_applied_accepted_row_is_not_in_the_body(adapter_client):
-    """C4.2 — a removal must not deploy intent that no apply has ever pushed."""
+async def test_c4_1b_a_live_key_no_row_renders_and_no_carrier_claims_blocks(adapter_client):
+    """The live-relative body preserved an unowned entry silently; the guard now asks.
+
+    An entry that is neither rendered, retained nor operation-selected is BROWNFIELD, and
+    omitting it from a full-document PUT would retract it. That is the collateral the guard
+    exists for, reported scope-qualified because the guard is device-wide.
+    """
+    device_id = await seed_device(nso_device_name="sr-c41b", netbox_device_id=74011)
+    await seed_owned(device_id, [B])
+    fake = SrFake("sr-c41b", service=[wire(A), wire(B), wire(C)])
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {"removed": {"route": [list(A)]}}, tombs=(tomb,))
+
+    job = await run_removal_job(device_id, job_id, sr_client(fake))
+
+    assert job.status == JobStatus.failed
+    assert job.error["code"] == "removal_blocked_collateral"
+    assert job.error["detail"]["orphans"] == {"static_route/route": [list(C)]}
+    assert fake.writes == [], "a blocked write commits nothing"
+    assert await tombstone_ids(device_id) == [tomb], "and consumes nothing"
+
+
+async def test_c4_2_a_store_only_row_is_absent_from_the_document(adapter_client):
+    """C4.2 — a removal must not deploy intent no authorization ever promoted.
+
+    The document is the authorized state, so a row written after the freeze is invisible to
+    it. Under the old live-relative body the same protection came from never rendering the
+    store at all; now it comes from rendering the DOCUMENT.
+    """
     device_id = await seed_device(nso_device_name="sr-c42", netbox_device_id=7402)
-    await seed_rows(device_id, [{"triple": D, "route_id": 2, "deployed_key": None}])
+    await seed_owned(device_id, [B])
     fake = SrFake("sr-c42", service=[wire(A), wire(B)])
-    job_id = await seed_removal_job(device_id, {"removed": {"route": [list(A)]}})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {"removed": {"route": [list(A)]}}, tombs=(tomb,))
+    # Store-only: written after the fragment was frozen, so nothing authorized it.
+    await seed_rows(device_id, [{"triple": D, "route_id": 2, "deployed_key": None}])
 
     await run_removal_job(device_id, job_id, sr_client(fake))
 
     assert fake.sent_keys() == {B}
+    assert D not in fake.sent_keys(), "an unauthorized store row must not ride a removal"
 
 
 # ── C4.3/C4.4/C4.5 — X6: authorized = {triple} ∪ {deployed_key} ──────────────
@@ -322,9 +402,10 @@ async def test_c4_2_a_never_applied_accepted_row_is_not_in_the_body(adapter_clie
 async def test_c4_3_delete_origin_drops_both_the_triple_and_the_predecessor(adapter_client):
     """C4.3 — authorizing only the triple leaves the predecessor entry service-owned forever."""
     device_id = await seed_device(nso_device_name="sr-c43", netbox_device_id=7403)
+    await seed_owned(device_id, [C])
     fake = SrFake("sr-c43", service=[wire(A), wire(B), wire(C)])
-    job_id = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, B, job_id=job_id, route_id=1, deployed_key=list(A))
+    tomb = await seed_tomb(device_id, B, route_id=1, deployed_key=list(A))
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -337,9 +418,10 @@ async def test_c4_3_delete_origin_drops_both_the_triple_and_the_predecessor(adap
 async def test_c4_4_detach_drops_and_proves_both_markings(adapter_client):
     """C4.4 — a detach un-owns the row's triple AND its ``deployed_key``, and proves both gone."""
     device_id = await seed_device(nso_device_name="sr-c44", netbox_device_id=7404)
+    await seed_owned(device_id, [C])
     fake = SrFake("sr-c44", service=[wire(A), wire(B), wire(C)])
-    job_id = await seed_removal_job(device_id, {"detach": True})
-    await seed_tomb(device_id, B, job_id=job_id, route_id=1, deployed_key=list(A), marking="detach")
+    tomb = await seed_tomb(device_id, B, route_id=1, deployed_key=list(A), marking="detach")
+    job_id = await seed_removal_job(device_id, {"detach": True}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -354,9 +436,10 @@ async def test_c4_4_detach_drops_and_proves_both_markings(adapter_client):
 async def test_c4_5_detach_with_a_null_deployed_key_still_drops_the_triple(adapter_client):
     """C4.5 — authorizing only ``deployed_key`` would make a NULL one un-own nothing at all."""
     device_id = await seed_device(nso_device_name="sr-c45", netbox_device_id=7405)
+    await seed_owned(device_id, [B])
     fake = SrFake("sr-c45", service=[wire(A), wire(B)])
-    job_id = await seed_removal_job(device_id, {"detach": True})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1, deployed_key=None, marking="detach")
+    tomb = await seed_tomb(device_id, A, route_id=1, deployed_key=None, marking="detach")
+    job_id = await seed_removal_job(device_id, {"detach": True}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -370,26 +453,36 @@ async def test_c4_5_detach_with_a_null_deployed_key_still_drops_the_triple(adapt
 
 @pytest.mark.parametrize("shape", ["triple", "deployed_key"])
 async def test_c4_6_a_reclaimed_key_is_not_dropped(adapter_client, shape):
-    """C4.6 — another route claims ``A``; deleting it would retract a live route's config."""
+    """C4.6 — a live row RENDERING ``A`` reclaims it; deleting it would retract live config.
+
+    Supersession is by a rendered key only (#1683). A row that merely names ``A`` as its
+    ``deployed_key`` has moved on to ``D`` and asserts ``A`` nowhere, so ``A`` is stale
+    service state this deletion still owes: the old conflation consumed the carrier with
+    ``A`` left on the service and nothing to own its cleanup.
+    """
     from structlog.testing import capture_logs
 
+    rendered = shape == "triple"
     device_id = await seed_device(nso_device_name=f"sr-c46-{shape}", netbox_device_id=7406 + len(shape))
-    spec = {"triple": A, "route_id": 2} if shape == "triple" else {"triple": D, "route_id": 2, "deployed_key": list(A)}
+    spec = {"triple": A, "route_id": 2} if rendered else {"triple": D, "route_id": 2, "deployed_key": list(A)}
     await seed_rows(device_id, [spec])
     fake = SrFake(f"sr-c46-{shape}", service=[wire(A), wire(B)])
-    job_id = await seed_removal_job(device_id, {})
-    # Two authorized keys, so the PUT still runs and the reclaimed one is visibly preserved.
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
-    await seed_tomb(device_id, B, job_id=job_id, route_id=3)
+    # Two authorized keys, so the PUT still runs and a reclaimed one is visibly preserved.
+    tomb_a = await seed_tomb(device_id, A, route_id=1)
+    tomb_b = await seed_tomb(device_id, B, route_id=3)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb_a, tomb_b))
 
     with capture_logs() as logs:
         job = await run_removal_job(device_id, job_id, sr_client(fake))
 
     assert job.status == JobStatus.succeeded
-    assert fake.sent_keys() == {A}, "A is claimed by a live row — it is no longer this deletion's to drop"
-    assert fake.device_keys == {A}
+    # The body is the document: the rendering row survives, and the authorized keys are the
+    # ones it does not render. A deployed-only claim is authority, never supersession.
+    expected = {A} if rendered else {D}
+    assert fake.sent_keys() == expected
+    assert fake.device_keys == expected
     warnings = [log for log in logs if log["event"] == "static_route.removal_key_reclaimed"]
-    assert len(warnings) == 1
+    assert len(warnings) == int(rendered)
 
 
 async def test_c4_7_a_fully_superseded_removal_issues_no_http_at_all(adapter_client):
@@ -398,8 +491,8 @@ async def test_c4_7_a_fully_superseded_removal_issues_no_http_at_all(adapter_cli
     await seed_rows(device_id, [{"triple": A, "route_id": 2}])
     fake = SrFake("sr-c47", service=[wire(A), wire(B)])
     client = sr_client(fake)
-    job_id = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, client)
 
@@ -417,12 +510,12 @@ async def test_c4_8_service_absent_still_runs_the_proof(adapter_client):
     """C4.8 — ``absent`` proves the SERVICE has no instance, never that the device is clean."""
     device_id = await seed_device(nso_device_name="sr-c48", netbox_device_id=7408)
     fake = SrFake("sr-c48", service=None, device=[wire(A)])
-    job_id = await seed_removal_job(device_id, {})
-    tomb = await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
-    assert fake.writes == [], "no service instance, nothing to PUT"
+    assert len(fake.writes) == 1, "certified absence does not suppress the document"
     assert job.result["residue_check"] == "found"
     assert job.status == JobStatus.failed
     assert await tombstone_ids(device_id) == [tomb], "consuming here strands the route permanently"
@@ -433,9 +526,10 @@ async def test_c4_9_residue_found_fails_the_job_and_the_next_sweep_reissues(adap
     from nso_adapter.core.tombstone_sweep import sweep_tombstones
 
     device_id = await seed_device(nso_device_name="sr-c49", netbox_device_id=7409)
+    await seed_owned(device_id, [B])
     fake = SrFake("sr-c49", service=[wire(A), wire(B)])
-    job_id = await seed_removal_job(device_id, {})
-    tomb = await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
     # The device keeps A after the commit — FASTMAP held an entry carrying a foreign leaf.
     client = sr_client(fake)
     original = fake.section
@@ -463,12 +557,12 @@ async def test_c4_10_detach_whose_service_still_holds_the_key_fails(adapter_clie
     """C4.10 — the un-own did not happen; succeeding would throw away the only record of it."""
     device_id = await seed_device(nso_device_name="sr-c410", netbox_device_id=7410)
     fake = SrFake("sr-c410", service=[wire(A), wire(B)])
-    job_id = await seed_removal_job(device_id, {"detach": True})
-    tomb = await seed_tomb(device_id, A, job_id=job_id, route_id=1, marking="detach")
+    tomb = await seed_tomb(device_id, A, route_id=1, marking="detach")
+    job_id = await seed_removal_job(device_id, {"detach": True}, tombs=(tomb,))
     client = sr_client(fake)
     # The post-commit read still shows A: the service did not really drop it.
     fake.state = lambda: __import__("nso_adapter.nso.client", fromlist=["ServiceInstanceState"]).ServiceInstanceState(
-        "present", {"device": "sr-c410", "route": [wire(A), wire(B)]}
+        "present", {"device": "sr-c410", _SR_CONTAINER: {"route": [wire(A), wire(B)]}}
     )
 
     job = await run_removal_job(device_id, job_id, client)
@@ -482,8 +576,8 @@ async def test_c4_11_detach_whose_sync_from_never_lands_fails(adapter_client):
     """C4.11 — G11's unconditional success is gone: CDB keeps the reverse diff, so it is unproven."""
     device_id = await seed_device(nso_device_name="sr-c411", netbox_device_id=7411)
     fake = SrFake("sr-c411", service=[wire(A), wire(B)])
-    job_id = await seed_removal_job(device_id, {"detach": True})
-    tomb = await seed_tomb(device_id, A, job_id=job_id, route_id=1, marking="detach")
+    tomb = await seed_tomb(device_id, A, route_id=1, marking="detach")
+    job_id = await seed_removal_job(device_id, {"detach": True}, tombs=(tomb,))
 
     job = await run_removal_job(
         device_id, job_id, sr_client(fake), sync_from=AsyncMock(side_effect=RuntimeError("read eof"))
@@ -506,9 +600,10 @@ async def test_c4_12_consumption_and_status_are_one_transaction(adapter_client):
     from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimOutcome
 
     device_id = await seed_device(nso_device_name="sr-c412", netbox_device_id=7412)
+    await seed_owned(device_id, [B])
     fake = SrFake("sr-c412", service=[wire(A), wire(B)])
-    job_id = await seed_removal_job(device_id, {})
-    tomb = await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     async def _unknown(db):
         await db.rollback()
@@ -529,9 +624,10 @@ async def test_c4_12_consumption_and_status_are_one_transaction(adapter_client):
 async def test_c4_13_a_tombstone_written_during_the_call_survives(adapter_client):
     """C4.13 — only the SNAPSHOTTED ids die; nothing has proven anything about a newer one."""
     device_id = await seed_device(nso_device_name="sr-c413", netbox_device_id=7413)
+    await seed_owned(device_id, [B])
     fake = SrFake("sr-c413", service=[wire(A), wire(B)])
-    job_id = await seed_removal_job(device_id, {})
-    owned = await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    owned = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(owned,))
     client = sr_client(fake)
     late: dict[str, int] = {}
 
@@ -582,56 +678,53 @@ async def test_c4_15_a_pure_clear_deletes_only_the_named_leaf(adapter_client):
     ids = await seed_rows(
         device_id,
         [
-            # X: metric cleared in the store, tag co-edited to 200 (still live as 100).
+            # X: metric cleared in the store, tag 100 authorized alongside it.
             {"triple": A, "route_id": 1, "pending_clear": {"authorized": ["metric"], "store_only": []}},
-            {"triple": B, "route_id": 2},  # Y — unrelated, edited
-            # Z — replacement open AND cleared: waits for the Apply PUT.
-            {
-                "triple": C,
-                "route_id": 3,
-                "deployed_key": list(D),
-                "pending_clear": {"authorized": ["metric"], "store_only": []},
-            },
+            {"triple": B, "route_id": 2},  # Y — unrelated
         ],
     )
     async with session() as db:
         row = await db.get(StaticRouteIntent, ids[A])
+        row.tag = 100
+        await db.commit()
+    fake = SrFake("sr-c415", service=[wire(A, metric=10, tag=100), wire(B)])
+    job_id = await seed_removal_job(device_id, {})
+    # Store-only, written after the freeze: the co-edited tag no authorization promoted.
+    async with session() as db:
+        row = await db.get(StaticRouteIntent, ids[A])
         row.tag = 200
         await db.commit()
-    fake = SrFake(
-        "sr-c415",
-        service=[wire(A, metric=10, tag=100), wire(B, metric=5), wire(D, metric=1)],
-    )
-    job_id = await seed_removal_job(device_id, {})
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
     assert job.status == JobStatus.succeeded
     sent = {key_of(e): e for e in fake.sent_routes()}
-    assert sent[A] == wire(A, tag=100), "only metric is deleted — the live tag 100 survives"
-    assert sent[B] == wire(B, metric=5), "an unrelated row is carried verbatim, never re-rendered"
-    assert sent[D] == wire(D, metric=1), "a replacement-open row's live entry is untouched"
-    assert C not in sent, "a removal must never deploy a replacement-open row's new identity"
+    assert sent[A] == wire(A, tag=100), "the cleared metric is gone and the AUTHORIZED tag stands"
+    assert sent[A].get("tag") != 200, "a store-only co-edit must never ride a removal"
+    assert sent[B] == wire(B)
     assert (await carriers(device_id))[A] is None, "X's carrier is consumed by per-field evidence"
-    assert (await carriers(device_id))[C] == {"authorized": ["metric"], "store_only": []}, "Z waits for the PUT"
 
 
-async def test_c4_16_a_mixed_delete_origin_and_clear_delivers_both(adapter_client):
+@pytest.mark.parametrize("service_absent", [False, True])
+async def test_c4_16_a_mixed_delete_origin_and_clear_delivers_both(adapter_client, service_absent):
     """C4.16 — one PUT: ``A`` gone AND ``B``'s cleared leaf gone, every other ``B`` leaf live."""
     device_id = await seed_device(nso_device_name="sr-c416", netbox_device_id=7416)
     await seed_rows(
         device_id, [{"triple": B, "route_id": 2, "pending_clear": {"authorized": ["metric"], "store_only": []}}]
     )
-    fake = SrFake("sr-c416", service=[wire(A), wire(B, metric=10, tag=7)])
-    job_id = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    fake = SrFake("sr-c416", service=None if service_absent else [wire(A), wire(B, metric=10, tag=7)])
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
     assert job.status == JobStatus.succeeded
     assert len(fake.writes) == 1, "one push, not two"
     assert fake.sent_keys() == {B}
-    assert fake.sent_routes()[0] == wire(B, tag=7)
+    # The document renders B from its authorized row, so the cleared metric is simply not in
+    # it. The live `tag` is not re-asserted either: a full-document PUT carries the state the
+    # store owns, and the store has no opinion on that leaf.
+    assert fake.sent_routes()[0] == wire(B)
     assert await tombstone_ids(device_id) == []
     assert (await carriers(device_id))[B] is None
 
@@ -649,7 +742,7 @@ async def test_c4_17_the_same_mixed_push_with_the_fence_shut(adapter_client):
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
     assert job.status == JobStatus.succeeded
-    assert fake.sent_routes() == [wire(B, tag=7)]
+    assert fake.sent_routes() == [wire(B)], "the document's row, with the cleared leaf absent"
     assert fake.device_keys == {B}
     assert (await carriers(device_id))[B] is None
 
@@ -658,21 +751,28 @@ async def test_c4_17_the_same_mixed_push_with_the_fence_shut(adapter_client):
 
 
 async def test_c4_18_a_clear_riding_a_detach_is_deferred_not_delivered(adapter_client):
-    """C4.18 — a ``no-networking`` PUT can never deliver a clear; it must not try, or lose it."""
+    """C4.18 — a ``no-networking`` PUT can never deliver a clear, so the carrier must survive it.
+
+    The body is the document either way, and the document's row already carries no metric.
+    What makes the clear undelivered is the COMMIT, not the bytes: ``no-networking`` reaches
+    CDB and never the device, so consuming the carrier here would lose the only record that
+    the leaf is still live on the router.
+    """
     device_id = await seed_device(nso_device_name="sr-c418", netbox_device_id=7418)
     await seed_rows(
         device_id, [{"triple": B, "route_id": 2, "pending_clear": {"authorized": ["metric"], "store_only": []}}]
     )
     fake = SrFake("sr-c418", service=[wire(A), wire(B, metric=10)])
-    job_id = await seed_removal_job(device_id, {"detach": True})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1, marking="detach")
+    tomb = await seed_tomb(device_id, A, route_id=1, marking="detach")
+    job_id = await seed_removal_job(device_id, {"detach": True}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
     assert job.status == JobStatus.succeeded
     assert fake.writes[-1]["no_networking"] is True
-    assert fake.sent_routes() == [wire(B, metric=10)], "the detach body leaves the cleared leaf alone"
-    assert (await carriers(device_id))[B] == {"authorized": ["metric"], "store_only": []}
+    assert (await carriers(device_id))[B] == {"authorized": ["metric"], "store_only": []}, (
+        "a no-networking commit delivers nothing, so the clear is still owed"
+    )
 
     # A later networked retract — the job §4.11's retry path enqueues — delivers it.
     follow = await seed_removal_job(device_id, {})
@@ -695,8 +795,8 @@ async def test_c4_18b_a_sweeper_reissued_job_rederives_the_clear(adapter_client)
         device_id, [{"triple": B, "route_id": 2, "pending_clear": {"authorized": ["metric"], "store_only": []}}]
     )
     fake = SrFake("sr-c418b", service=[wire(A), wire(B, metric=10)])
-    failed = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, A, job_id=failed, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    failed = await seed_removal_job(device_id, {}, tombs=(tomb,))
     async with session() as db:
         job = await db.get(Job, failed)
         job.status = JobStatus.failed
@@ -728,10 +828,16 @@ async def test_c4_18b_a_sweeper_reissued_job_rederives_the_clear(adapter_client)
 # ── C4.19/C4.20/C4.21 — fence-shut and crash-retry shapes ───────────────────
 
 
-async def test_c4_19_fence_shut_removal_is_live_relative(adapter_client):
-    """C4.19 — R1 BLOCKED on ``C``; R2 retains it and drops only what was authorized."""
+async def test_c4_19_a_fence_shut_removal_drops_only_what_it_authorized(adapter_client):
+    """C4.19 — with the fence shut there is no tombstone, so the authority is the context.
+
+    R1 blocked on the unrelated ``C``. R2 preserved it by copying the live service. C9 does
+    neither: the document renders what the device owns, ``A`` is omitted under the context's
+    authority, and an entry belonging to nobody is the guard's question, not a silent copy.
+    """
     device_id = await seed_device(nso_device_name="sr-c419", netbox_device_id=7420)
     await seed_rows(device_id, [{"triple": B, "route_id": None}])
+    await seed_owned(device_id, [C])
     fake = SrFake("sr-c419", service=[wire(A), wire(B), wire(C, metric=3)])
     job_id = await seed_removal_job(device_id, {"removed": {"route": [list(A)]}})
 
@@ -739,15 +845,16 @@ async def test_c4_19_fence_shut_removal_is_live_relative(adapter_client):
 
     assert job.status == JobStatus.succeeded
     assert fake.sent_keys() == {B, C}
-    assert job.result["retained_orphans"] == [list(C)], "C is retained, and named as an orphan"
+    assert fake.device_keys == {B, C}, "only the authorized key left the device"
 
 
 async def test_c4_20_a_requeued_delete_origin_whose_put_already_landed(adapter_client):
     """C4.20 — the key is already gone; the retry must be a no-op PUT, not a second failure."""
     device_id = await seed_device(nso_device_name="sr-c420", netbox_device_id=7421)
+    await seed_owned(device_id, [B])
     fake = SrFake("sr-c420", service=[wire(B)], device=[wire(B)])
-    job_id = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -761,12 +868,13 @@ async def test_c4_21_a_requeued_detach_whose_put_removed_the_instance(adapter_cl
     """C4.21 — demanding a literal 2xx makes this retry permanently unprovable, forever re-swept."""
     device_id = await seed_device(nso_device_name="sr-c421", netbox_device_id=7422)
     fake = SrFake("sr-c421", service=None, device=[wire(A)])
-    job_id = await seed_removal_job(device_id, {"detach": True})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1, marking="detach")
+    tomb = await seed_tomb(device_id, A, route_id=1, marking="detach")
+    job_id = await seed_removal_job(device_id, {"detach": True}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
-    assert fake.writes == [], "no instance to PUT"
+    assert len(fake.writes) == 1
+    assert fake.writes[0]["no_networking"]
     assert job.status == JobStatus.succeeded
     assert await tombstone_ids(device_id) == []
     assert fake.device_keys == {A}, "the device keeps it — that is what a detach means"
@@ -795,8 +903,8 @@ async def test_c4_24_apply_and_removal_interleaving_literal_vector(adapter_clien
         ],
     )
     fake = SrFake(f"sr-c424-{tag}", service=[wire(A, metric=10), wire(B), wire(C)])
-    removal_id = await seed_removal_job(device_id, {"detach": True} if marking == "detach" else {})
-    await seed_tomb(device_id, A, job_id=removal_id, route_id=1, marking=marking)
+    tomb = await seed_tomb(device_id, A, route_id=1, marking=marking)
+    removal_id = await seed_removal_job(device_id, {"detach": True} if marking == "detach" else {}, tombs=(tomb,))
 
     if order == "removal_first":
         removal = await run_removal_job(device_id, removal_id, sr_client(fake))
@@ -820,16 +928,16 @@ async def test_c4_24_apply_and_removal_interleaving_literal_vector(adapter_clien
 # ── C4.25 — every clear is re-validated at execution ────────────────────────
 
 
-@pytest.mark.parametrize("case", ["reset", "deleted", "moved", "reclaimed", "unchanged"])
+@pytest.mark.parametrize("case", ["reset", "reclaimed", "unchanged"])
 async def test_c4_25_a_queued_clear_is_revalidated_under_the_claim(adapter_client, case):
-    """C4.25 — a snapshot of the clear would re-break a re-set value or edit another route."""
+    """C4.25 — a snapshot of the clear would re-break a re-set value or edit another route.
+
+    The revalidation is the document's: the body renders the row the authorization froze, so
+    a carrier naming a field that row no longer clears delivers nothing and is retained.
+    """
     device_id = await seed_device(nso_device_name=f"sr-c425-{case}", netbox_device_id=7800 + len(case))
     carrier = {"authorized": ["metric"], "store_only": []}
-    if case == "deleted":
-        rows: list[dict] = []
-    elif case == "moved":
-        rows = [{"triple": D, "route_id": 2, "pending_clear": carrier}]
-    elif case == "reclaimed":
+    if case == "reclaimed":
         rows = [{"triple": D, "route_id": 2, "pending_clear": carrier}, {"triple": A, "route_id": 4}]
     else:
         rows = [{"triple": A, "route_id": 2, "pending_clear": carrier}]
@@ -841,8 +949,8 @@ async def test_c4_25_a_queued_clear_is_revalidated_under_the_claim(adapter_clien
             await db.commit()
 
     fake = SrFake(f"sr-c425-{case}", service=[wire(A, metric=10), wire(B)])
-    job_id = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, B, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, B, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -851,8 +959,40 @@ async def test_c4_25_a_queued_clear_is_revalidated_under_the_claim(adapter_clien
     if case == "unchanged":
         assert entry == wire(A), "the valid clear is applied and its carrier consumed"
         assert (await carriers(device_id))[A] is None
+    elif case == "reset":
+        assert entry == wire(A, metric=20), "the re-set value is deployed, and the clear is discarded"
+        assert (await carriers(device_id))[A] == carrier, "an undelivered clear keeps its carrier"
     else:
-        assert entry == wire(A, metric=10), f"{case}: the queued clear must be discarded at execution"
+        # The carrier moved to D, and each row renders its OWN key: the clear reaches D's
+        # entry and can no longer be mis-applied to the route A that reclaimed the key.
+        assert entry == wire(A), "A is rendered by a row that owns no clear at all"
+        assert {key_of(e): e for e in fake.sent_routes()}[D] == wire(D)
+        assert (await carriers(device_id))[D] is None
+
+
+@pytest.mark.parametrize("case", ["deleted", "moved"])
+async def test_c4_25b_a_clear_whose_row_is_gone_leaves_an_unauthorized_omission(adapter_client, case):
+    """The two arms C4.25 can no longer express as a body: nothing renders the key at all.
+
+    Under the live-relative body the live entry was copied through untouched. One document
+    cannot do that: a key no row renders and no authority names would be RETRACTED by the
+    PUT, so the guard blocks it and the operator decides.
+    """
+    device_id = await seed_device(nso_device_name=f"sr-c425b-{case}", netbox_device_id=7810 + len(case))
+    carrier = {"authorized": ["metric"], "store_only": []}
+    rows = [] if case == "deleted" else [{"triple": D, "route_id": 2, "pending_clear": carrier}]
+    await seed_rows(device_id, rows)
+
+    fake = SrFake(f"sr-c425b-{case}", service=[wire(A, metric=10), wire(B)])
+    tomb = await seed_tomb(device_id, B, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
+
+    job = await run_removal_job(device_id, job_id, sr_client(fake))
+
+    assert job.status == JobStatus.failed
+    assert job.error["code"] == "removal_blocked_collateral"
+    assert job.error["detail"]["orphans"] == {"static_route/route": [list(A)]}
+    assert fake.writes == [], "a blocked write commits nothing"
 
 
 # ── C4.26/C4.27 — an uncertified read never becomes a PUT (A2(ii) = C2.9b) ──
@@ -872,10 +1012,8 @@ async def test_c2_9b_an_inconclusive_read_issues_no_removal_put(adapter_client, 
         service=[wire(A), wire(B)],
         service_status="inconclusive",
     )
-    job_id = await seed_removal_job(device_id, {"detach": True} if branch == "detach" else {})
-    tomb = await seed_tomb(
-        device_id, A, job_id=job_id, route_id=1, marking="detach" if branch == "detach" else "delete_origin"
-    )
+    tomb = await seed_tomb(device_id, A, route_id=1, marking="detach" if branch == "detach" else "delete_origin")
+    job_id = await seed_removal_job(device_id, {"detach": True} if branch == "detach" else {}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -903,20 +1041,27 @@ async def test_c3_5_c4_28_a_carrier_owning_removal_fails_on_any_inconclusive_sig
     clear_case = signal == "field_unsupported"
     if clear_case:
         await seed_rows(
-            device_id, [{"triple": B, "route_id": 2, "pending_clear": {"authorized": ["metric"], "store_only": []}}]
+            device_id,
+            [
+                {"triple": B, "route_id": 2, "pending_clear": {"authorized": ["metric"], "store_only": []}},
+                # A pure clear drops nothing, so A survives and the document must own it.
+                {"triple": A, "route_id": 3},
+            ],
         )
         section_status = "unsupported"
+    else:
+        # B survives this removal, so the document must own it: a live key no row renders is
+        # collateral the device-wide guard blocks before any proof runs.
+        await seed_owned(device_id, [B])
     fake = SrFake(
         f"sr-c35-{signal}",
         service=[wire(A), wire(B, metric=10)],
         section_status=section_status,
         dry_run_status=500 if signal == "verify_inconclusive" else 200,
     )
-    job_id = await seed_removal_job(device_id, {})
-    tomb = None if clear_case else await seed_tomb(device_id, A, job_id=job_id, route_id=1)
-    if clear_case:
-        # A pure-clear job owns a carrier too — the pending_clear entry itself.
-        pass
+    # A pure-clear job owns a carrier too — the pending_clear entry itself.
+    tomb = None if clear_case else await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=() if clear_case else (tomb,))
 
     ctx = patch("nso_adapter.nso.apply.VERIFY_AFTER_APPLY", False) if signal == "verify_disabled" else None
     if ctx is None:
@@ -965,19 +1110,7 @@ async def test_any_carried_static_route_generation_makes_unproven_removal_fail(a
         for seq, stream_revisions in ((base + 1, {"vlan": 1}), (base + 2, {"static_route": 1})):
             document = {}
             if "static_route" in stream_revisions:
-                document = {
-                    "static_route": {
-                        "_execution": {
-                            "removal": {
-                                "authorized_removal_keys": [list(A)],
-                                "claimed_keys": [],
-                                "tombstone_ids": [],
-                                "candidate_clears": [],
-                                "reclaimed_keys": [],
-                            }
-                        }
-                    }
-                }
+                document = {"static_route": await synthetic_section(device_id, authorized_keys=[A])}
             db.add(
                 DeploymentGeneration(
                     device_id=device_id,
@@ -1014,19 +1147,7 @@ async def test_non_static_generation_does_not_make_carrierless_removal_fail(adap
         base = await db.scalar(
             select(func.max(DeploymentGeneration.seq)).where(DeploymentGeneration.device_id == device_id)
         )
-        document = {
-            "static_route": {
-                "_execution": {
-                    "removal": {
-                        "authorized_removal_keys": [list(A)],
-                        "claimed_keys": [],
-                        "tombstone_ids": [],
-                        "candidate_clears": [],
-                        "reclaimed_keys": [],
-                    }
-                }
-            }
-        }
+        document = {"static_route": await synthetic_section(device_id, authorized_keys=[A])}
         db.add(
             DeploymentGeneration(
                 device_id=device_id,
@@ -1090,9 +1211,10 @@ async def test_c4_29_a_revoked_claim_stops_a_pure_clear_terminal_commit(adapter_
 async def test_c4_29b_consuming_a_tombstone_refuses_an_unregistered_claim(adapter_client):
     """G19/§4.7 — carrier deletion is never made unguarded to keep a caller convenient."""
     device_id = await seed_device(nso_device_name="sr-c429b", netbox_device_id=7961)
+    await seed_owned(device_id, [B])
     fake = SrFake("sr-c429b", service=[wire(A), wire(B)])
-    job_id = await seed_removal_job(device_id, {})
-    tomb = await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     from nso_adapter.core.claim import ClaimRegistration
 
@@ -1111,9 +1233,10 @@ async def test_a_superseded_run_attempt_refuses_the_removal_terminal_write(adapt
     carrier this transaction consumed must roll back with it, ready for the owning execution.
     """
     device_id = await seed_device(nso_device_name="sr-attempt-fence", netbox_device_id=7962)
+    await seed_owned(device_id, [B])
     fake = SrFake("sr-attempt-fence", service=[wire(A), wire(B)])
-    job_id = await seed_removal_job(device_id, {})
-    tomb = await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     section = fake.section
 
@@ -1139,33 +1262,27 @@ async def test_a_superseded_run_attempt_refuses_the_removal_terminal_write(adapt
 # ── C4.31/C4.32 and C1.13's device half ─────────────────────────────────────
 
 
-async def test_c4_31_retained_orphans_names_exactly_the_unclaimed_keys(adapter_client):
-    """C4.31 — the guard cannot block here, so the event is the operator's only signal."""
+async def test_c4_31_a_predecessor_key_is_re_asserted_not_orphaned(adapter_client):
+    """C4.31 — a live key a row still names as its ``deployed_key`` is not collateral.
+
+    ``SR_RETAINED_ORPHANS_EVENT`` reported the keys a LIVE-RELATIVE body preserved that no
+    row claimed. There is no such body now: the document renders what it renders, and an
+    unclaimed live key is the guard's block (see ``test_c4_1b``), not a warning after a
+    successful write. What still needs pinning is that a predecessor key does NOT block:
+    the removal's authority names it, so dropping it is authorized work.
+    """
     device_id = await seed_device(nso_device_name="sr-c431", netbox_device_id=7970)
     await seed_rows(device_id, [{"triple": B, "route_id": 2}, {"triple": D, "route_id": 3, "deployed_key": list(C)}])
     fake = SrFake("sr-c431", service=[wire(A), wire(B), wire(C), wire(D)])
-    job_id = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1, deployed_key=list(C))
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
     assert job.status == JobStatus.succeeded
-    # B is a live triple, C is a live deployed_key — neither is an orphan. Nothing else is
-    # retained, so the event must not fire at all here.
-    assert "retained_orphans" not in job.result
-    assert fake.sent_keys() == {B, C, D}
-
-
-async def test_c4_31b_an_unclaimed_retained_key_is_named(adapter_client):
-    device_id = await seed_device(nso_device_name="sr-c431b", netbox_device_id=7971)
-    await seed_rows(device_id, [{"triple": B, "route_id": 2}])
-    fake = SrFake("sr-c431b", service=[wire(A), wire(B), wire(C), wire(D)])
-    job_id = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
-
-    job = await run_removal_job(device_id, job_id, sr_client(fake))
-
-    assert job.result["retained_orphans"] == [list(C), list(D)]
+    assert "retained_orphans" not in job.result, "the live-relative body's warning has no subject left"
+    assert fake.sent_keys() == {B, D}, "the document's rows, with the authorized keys omitted"
+    assert fake.device_keys == {B, D}
 
 
 @pytest.mark.parametrize(
@@ -1211,12 +1328,21 @@ async def test_c1_13_device_half_a_store_only_clear_is_invisible_to_a_removal(ad
     contract and "a removal never forward-deploys store intent".
     """
     device_id = await seed_device(nso_device_name="sr-c113", netbox_device_id=7990)
-    await seed_rows(
-        device_id, [{"triple": B, "route_id": 2, "pending_clear": {"authorized": [], "store_only": ["metric"]}}]
-    )
+    ids = await seed_rows(device_id, [{"triple": B, "route_id": 2}])
+    async with session() as db:
+        row = await db.get(StaticRouteIntent, ids[B])
+        row.metric = 10
+        await db.commit()
     fake = SrFake("sr-c113", service=[wire(A), wire(B, metric=10)])
-    job_id = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
+    # The store-only push: it clears the column and records the carrier, and it bumps NO
+    # authorized revision, so the document the removal transmits still holds metric 10.
+    async with session() as db:
+        row = await db.get(StaticRouteIntent, ids[B])
+        row.metric = None
+        row.pending_clear = {"authorized": [], "store_only": ["metric"]}
+        await db.commit()
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -1229,11 +1355,13 @@ async def test_c1_13_device_half_a_store_only_clear_is_invisible_to_a_removal(ad
 # ── A2(iii) — one authorized clear can queue TWO removals ───────────────────
 
 
-async def test_a2_iii_the_duplicate_retract_is_a_no_op_via_supersession(adapter_client):
+async def test_a2_iii_the_duplicate_retract_re_asserts_the_delivered_clear(adapter_client):
     """A2(iii) — the endpoint queues one retract and a PATCH-mode apply queues another.
 
-    The second must find nothing left to deliver and no-op through supersession: no PUT, no
-    failure, and the ``removal_superseded`` record.
+    Both jobs freeze their clear at creation, so the second still names it (#1663: a removal
+    plan is a property of the document, never re-derived from the store at execution). Its
+    body is the certified snapshot with a leaf that is already gone, so the duplicate delivers
+    the same state again and neither fails nor strands the carrier.
     """
     device_id = await seed_device(nso_device_name="sr-a2iii", netbox_device_id=7995)
     await seed_rows(
@@ -1250,32 +1378,7 @@ async def test_a2_iii_the_duplicate_retract_is_a_no_op_via_supersession(adapter_
     assert job1.status == JobStatus.succeeded
     assert (await carriers(device_id))[B] is None
     assert job2.status == JobStatus.succeeded
-    assert job2.result["superseded"] is True
-    assert len(fake.writes) == writes_after_first, "the duplicate must issue no PUT"
-
-
-# ── codex C4-F1 — a body with nothing left to deliver must not be PUT ────────
-
-
-async def test_a_clear_that_live_validation_rejects_issues_no_put(adapter_client):
-    """codex C4-F1 — the store-side clear passes, the LIVE entry is gone, nothing is authorized.
-
-    ``candidate_clears`` is what gets us past the pre-read no-op branch, but the live entry
-    for that row is absent, so the body delivers nothing. PUT-replacing the whole instance
-    anyway is a device commit with no authority behind it — and it would retract any service
-    change made between the snapshot and the write.
-    """
-    device_id = await seed_device(nso_device_name="sr-f1", netbox_device_id=7996)
-    # The row's identity moved to D; the service still holds only A and B.
-    await seed_rows(
-        device_id, [{"triple": D, "route_id": 2, "pending_clear": {"authorized": ["metric"], "store_only": []}}]
-    )
-    fake = SrFake("sr-f1", service=[wire(A), wire(B, metric=10)])
-    job_id = await seed_removal_job(device_id, {})
-
-    job = await run_removal_job(device_id, job_id, sr_client(fake))
-
-    assert fake.writes == [], "nothing authorized and nothing deliverable ⇒ no device commit"
-    assert job.status == JobStatus.succeeded
-    assert job.result["superseded"] is True
-    assert (await carriers(device_id))[D] == {"authorized": ["metric"], "store_only": []}
+    assert "superseded" not in job2.result
+    assert fake.sent_routes() == [wire(B)], "the duplicate re-asserts the already-cleared entry"
+    assert len(fake.writes) == writes_after_first + 1
+    assert (await carriers(device_id))[B] is None

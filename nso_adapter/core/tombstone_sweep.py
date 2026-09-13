@@ -91,7 +91,8 @@ async def reissue_removal_job(conn: AsyncSession, device_id: int, row: StaticRou
         device_id,
         mode=GenerationMode.detach if context["detach"] else GenerationMode.networked,
         removal_context=context,
-        allowed_removal_keys=context["removed"],
+        allowed_removal_keys={"static_route": context["removed"]},
+        static_route_tombstone_ids=(row.id,),
     )
     job = await create_dedicated_job(conn, device_id, JobType.removal, context=context)
     if not await attach_to_job(conn, generation, job):
@@ -167,6 +168,10 @@ async def sweep_one_device(device_id: int, *, db: AsyncSession | None = None) ->
                 await reissue_removal_job(conn, device_id, row)
                 created += 1
             await conn.commit()
+    except BaseException:
+        if db is not None:
+            await db.rollback()
+        raise
     finally:
         await release_claim(reg, db=db)
     if created:
@@ -176,7 +181,14 @@ async def sweep_one_device(device_id: int, *, db: AsyncSession | None = None) ->
 
 async def sweep_tombstones(*, db: AsyncSession | None = None) -> int:
     """One full pass over every device holding an uncarried deletion."""
+    from nso_adapter.core.generation import OperationSectionAbsent
+
     created = 0
     for device_id in await _devices_with_eligible_tombstones(db):
-        created += await sweep_one_device(device_id, db=db)
+        try:
+            created += await sweep_one_device(device_id, db=db)
+        except OperationSectionAbsent as exc:
+            # This ONE device has nothing authorized for the carrier to act on, which is a
+            # data condition, not a sweeper fault. Every other device still drains.
+            logger.warning("tombstone_sweep.no_authorized_section", device_id=device_id, error=str(exc))
     return created

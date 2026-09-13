@@ -6,7 +6,7 @@ Admission keys on the ENDPOINT the plugin's outbox delivered to, not on the remo
 The plugin runs one claim sequence per intent family, so two families sharing one receipt
 row would each read the other's sequences as ``stale``; and two families that HAVE a PUT but
 no removal scope — the interface-IP intent and the IS-IS flex-algo intent — could never be
-admitted at all while the vocabulary came from :data:`core.removal.VALID_REMOVAL_SCOPES`.
+admitted at all while the vocabulary came from the removal scopes.
 
 That per-endpoint lane is the ``stream``, and it is the AUTHORIZATION unit as well as the
 replay one: each stream owns an explicit set of intent tables (:mod:`core.projection`), and

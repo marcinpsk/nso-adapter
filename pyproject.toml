@@ -127,7 +127,7 @@ exclude_also = [
 line-length = 120
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "D", "C901", "I", "RET", "UP", "DTZ"]
+select = ["E", "F", "W", "D", "C901", "I", "RET", "UP", "DTZ", "ASYNC"]
 ignore = [
     "E501",
     "F403",
@@ -146,6 +146,9 @@ ignore = [
     "D203",
     "D213",
     "UP042",
+    # 24 async functions take an explicit timeout parameter by design: the worker passes
+    # bounded timeouts down its own call chain rather than reading a global.
+    "ASYNC109",
 ]
 
 [tool.ruff.lint.mccabe]

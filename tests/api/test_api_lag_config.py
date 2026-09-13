@@ -327,9 +327,10 @@ async def test_apply_lag_config_treats_empty_timer_and_system_id_as_unset(adapte
 
     from sqlalchemy import update
 
-    from nso_adapter.core.projection import hydrate_section, snapshot_stream
+    from nso_adapter.core.projection import hydrate_section
     from nso_adapter.core.switching_intent import encode_lag_section
     from nso_adapter.store.models import LagBundleIntent
+    from tests.core.projection_helpers import freeze_snapshot
 
     device_id = await seed_device(nso_device_name="lag-empty-strings", netbox_device_id=1215)
     body = {"bundles": [{"name": "Port-channel1", "lag_id": 1}], "deleted_roots": []}
@@ -364,7 +365,7 @@ async def test_apply_lag_config_treats_empty_timer_and_system_id_as_unset(adapte
     assert (row.accepted_at, row.last_apply_at) == (evidence_at, evidence_at), "an unchanged row keeps its evidence"
 
     async with session() as db:
-        document = {"lag": await snapshot_stream(db, device_id, "lag")}
+        document = {"lag": await freeze_snapshot(db, device_id, "lag")}
         await db.rollback()
     context = {"ned_id": "cisco-ios-cli-6.95", "dialect": "identity"}
     assert encode_lag_section(hydrate_section(document, "lag"), context) == {
@@ -605,6 +606,7 @@ async def test_apply_lag_accepts_the_lacp_vocabulary_the_export_emits(adapter_cl
     """A GET body must replay into apply: the export serves the raw NED string, not a fixed set."""
     from nso_adapter.core.projection import hydrate_section
     from nso_adapter.core.switching_intent import encode_lag_section
+    from tests.core.projection_helpers import freeze_tables
 
     device_id = await seed_device(nso_device_name="lag-export-vocabulary", netbox_device_id=None)
     body = {
@@ -652,7 +654,9 @@ async def test_apply_lag_accepts_the_lacp_vocabulary_the_export_emits(adapter_cl
     ]
 
     context = {"ned_id": "cisco-ios-cli-6.95", "dialect": "identity"}
-    document = {"lag": (await _stream_row(device_id)).prepared_tables}
+    async with session() as db:
+        document = {"lag": await freeze_tables(db, device_id, "lag", (await _stream_row(device_id)).prepared_tables)}
+        await db.rollback()
     assert encode_lag_section(hydrate_section(document, "lag"), context) == {
         "bundle": [
             {
@@ -680,6 +684,7 @@ async def test_apply_lag_accepts_an_lacp_leaf_at_the_column_width(adapter_client
     """The request bound equals the store column width, so the longest accepted value fits."""
     from nso_adapter.core.projection import hydrate_section
     from nso_adapter.core.switching_intent import encode_lag_section
+    from tests.core.projection_helpers import freeze_tables
 
     device_id = await seed_device(nso_device_name="lag-leaf-width", netbox_device_id=None)
     mode, timer = "m" * 16, "t" * 8
@@ -715,7 +720,9 @@ async def test_apply_lag_accepts_an_lacp_leaf_at_the_column_width(adapter_client
     assert tuple(stored) == (timer, mode)
 
     context = {"ned_id": "cisco-ios-cli-6.95", "dialect": "identity"}
-    document = {"lag": (await _stream_row(device_id)).prepared_tables}
+    async with session() as db:
+        document = {"lag": await freeze_tables(db, device_id, "lag", (await _stream_row(device_id)).prepared_tables)}
+        await db.rollback()
     assert encode_lag_section(hydrate_section(document, "lag"), context) == {
         "bundle": [
             {
@@ -752,6 +759,7 @@ async def test_apply_lag_rejects_an_lacp_leaf_past_the_column_width(adapter_clie
 async def test_apply_lag_treats_an_empty_member_mode_as_unset(adapter_client, mode):
     from nso_adapter.core.projection import hydrate_section
     from nso_adapter.core.switching_intent import encode_lag_section
+    from tests.core.projection_helpers import freeze_tables
 
     device_id = await seed_device(nso_device_name="lag-unset-mode", netbox_device_id=None)
     response = await _post_lag(
@@ -782,7 +790,9 @@ async def test_apply_lag_treats_an_empty_member_mode_as_unset(adapter_client, mo
             )
         ) is None
     context = {"ned_id": "cisco-ios-cli-6.95", "dialect": "identity"}
-    document = {"lag": (await _stream_row(device_id)).prepared_tables}
+    async with session() as db:
+        document = {"lag": await freeze_tables(db, device_id, "lag", (await _stream_row(device_id)).prepared_tables)}
+        await db.rollback()
     assert encode_lag_section(hydrate_section(document, "lag"), context) == {
         "bundle": [{"name": "Port-channel1", "lag-id": 1, "member": [{"interface-name": "Gi0/1"}]}]
     }

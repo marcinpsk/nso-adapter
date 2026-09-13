@@ -58,14 +58,44 @@ async def _backdate_both(device_id: int, job_id: int, *, seconds: float) -> None
         await db.commit()
 
 
-async def _one_tick(job_id: int, reg: ClaimRegistration | None, monkeypatch) -> None:
-    """Run exactly one heartbeat tick, without waiting the real interval."""
+@contextlib.asynccontextmanager
+async def _running_heartbeat(job_id: int, reg: ClaimRegistration | None, monkeypatch):
+    """Run the heartbeat at a short interval for the body, then cancel it."""
     monkeypatch.setattr(worker_mod, "_HEARTBEAT_INTERVAL", 0.01)
     task = asyncio.create_task(worker_mod._heartbeat(job_id, reg))
-    await asyncio.sleep(0.15)
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
+    try:
+        yield task
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def _wait_for(predicate, what: str, *, timeout: float = 10.0) -> None:
+    """Poll until the heartbeat's write is observable, rather than sleeping a fixed window.
+
+    A wall-clock sleep races the tick's DB round trip, so a loaded runner lands no tick and
+    the assertion reads back the stamp it started from.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if await predicate():
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"timed out after {timeout}s waiting for {what}")
+
+
+async def _claim_advanced(device_id: int, job_id: int, before) -> bool:
+    """True once the claim stamp is set and newer than *before* (which starts unset)."""
+    claim, _ = await _stamps(device_id, job_id)
+    return claim is not None and (before is None or claim > before)
+
+
+async def _job_advanced(device_id: int, job_id: int, before) -> bool:
+    """True once the job stamp is set and newer than *before* (which starts unset)."""
+    _, job = await _stamps(device_id, job_id)
+    return job is not None and (before is None or job > before)
 
 
 async def test_registered_tick_refreshes_both_rows(adapter_client, monkeypatch):
@@ -77,7 +107,11 @@ async def test_registered_tick_refreshes_both_rows(adapter_client, monkeypatch):
     await _backdate_both(device_id, job_id, seconds=600)
     before_claim, before_job = await _stamps(device_id, job_id)
 
-    await _one_tick(job_id, reg, monkeypatch)
+    async with _running_heartbeat(job_id, reg, monkeypatch):
+        await _wait_for(
+            lambda: _claim_advanced(device_id, job_id, before_claim),
+            "the claim heartbeat to advance",
+        )
 
     after_claim, after_job = await _stamps(device_id, job_id)
     assert after_claim > before_claim, "the claim heartbeat did not advance"
@@ -95,7 +129,10 @@ async def test_unregistered_tick_refreshes_the_job_only(adapter_client, monkeypa
     await _backdate_both(device_id, job_id, seconds=600)
     before_claim, before_job = await _stamps(device_id, job_id)
 
-    await _one_tick(job_id, ClaimRegistration(), monkeypatch)
+    async with _running_heartbeat(job_id, ClaimRegistration(), monkeypatch):
+        # Wait for a tick to land, so the claim assertion below cannot pass merely because
+        # the heartbeat never ran.
+        await _wait_for(lambda: _job_advanced(device_id, job_id, before_job), "the job heartbeat to advance")
 
     after_claim, after_job = await _stamps(device_id, job_id)
     assert after_claim == before_claim, "an unregistered run refreshed someone else's claim"
@@ -110,22 +147,24 @@ async def test_lane_switches_live_after_registration(adapter_client, monkeypatch
     job_id = await _seed_running_job(None, JobType.provision)
     reg = ClaimRegistration()
 
-    monkeypatch.setattr(worker_mod, "_HEARTBEAT_INTERVAL", 0.01)
-    task = asyncio.create_task(worker_mod._heartbeat(job_id, reg))
-    try:
-        await asyncio.sleep(0.1)  # ticks while unregistered
+    _, before_job = await _stamps(device_id, job_id)
+
+    async with _running_heartbeat(job_id, reg, monkeypatch):
+        # Prove it really ticked on the unregistered lane before registering, so the lane
+        # switch below is what the second wait observes.
+        await _wait_for(lambda: _job_advanced(device_id, job_id, before_job), "a tick on the unregistered lane")
+
         acquired = await acquire_claim(device_id, "job", job_id=job_id)
         reg.register(acquired.device_id, acquired.token)
         await _backdate_both(device_id, job_id, seconds=600)
         before_claim, _ = await _stamps(device_id, job_id)
 
-        await asyncio.sleep(0.15)  # ticks after registration
+        await _wait_for(
+            lambda: _claim_advanced(device_id, job_id, before_claim),
+            "the heartbeat to switch to the claimed lane",
+        )
         after_claim, _ = await _stamps(device_id, job_id)
         assert after_claim > before_claim, "the heartbeat never switched to the claimed lane"
-    finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
 
 
 async def test_revoked_claim_stops_the_heartbeat_without_resurrecting_it(adapter_client, monkeypatch):
