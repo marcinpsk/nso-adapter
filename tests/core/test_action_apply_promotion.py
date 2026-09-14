@@ -839,9 +839,11 @@ async def test_interface_config_generation_refuses_unresolvable_attribute_eligib
     assert (await _stream(device_id, "interface_config")).authorized_revision == 0
     warning = next(log for log in logs if log["event"] == "generation.interface_eligibility_unresolved")
     assert warning["device_id"] == device_id
-    assert f"interface {iface_id}" in warning["detail"]
-    assert "attribute 'description'" in warning["detail"]
-    assert warning["exc_info"] is True
+    assert warning["error"] == "InterfaceEligibilityUnresolved"
+    assert "detail" not in warning
+    assert "exc_info" not in warning
+    assert f"interface {iface_id}" not in str(warning)
+    assert "description" not in str(warning)
 
 
 async def test_unrelated_promotion_preserves_recorded_interface_eligibility(adapter_client):

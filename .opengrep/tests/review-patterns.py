@@ -18,6 +18,10 @@ def raw_outcome_errors(logger, exc, failure_detail):
     logger.exception("family.outcome.read_record_failed")
     # ruleid: nso-outcome-raw-exception-renderer
     logger.exception("family.outcome.read_record_failed", error=failure_detail(exc))
+    # ruleid: nso-outcome-raw-exception-renderer
+    logger.warning("generation.interface_eligibility_unresolved", detail=str(exc))
+    # ruleid: nso-outcome-raw-exception-renderer
+    logger.warning("generation.interface_eligibility_unresolved", exc_info=True)
 
 
 def classified_outcome_errors(logger, exc, failure_detail):

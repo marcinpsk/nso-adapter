@@ -81,6 +81,7 @@ from nso_adapter.core.projection import (
     stream_section,
 )
 from nso_adapter.core.receipt import promotion_deletion_identity
+from nso_adapter.nso.client import failure_detail
 from nso_adapter.store.models import (
     SETTLEMENT_COHORT_SEQUENCE,
     DeploymentGeneration,
@@ -549,8 +550,7 @@ async def _freeze(db: AsyncSession, device, stream: str, tables: dict[str, list[
         logger.warning(
             "generation.interface_eligibility_unresolved",
             device_id=device.id,
-            detail=str(exc),
-            exc_info=True,
+            error=failure_detail(exc),
         )
         unexecutable = ApplyUnexecutable({"interface_config": "interface_attribute_eligibility_unresolved"})
     raise unexecutable
@@ -2210,10 +2210,18 @@ async def recover_generations() -> int:
     for device_id in devices:
         try:
             await advance_device_generations(device_id)
-        except GenerationCarrierCorruption:
-            logger.error("generation.carrier_corruption_on_restart", device_id=device_id, exc_info=True)
-        except (DBAPIError, DeviceProjectionGone, GenerationModeConflict):
-            logger.error("generation.recovery_failed_on_restart", device_id=device_id, exc_info=True)
+        except GenerationCarrierCorruption as exc:
+            logger.error(
+                "generation.carrier_corruption_on_restart",
+                device_id=device_id,
+                error=failure_detail(exc),
+            )
+        except (DBAPIError, DeviceProjectionGone, GenerationModeConflict) as exc:
+            logger.error(
+                "generation.recovery_failed_on_restart",
+                device_id=device_id,
+                error=failure_detail(exc),
+            )
     return len(stranded)
 
 

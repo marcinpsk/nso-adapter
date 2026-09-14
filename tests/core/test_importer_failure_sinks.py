@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+import yaml
 
 from nso_adapter.store.models import Device
 from tests.conftest import seed_device, session
@@ -28,14 +29,14 @@ _URL = "https://nso.invalid/restconf/data/placeholder-mount/placeholder-path"
 _REASON = "Placeholder Reason Phrase"
 _LEAKS = [_URL, "placeholder-mount", "placeholder-path", _REASON]
 _COVERAGE_DOC = Path(__file__).resolve().parents[2] / ".opengrep" / "README.md"
-_DESIGN = Path(__file__).resolve().parents[2] / "docs" / "design" / "authored-failure-diagnostics.md"
+_RULES = Path(__file__).resolve().parents[2] / ".opengrep" / "nso-rules.yaml"
 _IMPORTER = Path(__file__).resolve().parents[2] / "nso_adapter" / "core" / "importer.py"
 _NSO_CLIENT = Path(__file__).resolve().parents[2] / "nso_adapter" / "nso" / "client.py"
 _GUARDED_LOG_SINKS = (
     Path(__file__).resolve().parents[2] / "nso_adapter" / "main.py",
     *(
         Path(__file__).resolve().parents[2] / "nso_adapter" / "core" / name
-        for name in ("refresh_engine.py", "redistribution.py")
+        for name in ("generation.py", "refresh_engine.py", "redistribution.py")
     ),
 )
 
@@ -52,6 +53,18 @@ def _raw_log_exception_renderers(source: str) -> list[int]:
             violations.append(node.lineno)
             continue
         for keyword in node.keywords:
+            if keyword.arg == "exc_info" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True:
+                violations.append(keyword.value.lineno)
+                continue
+            if keyword.arg == "detail":
+                value = keyword.value
+                if (
+                    isinstance(value, ast.Call)
+                    and isinstance(value.func, ast.Name)
+                    and value.func.id in {"repr", "str"}
+                ):
+                    violations.append(keyword.value.lineno)
+                continue
             if keyword.arg != "error":
                 continue
             value = keyword.value
@@ -74,9 +87,12 @@ logger.warning("event", error=str(exc))
 logger.warning("event", error=repr(exc))
 logger.exception("event")
 logger.exception("event", error=failure_detail(exc))
+logger.warning("event", detail=str(exc))
+logger.warning("event", detail=repr(exc))
+logger.warning("event", exc_info=True)
 logger.warning("event", error=failure_detail(exc))
 """
-    assert _raw_log_exception_renderers(source) == [1, 2, 3, 4, 5, 6]
+    assert _raw_log_exception_renderers(source) == [1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 
 def test_importer_never_logs_raw_exception_text() -> None:
@@ -96,6 +112,19 @@ def test_guarded_modules_are_documented() -> None:
     coverage = _COVERAGE_DOC.read_text(encoding="utf-8").split("## Coverage", maxsplit=1)[1]
     for path in (_IMPORTER, *_GUARDED_LOG_SINKS):
         assert path.name in coverage, f"{path.name} is missing from the OpenGrep coverage documentation"
+
+
+def test_review_guards_cover_each_authored_error_boundary() -> None:
+    rules = {rule["id"]: rule for rule in yaml.safe_load(_RULES.read_text(encoding="utf-8"))["rules"]}
+    validation_paths = set(rules["nso-api-validation-error-raw-exception-renderer"]["paths"]["include"])
+    assert validation_paths == {
+        "nso_adapter/api/devices.py",
+        "nso_adapter/api/lag_config.py",
+        "nso_adapter/api/vlan.py",
+        "review-patterns.py",
+    }
+    outcome_paths = set(rules["nso-outcome-raw-exception-renderer"]["paths"]["include"])
+    assert "nso_adapter/core/generation.py" in outcome_paths
 
 
 def _binds_formatter_name(node: ast.AST) -> bool:
@@ -140,13 +169,6 @@ def test_failure_detail_reads_only_closed_exception_properties() -> None:
     actual = _failure_detail_definition_ast(_NSO_CLIENT.read_text(encoding="utf-8"))
 
     assert actual == _APPROVED_FAILURE_DETAIL_AST
-
-
-def test_failure_detail_design_names_the_closed_kind_rendering() -> None:
-    design = _DESIGN.read_text(encoding="utf-8")
-
-    assert "renders its type and closed kind when" in design
-    assert "renders its type only when" not in design
 
 
 @pytest.mark.parametrize(

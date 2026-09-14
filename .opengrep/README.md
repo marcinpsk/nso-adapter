@@ -36,14 +36,13 @@ for its configuration names and workflow skip conditions.
 
 ## Coverage
 
-`nso-outcome-raw-exception-renderer` rejects `logger.exception` and any
-diagnostic `error` field that is not one direct `failure_detail` call. It covers
-`nso_adapter/main.py`, `importer.py`, both SSE subscriber modules, and the
-outcome bookkeeping logs in `refresh_engine.py` and `redistribution.py`. These
-logs must use `failure_detail` so an HTTP exception cannot repeat a request URL
-or server text. The behavioral and AST regressions in
-`tests/core/test_importer_failure_sinks.py` remain authoritative for the
-classification contract and complete Python syntax.
+`nso-outcome-raw-exception-renderer` rejects traceback logging and raw exception
+fields. It covers `nso_adapter/main.py`, `core/importer.py`, `core/generation.py`,
+both SSE subscriber modules, and the outcome bookkeeping logs in
+`refresh_engine.py` and `redistribution.py`. These logs must use `failure_detail`
+so an HTTP exception cannot repeat a request URL or server text. The behavioral
+and AST regressions in `tests/core/test_importer_failure_sinks.py` remain
+authoritative for the classification contract and complete Python syntax.
 
 `nso-api-validation-error-raw-exception-renderer` rejects exception rendering
 and formatted values in device validation responses. These responses use

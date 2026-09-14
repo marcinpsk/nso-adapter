@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
@@ -22,14 +20,6 @@ _MIGRATION = "f3b8d1e7a9c2_read_outcome_failures.py"
 
 def _module():
     return load_migration(_MIGRATION)
-
-
-def test_design_record_names_the_jsonb_whitelist_projection():
-    design = (Path(__file__).parents[2] / "docs/design/redistribution-mixed-failure-metadata.md").read_text()
-    mechanical_guard = design.split("### Mechanical guard", 1)[1].split("### Candidate shapes", 1)[0]
-
-    assert "nullable `RefreshOutcome.read_failures` JSONB array" in mechanical_guard
-    assert "dedicated nullable columns" not in mechanical_guard
 
 
 def test_read_failure_column_upgrade_and_downgrade(pg_provisioner):

@@ -8,6 +8,7 @@ rules:
     paths:
       include:
         - nso_adapter/main.py
+        - nso_adapter/core/generation.py
         - nso_adapter/core/importer.py
         - nso_adapter/core/refresh_engine.py
         - nso_adapter/core/redistribution.py
@@ -18,6 +19,9 @@ rules:
       - patterns:
           - pattern: logger.$LEVEL(..., error=$ERROR, ...)
           - pattern-not: logger.$LEVEL(..., error=failure_detail($EXCEPTION), ...)
+      - pattern: logger.$LEVEL(..., detail=str($EXCEPTION), ...)
+      - pattern: logger.$LEVEL(..., detail=repr($EXCEPTION), ...)
+      - pattern: logger.$LEVEL(..., exc_info=True, ...)
       - pattern: logger.exception(...)
   - id: nso-api-validation-error-raw-exception-renderer
     languages: [python]
@@ -26,6 +30,8 @@ rules:
     paths:
       include:
         - nso_adapter/api/devices.py
+        - nso_adapter/api/lag_config.py
+        - nso_adapter/api/vlan.py
         - review-patterns.py
     pattern-either:
       - pattern: api_error(..., "validation_error", str($EXCEPTION), ...)
