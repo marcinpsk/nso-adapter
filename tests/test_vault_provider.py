@@ -296,7 +296,7 @@ _STARTUP_PARTS = [
 
 
 def test_a_MISSING_field_refuses_without_the_mount_the_path_or_the_key(fake_hvac):
-    """The KeyError named ``{field} not found at {mount}/{path}`` — the whole address.
+    """The KeyError named ``{field} not found at {mount}/{path}``, the whole address.
 
     ``get()`` sits outside the sanitized API wrapper, so nothing downstream redacts it.
     """

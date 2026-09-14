@@ -65,8 +65,8 @@ class VaultRefError(ValueError):
     ``vault_ref`` field is told what to fix without being sent its own material back.
     """
 
-    def __init__(self, reason: str, reference: object) -> None:
-        super().__init__(f"{reason}: {reference!r}")
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
         self.reason = reason
 
 
@@ -90,24 +90,24 @@ def parse_vault_ref(reference: str, *, require_key: bool | None = None) -> Vault
     ``reason`` names the broken rule without repeating the input.
     """
     if not isinstance(reference, str) or not reference:
-        raise VaultRefError("vault_ref is empty or not a string", reference)
+        raise VaultRefError("vault_ref is empty or not a string")
     if any(ch.isspace() for ch in reference):
-        raise VaultRefError("vault_ref contains whitespace", reference)
+        raise VaultRefError("vault_ref contains whitespace")
     if reference.count("#") > 1:
-        raise VaultRefError("vault_ref has more than one '#'", reference)
+        raise VaultRefError("vault_ref has more than one '#'")
 
     locator, sep, key = reference.partition("#")
     if sep and not key:
-        raise VaultRefError("vault_ref has an empty key after '#'", reference)
+        raise VaultRefError("vault_ref has an empty key after '#'")
     if require_key is True and not sep:
-        raise VaultRefError("vault_ref must end in '#<key>'", reference)
+        raise VaultRefError("vault_ref must end in '#<key>'")
     if require_key is False and sep:
-        raise VaultRefError("vault_ref must not carry a '#<key>' here", reference)
+        raise VaultRefError("vault_ref must not carry a '#<key>' here")
 
     mount, slash, path = locator.partition("/")
     if not slash or not mount or not path:
-        raise VaultRefError("vault_ref must be '<mount>/<path...>'", reference)
+        raise VaultRefError("vault_ref must be '<mount>/<path...>'")
     if "" in path.split("/"):
-        raise VaultRefError("vault_ref has an empty path segment", reference)
+        raise VaultRefError("vault_ref has an empty path segment")
 
     return VaultRef(mount=mount, path=path, key=key if sep else None)

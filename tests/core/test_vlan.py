@@ -11,6 +11,7 @@ import pytest
 from sqlalchemy import select
 
 from nso_adapter.core.vlan import (
+    parse_vlan_string,
     refresh_switchport_for_device,
     refresh_vlan_database_for_device,
 )
@@ -45,6 +46,12 @@ def _serve_sections(nso: AsyncMock) -> dict:
 
     nso.get_device_state_section.side_effect = _get
     return sections
+
+
+@pytest.mark.parametrize("raw", [[], ["10", "20"], ("10", "20"), 10])
+def test_tagged_vlan_parser_rejects_non_wire_shapes(raw):
+    with pytest.raises(ValueError, match=rf"^tagged-vlans must be a string \(type {type(raw).__name__}\)$"):
+        parse_vlan_string(raw)
 
 
 @pytest.mark.anyio
@@ -135,7 +142,7 @@ async def _switchport_surface_failure(device_id: int, interface: dict) -> tuple[
         await refresh_vlan_database_for_device(db, device, nso)
 
         sections["switchport"] = {"status": "ok", "interface": [interface]}
-        with pytest.raises(Exception) as caught:  # noqa: B017 — the raise IS what is under test
+        with pytest.raises(Exception) as caught:  # noqa: B017, the raise IS what is under test
             await refresh_switchport_for_device(db, device, nso)
 
         with capture_logs() as logs:
@@ -171,7 +178,7 @@ async def test_a_malformed_UNTAGGED_VLAN_is_named_by_its_field_and_never_repeate
 
 @pytest.mark.anyio
 async def test_a_malformed_TAGGED_VLAN_entry_is_named_by_its_field_and_never_repeated(adapter_client):
-    """The tagged-list conversion had the same shape, and removal.py reads it too."""
+    """Reject a non-wire tagged shape without repeating its device-served entries."""
     from tests._secret_discipline import assert_chain_free_of, assert_records_free_of
 
     device_id = await seed_device(nso_device_name="vsw-tagged-sink", netbox_device_id=1312)
@@ -183,7 +190,7 @@ async def test_a_malformed_TAGGED_VLAN_entry_is_named_by_its_field_and_never_rep
     message = str(raised)
     assert _TAGGED_TEXT not in message, "the refusal repeats the device's own leaf"
     assert "tagged-vlans" in message, "the diagnostic must still name the field"
-    assert "type str" in message, "the diagnostic must still name the received type"
+    assert "type list" in message, "the diagnostic must still name the received type"
     assert_chain_free_of(raised, [_TAGGED_TEXT])
     reported = [record for record in logs if record["event"] == "sync.surface_refresh_failed"]
     assert reported, "the failed surface was not reported at all"
@@ -208,7 +215,7 @@ async def test_refresh_switchport_links_vlans(adapter_client):
                     "interface-name": "Gi0/1",
                     "mode": "trunk",
                     "untagged-vlan": 99,
-                    "tagged-vlans": ["10", "10", "20"],
+                    "tagged-vlans": "10,10,20",
                 }
             ],
         }

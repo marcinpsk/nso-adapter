@@ -146,7 +146,7 @@ async def _vault_op(operation):
     """
     try:
         return await anyio.to_thread.run_sync(operation)
-    except Exception as exc:  # noqa: BLE001 — every provider failure is the same 502
+    except Exception as exc:  # noqa: BLE001, every provider failure is the same 502
         failure = type(exc).__name__
     # Raised outside the handler: `from None` would still leave the provider's exception
     # reachable on __context__, and a formatted traceback prints it.

@@ -71,8 +71,8 @@ def _executes_in_handler(handler: ast.ExceptHandler) -> Iterator[ast.AST]:
 
     A nested function or lambda BODY does not: defining it executes nothing there, and
     calling it later runs where the interpreter has no exception to attach. Walking into
-    those bodies rejects code that is correct. What the definition itself evaluates —
-    decorators and defaults — does run here, so those are walked.
+    those bodies rejects code that is correct. What the definition itself evaluates,
+    decorators and defaults, does run here, so those are walked.
     """
     stack: list[ast.AST] = list(handler.body)
     while stack:
@@ -582,7 +582,7 @@ def test_no_raise_inside_an_except_handler_keeps_the_caught_exception_attached()
         violations.extend(scan_source(path.read_text(encoding="utf-8"), str(path.relative_to(_PACKAGE.parent))))
     assert not violations, (
         "a plain `raise X` attaches the caught exception to __context__ and `from None` only "
-        "hides it — build the sanitized exception in the handler and raise it AFTER the "
+        "hides it. Build the sanitized exception in the handler and raise it AFTER the "
         "handler: " + ", ".join(violations)
     )
 
@@ -661,7 +661,7 @@ def _runtime_context(source: str) -> BaseException | None:
     namespace: dict = {"Boom": _Boom, "trigger": _trigger}
     raised: BaseException | None = None
     try:
-        exec(compile(source, "runtime.py", "exec"), namespace)  # noqa: S102 — the behaviour IS the test
+        exec(compile(source, "runtime.py", "exec"), namespace)  # noqa: S102, the behaviour IS the test
     except _Boom as exc:
         raised = exc
     assert raised is not None, "the snippet did not raise Boom"

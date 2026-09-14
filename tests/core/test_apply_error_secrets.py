@@ -619,7 +619,7 @@ async def test_a_refused_escalation_keeps_the_certification_text_out_of_the_refr
     """The escalation's own exception is a sink too: only its TYPE may reach the record.
 
     A `not-ready` section escalates to the device-state-read action. The action's response is
-    certified, and the refusal names what the server echoed — so carrying the exception repr
+    certified, and the refusal names what the server echoed. Carrying the exception repr
     into `detail` re-published it.
     """
     from structlog.testing import capture_logs

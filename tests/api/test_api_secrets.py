@@ -581,7 +581,7 @@ async def test_a_SUCCESSFUL_set_echoes_no_REFERENCE_COMPONENT_anywhere(vault_cli
 
     A ref names a Vault mount, a path and a key, and the caller chose all three. Whoever reads
     the adapter log, or the answer, then knows exactly where every secret the adapter writes
-    lives — and a caller that pastes a secret into the ref reads it straight back.
+    lives. A caller that pastes a secret into the ref reads it straight back.
     """
     from structlog.testing import capture_logs
 

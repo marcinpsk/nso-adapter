@@ -326,7 +326,7 @@ def test_secret_maps_are_registered_for_loc_redaction():
                 if field.annotation == dict[str, SecretStr]:
                     found.add(("body", name))
 
-    assert found, "no secret map was found at all — the introspection stopped matching"
+    assert found, "no secret map was found at all; the introspection stopped matching"
     assert found <= DYNAMIC_KEY_LOCATIONS, (
         "a request field keyed by a caller-chosen name is not registered for loc redaction: "
         f"{sorted(found - DYNAMIC_KEY_LOCATIONS)}"

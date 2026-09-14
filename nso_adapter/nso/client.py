@@ -131,7 +131,7 @@ def _certify_device_state_output(output: object, device_name: str, wire_families
     if output.get("device-name") != device_name:
         # The echo is the server's own value: name the device we asked for, never the one it sent.
         raise NsoReadContractError(
-            f"device-state-read echoed a different device than {device_name!r} — refusing a "
+            f"device-state-read echoed a different device than {device_name!r}; refusing a "
             "version-skewed / wrong-device snapshot"
         )
     for wire in wire_families:

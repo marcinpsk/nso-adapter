@@ -61,6 +61,16 @@ def test_non_string_rejected():
         parse_vault_ref(None)  # type: ignore[arg-type]
 
 
+def test_rejected_reference_is_not_repeated_in_the_exception():
+    rejected = "placeholder-vault-reference"
+
+    with pytest.raises(VaultRefError) as caught:
+        parse_vault_ref(rejected)
+
+    assert str(caught.value) == "vault_ref must be '<mount>/<path...>'"
+    assert rejected not in str(caught.value)
+
+
 def test_require_secret_fingerprint_owns_its_pattern_and_diagnostic():
     from nso_adapter.secrets.refs import require_secret_fingerprint
 

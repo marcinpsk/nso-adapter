@@ -110,7 +110,7 @@ class VaultSecretsProvider:
                 logger.warning("vault.reauthenticating", cause="forbidden")
                 self._authenticate()
                 data = self._fetch_path(path)
-        except Exception as exc:  # noqa: BLE001 — every Vault failure is one classified refusal
+        except Exception as exc:  # noqa: BLE001, every Vault failure is one classified refusal
             failure = SecretResolutionError(f"the Vault read failed ({type(exc).__name__})")
         # Raised outside the handler: hvac's exception would otherwise ride on __context__.
         if failure is not None:

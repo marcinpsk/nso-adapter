@@ -35,7 +35,7 @@ class LocalSecretsProvider:
             try:
                 return Path(file_path).read_text(encoding="utf-8").strip()
             except FileNotFoundError:
-                pass  # an absent path is "unset", not a read failure — fall through
+                pass  # an absent path is "unset", not a read failure; fall through
             except (OSError, UnicodeError) as exc:
                 # A permission, device or decode failure names the path, and the path is the
                 # deployment's own layout; only the classification is ours to hand back.

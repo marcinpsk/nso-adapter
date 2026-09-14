@@ -387,7 +387,7 @@ def _failure_fields(device: Device, spec: FamilySpec, failure: ReadFailure | Non
     """Build the record fields for a kept read: the authored classification, or the bare ask.
 
     ``failure`` is None only for a DECLARED state the engine still keeps rows on (a
-    ``not-ready`` section nobody escalated, a merged composite outcome) — nothing failed,
+    ``not-ready`` section nobody escalated, a merged composite outcome). Nothing failed,
     so there is nothing to classify beyond what was asked for.
     """
     if failure is None:

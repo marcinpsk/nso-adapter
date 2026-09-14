@@ -33,29 +33,14 @@ def _now():
     return datetime.now(UTC)
 
 
-def parse_vlan_string(raw) -> list[int]:
-    """Expand the NSO 'tagged-vlans' string ('805,1518-1519,3629') into a sorted int list.
-
-    Also tolerates a list (legacy/test) — returns it as ints. An entry that is not a vlan id
-    is refused by field and TYPE: the values are device-served and reach the refresh log.
-    """
-    if not raw:
+def parse_vlan_string(raw: str | None) -> list[int]:
+    """Expand the NSO ``tagged-vlans`` range string into a sorted VLAN ID list."""
+    if raw is None or raw == "":
         return []
-    if isinstance(raw, (list, tuple)):
-        listed: list[int] = []
-        unusable = None
-        for value in raw:
-            try:
-                listed.append(int(value))
-            except (TypeError, ValueError):
-                unusable = ValueError(f"a tagged-vlans entry is not a vlan id (type {type(value).__name__})")
-                break
-        # Raised outside the handler: the caught error repeats the entry verbatim.
-        if unusable is not None:
-            raise unusable
-        return sorted(set(listed))
+    if not isinstance(raw, str):
+        raise ValueError(f"tagged-vlans must be a string (type {type(raw).__name__})")
     vlans: set[int] = set()
-    for chunk in str(raw).split(","):
+    for chunk in raw.split(","):
         chunk = chunk.strip()
         if not chunk:
             continue

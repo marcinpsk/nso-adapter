@@ -132,7 +132,7 @@ class ReadFailure:
         return replace(self, family=family)
 
     def log_fields(self) -> dict[str, object]:
-        """Render the classification as record fields — the only shape any sink prints."""
+        """Render the classification as record fields, the only shape any sink prints."""
         return {
             "device_name": self.device,
             "family": self.family,

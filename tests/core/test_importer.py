@@ -2165,7 +2165,7 @@ async def test_ned_id_read_failure_record_names_the_read_and_not_what_the_server
     numeric status, and nothing the server wrote.
 
     Drives the real NsoClient over a real transport, so the message is the one httpx
-    really builds — a stubbed exception would only repeat the test's own text.
+    really builds. A stubbed exception would only repeat the test's own text.
     """
     import httpx
     from structlog.testing import capture_logs

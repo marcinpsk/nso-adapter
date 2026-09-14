@@ -99,7 +99,7 @@ _READ_MIRROR_ROOTS = (
 
 
 #: The failures whose message the adapter WROTE: it names the failure and repeats nothing
-#: the server said. Every other exception is classified by its type alone — a decode of a
+#: the server said. Every other exception is classified by its type alone. A decode of a
 #: malformed answer carries the server's bytes, and a store failure carries the statement.
 async def _bootstrap_address(client, device_name: str, primary: str, oob_ip: str | None) -> tuple[str, dict | None]:
     """Reachability-aware initial management address.

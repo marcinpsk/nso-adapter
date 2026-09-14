@@ -28,8 +28,8 @@ class SecretResolutionError(RuntimeError):
 
     ``reason`` classifies the failure and repeats no part of the reference. Startup resolves
     every configured reference before the app serves, so whatever this carries lands in the
-    startup diagnostics. The CALLER stamps ``slot`` — the configuration entry it was loading
-    — because only the caller knows which one that was.
+    startup diagnostics. The CALLER stamps ``slot``, the configuration entry it was loading,
+    because only the caller knows which one that was.
     """
 
     def __init__(self, reason: str, *, slot: str | None = None) -> None:
@@ -49,7 +49,7 @@ def resolve_secret(provider: SecretsProvider, reference: str, *, slot: str) -> s
         return provider.get(reference)
     except SecretResolutionError as exc:
         failure = SecretResolutionError(exc.reason, slot=slot)
-    except Exception as exc:  # noqa: BLE001 — every provider failure is one classified refusal
+    except Exception as exc:  # noqa: BLE001, every provider failure is one classified refusal
         failure = SecretResolutionError(f"the provider failed ({type(exc).__name__})", slot=slot)
     # Raised outside the handler: the provider exception would otherwise ride on __context__.
     raise failure
