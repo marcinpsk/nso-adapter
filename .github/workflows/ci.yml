@@ -40,11 +40,12 @@ jobs:
       - name: Type check (mypy, new errors only)
         run: uv run --native-tls -- scripts/mypy-gate.sh
 
-      # GitHub Actions security audit, from the version pinned in [dependency-groups].dev
-      # that `uv sync` above installed. The parity guard verifies that this target covers
-      # every repository file matched by the pinned hook's upstream pattern.
+      # Audit each GitHub configuration kind with the dependency resolved in uv.lock.
+      # The explicit collection list also includes Dependabot configuration.
       - name: Zizmor (GitHub Actions security audit)
-        run: uv run --native-tls -- zizmor .github
+        run: >-
+          uv run --locked --native-tls -- zizmor --no-progress
+          --collect=workflows --collect=actions --collect=dependabot .
 
   container-smoke:
     name: Container runtime smoke test
