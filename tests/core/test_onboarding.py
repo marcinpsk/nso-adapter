@@ -125,6 +125,44 @@ async def test_onboard_adopts_unlinked_existing_device(adapter_client_with_nso):
         assert rows[0].netbox_device_id == 77
 
 
+async def test_onboard_existing_adoption_reports_a_late_netbox_conflict(adapter_client_with_nso):
+    """A competing owner committed after the pre-check produces the public conflict."""
+    from nso_adapter.core.onboarding import onboard_device
+    from tests.conftest import seed_device
+
+    existing_id = await seed_device(
+        nso_instance="nso-dev",
+        nso_device_name="existing-adoption-winner",
+        netbox_device_id=None,
+    )
+    owner_id = None
+    async with session() as db:
+        original_commit = db.commit
+
+        async def commit_after_the_target_is_claimed():
+            nonlocal owner_id
+            owner_id = await seed_device(
+                nso_instance="nso-dev",
+                nso_device_name="existing-adoption-owner",
+                netbox_device_id=78,
+            )
+            db.commit = original_commit
+            await original_commit()
+
+        db.commit = commit_after_the_target_is_claimed
+        with pytest.raises(LookupError, match="NetBox device 78 is already onboarded") as caught:
+            await onboard_device(db, "nso-dev", "existing-adoption-winner", 78)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert owner_id is not None
+    async with session() as db:
+        existing = await db.get(Device, existing_id)
+        owner = await db.get(Device, owner_id)
+        assert existing is not None and existing.netbox_device_id is None
+        assert owner is not None and owner.netbox_device_id == 78
+
+
 async def test_onboard_is_idempotent_for_same_link(adapter_client_with_nso):
     """Re-onboarding the same (instance, name) already linked to the SAME netbox_device_id returns
     the existing row (idempotent no-op), not a 409 — so a re-fired manage signal is safe."""

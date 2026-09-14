@@ -44,7 +44,13 @@ _GUARDED_LOG_SINKS = (
 def _raw_log_exception_renderers(source: str) -> list[int]:
     """Return log calls that do not use the one classified exception shape."""
     violations: list[int] = []
-    for node in ast.walk(ast.parse(source)):
+    tree = ast.parse(source)
+    exception_names = {
+        handler.name
+        for handler in ast.walk(tree)
+        if isinstance(handler, ast.ExceptHandler) and handler.name is not None
+    } | {"exc"}
+    for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
             continue
         if not isinstance(node.func.value, ast.Name) or node.func.value.id != "logger":
@@ -62,6 +68,18 @@ def _raw_log_exception_renderers(source: str) -> list[int]:
                     isinstance(value, ast.Call)
                     and isinstance(value.func, ast.Name)
                     and value.func.id in {"repr", "str"}
+                    or isinstance(value, ast.Name)
+                    and value.id in exception_names
+                    or isinstance(value, ast.JoinedStr)
+                    and any(isinstance(part, ast.Name) and part.id in exception_names for part in ast.walk(value))
+                    or isinstance(value, ast.Call)
+                    and isinstance(value.func, ast.Attribute)
+                    and value.func.attr == "format"
+                    and any(
+                        isinstance(part, ast.Name) and part.id in exception_names
+                        for argument in (*value.args, *(keyword.value for keyword in value.keywords))
+                        for part in ast.walk(argument)
+                    )
                 ):
                     violations.append(keyword.value.lineno)
                 continue
@@ -87,12 +105,15 @@ logger.warning("event", error=str(exc))
 logger.warning("event", error=repr(exc))
 logger.exception("event")
 logger.exception("event", error=failure_detail(exc))
+logger.warning("event", detail=exc)
+logger.warning("event", detail=f"{exc}")
+logger.warning("event", detail="{}".format(exc))
 logger.warning("event", detail=str(exc))
 logger.warning("event", detail=repr(exc))
 logger.warning("event", exc_info=True)
 logger.warning("event", error=failure_detail(exc))
 """
-    assert _raw_log_exception_renderers(source) == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    assert _raw_log_exception_renderers(source) == list(range(1, 13))
 
 
 def test_importer_never_logs_raw_exception_text() -> None:

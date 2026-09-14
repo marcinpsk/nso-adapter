@@ -100,6 +100,7 @@ def test_flags_credential_literals_in_lambda_defaults(statement):
     [
         'password = f"admin"',
         'password = "ad" + "min"',
+        'username = "".join(("ad", "min"))',
     ],
 )
 def test_flags_constant_credential_string_expressions(statement):

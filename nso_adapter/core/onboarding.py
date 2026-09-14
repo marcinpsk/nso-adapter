@@ -160,13 +160,8 @@ async def _once_with_retry(action, *, backoff: float = _ONBOARD_RETRY_BACKOFF_SE
     return result
 
 
-async def _commit_lost_insert_adoption(
-    db: AsyncSession,
-    winner: Device,
-    nso_device_name: str,
-    netbox_device_id: int,
-) -> Device | LookupError:
-    """Commit a lost-insert adoption or report a late NetBox ownership conflict."""
+async def _commit_adoption_or_conflict(db: AsyncSession, netbox_device_id: int) -> LookupError | None:
+    """Commit an adoption or return a late NetBox ownership conflict."""
     ownership_conflict = False
     try:
         await db.commit()
@@ -176,6 +171,19 @@ async def _commit_lost_insert_adoption(
 
     if ownership_conflict:
         return LookupError(f"NetBox device {netbox_device_id} is already onboarded")
+    return None
+
+
+async def _commit_lost_insert_adoption(
+    db: AsyncSession,
+    winner: Device,
+    nso_device_name: str,
+    netbox_device_id: int,
+) -> Device | LookupError:
+    """Commit a lost-insert adoption or report a late NetBox ownership conflict."""
+    conflict = await _commit_adoption_or_conflict(db, netbox_device_id)
+    if conflict is not None:
+        return conflict
 
     await db.refresh(winner)
     logger.info(
@@ -311,7 +319,9 @@ async def onboard_device(
             raise LookupError(f"NetBox device {netbox_device_id} is already onboarded")
         existing.netbox_device_id = netbox_device_id
         existing.mapping_status = MappingStatus.mapped
-        await db.commit()
+        conflict = await _commit_adoption_or_conflict(db, netbox_device_id)
+        if conflict is not None:
+            raise conflict
         await db.refresh(existing)
         logger.info(
             "device.adopted", device_id=existing.id, nso_device=nso_device_name, netbox_device_id=netbox_device_id

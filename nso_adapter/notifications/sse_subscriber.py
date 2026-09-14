@@ -110,10 +110,8 @@ class SSESubscriber:
                                 parsed: dict | None = json.loads(raw)
                             except json.JSONDecodeError:
                                 parsed = None
-                            # Path/size only at INFO — the raw body can carry sensitive leaf
-                            # values (cleartext leak); keep the (truncated) body at DEBUG.
+                            # The raw body can carry sensitive leaf values. Log metadata only.
                             logger.info("sse_event", stream=stream_url, bytes=len(raw))
-                            logger.debug("sse_event.body", stream=stream_url, raw=raw[:200])
                             on_event(raw, parsed)
                             current_block = []
 
