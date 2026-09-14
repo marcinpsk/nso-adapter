@@ -15,6 +15,7 @@ import pytest
 
 from nso_adapter.secrets.base import SecretResolutionError
 from nso_adapter.secrets.vault import VaultSecretsProvider
+from tests._secret_discipline import assert_text_free_of
 
 
 class _FakeForbidden(Exception):
@@ -308,8 +309,7 @@ def test_a_MISSING_field_refuses_without_the_mount_the_path_or_the_key(fake_hvac
     with pytest.raises(SecretResolutionError) as caught:
         _provider(mount=_STARTUP_MOUNT).get(_STARTUP_REF)
 
-    for part in _STARTUP_PARTS:
-        assert part not in str(caught.value), "the refusal repeats part of the reference"
+    assert_text_free_of(caught.value, _STARTUP_PARTS)
     assert "not at the referenced path" in str(caught.value), "the caller must still learn WHAT failed"
     assert_chain_free_of(caught.value, _STARTUP_PARTS)
     assert exception_chain(caught.value) == [caught.value], "an upstream exception is still attached"
@@ -322,7 +322,7 @@ def test_an_INVALID_reference_refuses_without_the_input(fake_hvac):
     with pytest.raises(SecretResolutionError) as caught:
         _provider(mount=_STARTUP_MOUNT).get("placeholder-secret-pasted-into-the-ref")
 
-    assert "placeholder-secret-pasted-into-the-ref" not in str(caught.value)
+    assert_text_free_of(caught.value, ["placeholder-secret-pasted-into-the-ref"])
     assert "not in 'path#field' form" in str(caught.value)
     assert_chain_free_of(caught.value, ["placeholder-secret-pasted-into-the-ref"])
 
@@ -342,8 +342,7 @@ def test_a_VAULT_OUTAGE_refuses_by_type_and_attaches_no_hvac_exception(fake_hvac
         _provider(mount=_STARTUP_MOUNT).get(_STARTUP_REF)
 
     assert "the Vault read failed (RuntimeError)" in str(caught.value), "the TYPE tells an outage from a miss"
-    for part in _STARTUP_PARTS:
-        assert part not in str(caught.value)
+    assert_text_free_of(caught.value, _STARTUP_PARTS)
     assert_chain_free_of(caught.value, _STARTUP_PARTS)
     assert exception_chain(caught.value) == [caught.value], "the hvac exception is still on the chain"
 
@@ -371,6 +370,5 @@ def test_a_FAILED_STARTUP_resolution_names_the_CONFIG_SLOT(fake_hvac):
 
     assert caught.value.slot == "nso_instances[nso-a].username_ref"
     assert "nso_instances[nso-a].username_ref" in str(caught.value), "the operator must learn WHICH slot"
-    for part in _STARTUP_PARTS:
-        assert part not in str(caught.value)
+    assert_text_free_of(caught.value, _STARTUP_PARTS)
     assert_chain_free_of(caught.value, _STARTUP_PARTS)

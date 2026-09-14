@@ -52,40 +52,84 @@ def _is_classified_failure_detail(value: ast.expr) -> bool:
     )
 
 
+class _RawLogExceptionVisitor(ast.NodeVisitor):
+    """Track exception values through simple assignments while visiting log calls."""
+
+    def __init__(self) -> None:
+        self.aliases = {"exc"}
+        self.violations: list[int] = []
+
+    def _assignment(self, targets: list[ast.expr], value: ast.expr) -> None:
+        aliases_exception = isinstance(value, ast.Name) and value.id in self.aliases
+        for target in targets:
+            if not isinstance(target, ast.Name):
+                continue
+            if aliases_exception:
+                self.aliases.add(target.id)
+            else:
+                self.aliases.discard(target.id)
+
+    def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        outer_aliases = self.aliases
+        self.aliases = {"exc"}
+        for statement in node.body:
+            self.visit(statement)
+        self.aliases = outer_aliases
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802 - ast visitor API
+        self._visit_function(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:  # noqa: N802 - ast visitor API
+        self._visit_function(node)
+
+    def visit_Assign(self, node: ast.Assign) -> None:  # noqa: N802 - ast visitor API
+        self.visit(node.value)
+        self._assignment(node.targets, node.value)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:  # noqa: N802 - ast visitor API
+        if node.value is not None:
+            self.visit(node.value)
+            self._assignment([node.target], node.value)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:  # noqa: N802 - ast visitor API
+        handler_name = node.name
+        if handler_name is not None:
+            self.aliases.add(handler_name)
+        for statement in node.body:
+            self.visit(statement)
+        if handler_name is not None:
+            self.aliases.discard(handler_name)
+
+    def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 - ast visitor API
+        if (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "logger"
+        ):
+            if node.func.attr == "exception":
+                self.violations.append(node.lineno)
+            for keyword in node.keywords:
+                if (
+                    keyword.arg == "exc_info"
+                    and isinstance(keyword.value, ast.Constant)
+                    and keyword.value.value is True
+                ):
+                    self.violations.append(keyword.value.lineno)
+                elif keyword.arg == "detail":
+                    if not _is_classified_failure_detail(keyword.value) and any(
+                        isinstance(part, ast.Name) and part.id in self.aliases for part in ast.walk(keyword.value)
+                    ):
+                        self.violations.append(keyword.value.lineno)
+                elif keyword.arg == "error" and not _is_classified_failure_detail(keyword.value):
+                    self.violations.append(keyword.value.lineno)
+        self.generic_visit(node)
+
+
 def _raw_log_exception_renderers(source: str) -> list[int]:
     """Return log calls that do not use the one classified exception shape."""
-    violations: list[int] = []
-    tree = ast.parse(source)
-    exception_names = {
-        handler.name
-        for handler in ast.walk(tree)
-        if isinstance(handler, ast.ExceptHandler) and handler.name is not None
-    } | {"exc"}
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-            continue
-        if not isinstance(node.func.value, ast.Name) or node.func.value.id != "logger":
-            continue
-        if node.func.attr == "exception":
-            violations.append(node.lineno)
-            continue
-        for keyword in node.keywords:
-            if keyword.arg == "exc_info" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True:
-                violations.append(keyword.value.lineno)
-                continue
-            if keyword.arg == "detail":
-                value = keyword.value
-                if not _is_classified_failure_detail(value) and any(
-                    isinstance(part, ast.Name) and part.id in exception_names for part in ast.walk(value)
-                ):
-                    violations.append(keyword.value.lineno)
-                continue
-            if keyword.arg != "error":
-                continue
-            value = keyword.value
-            if not _is_classified_failure_detail(value):
-                violations.append(keyword.value.lineno)
-    return violations
+    visitor = _RawLogExceptionVisitor()
+    visitor.visit(ast.parse(source))
+    return visitor.violations
 
 
 def test_raw_exception_log_guard_rejects_every_unsanitized_form() -> None:
@@ -109,6 +153,33 @@ logger.warning("event", detail=failure_detail(exc))
 logger.warning("event", error=failure_detail(exc))
 """
     assert _raw_log_exception_renderers(source) == list(range(1, 16))
+
+
+def test_raw_exception_log_guard_tracks_simple_aliases() -> None:
+    source = """\
+try:
+    work()
+except Exception as caught:
+    alias = caught
+    logger.warning("event", detail=alias)
+    alias = "authored detail"
+    logger.warning("event", detail=alias)
+"""
+    assert _raw_log_exception_renderers(source) == [5]
+
+
+def test_raw_exception_log_guard_does_not_leak_aliases_between_functions() -> None:
+    source = """\
+def first():
+    try:
+        work()
+    except Exception as caught:
+        alias = caught
+
+def second(alias):
+    logger.warning("event", detail=alias)
+"""
+    assert _raw_log_exception_renderers(source) == []
 
 
 def test_importer_never_logs_raw_exception_text() -> None:

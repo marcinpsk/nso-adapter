@@ -39,6 +39,25 @@ rules:
               regex: ^(exc|exception|error)$
       - pattern: logger.$LEVEL(..., exc_info=True, ...)
       - pattern: logger.exception(...)
+  - id: nso-outcome-raw-exception-alias-renderer
+    languages: [python]
+    severity: ERROR
+    message: Classify an aliased outcome failure with failure_detail instead of rendering it.
+    mode: taint
+    pattern-sources:
+      - patterns:
+          - pattern-inside: |
+              try:
+                ...
+              except $TYPE as $EXCEPTION:
+                ...
+          - pattern: $EXCEPTION
+    pattern-sanitizers:
+      - pattern: failure_detail(...)
+    pattern-sinks:
+      - patterns:
+          - pattern: logger.$LEVEL(..., detail=$DETAIL, ...)
+          - focus-metavariable: $DETAIL
   - id: nso-api-validation-error-raw-exception-renderer
     languages: [python]
     severity: ERROR

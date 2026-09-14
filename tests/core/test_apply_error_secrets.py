@@ -690,13 +690,44 @@ async def test_a_refused_device_state_read_keeps_the_echoed_value_out_of_every_s
     failed = [record for record in logs if record["event"] == "static_route.device_state_read_failed"]
     assert failed, "the failed read was not reported at all"
     assert_records_free_of(logs, _SECRETS)
-    assert failed[0]["error_type"] == "NsoReadContractError", "the type tells a contract breach from a blip"
+    assert failed[0]["error"] == "NsoReadContractError", "the type tells a contract breach from a blip"
 
     # The same read again, through the same real client: the refusal itself must carry nothing
     # of the echoed value on any node of its cause/context chain.
     with pytest.raises(NsoReadContractError) as caught:
         await client.run_device_state_read(name, ["static-route"])
     assert_chain_free_of(caught.value, _SECRETS)
+
+
+async def test_a_failed_device_state_read_preserves_only_the_http_status():
+    """The warning distinguishes an HTTP refusal from an outage without copying its text."""
+    from types import SimpleNamespace
+
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core import apply as apply_mod
+
+    request_urls: list[str] = []
+
+    def reject(request):
+        request_urls.append(str(request.url))
+        return httpx.Response(
+            503,
+            request=request,
+            extensions={"reason_phrase": b"Placeholder Device State Failure"},
+            text="placeholder device-state body",
+        )
+
+    client = _client_with(httpx.MockTransport(reject))
+    device = SimpleNamespace(id=9425, nso_device_name="device-state-http-failure")
+    with capture_logs() as logs:
+        status, entries = await apply_mod._static_route_device_state(client, device)
+
+    assert (status, entries) == ("error", {})
+    failed = [record for record in logs if record["event"] == "static_route.device_state_read_failed"]
+    assert len(failed) == 1
+    assert failed[0]["error"] == "HTTPStatusError (HTTP 503)"
+    assert_records_free_of(logs, [*request_urls, "Placeholder Device State Failure", "placeholder device-state body"])
 
 
 # ── a failed host-key fetch: the action's own info text reaches no sink ──

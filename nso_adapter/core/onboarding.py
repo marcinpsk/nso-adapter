@@ -585,7 +585,9 @@ async def _link_existing_under_claim(
 
     existing.netbox_device_id = netbox_device_id
     existing.mapping_status = MappingStatus.mapped
-    await db.commit()
+    conflict = await _commit_adoption_or_conflict(db, netbox_device_id)
+    if conflict is not None:
+        raise conflict
     reg.register(*acquired.identity())
     await db.refresh(existing)
     logger.info(

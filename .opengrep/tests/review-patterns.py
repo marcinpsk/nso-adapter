@@ -43,6 +43,20 @@ def classified_outcome_errors(logger, exc, failure_detail):
     logger.warning("family.outcome.read_record_failed", detail=failure_detail(exc))
 
 
+def aliased_outcome_error(logger, failure_detail):
+    try:
+        work()
+    except Exception as caught:
+        alias = caught
+        # ruleid: nso-outcome-raw-exception-alias-renderer
+        logger.warning("family.outcome.read_record_failed", detail=alias)
+        alias = "authored detail"
+        # ok: nso-outcome-raw-exception-alias-renderer
+        logger.warning("family.outcome.read_record_failed", detail=alias)
+        # ok: nso-outcome-raw-exception-alias-renderer
+        logger.warning("family.outcome.read_record_failed", detail=failure_detail(caught))
+
+
 def authored_outcome_details(logger, reason):
     # ok: nso-outcome-raw-exception-renderer
     logger.warning("family.outcome.read_record_failed", detail=f"Reason: {reason}")

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import VALID_TOKEN, seed_device
 
 
@@ -53,7 +54,7 @@ async def test_jobs_list_invalid_status_is_refused_without_the_value(adapter_cli
     error = resp.json()["error"]
     assert error["code"] == "validation_error"
     assert error["message"] == "Invalid job status"
-    assert "placeholder-status-value" not in resp.text, "the refusal echoes the submitted value"
+    assert_text_free_of(resp.text, ["placeholder-status-value"])
 
 
 async def test_job_not_found(adapter_client):

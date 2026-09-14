@@ -15,6 +15,7 @@ from nso_adapter.core.redistribution import refresh_redistribution_for_device, r
 from nso_adapter.nso.client import NsoExportUnavailableError
 from nso_adapter.nso.read_outcome import Freshness, Present, Unavailable, UnavailableReason
 from nso_adapter.store.models import Device, DeviceRedistribution
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import seed_device, session
 
 
@@ -652,7 +653,7 @@ async def test_mixed_replaced_and_error_retained_is_degraded_present(adapter_cli
             "failure_code": None,
         },
     ]
-    assert "placeholder-secret" not in str(outcome.read_failures)
+    assert_text_free_of(outcome.read_failures, ["placeholder-secret"])
 
 
 @pytest.mark.anyio

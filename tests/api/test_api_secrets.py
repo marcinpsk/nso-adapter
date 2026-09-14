@@ -23,6 +23,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from nso_adapter.main import create_app
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import VALID_TOKEN, seed_device, session
 from tests.test_vault_provider import _FakeClient, _FakeForbidden, _FakeInvalidPath, _FakeKvV2
 
@@ -205,8 +206,7 @@ async def test_set_secret_writes_vault_and_reports_the_version(vault_client):
     assert body["operation_id"], "the answer must still be joinable to its log record"
     assert store["netbox/snmp/v3/monitor"] == {"auth": "hunter2", "priv": "hunter3"}
     # the response never carries the values, the ref, or the field names the caller chose
-    for echoed in ("hunter2", "hunter3", "network/netbox/snmp/v3/monitor", "auth", "priv"):
-        assert echoed not in resp.text
+    assert_text_free_of(resp.text, ["hunter2", "hunter3", "network/netbox/snmp/v3/monitor", "auth", "priv"])
 
 
 @pytest.mark.anyio
@@ -220,8 +220,7 @@ async def test_set_secret_keyed_ref_writes_that_field(vault_client):
     assert resp.status_code == 200
     assert resp.json()["version"] == 1
     assert store["netbox/snmp/community/abc123"] == {"community": "s3cr3t-comm"}
-    for echoed in ("s3cr3t-comm", ref, "abc123", "community"):
-        assert echoed not in resp.text
+    assert_text_free_of(resp.text, ["s3cr3t-comm", ref, "abc123", "community"])
 
 
 @pytest.mark.anyio
@@ -235,8 +234,7 @@ async def test_set_secret_keyed_ref_rejects_other_fields(vault_client):
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "invalid_vault_ref"
     # Both halves of the mismatch are the caller's own strings: the refusal states the rule.
-    for echoed in ("other", "network/p#community", "placeholder-secret-value"):
-        assert echoed not in resp.text
+    assert_text_free_of(resp.text, ["other", "network/p#community", "placeholder-secret-value"])
     assert "exactly that one field" in resp.json()["error"]["message"]
 
 
@@ -307,7 +305,7 @@ async def test_verify_returns_fields_and_hashes_never_values(vault_client):
     assert sorted(body["fields"]) == ["auth", "priv"]
     assert body["hashes"] == {"auth": _h("hunter2"), "priv": _h("hunter3")}
     assert body["version"] == 2
-    assert "hunter2" not in resp.text and "hunter3" not in resp.text
+    assert_text_free_of(resp.text, ["hunter2", "hunter3"])
 
 
 @pytest.mark.anyio
@@ -340,7 +338,7 @@ async def test_vault_permission_denied_returns_structured_502(vault_client):
 
     assert resp.status_code == 502
     assert resp.json()["error"]["code"] == "vault_error"
-    assert "x" not in resp.json()["error"]["message"]
+    assert_text_free_of(resp.json()["error"]["message"], ["x"])
 
 
 @pytest.mark.anyio
@@ -425,9 +423,8 @@ async def test_harvest_community_ios_happy_path(vault_client):
         "access": "RO",
         "acl": "20",
     }
-    assert ref not in resp.text, "the harvest answered with the caller's own reference"
+    assert_text_free_of(resp.text, [ref, "s3cr3t-comm"])
     assert store[f"netbox/snmp/community/{target_hash}"] == {"community": "s3cr3t-comm"}
-    assert "s3cr3t-comm" not in resp.text
     # the GET was the targeted per-NED community subtree, not the full device config
     assert "snmp-server/community" in str(transport.requests[0].url)
 
@@ -473,7 +470,7 @@ async def test_a_harvest_hash_THAT_IS_NOT_A_FINGERPRINT_is_refused_at_the_bounda
         )
 
     assert resp.status_code == 422, "a value that is not a fingerprint is not a request we can serve"
-    assert "placeholder-secret-pasted-here" not in resp.text, "the refusal repeats the caller's own value"
+    assert_text_free_of(resp.text, ["placeholder-secret-pasted-here"])
     assert_records_free_of(logs, ["placeholder-secret-pasted-here"])
 
 
@@ -494,8 +491,7 @@ async def test_a_missing_community_404_repeats_no_part_of_the_request(vault_clie
     assert resp.status_code == 404
     err = resp.json()["error"]
     assert err["code"] == "community_not_found"
-    assert asked not in resp.text, "the refusal echoes the submitted value"
-    assert "harvest-dev" not in resp.text, "the refusal repeats the device's name in NSO"
+    assert_text_free_of(resp.text, [asked, "harvest-dev"])
     assert f"device {device_id}" in err["message"], "the operator must still learn WHICH device could not serve it"
     assert "sync-from" in err["message"]
 
@@ -550,8 +546,7 @@ async def test_a_vault_failure_puts_no_reference_or_provider_text_in_the_502(vau
     resp = await client.post("/api/v1/secrets/verify", json={"vault_ref": ref}, headers=AUTH)
 
     assert resp.status_code == 502
-    for secret in leaked:
-        assert secret not in resp.text, "the 502 body repeats the reference or the provider's text"
+    assert_text_free_of(resp.text, leaked)
     message = resp.json()["error"]["message"]
     assert resp.json()["error"]["code"] == "vault_error"
     assert "RuntimeError" in message, "the failure type is the half the operator needs"
@@ -600,8 +595,7 @@ async def test_a_SUCCESSFUL_set_echoes_no_REFERENCE_COMPONENT_anywhere(vault_cli
     written = [record for record in logs if record["event"] == "secrets.set"]
     assert written, "the write was not reported at all"
     assert_records_free_of(logs, _REF_LOCATORS)
-    for echoed in _REF_LOCATORS:
-        assert echoed not in resp.text, "the answer repeats a component of the caller's reference"
+    assert_text_free_of(resp.text, _REF_LOCATORS)
     assert written[0]["version"] == 1
     assert written[0]["operation_id"] == resp.json()["operation_id"], "the record must join to the answer"
 
@@ -632,8 +626,7 @@ async def test_a_SUCCESSFUL_harvest_echoes_no_REFERENCE_COMPONENT_anywhere(vault
     harvested = [record for record in logs if record["event"] == "secrets.harvest_community"]
     assert harvested, "the harvest was not reported at all"
     assert_records_free_of(logs, _REF_LOCATORS)
-    for echoed in _REF_LOCATORS:
-        assert echoed not in resp.text, "the answer repeats a component of the caller's reference"
+    assert_text_free_of(resp.text, _REF_LOCATORS)
     assert harvested[0]["device_id"] == device_id, "the adapter's own device id, never the name in NSO"
     assert_records_free_of(logs, ["harvest-dev"])
     assert harvested[0]["community_hash"] == target_hash
@@ -714,8 +707,10 @@ async def test_a_SUCCESSFUL_verify_echoes_no_REFERENCE_COMPONENT_anywhere(vault_
     assert body["exists"] is True
     assert body["hashes"] == {_REF_KEY: _h("placeholder-secret")}, "what Vault holds is the point of the verify"
     assert_records_free_of(logs, _REF_LOCATORS)
-    for echoed in (_REF, _REF_PATH, _REF_MOUNT, "placeholder-path", "placeholder-leaf", "placeholder-secret"):
-        assert echoed not in resp.text, "the answer repeats a component of the caller's reference"
+    assert_text_free_of(
+        resp.text,
+        [_REF, _REF_PATH, _REF_MOUNT, "placeholder-path", "placeholder-leaf", "placeholder-secret"],
+    )
     verified = [record for record in logs if record["event"] == "secrets.verify"]
     assert verified, "the verify was not reported at all"
     assert verified[0]["operation_id"] == body["operation_id"], "the record must join to the answer"
@@ -738,7 +733,7 @@ async def test_an_INVALID_values_ENTRY_keeps_the_callers_key_out_of_the_422(vaul
 
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "validation_error"
-    assert "placeholder-secret" not in resp.text, "the 422 location repeats the caller's map key"
+    assert_text_free_of(resp.text, ["placeholder-secret"])
     locations = [error["loc"] for error in resp.json()["error"]["detail"]["errors"]]
     assert ["body", "values", "[redacted]"] in locations, "the operator must still learn WHERE it broke"
 
@@ -765,8 +760,7 @@ async def test_a_MALFORMED_ref_is_answered_with_the_broken_RULE_not_the_input(va
 
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "invalid_vault_ref"
-    for echoed in (malformed, "placeholder-path", "placeholder-secret"):
-        assert echoed not in resp.text, "the 400 body repeats the caller's own reference"
+    assert_text_free_of(resp.text, [malformed, "placeholder-path", "placeholder-secret"])
     assert "whitespace" in resp.json()["error"]["message"], "the caller must still learn WHAT is malformed"
 
     # The same input through the real helper: `from exc` kept the parser exception, whose
@@ -810,7 +804,7 @@ async def test_an_UNREGISTERED_instance_answers_502_with_nothing_attached(vault_
     assert resp.status_code == 502
     assert resp.json()["error"]["code"] == "nso_unavailable"
     assert resp.json()["error"]["message"] == "No NSO client is registered"
-    assert "nso-not-registered" not in resp.text
+    assert_text_free_of(resp.text, ["nso-not-registered"])
     assert built, "the refusal never went through api_error"
     refusal = built[-1]
     assert exception_chain(refusal) == [refusal], "the registry exception is still attached to the 502"

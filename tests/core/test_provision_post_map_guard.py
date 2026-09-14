@@ -487,6 +487,53 @@ async def test_a_taken_netbox_id_is_refused_and_leaks_no_claim(adapter_client_wi
         assert (await db.execute(sa.select(DeviceClaim))).first() is None
 
 
+async def test_a_late_taken_netbox_id_in_claim_held_adoption_is_sanitized(adapter_client_with_nso):
+    """A uniqueness race after the pre-check uses the ordinary mapping-conflict result."""
+    from nso_adapter.store.models import Device
+
+    existing_id = await _seed_unlinked_device("pg-late-ownership")
+    reg = ClaimRegistration()
+    job_id = await _seed_provision_job()
+    refresh = _BarrierRefresh()
+    refresh.release.set()
+    owner_id = None
+
+    async with session() as db:
+        original_commit = db.commit
+
+        async def commit_after_the_target_is_claimed():
+            nonlocal owner_id
+            owner_id = await seed_device(
+                nso_device_name="pg-late-ownership-holder",
+                netbox_device_id=7265,
+                attributes=[],
+            )
+            db.commit = original_commit
+            await original_commit()
+
+        db.commit = commit_after_the_target_is_claimed
+        result = await _provision(
+            db,
+            name="pg-late-ownership",
+            netbox_device_id=7265,
+            reg=reg,
+            job_id=job_id,
+            refresh=refresh,
+        )
+
+    mapping = next(step for step in result["steps"] if step["step"] == "adapter_mapping")
+    assert mapping == {"step": "adapter_mapping", "status": "exists", "detail": "LookupError"}
+    assert result["device_id"] is None
+    assert not reg.registered
+    assert await _claim_row(existing_id) is None
+    assert owner_id is not None
+    async with session() as db:
+        existing = await db.get(Device, existing_id)
+        owner = await db.get(Device, owner_id)
+        assert existing is not None and existing.netbox_device_id is None
+        assert owner is not None and owner.netbox_device_id == 7265
+
+
 async def test_a_pair_mapped_elsewhere_is_reported_and_leaks_no_claim(adapter_client_with_nso):
     """The node is already linked to a DIFFERENT NetBox device: report it, never repoint it.
 

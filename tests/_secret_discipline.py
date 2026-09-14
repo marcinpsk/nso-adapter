@@ -37,8 +37,17 @@ def assert_chain_free_of(exc: BaseException, secrets) -> None:
     """Fail when any node of *exc*'s chain, its notes included, repeats one of *secrets*."""
     for node in exception_chain(exc):
         rendered = " ".join((repr(node), str(node), *getattr(node, "__notes__", ())))
-        for secret in secrets:
-            assert secret not in rendered, f"{type(node).__name__} in the chain repeats secret material"
+        for index, secret in enumerate(secrets):
+            if secret in rendered:
+                raise AssertionError(f"exception chain repeats secret material (secrets[{index}])")
+
+
+def assert_text_free_of(value, secrets) -> None:
+    """Fail without copying protected material or the inspected value into diagnostics."""
+    rendered = str(value)
+    for index, secret in enumerate(secrets):
+        if secret in rendered:
+            raise AssertionError(f"text repeats secret material (secrets[{index}])")
 
 
 class EchoingVault:
@@ -64,4 +73,5 @@ def assert_records_free_of(records, secrets) -> None:
     rendered = repr([dict(record) for record in records])
     for index, secret in enumerate(secrets):
         # The index, never the value: a failure prints this into pytest output and CI logs.
-        assert secret not in rendered, f"a log record repeats secret material (secrets[{index}])"
+        if secret in rendered:
+            raise AssertionError(f"a log record repeats secret material (secrets[{index}])")

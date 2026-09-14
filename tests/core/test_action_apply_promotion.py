@@ -17,6 +17,7 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from tests._secret_discipline import assert_text_free_of
 from tests.api.test_static_route_deleted_routes import deleted as deleted_route
 from tests.api.test_static_route_identity import entry as route_entry
 from tests.conftest import VALID_TOKEN, seed_device, session
@@ -842,8 +843,10 @@ async def test_interface_config_generation_refuses_unresolvable_attribute_eligib
     assert warning["error"] == "InterfaceEligibilityUnresolved"
     assert "detail" not in warning
     assert "exc_info" not in warning
-    assert f"interface {iface_id}" not in str(warning)
-    assert "description" not in str(warning)
+    identifier_fields = {"interface_id", "interface_name", "netbox_interface_id", "nso_if_key"}
+    assert identifier_fields.isdisjoint(warning)
+    non_device_fields = {key: value for key, value in warning.items() if key != "device_id"}
+    assert_text_free_of(non_device_fields, [str(iface_id), "description"])
 
 
 async def test_unrelated_promotion_preserves_recorded_interface_eligibility(adapter_client):

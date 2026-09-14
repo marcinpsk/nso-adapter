@@ -86,7 +86,7 @@ parse_squash_commits = false
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "--cov=nso_adapter --cov-report=term-missing -n auto"
+addopts = "--cov=nso_adapter --cov-report=term-missing -n auto -p anyio"
 
 [tool.mypy]
 python_version = "3.12"

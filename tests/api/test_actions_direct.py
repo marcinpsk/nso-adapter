@@ -16,6 +16,7 @@ from nso_adapter.api.actions import (
 )
 from nso_adapter.api.errors import ApiError
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import VALID_TOKEN, session
 from tests.core.removal_helpers import authorize_stream
 
@@ -179,7 +180,7 @@ async def test_action_force_removal_rejects_unknown_scope(adapter_client):
     assert response.status_code == 400
     error = response.json()["error"]
     assert error == {"code": "bad_request", "message": "Unknown removal scope", "detail": {}}
-    assert submitted not in response.text
+    assert_text_free_of(response.text, [submitted])
 
 
 async def test_action_force_removal_interface_config_needs_no_interface_list(adapter_client):

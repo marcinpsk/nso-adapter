@@ -11,6 +11,7 @@ import pytest
 from sqlalchemy import text
 
 from nso_adapter.store.models import LagBundleConfig
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import VALID_TOKEN, seed_device, seed_lag_config, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -518,8 +519,7 @@ async def test_apply_lag_config_refuses_an_invalid_deletion_authority(adapter_cl
     assert response.json()["error"]["code"] == "validation_error"
     assert reason in response.json()["error"]["message"]
     assert response.json()["error"]["detail"] == {"reason": code}, "the three refusals must stay distinguishable"
-    for root in deleted_roots:
-        assert root not in response.text, "the answer repeats a root the caller sent"
+    assert_text_free_of(response.text, deleted_roots)
     row = await _stream_row(device_id)
     assert (row.desired_revision, row.prepared_revision) == (1, 1), "a refusal leaves every revision untouched"
 
@@ -832,8 +832,7 @@ async def test_switching_apply_refuses_many_duplicate_roots_promptly(adapter_cli
     assert response.status_code == 422, response.text
     assert response.json()["error"]["message"] == "deleted_roots repeats a root"
     assert response.json()["error"]["detail"] == {"reason": "repeated_root"}
-    for root in ("root-z", "root-a", "root-once"):
-        assert root not in response.text, "the answer lists the roots the caller sent"
+    assert_text_free_of(response.text, ["root-z", "root-a", "root-once"])
     assert elapsed < 5.0, f"80,000 deletion entries took {elapsed:.3f}s; expected less than 5s"
     async with session() as db:
         counts = (

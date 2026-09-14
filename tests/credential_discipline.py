@@ -93,6 +93,16 @@ def _constant_string(node: ast.AST) -> str | None:
     if (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "lower"
+        and not node.args
+        and not node.keywords
+    ):
+        value = _constant_string(node.func.value)
+        if value is not None:
+            return value.lower()
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
         and node.func.attr == "join"
         and not node.keywords
         and len(node.args) == 1

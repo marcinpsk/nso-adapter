@@ -30,6 +30,7 @@ from nso_adapter.main import (
     _shutdown_sse,
     _start_sse_streams,
 )
+from tests._secret_discipline import assert_records_free_of
 from tests.conftest import session
 
 _SSE_FAILURE_URL = "https://nso.invalid/restconf/data/placeholder-sse"
@@ -53,11 +54,23 @@ def _sse_httpx_failure() -> httpx.HTTPStatusError:
 
 
 def _assert_sse_failure_classified(logs: list[dict], event: str) -> None:
+    assert_records_free_of(logs, [_SSE_FAILURE_URL, _SSE_FAILURE_REASON, "placeholder body"])
     record = next(item for item in logs if item["event"] == event)
     detail = record["error"]
-    assert _SSE_FAILURE_URL not in detail
-    assert _SSE_FAILURE_REASON not in detail
     assert detail == "HTTPStatusError (HTTP 503)"
+
+
+def test_sse_failure_assertion_checks_the_complete_record() -> None:
+    logs = [
+        {
+            "event": "sse.reader.failed",
+            "error": "HTTPStatusError (HTTP 503)",
+            "unexpected": _SSE_FAILURE_URL,
+        }
+    ]
+
+    with pytest.raises(AssertionError, match="log record repeats secret material"):
+        _assert_sse_failure_classified(logs, "sse.reader.failed")
 
 
 def _scheduler(**flags):
