@@ -157,7 +157,7 @@ async def test_worker_provision_job_records_blocking_step_failure(adapter_client
         assert {s["step"]: s["status"] for s in job.result["steps"]}["create"] == "failed"
 
 
-# ── the step detail carries no server bytes (#1698) ─────────────────────────
+# ── the step detail carries no server bytes ─────────────────────────
 
 #: What a proxy or a NED can put in a host-key answer. Not UTF-8, so the parse raises.
 _SERVER_BYTES = b"\xffplaceholder-server-secret"

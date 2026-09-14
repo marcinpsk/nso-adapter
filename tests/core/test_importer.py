@@ -2151,7 +2151,7 @@ async def test_from_outcomes_lock_discipline(db_session: AsyncSession, monkeypat
     assert acquired == [], "own_lock=False must not touch the lock registry"
 
 
-# ── the kept-NED record carries no server text (#1698) ──────────────────────
+# ── the kept-NED record carries no server text ──────────────────────
 
 
 async def test_ned_id_read_failure_record_names_the_read_and_not_what_the_server_said(

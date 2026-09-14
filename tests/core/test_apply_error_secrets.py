@@ -789,7 +789,7 @@ async def _unavailable_record(device_id: int, client) -> dict:
 
 
 async def test_an_auth_refusal_and_an_outage_do_not_classify_the_same(adapter_client):
-    """Round 1 collapsed both to "the section GET raised HTTPStatusError".
+    """A type-only classification collapses both into an HTTPStatusError.
 
     A 401 is a credential problem an operator fixes in config; a 503 is an outage they wait
     out. The record has to separate them, and neither may repeat the reason phrase, the URL
@@ -820,7 +820,7 @@ async def test_an_authored_contract_refusal_classifies_apart_from_an_http_failur
     """The third operator case: NSO answered 200 and the read contract refused it.
 
     An authored code says WHICH rule broke, and it carries no status because the server
-    answered a clean one. Round 1 had only the exception type here, and a served
+    answered a clean one. An exception-only classification had no authored code, and a served
     ``status=error`` section raises nothing at all, so it had nothing to say.
     """
     device_id = await seed_device(nso_device_name="refresh-contract", netbox_device_id=9433)

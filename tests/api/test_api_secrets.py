@@ -571,7 +571,7 @@ _REF_PATH = "placeholder-path/placeholder-leaf"
 _REF = f"{_REF_MOUNT}/{_REF_PATH}#{_REF_KEY}"
 #: Every component of the reference, plus the plaintext. The caller chose all of them, so a
 #: caller that pastes a secret into any of them would read it back out of the answer or out
-#: of whatever recorded the answer. Round 2 allowed the mount and the key; both leak.
+#: of whatever recorded the answer. Allowing the mount and key would leak both.
 _REF_LOCATORS = [_REF, _REF_PATH, _REF_MOUNT, _REF_KEY, "placeholder-path", "placeholder-leaf", "placeholder-secret"]
 
 

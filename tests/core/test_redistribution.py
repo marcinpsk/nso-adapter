@@ -773,7 +773,7 @@ async def test_all_components_device_absent_keeps_and_succeeds(adapter_client):
     )
 
 
-# ── the merged composite keeps the failing component's classification (#1698) ──
+# ── the merged composite keeps each failing component's classification ──
 
 
 def _read_failure(family: str):
