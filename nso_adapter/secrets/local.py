@@ -33,7 +33,7 @@ class LocalSecretsProvider:
         failure = None
         if file_path:
             try:
-                return Path(file_path).read_text().strip()
+                return Path(file_path).read_text(encoding="utf-8").strip()
             except FileNotFoundError:
                 pass  # an absent path is "unset", not a read failure — fall through
             except (OSError, UnicodeError) as exc:

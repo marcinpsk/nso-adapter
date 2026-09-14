@@ -192,7 +192,7 @@ async def action_force_removal(
     if not device:
         raise api_error(404, "not_found", "Device not found")
     if body.scope not in valid_removal_scopes():
-        raise api_error(400, "bad_request", f"Unknown removal scope {body.scope!r}")
+        raise api_error(400, "bad_request", "Unknown removal scope")
     refusal = None
     try:
         job = await _force_removal_job(db, device_id, body)

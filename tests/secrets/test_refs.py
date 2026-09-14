@@ -59,3 +59,11 @@ def test_require_key_modes():
 def test_non_string_rejected():
     with pytest.raises(VaultRefError):
         parse_vault_ref(None)  # type: ignore[arg-type]
+
+
+def test_require_secret_fingerprint_owns_its_pattern_and_diagnostic():
+    from nso_adapter.secrets.refs import require_secret_fingerprint
+
+    assert require_secret_fingerprint("0123456789abcdef") == "0123456789abcdef"
+    with pytest.raises(ValueError, match="^secret fingerprint must be 16 lowercase hexadecimal characters$"):
+        require_secret_fingerprint("not-a-fingerprint")

@@ -18,6 +18,7 @@ test suites share the same golden vectors.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 __all__ = [
@@ -25,6 +26,7 @@ __all__ = [
     "VaultRef",
     "VaultRefError",
     "parse_vault_ref",
+    "require_secret_fingerprint",
     "secret_fingerprint",
 ]
 
@@ -34,6 +36,13 @@ _FINGERPRINT_HEX_CHARS = 16
 #: Exactly what :func:`secret_fingerprint` produces, for validating one at a request
 #: boundary: a field declared to hold a fingerprint must never accept a plaintext secret.
 SECRET_FINGERPRINT_PATTERN = rf"^[0-9a-f]{{{_FINGERPRINT_HEX_CHARS}}}$"
+
+
+def require_secret_fingerprint(value: object) -> str:
+    """Return a valid cross-repo fingerprint or reject malformed producer data."""
+    if not isinstance(value, str) or re.fullmatch(SECRET_FINGERPRINT_PATTERN, value) is None:
+        raise ValueError(f"secret fingerprint must be {_FINGERPRINT_HEX_CHARS} lowercase hexadecimal characters")
+    return value
 
 
 def secret_fingerprint(value: str) -> str:

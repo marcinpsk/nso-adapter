@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for SecretsProvider implementations."""
 
+import os
+import subprocess
+import sys
+
 import pytest
 
 from nso_adapter.secrets.base import SecretResolutionError, SecretsProvider, resolve_secret
@@ -93,6 +97,32 @@ def test_local_provider_classifies_undecodable_file_bytes(tmp_path, monkeypatch)
 
     assert caught.value.reason == "the referenced file could not be read (UnicodeDecodeError)"
     assert_chain_free_of(caught.value, ["binary-token", str(tmp_path), "secret-bytes"])
+
+
+def test_local_provider_does_not_use_the_process_default_file_encoding(tmp_path):
+    secret_file = tmp_path / "token"
+    secret_file.write_text("placeholder-token", encoding="utf-8")
+    environment = {**os.environ, "MY_TOKEN_FILE": str(secret_file)}
+    environment.pop("MY_TOKEN", None)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-X",
+            "warn_default_encoding",
+            "-W",
+            "error::EncodingWarning",
+            "-c",
+            "from nso_adapter.secrets.local import LocalSecretsProvider; LocalSecretsProvider().get('MY_TOKEN')",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_local_provider_falls_through_when_the_referenced_file_is_gone(tmp_path, monkeypatch):

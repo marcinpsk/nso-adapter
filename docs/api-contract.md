@@ -375,7 +375,10 @@ Request:
   "netbox_device_id": 42 }
 ```
 → `201` device object (as above). `409 conflict` if the NetBox device or NSO
-device is already onboarded.
+device is already onboarded. An `error.detail.reason` of
+`netbox_device_claimed` means another mapping owns the requested NetBox device.
+An `error.detail.reason` of `onboarded_elsewhere` means the requested NSO
+device is linked to a different NetBox device.
 
 This onboard only creates the adapter **mapping row**; it assumes the device node
 already exists in NSO. To create the device *in NSO* and bring it up, use
@@ -552,7 +555,8 @@ Request (any subset):
 ```
 Changing `nso_device_name` or `nso_instance` re-keys the device: stored
 interface mappings and `interface_attr_state` are cleared and rebuilt on the
-next sync; `job` history is retained. → `200` device object.
+next sync; `job` history is retained. → `200` device object. A claimed target
+returns `409 conflict` with an `error.detail.reason` of `identity_claimed`.
 
 ### `DELETE /api/v1/devices/{id}` — offboard
 → `204`. Removes adapter state for the device. Does **not** modify NetBox.

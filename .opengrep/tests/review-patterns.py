@@ -36,6 +36,193 @@ def validation_error_messages(api_error, exc):
     api_error(422, "validation_error", "The request is invalid")
 
 
+async def action_force_removal(device_id, body, db):
+    outside_alias = body.scope
+    if body.scope not in valid_removal_scopes():
+        # ruleid: nso-api-unknown-request-renderer
+        api_error(400, "bad_request", body.scope)
+        # ruleid: nso-api-unknown-request-renderer
+        api_error(400, "bad_request", f"Unknown removal scope {body.scope!r}")
+        # ruleid: nso-api-unknown-request-renderer
+        api_error(400, "bad_request", str(body.scope))
+        # ruleid: nso-api-unknown-request-renderer
+        api_error(400, "bad_request", repr(body.scope))
+        # ruleid: nso-api-unknown-request-renderer
+        api_error(400, "bad_request", "Unknown removal scope %s" % body.scope)
+        # ruleid: nso-api-unknown-request-renderer
+        api_error(400, "bad_request", "Unknown removal scope {}".format(body.scope))
+        # ruleid: nso-api-unknown-request-renderer
+        api_error(400, "bad_request", format(body.scope))
+        # ruleid: nso-api-unknown-request-renderer
+        api_error(400, "bad_request", outside_alias)
+        inside_alias = body.scope
+        # ruleid: nso-api-unknown-request-renderer
+        api_error(400, "bad_request", inside_alias)
+        # ok: nso-api-unknown-request-renderer
+        api_error(400, "bad_request", "Unknown removal scope")
+
+    try:
+        work()
+    except OperationSectionAbsent as absent:
+        # ok: nso-api-unknown-request-renderer
+        api_error(
+            400,
+            "bad_request",
+            f"Nothing is authorized for {body.scope!r}",
+            {"scope": body.scope, "reason": absent.reason},
+        )
+
+
+def safe_generic_conflicts(api_error):
+    try:
+        onboard()
+    except DeviceIdentityRefused as exc:
+        refused = api_error(409, "conflict", str(exc), {"reason": exc.reason})
+    except LookupError:
+        # ok: nso-api-conflict-handler-contract
+        refused = api_error(
+            409,
+            "conflict",
+            _NETBOX_DEVICE_CLAIMED_MESSAGE,
+            {"reason": "netbox_device_claimed"},
+        )
+    except ValueError:
+        refused = api_error(422, "validation_error", "Unknown instance")
+
+    try:
+        rekey()
+    except LookupError:
+        # ok: nso-api-conflict-handler-contract
+        refused = api_error(
+            409,
+            "conflict",
+            _DEVICE_IDENTITY_CLAIMED_MESSAGE,
+            {"reason": "identity_claimed"},
+        )
+
+
+def bound_string_conflict(api_error):
+    # ruleid: nso-api-conflict-handler-contract
+    try:
+        onboard()
+    except LookupError as exc:
+        refused = api_error(409, "conflict", str(exc))
+
+
+def formatted_conflict(api_error):
+    # ruleid: nso-api-conflict-handler-contract
+    try:
+        onboard()
+    except LookupError as exc:
+        refused = api_error(409, "conflict", f"Conflict: {exc}")
+
+
+def percent_conflict(api_error):
+    # ruleid: nso-api-conflict-handler-contract
+    try:
+        onboard()
+    except LookupError as exc:
+        refused = api_error(409, "conflict", "Conflict: %s" % exc)
+
+
+def method_formatted_conflict(api_error):
+    # ruleid: nso-api-conflict-handler-contract
+    try:
+        onboard()
+    except LookupError as exc:
+        refused = api_error(409, "conflict", "Conflict: {}".format(exc))
+
+
+def direct_conflict(api_error):
+    # ruleid: nso-api-conflict-handler-contract
+    try:
+        onboard()
+    except LookupError as exc:
+        refused = api_error(409, "conflict", exc)
+
+
+def current_exception_conflict(api_error):
+    # ruleid: nso-api-conflict-handler-contract
+    try:
+        onboard()
+    except LookupError:
+        refused = api_error(409, "conflict", sys.exception())
+
+
+def current_exception_info_conflict(api_error):
+    # ruleid: nso-api-conflict-handler-contract
+    try:
+        onboard()
+    except LookupError:
+        refused = api_error(409, "conflict", sys.exc_info()[1])
+
+
+def conflict_without_detail(api_error):
+    # ruleid: nso-api-conflict-handler-contract
+    try:
+        onboard()
+    except LookupError:
+        refused = api_error(409, "conflict", _NETBOX_DEVICE_CLAIMED_MESSAGE)
+
+
+def conflict_with_empty_detail(api_error):
+    # ruleid: nso-api-conflict-handler-contract
+    try:
+        onboard()
+    except LookupError:
+        refused = api_error(409, "conflict", _NETBOX_DEVICE_CLAIMED_MESSAGE, {})
+
+
+def conflict_with_mismatched_reason(api_error):
+    # ruleid: nso-api-conflict-handler-contract
+    try:
+        onboard()
+    except LookupError:
+        refused = api_error(
+            409,
+            "conflict",
+            _NETBOX_DEVICE_CLAIMED_MESSAGE,
+            {"reason": "identity_claimed"},
+        )
+
+
+def conflict_with_extra_statement(api_error):
+    # ruleid: nso-api-conflict-handler-contract
+    try:
+        onboard()
+    except LookupError:
+        audit_conflict()
+        refused = api_error(
+            409,
+            "conflict",
+            _NETBOX_DEVICE_CLAIMED_MESSAGE,
+            {"reason": "netbox_device_claimed"},
+        )
+
+
+def conflict_with_message_alias(api_error):
+    # ruleid: nso-api-conflict-handler-contract
+    try:
+        onboard()
+    except LookupError:
+        message = _NETBOX_DEVICE_CLAIMED_MESSAGE
+        refused = api_error(409, "conflict", message, {"reason": "netbox_device_claimed"})
+
+
+def conflict_with_response_alias(api_error):
+    # ruleid: nso-api-conflict-handler-contract
+    try:
+        onboard()
+    except LookupError:
+        error = api_error(
+            409,
+            "conflict",
+            _NETBOX_DEVICE_CLAIMED_MESSAGE,
+            {"reason": "netbox_device_claimed"},
+        )
+        refused = error
+
+
 def returned_failure_details(exc):
     # ruleid: nso-failure-detail-raw-exception-renderer
     return repr(exc)

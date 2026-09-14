@@ -31,6 +31,67 @@ rules:
       - pattern: api_error(..., "validation_error", str($EXCEPTION), ...)
       - pattern: api_error(..., "validation_error", repr($EXCEPTION), ...)
       - pattern: api_error(..., "validation_error", f"...{$VALUE}...", ...)
+  - id: nso-api-unknown-request-renderer
+    languages: [python]
+    severity: ERROR
+    message: Use an authored unknown-value response instead of rendering request data.
+    mode: taint
+    paths:
+      include:
+        - nso_adapter/api/actions.py
+        - review-patterns.py
+    pattern-sources:
+      - patterns:
+          - pattern-inside: |
+              async def action_force_removal(...):
+                ...
+          - pattern: body.scope
+    pattern-sinks:
+      - patterns:
+          - pattern-inside: |
+              if body.scope not in valid_removal_scopes():
+                ...
+          - pattern: api_error(...)
+  - id: nso-api-conflict-handler-contract
+    languages: [python]
+    severity: ERROR
+    message: Use one approved authored LookupError conflict handler and its stable reason.
+    paths:
+      include:
+        - nso_adapter/api/devices.py
+        - review-patterns.py
+    patterns:
+      - pattern-either:
+          - pattern: |
+              try:
+                ...
+              except LookupError as $EXCEPTION:
+                $HANDLER
+          - pattern: |
+              try:
+                ...
+              except LookupError:
+                $HANDLER
+      - pattern-not: |
+          try:
+            ...
+          except LookupError:
+            refused = api_error(
+                409,
+                "conflict",
+                _NETBOX_DEVICE_CLAIMED_MESSAGE,
+                {"reason": "netbox_device_claimed"},
+            )
+      - pattern-not: |
+          try:
+            ...
+          except LookupError:
+            refused = api_error(
+                409,
+                "conflict",
+                _DEVICE_IDENTITY_CLAIMED_MESSAGE,
+                {"reason": "identity_claimed"},
+            )
   - id: nso-failure-detail-raw-exception-renderer
     languages: [python]
     severity: ERROR

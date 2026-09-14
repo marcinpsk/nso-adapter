@@ -86,7 +86,7 @@ string subclasses.
 `failure_detail()` keeps one interface:
 
 - A real HTTP status error renders as its type and numeric status.
-- An exact `NsoActionFailedError` instance renders its type only when
+- An exact `NsoActionFailedError` instance renders its type and closed kind when
   `type(exc.kind) is NsoActionFailureKind`; otherwise it falls back to its type.
 - Every other exception renders by type only.
 
@@ -123,3 +123,84 @@ The adversarial ratifier executed a candidate with exact type checks against
 both closed kinds, equal strings, string subclasses, tampered arguments,
 invalid and missing kinds, exception subclasses, secret-bearing read and export
 errors, and a real hostile HTTP status error. No blocking defect remained.
+
+## 8. API response guard extension
+
+### Status
+
+Ratified as revision r3, scope: request and generic-conflict response guards.
+
+### Review ledger
+
+- NOT-CLOSED: The first OpenGrep rules match only specific renderings. They do
+  not prevent every flow from `body.scope`, do not prevent every use of a bound
+  `LookupError`, and do not require a structured conflict reason.
+- CLOSED in r3: The r2 endpoint-wide taint source was too broad because a later
+  response intentionally returns a scope after membership validation. Restrict
+  the sink to the invalid-scope branch.
+- CLOSED in r3: Prohibiting an exception binding alone does not make the current
+  exception unavailable because `sys.exception()` can retrieve it. Require the
+  complete generic handler to match an approved authored response instead.
+
+### Brief
+
+The API endpoint owns the authored response. The OpenGrep configuration owns
+the pre-commit guard at the response-construction seam. The guard must make
+these failures observable before a commit:
+
+1. Any flow from `body.scope` into `api_error()` inside the branch that rejects
+   a scope outside `valid_removal_scopes()`.
+2. Any generic `LookupError` handler in the device API that is not one of the
+   approved authored message and stable reason pairs.
+
+The current API contract must document each new stable reason. The guard must
+not reject the earlier typed `DeviceIdentityRefused` handlers, which expose
+only authored text and a reason from that closed refusal interface.
+
+### Selected design
+
+The operator selected custom OpenGrep in pre-commit as the mechanical guard.
+Use taint tracking from the submitted removal scope to `api_error()` so direct,
+formatted, converted, and aliased renderings have one rule. Restrict the sink
+to the invalid membership branch, so the later response can return a validated
+scope. For generic `LookupError`, reject every complete handler except the two
+approved `api_error()` calls. Each approved call pairs one authored message
+constant with its stable literal reason. This allowlist rejects bound names,
+`sys.exception()`, alternate rendering syntax, missing reasons, and mismatched
+message and reason pairs without enumerating those bypasses.
+
+Add positive and negative fixture cases for each rule. Document the two reason
+values in `docs/api-contract.md`. No alternate AST guard is in scope because it
+would duplicate the selected pre-commit mechanism.
+
+### Divergence table
+
+| Decision | Selected choice | Alternate | Disposition | Consequence |
+| --- | --- | --- | --- | --- |
+| Mechanical owner | OpenGrep pre-commit rules | Python AST regression | Operator selected OpenGrep | One guard system owns these response checks |
+| Request-data detection | Taint from `body.scope` to `api_error()` in the invalid branch | Endpoint-wide taint or enumerate rendering syntax | Branch scope preserves the valid closed-scope response | New rendering syntax does not bypass the invalid-value guard |
+| Generic exception detection | Allowlist the complete authored handlers | Ban a bound name or enumerate exception renderers | Python can recover an unbound exception through `sys.exception()` | Any alternate handler fails pre-commit |
+| Stable conflict reason | Pin each authored message and literal reason pair | Require only a `reason` key | The public API promises the exact machine reason | Missing or mismatched reasons fail pre-commit |
+
+### Observable acceptance conditions
+
+- Fixture tests detect direct, interpolated, converted, percent-formatted, and
+  method-formatted uses of `body.scope` in an API error.
+- Fixture tests detect direct exception access, `sys.exception()`, a missing
+  reason, and a mismatched message and reason pair in generic handlers.
+- The repository scan reports no findings.
+- The API contract names `netbox_device_claimed` and `identity_claimed` at the
+  POST and PATCH device boundaries.
+
+### Ratification
+
+Revision r2 was not ratified because its request scope was too broad and its
+unbound-exception guarantee was false.
+
+`RATIFY revision r3, scope: request and generic-conflict response guards`
+
+The adversarial ratifier ran the rules against both production handlers and
+the action endpoint. The generic-handler proof rejected 13 mutations, including
+bound renderings, current-exception APIs, aliases, missing or mismatched reasons,
+and extra statements. The invalid-scope proof rejected nine direct, formatted,
+converted, and aliased flows. It allowed the later validated-scope response.

@@ -167,16 +167,19 @@ async def test_action_force_removal_enqueues_forced_removal_job(adapter_client):
 
 
 async def test_action_force_removal_rejects_unknown_scope(adapter_client):
-    from nso_adapter.api.actions import ForceRemovalBody, action_force_removal
-
     device_id = await _seed_device("actions-frm-02", 1341)
-    async with session() as db:
-        try:
-            await action_force_removal(device_id=device_id, body=ForceRemovalBody(scope="nonsense"), db=db)
-        except Exception as exc:
-            assert getattr(exc, "status_code", None) == 400
-        else:
-            raise AssertionError("unknown scope must be rejected")
+    submitted = "placeholder-secret-scope"
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/force-removal",
+        json={"scope": submitted},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error == {"code": "bad_request", "message": "Unknown removal scope", "detail": {}}
+    assert submitted not in response.text
 
 
 async def test_action_force_removal_interface_config_needs_no_interface_list(adapter_client):

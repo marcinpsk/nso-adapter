@@ -422,6 +422,8 @@ class DeviceCreate(BaseModel):
 
 
 _UNKNOWN_NSO_INSTANCE_MESSAGE = "The requested NSO instance is not configured"
+_NETBOX_DEVICE_CLAIMED_MESSAGE = "The requested NetBox device is already onboarded"
+_DEVICE_IDENTITY_CLAIMED_MESSAGE = "The requested device identity is already claimed"
 
 
 @router.post(
@@ -442,9 +444,14 @@ async def onboard_device(body: DeviceCreate, db: AsyncSession = Depends(get_db))
     except DeviceIdentityRefused as exc:
         # Authored text: the link that refuses the request is server-side state, and it is logged.
         refused = api_error(409, "conflict", str(exc), {"reason": exc.reason})
-    except LookupError as exc:
+    except LookupError:
         # Built in the handler, raised after it: a raise inside attaches the caught exception.
-        refused = api_error(409, "conflict", str(exc))
+        refused = api_error(
+            409,
+            "conflict",
+            _NETBOX_DEVICE_CLAIMED_MESSAGE,
+            {"reason": "netbox_device_claimed"},
+        )
     except ValueError:
         refused = api_error(422, "validation_error", _UNKNOWN_NSO_INSTANCE_MESSAGE)
     if refused is not None:
@@ -772,8 +779,13 @@ async def rekey_device(device_id: int, body: DevicePatch, db: AsyncSession = Dep
     except DeviceIdentityRefused as exc:
         # A patch may name only the instance, so the refused identity is half the stored row.
         refused = api_error(409, "conflict", str(exc), {"reason": exc.reason})
-    except LookupError as exc:
-        refused = api_error(409, "conflict", str(exc))
+    except LookupError:
+        refused = api_error(
+            409,
+            "conflict",
+            _DEVICE_IDENTITY_CLAIMED_MESSAGE,
+            {"reason": "identity_claimed"},
+        )
     except ValueError:
         refused = api_error(422, "validation_error", _UNKNOWN_NSO_INSTANCE_MESSAGE)
     if refused is not None:

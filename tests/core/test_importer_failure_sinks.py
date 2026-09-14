@@ -28,6 +28,7 @@ _URL = "https://nso.invalid/restconf/data/placeholder-mount/placeholder-path"
 _REASON = "Placeholder Reason Phrase"
 _LEAKS = [_URL, "placeholder-mount", "placeholder-path", _REASON]
 _COVERAGE_DOC = Path(__file__).resolve().parents[2] / ".opengrep" / "README.md"
+_DESIGN = Path(__file__).resolve().parents[2] / "docs" / "design" / "authored-failure-diagnostics.md"
 _IMPORTER = Path(__file__).resolve().parents[2] / "nso_adapter" / "core" / "importer.py"
 _NSO_CLIENT = Path(__file__).resolve().parents[2] / "nso_adapter" / "nso" / "client.py"
 _GUARDED_LOG_SINKS = (
@@ -139,6 +140,13 @@ def test_failure_detail_reads_only_closed_exception_properties() -> None:
     actual = _failure_detail_definition_ast(_NSO_CLIENT.read_text(encoding="utf-8"))
 
     assert actual == _APPROVED_FAILURE_DETAIL_AST
+
+
+def test_failure_detail_design_names_the_closed_kind_rendering() -> None:
+    design = _DESIGN.read_text(encoding="utf-8")
+
+    assert "renders its type and closed kind when" in design
+    assert "renders its type only when" not in design
 
 
 @pytest.mark.parametrize(

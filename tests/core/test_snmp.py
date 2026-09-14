@@ -10,7 +10,8 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import select
 
-from nso_adapter.core.snmp import refresh_snmp_config_for_device
+from nso_adapter.core.refresh_engine import run_family_refresh_from_section
+from nso_adapter.core.snmp import SNMP_SPEC, refresh_snmp_config_for_device
 from nso_adapter.store.models import Device, SnmpCommunity, SnmpHost, SnmpSystemInfo, SnmpV3User
 from tests.conftest import seed_device, session
 
@@ -51,6 +52,28 @@ async def test_refresh_inserts_communities(adapter_client):
         assert ro.access == "RO"
         assert ro.acl == "20"
         assert ro.refresh_source == "poll"
+
+
+@pytest.mark.anyio
+async def test_refresh_refuses_a_community_identity_that_is_not_a_fingerprint(adapter_client):
+    """The NSO package emits sha256[:16]; malformed producer data must not enter the mirror."""
+    device_id = await seed_device(nso_device_name="snmp-invalid-community", netbox_device_id=971)
+    async with _device_session(device_id) as (db, device):
+        with pytest.raises(ValueError, match="secret fingerprint"):
+            await run_family_refresh_from_section(
+                db,
+                device,
+                SNMP_SPEC,
+                {
+                    "status": "ok",
+                    "community": [{"name": "placeholder-plaintext-community", "access": "RO"}],
+                },
+                refresh_source="poll",
+            )
+
+    async with session() as db:
+        rows = (await db.scalars(select(SnmpCommunity).where(SnmpCommunity.device_id == device_id))).all()
+        assert rows == []
 
 
 @pytest.mark.anyio
@@ -169,8 +192,8 @@ async def test_refresh_full_replaces_existing_rows(adapter_client):
             "status": "ok",
             "name": "snmp-replace-sw01",
             "community": [
-                {"name": "hash_old1_abcd1234", "access": "RO"},
-                {"name": "hash_old2_efgh5678", "access": "RW"},
+                {"name": "1111222233334444", "access": "RO"},
+                {"name": "5555666677778888", "access": "RW"},
             ],
         }
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
@@ -180,7 +203,7 @@ async def test_refresh_full_replaces_existing_rows(adapter_client):
             "status": "ok",
             "name": "snmp-replace-sw01",
             "community": [
-                {"name": "hash_new1_mnop9012", "access": "RO"},
+                {"name": "9999aaaabbbbcccc", "access": "RO"},
             ],
         }
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
@@ -188,7 +211,7 @@ async def test_refresh_full_replaces_existing_rows(adapter_client):
         result = await db.execute(select(SnmpCommunity).where(SnmpCommunity.device_id == device.id))
         rows = result.scalars().all()
         assert len(rows) == 1
-        assert rows[0].community_hash == "hash_new1_mnop9012"
+        assert rows[0].community_hash == "9999aaaabbbbcccc"
 
 
 @pytest.mark.anyio
@@ -245,7 +268,7 @@ async def test_refresh_clears_stale_rows_on_authoritative_empty(adapter_client):
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "name": "snmp-clear-sw01",
-            "community": [{"name": "clear_me_abcd1234", "access": "RO"}],
+            "community": [{"name": "aaaabbbbccccdddd", "access": "RO"}],
             "v3-user": [{"username": "monitor", "has-auth-secret": True, "has-priv-secret": False}],
             "host": [{"address": "10.0.9.9", "version": "2c", "notify-type": "trap"}],
             "location": "ITC-Lab",
@@ -283,7 +306,7 @@ async def test_refresh_keeps_rows_on_read_error(adapter_client):
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "name": "snmp-degraded-sw01",
-            "community": [{"name": "keep_me_efgh5678", "access": "RW"}],
+            "community": [{"name": "ddddeeeeffff0000", "access": "RW"}],
         }
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
 
@@ -294,4 +317,4 @@ async def test_refresh_keeps_rows_on_read_error(adapter_client):
         assert result is False  # degraded surface
         rows = (await db.execute(select(SnmpCommunity).where(SnmpCommunity.device_id == device.id))).scalars().all()
         assert len(rows) == 1
-        assert rows[0].community_hash == "keep_me_efgh5678"
+        assert rows[0].community_hash == "ddddeeeeffff0000"

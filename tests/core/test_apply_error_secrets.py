@@ -579,7 +579,16 @@ async def _outcome_rows(device_id: int) -> list[dict]:
 
     async with session() as db:
         rows = (await db.execute(select(RefreshOutcome).where(RefreshOutcome.device_id == device_id))).scalars().all()
+        if not rows:
+            raise AssertionError("the refresh persisted no outcome row, so the scan below proves nothing")
         return [{c.name: getattr(row, c.name) for c in row.__table__.columns} for row in rows]
+
+
+async def test_outcome_rows_refuses_an_empty_persistence_proof(adapter_client):
+    device_id = await seed_device(nso_device_name="refresh-without-outcome", netbox_device_id=9434)
+
+    with pytest.raises(AssertionError, match="persisted no outcome row"):
+        await _outcome_rows(device_id)
 
 
 async def test_an_error_section_keeps_the_wire_reason_out_of_the_refresh_log(adapter_client):
