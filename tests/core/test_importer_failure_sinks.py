@@ -91,6 +91,20 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
             self.visit(node.value)
             self._assignment([node.target], node.value)
 
+    def visit_If(self, node: ast.If) -> None:  # noqa: N802 - ast visitor API
+        self.visit(node.test)
+        incoming = self.aliases.copy()
+
+        self.aliases = incoming.copy()
+        for statement in node.body:
+            self.visit(statement)
+        body_aliases = self.aliases
+
+        self.aliases = incoming.copy()
+        for statement in node.orelse:
+            self.visit(statement)
+        self.aliases |= body_aliases
+
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:  # noqa: N802 - ast visitor API
         handler_name = node.name
         if handler_name is not None:
@@ -166,6 +180,56 @@ except Exception as caught:
     logger.warning("event", detail=alias)
 """
     assert _raw_log_exception_renderers(source) == [5]
+
+
+def test_raw_exception_log_guard_preserves_aliases_from_conditional_branches() -> None:
+    source = """\
+try:
+    work()
+except Exception as caught:
+    if condition:
+        alias = caught
+    else:
+        alias = "authored detail"
+    logger.warning("event", detail=alias)
+"""
+    assert _raw_log_exception_renderers(source) == [8]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            """\
+alias = exc
+if condition:
+    alias = "authored detail"
+logger.warning("event", detail=alias)
+""",
+            [4],
+        ),
+        (
+            """\
+alias = exc
+if condition:
+    alias = "authored detail"
+else:
+    alias = "also authored"
+logger.warning("event", detail=alias)
+""",
+            [],
+        ),
+        (
+            """\
+if logger.warning("event", detail=exc):
+    pass
+""",
+            [1],
+        ),
+    ],
+)
+def test_raw_exception_log_guard_preserves_conditional_flow(source: str, expected: list[int]) -> None:
+    assert _raw_log_exception_renderers(source) == expected
 
 
 def test_raw_exception_log_guard_does_not_leak_aliases_between_functions() -> None:
