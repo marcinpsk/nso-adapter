@@ -2,6 +2,27 @@
 
 <!-- version list -->
 
+## v1.4.1 (2026-09-14)
+
+### Bug Fixes
+
+- **ci**: Derive zizmor consumers from uv lock
+  ([`60e2093`](https://github.com/marcinpsk/nso-adapter/commit/60e2093e3c7c588711e1adf3f31c640195493f86))
+
+### Chores
+
+- **deps**: Bump the python-minor-patch group with 3 updates
+  ([`b2969e2`](https://github.com/marcinpsk/nso-adapter/commit/b2969e2f870a9d0ec36b54419b5e7fa345b8c8f6))
+
+- **deps**: Bump types-pyyaml from 6.0.12.20260815 to 6.0.12.20260906
+  ([`4c2ae37`](https://github.com/marcinpsk/nso-adapter/commit/4c2ae37b525373b168c092f6b9e16421978c3546))
+
+### Documentation
+
+- Keep internal design notes local
+  ([`49b7963`](https://github.com/marcinpsk/nso-adapter/commit/49b79638160cd78f26f1cb47b41136d2f6c38997))
+
+
 ## v1.4.0 (2026-09-13)
 
 ### Bug Fixes
