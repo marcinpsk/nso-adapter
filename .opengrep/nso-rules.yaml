@@ -19,8 +19,24 @@ rules:
       - patterns:
           - pattern: logger.$LEVEL(..., error=$ERROR, ...)
           - pattern-not: logger.$LEVEL(..., error=failure_detail($EXCEPTION), ...)
-      - pattern: logger.$LEVEL(..., detail=str($EXCEPTION), ...)
-      - pattern: logger.$LEVEL(..., detail=repr($EXCEPTION), ...)
+      - patterns:
+          - pattern-either:
+              - pattern: logger.$LEVEL(..., detail=$EXCEPTION, ...)
+              - pattern: logger.$LEVEL(..., detail=str($EXCEPTION), ...)
+              - pattern: logger.$LEVEL(..., detail=repr($EXCEPTION), ...)
+              - pattern: logger.$LEVEL(..., detail=f"...{$EXCEPTION}...", ...)
+              - pattern: logger.$LEVEL(..., detail=$FORMAT.format(..., $EXCEPTION, ...), ...)
+              - pattern: logger.$LEVEL(..., detail=$FORMAT % $EXCEPTION, ...)
+              - pattern: logger.$LEVEL(..., detail=$LEFT + $EXCEPTION, ...)
+              - pattern: logger.$LEVEL(..., detail=$EXCEPTION + $RIGHT, ...)
+              - pattern: logger.$LEVEL(..., detail=$LEFT + str($EXCEPTION), ...)
+              - pattern: logger.$LEVEL(..., detail=str($EXCEPTION) + $RIGHT, ...)
+              - pattern: logger.$LEVEL(..., detail=$LEFT + repr($EXCEPTION), ...)
+              - pattern: logger.$LEVEL(..., detail=repr($EXCEPTION) + $RIGHT, ...)
+              - pattern: logger.$LEVEL(..., detail=format($EXCEPTION), ...)
+          - metavariable-regex:
+              metavariable: $EXCEPTION
+              regex: ^(exc|exception|error)$
       - pattern: logger.$LEVEL(..., exc_info=True, ...)
       - pattern: logger.exception(...)
   - id: nso-api-validation-error-raw-exception-renderer

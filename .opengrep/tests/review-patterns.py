@@ -21,12 +21,39 @@ def raw_outcome_errors(logger, exc, failure_detail):
     # ruleid: nso-outcome-raw-exception-renderer
     logger.warning("generation.interface_eligibility_unresolved", detail=str(exc))
     # ruleid: nso-outcome-raw-exception-renderer
+    logger.warning("generation.interface_eligibility_unresolved", detail=exc)
+    # ruleid: nso-outcome-raw-exception-renderer
+    logger.warning("generation.interface_eligibility_unresolved", detail=f"{exc}")
+    # ruleid: nso-outcome-raw-exception-renderer
+    logger.warning("generation.interface_eligibility_unresolved", detail="{}".format(exc))
+    # ruleid: nso-outcome-raw-exception-renderer
+    logger.warning("generation.interface_eligibility_unresolved", detail="%s" % exc)
+    # ruleid: nso-outcome-raw-exception-renderer
+    logger.warning("generation.interface_eligibility_unresolved", detail="failure: " + str(exc))
+    # ruleid: nso-outcome-raw-exception-renderer
+    logger.warning("generation.interface_eligibility_unresolved", detail=format(exc))
+    # ruleid: nso-outcome-raw-exception-renderer
     logger.warning("generation.interface_eligibility_unresolved", exc_info=True)
 
 
 def classified_outcome_errors(logger, exc, failure_detail):
     # ok: nso-outcome-raw-exception-renderer
     logger.warning("family.outcome.read_record_failed", error=failure_detail(exc))
+    # ok: nso-outcome-raw-exception-renderer
+    logger.warning("family.outcome.read_record_failed", detail=failure_detail(exc))
+
+
+def authored_outcome_details(logger, reason):
+    # ok: nso-outcome-raw-exception-renderer
+    logger.warning("family.outcome.read_record_failed", detail=f"Reason: {reason}")
+    # ok: nso-outcome-raw-exception-renderer
+    logger.warning("family.outcome.read_record_failed", detail="Reason: {}".format(reason))
+    # ok: nso-outcome-raw-exception-renderer
+    logger.warning("family.outcome.read_record_failed", detail="Reason: %s" % reason)
+    # ok: nso-outcome-raw-exception-renderer
+    logger.warning("family.outcome.read_record_failed", detail="Reason: " + str(reason))
+    # ok: nso-outcome-raw-exception-renderer
+    logger.warning("family.outcome.read_record_failed", detail=format(reason))
 
 
 def validation_error_messages(api_error, exc):

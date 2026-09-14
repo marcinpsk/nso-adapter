@@ -41,6 +41,17 @@ _GUARDED_LOG_SINKS = (
 )
 
 
+def _is_classified_failure_detail(value: ast.expr) -> bool:
+    """Return whether the expression uses the approved failure classifier."""
+    return (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "failure_detail"
+        and len(value.args) == 1
+        and not value.keywords
+    )
+
+
 def _raw_log_exception_renderers(source: str) -> list[int]:
     """Return log calls that do not use the one classified exception shape."""
     violations: list[int] = []
@@ -64,35 +75,15 @@ def _raw_log_exception_renderers(source: str) -> list[int]:
                 continue
             if keyword.arg == "detail":
                 value = keyword.value
-                if (
-                    isinstance(value, ast.Call)
-                    and isinstance(value.func, ast.Name)
-                    and value.func.id in {"repr", "str"}
-                    or isinstance(value, ast.Name)
-                    and value.id in exception_names
-                    or isinstance(value, ast.JoinedStr)
-                    and any(isinstance(part, ast.Name) and part.id in exception_names for part in ast.walk(value))
-                    or isinstance(value, ast.Call)
-                    and isinstance(value.func, ast.Attribute)
-                    and value.func.attr == "format"
-                    and any(
-                        isinstance(part, ast.Name) and part.id in exception_names
-                        for argument in (*value.args, *(keyword.value for keyword in value.keywords))
-                        for part in ast.walk(argument)
-                    )
+                if not _is_classified_failure_detail(value) and any(
+                    isinstance(part, ast.Name) and part.id in exception_names for part in ast.walk(value)
                 ):
                     violations.append(keyword.value.lineno)
                 continue
             if keyword.arg != "error":
                 continue
             value = keyword.value
-            if not (
-                isinstance(value, ast.Call)
-                and isinstance(value.func, ast.Name)
-                and value.func.id == "failure_detail"
-                and len(value.args) == 1
-                and not value.keywords
-            ):
+            if not _is_classified_failure_detail(value):
                 violations.append(keyword.value.lineno)
     return violations
 
@@ -108,12 +99,16 @@ logger.exception("event", error=failure_detail(exc))
 logger.warning("event", detail=exc)
 logger.warning("event", detail=f"{exc}")
 logger.warning("event", detail="{}".format(exc))
+logger.warning("event", detail="%s" % exc)
+logger.warning("event", detail="failure: " + str(exc))
+logger.warning("event", detail=format(exc))
 logger.warning("event", detail=str(exc))
 logger.warning("event", detail=repr(exc))
 logger.warning("event", exc_info=True)
+logger.warning("event", detail=failure_detail(exc))
 logger.warning("event", error=failure_detail(exc))
 """
-    assert _raw_log_exception_renderers(source) == list(range(1, 13))
+    assert _raw_log_exception_renderers(source) == list(range(1, 16))
 
 
 def test_importer_never_logs_raw_exception_text() -> None:
