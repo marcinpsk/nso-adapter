@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nso-adapter"
-version = "1.3.0"
+version = "1.4.1"
 description = "Middleware adapter between Cisco NSO and NetBox"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -41,8 +41,8 @@ dev = [
     "ruff>=0.16.1",
     "types-PyYAML>=6.0.0,<7.0.0",
     "watchfiles>=1.0",
-    # Keep in step with the pinned zizmor hook rev in .pre-commit-config.yaml.
-    "zizmor==1.29.0",
+    # This pin owns the Zizmor version used by pre-commit and CI through uv.lock.
+    "zizmor==1.30.0",
 ]
 
 [tool.setuptools.packages.find]

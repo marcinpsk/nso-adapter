@@ -49,13 +49,14 @@ certs/
 *.sqlite
 *.sqlite3
 
-# Local dev notes — real hostnames, IPs, Vault paths, service-account names
+# Local dev notes: real hostnames, IPs, Vault paths, and service-account names
 LOCAL-DEV.md
 
-# Per-developer agent / superpowers staging dir — not part of the project
+# Per-developer agent state, not part of the project
+.handoff/
 docs/superpowers/
 
-# Internal working docs (milestone plans/scopes/designs, spike findings) — kept
+# Internal working docs (milestone plans, scopes, designs, and spike findings): kept
 # local, never tracked. Only the cross-component API contract stays in git.
 docs/*
 !docs/api-contract.md
