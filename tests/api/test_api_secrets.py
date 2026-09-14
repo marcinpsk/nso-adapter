@@ -67,8 +67,8 @@ database_url: {pg_url}
     monkeypatch.setenv("CONFIG_FILE", str(cfg_file))
     monkeypatch.setenv("VAULT_ROLE_ID", "role-test")
     monkeypatch.setenv("VAULT_SECRET_ID", "secret-test")
-    monkeypatch.setenv("NSO_USERNAME", "admin")
-    monkeypatch.setenv("NSO_PASSWORD", "admin")
+    monkeypatch.setenv("NSO_USERNAME", "placeholder-user")
+    monkeypatch.setenv("NSO_PASSWORD", "placeholder-password")
     monkeypatch.setenv("NETBOX_TOKEN", "nb-test-token")
 
     store: dict[str, dict[str, str]] = {

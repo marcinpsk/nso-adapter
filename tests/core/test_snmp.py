@@ -87,7 +87,7 @@ async def test_refresh_inserts_v3_users(adapter_client):
             "name": "snmp-v3-sw01",
             "v3-user": [
                 {"username": "monitor", "has-auth-secret": True, "has-priv-secret": False},
-                {"username": "admin", "has-auth-secret": True, "has-priv-secret": True},
+                {"username": "placeholder-user", "has-auth-secret": True, "has-priv-secret": True},
             ],
         }
 
@@ -99,7 +99,7 @@ async def test_refresh_inserts_v3_users(adapter_client):
         by_name = {r.username: r for r in rows}
         assert by_name["monitor"].has_auth_secret is True
         assert by_name["monitor"].has_priv_secret is False
-        assert by_name["admin"].has_priv_secret is True
+        assert by_name["placeholder-user"].has_priv_secret is True
 
 
 @pytest.mark.anyio

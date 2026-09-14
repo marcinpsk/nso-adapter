@@ -4,21 +4,22 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
+import yaml
 
 import tests.credential_discipline as credential_discipline
 from tests.credential_discipline import (
-    _counts_by_site,
-    load_baseline,
-    save_baseline,
+    Violation,
     scan_source,
     scan_tree,
-    unapproved,
 )
 
 
-def test_no_unapproved_credentials_beyond_baseline():
-    bad = unapproved()
+def test_repository_has_no_forbidden_credentials():
+    bad = scan_tree()
     assert not bad, (
         "Unapproved credential literal(s):\n"
         + "\n".join(f"  {v}" for v in bad)
@@ -26,8 +27,34 @@ def test_no_unapproved_credentials_beyond_baseline():
     )
 
 
-def test_no_stale_credential_baseline_allowances():
-    assert credential_discipline.stale_baseline_sites() == {}
+def test_baseline_update_argument_is_rejected_without_writing(monkeypatch, capsys):
+    wrote = False
+
+    def record_write(*args, **kwargs):
+        nonlocal wrote
+        wrote = True
+
+    monkeypatch.setattr(credential_discipline, "save_baseline", record_write, raising=False)
+
+    assert credential_discipline._main(["--update-baseline"]) == 2
+    assert wrote is False
+    assert "usage:" in capsys.readouterr().err
+
+
+def test_pre_commit_guard_selects_an_obsolete_baseline_file():
+    config = yaml.safe_load((Path(__file__).parents[1] / ".pre-commit-config.yaml").read_text(encoding="utf-8"))
+    hooks = [
+        hook
+        for repository in config["repos"]
+        if repository["repo"] == "local"
+        for hook in repository["hooks"]
+        if hook["id"] == "credential-discipline"
+    ]
+    assert len(hooks) == 1
+    files = re.compile(hooks[0]["files"])
+    assert files.search("tests/test_example.py")
+    assert files.search("tests/credential_discipline_baseline.txt")
+    assert not (Path(__file__).parent / "credential_discipline_baseline.txt").exists()
 
 
 @pytest.mark.parametrize(
@@ -123,68 +150,12 @@ def test_marker_requires_a_reason_and_belongs_to_its_statement(source):
     assert len(scan_source(source)) == 1
 
 
-def test_counts_by_lexical_scope():
-    source = (
-        'username = "admin"\n'
-        "class Example:\n"
-        "    async def connect(self):\n"
-        '        client("admin", "ADMIN")\n'
-        "        def nested():\n"
-        '            password = "admin"\n'
-    )
-    assert _counts_by_site(scan_source(source, "t.py")) == {
-        "t.py::<module>": 1,
-        "t.py::Example.connect": 2,
-        "t.py::Example.connect.nested": 1,
-    }
-
-
-def test_baseline_allows_existing_but_flags_excess_and_new_scope(tmp_path):
-    path = tmp_path / "test_example.py"
-    path.write_text('def existing():\n    client("admin", "admin")\n', encoding="utf-8")
-    baseline = {"test_example.py::existing": 2}
-    assert unapproved(tmp_path, baseline) == []
-    path.write_text(
-        'def existing():\n    client("admin", "admin")\n    token = "admin"\ndef new():\n    username = "admin"\n',
-        encoding="utf-8",
-    )
-    hits = unapproved(tmp_path, baseline)
-    assert [(v.lineno, v.qualname) for v in hits] == [(3, "existing"), (5, "new")]
-
-
-def test_stale_baseline_sites_reports_reduced_and_missing_scopes(tmp_path):
-    path = tmp_path / "test_example.py"
-    path.write_text('def reduced():\n    username = "admin"\n', encoding="utf-8")
-    baseline = {
-        "test_example.py::reduced": 2,
-        "test_removed.py::missing": 1,
-    }
-
-    assert credential_discipline.stale_baseline_sites(tmp_path, baseline) == {
-        "test_example.py::reduced": (2, 1),
-        "test_removed.py::missing": (1, 0),
-    }
-
-
-def test_main_reports_stale_baseline_allowances(monkeypatch, capsys):
-    monkeypatch.setattr(credential_discipline, "unapproved", lambda: [])
-    monkeypatch.setattr(
-        credential_discipline,
-        "stale_baseline_sites",
-        lambda: {"test_example.py::removed": (2, 0)},
-    )
+def test_main_reports_forbidden_credentials(monkeypatch, capsys):
+    violation = Violation("test_example.py", 3, "test_example")
+    monkeypatch.setattr(credential_discipline, "scan_tree", lambda: [violation])
 
     assert credential_discipline._main([]) == 1
-    assert "test_example.py::removed: stale baseline allowance 2, current count 0" in capsys.readouterr().out
-
-
-def test_baseline_round_trip(tmp_path):
-    path = tmp_path / "baseline.txt"
-    assert load_baseline(path) == {}
-    counts = {"t.py::second": 2, "t.py::first": 1}
-    save_baseline(counts, path)
-    assert load_baseline(path) == counts
-    assert path.read_text().index("t.py::first") < path.read_text().index("t.py::second")
+    assert str(violation) in capsys.readouterr().out
 
 
 def test_scan_tree_skips_only_its_own_files(tmp_path):
@@ -199,8 +170,3 @@ def test_scan_tree_skips_only_its_own_files(tmp_path):
         "nested/test_credential_discipline.py",
         "test_example.py",
     ]
-
-
-def test_importer_regressions_have_no_baseline_allowance():
-    baseline = load_baseline()
-    assert not any(site.startswith("core/test_importer.py::") for site in baseline)

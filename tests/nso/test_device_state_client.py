@@ -29,7 +29,7 @@ def _make_client() -> NsoClient:
         password_ref="NSO_PASSWORD",
         host_header=None,
     )
-    return NsoClient(cfg, "admin", "secret")
+    return NsoClient(cfg, "placeholder-user", "secret")
 
 
 class EnvelopeTransport(httpx.AsyncBaseTransport):

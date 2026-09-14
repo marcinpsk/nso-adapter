@@ -40,7 +40,7 @@ def _make_cfg(base_url: str = "http://nso:8080", ca_cert=None, host_header=None)
 
 
 def _make_client(base_url: str = "http://nso:8080", host_header=None) -> NsoClient:
-    return NsoClient(_make_cfg(base_url, host_header=host_header), "admin", "secret")
+    return NsoClient(_make_cfg(base_url, host_header=host_header), "placeholder-user", "secret")
 
 
 class MockTransport(httpx.AsyncBaseTransport):

@@ -70,7 +70,7 @@ STREAMS_PAYLOAD = {
 
 
 async def test_discover_streams_returns_list():
-    sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    sub = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     with patch_subscriber_client(sub, 200, STREAMS_PAYLOAD):
         streams = await sub.discover_streams()
     assert len(streams) == 1
@@ -79,7 +79,7 @@ async def test_discover_streams_returns_list():
 
 
 async def test_discover_streams_empty_on_no_stream_key():
-    sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    sub = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     payload = {"ietf-restconf-monitoring:streams": {}}  # no "stream" key
     with patch_subscriber_client(sub, 200, payload):
         streams = await sub.discover_streams()
@@ -87,7 +87,7 @@ async def test_discover_streams_empty_on_no_stream_key():
 
 
 async def test_discover_streams_raises_on_401():
-    sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    sub = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     with patch_subscriber_client(sub, 401):
         with pytest.raises(httpx.HTTPStatusError):
             await sub.discover_streams()
@@ -97,13 +97,13 @@ async def test_discover_streams_raises_on_401():
 
 
 def test_client_sets_host_header_when_configured():
-    sub = SSESubscriber("http://nso:8080", ("admin", "secret"), host_header="nso.example.com")
+    sub = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"), host_header="nso.example.com")
     client = sub._client()
     assert client.headers.get("host") == "nso.example.com"
 
 
 def test_client_omits_host_header_when_not_configured():
-    sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    sub = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     client = sub._client()
     assert client.headers.get("host") is None
 
@@ -190,7 +190,7 @@ async def test_post_header_idle_raises_sse_idle_timeout():
 
     from nso_adapter.notifications.sse_subscriber import SseIdleTimeout
 
-    sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    sub = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     original = sub._client
     sub._client = lambda timeout=None: httpx.AsyncClient(
         transport=_PostHeaderTimeoutTransport(), base_url="http://nso:8080"
@@ -213,7 +213,7 @@ async def test_pre_header_read_timeout_stays_a_transport_error():
 
     from nso_adapter.notifications.sse_subscriber import SseIdleTimeout
 
-    sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    sub = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     original = sub._client
     sub._client = lambda timeout=None: httpx.AsyncClient(
         transport=_PreHeaderTimeoutTransport(), base_url="http://nso:8080"
@@ -238,7 +238,7 @@ async def test_subscribe_calls_on_event_for_each_sse_block():
         received.append((raw, parsed))
 
     payload = json.dumps({"ietf-restconf:notification": {"eventTime": "2026-01-01T00:00:00Z"}})
-    sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    sub = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     with patch_subscriber_sse(sub, [payload]):
         await sub.subscribe(STREAM_URL, on_event, duration=5.0)
 
@@ -254,7 +254,7 @@ async def test_subscribe_delivers_multiple_events():
         received.append((raw, parsed))
 
     events = [json.dumps({"ietf-restconf:notification": {"eventTime": f"2026-01-0{i}T00:00:00Z"}}) for i in range(1, 4)]
-    sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    sub = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     with patch_subscriber_sse(sub, events):
         await sub.subscribe(STREAM_URL, on_event, duration=5.0)
 
@@ -267,7 +267,7 @@ async def test_subscribe_passes_none_parsed_on_invalid_json():
     def on_event(raw: str, parsed: dict | None) -> None:
         received.append((raw, parsed))
 
-    sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    sub = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     with patch_subscriber_sse(sub, ["not-valid-{json"]):
         await sub.subscribe(STREAM_URL, on_event, duration=5.0)
 
@@ -292,7 +292,7 @@ async def test_subscribe_raises_on_http_error():
                 extensions={"reason_phrase": b"placeholder-secret-reason"},
             )
 
-    sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    sub = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     original = sub._client
     sub._client = lambda timeout=None: httpx.AsyncClient(
         transport=HostileRequestTransport(), base_url="http://nso:8080"
@@ -311,7 +311,7 @@ async def test_subscribe_raises_on_http_error():
 async def test_subscribe_empty_stream_calls_no_events():
     """A stream that closes immediately with no data produces zero on_event calls."""
     received: list = []
-    sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    sub = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     with patch_subscriber_sse(sub, []):
         await sub.subscribe(STREAM_URL, lambda raw, parsed: received.append(1), duration=5.0)
     assert received == []
@@ -331,7 +331,7 @@ async def test_subscribe_skips_event_type_and_comment_lines():
                 request=request,
             )
 
-    sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    sub = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     original = sub._client
 
     def _mock(timeout=None):
@@ -353,7 +353,7 @@ async def test_subscribe_does_not_log_raw_body_at_info():
     from structlog.testing import capture_logs
 
     payload = json.dumps({"secret-leaf": "hunter2"})
-    sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    sub = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     with capture_logs() as logs, patch_subscriber_sse(sub, [payload]):
         await sub.subscribe(STREAM_URL, lambda *_: None, duration=5.0)
 
@@ -390,7 +390,7 @@ async def test_subscribe_idle_read_timeout_unwedges_half_open_connection():
     server = await _asyncio.start_server(_handle, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
     url = f"http://127.0.0.1:{port}/stream"
-    sub = SSESubscriber(f"http://127.0.0.1:{port}", ("admin", "secret"))
+    sub = SSESubscriber(f"http://127.0.0.1:{port}", ("placeholder-user", "secret"))
     try:
         # No watchdog → wedged: only the outer wait_for stops it (old read=None behaviour).
         with pytest.raises(_asyncio.TimeoutError):
@@ -423,7 +423,7 @@ async def test_subscribe_completes_on_timeout():
             await _asyncio.sleep(10)  # outlasts any short duration
             return httpx.Response(200, content=b"", headers={"content-type": "text/event-stream"}, request=request)
 
-    sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    sub = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     original = sub._client
 
     def _mock(timeout=None):

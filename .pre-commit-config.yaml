@@ -55,7 +55,7 @@ repos:
         entry: python3 -m tests.credential_discipline
         language: system
         pass_filenames: false
-        files: ^tests/.*\.py$
+        files: ^tests/(?:.*\.py|credential_discipline_baseline\.txt)$
       # Companion to ruff's DTZ rules: DTZ polices naive *construction*; this bans the
       # zone *strip* (.replace(tzinfo=None)) everywhere but the iso_z wire serializer.
       - id: tz-discipline

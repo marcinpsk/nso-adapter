@@ -11,19 +11,14 @@ Positional string arguments and their tuple/list members are potential credentia
 including client constructors, auth tuples, and environment setters. It does not
 resolve callable signatures or follow values through variables.
 
-There are three carve-outs:
+There are two carve-outs:
 
   1. **Bound the use.** Explicit noncredential fields such as role, reference fields
      such as username_ref, lookup keys, and comparisons are legitimate uses.
   2. **Mark it.** Add an inline # credential-ok: <reason> comment to the statement,
      or a contiguous comment block directly above it, for a deliberate exception.
-  3. **Grandfather it.** The baseline records accepted literal counts per
-     (file, function). New literals beyond those counts fail. Regenerate with::
-
-         python -m tests.credential_discipline --update-baseline
-
-Each username and password literal counts separately. Keep new code out of the
-baseline. Prefer neutral placeholders or a documented legitimate exception.
+Every other occurrence fails. Prefer neutral placeholders or a documented legitimate
+exception.
 """
 
 from __future__ import annotations
@@ -31,12 +26,13 @@ from __future__ import annotations
 import ast
 import io
 import re
+import sys
 import tokenize
 from dataclasses import dataclass
 from pathlib import Path
 
 TESTS_ROOT = Path(__file__).resolve().parent
-_BASELINE_PATH = TESTS_ROOT / "credential_discipline_baseline.txt"
+_OBSOLETE_BASELINE_PATH = TESTS_ROOT / "credential_discipline_baseline.txt"
 _CREDENTIAL_WORDS = {"username", "user", "password", "passwd", "pwd", "secret", "token", "auth", "credentials"}
 _REFERENCE_SUFFIXES = {"ref", "reference", "path", "file"}
 _MARKER = re.compile(r"#\s*credential-ok:\s*\S")
@@ -50,11 +46,6 @@ class Violation:
     path: str
     lineno: int
     qualname: str
-
-    @property
-    def site(self) -> str:
-        """Return the stable baseline key."""
-        return f"{self.path}::{self.qualname}"
 
     def __str__(self) -> str:
         return f"{self.path}:{self.lineno}: unapproved credential literal 'admin' in {self.qualname}()"
@@ -220,89 +211,19 @@ def scan_tree(root: Path = TESTS_ROOT) -> list[Violation]:
     return out
 
 
-def _counts_by_site(violations: list[Violation]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for v in violations:
-        counts[v.site] = counts.get(v.site, 0) + 1
-    return counts
-
-
-def load_baseline(path: Path = _BASELINE_PATH) -> dict[str, int]:
-    """Read the grandfathered per-site allowance (``site\\tcount`` lines)."""
-    if not path.exists():
-        return {}
-    allowed: dict[str, int] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        site, _, count = line.rpartition("\t")
-        allowed[site] = int(count)
-    return allowed
-
-
-def save_baseline(counts: dict[str, int], path: Path = _BASELINE_PATH) -> None:
-    """Write the per-site allowance file (sorted, with an explanatory header)."""
-    header = [
-        "# SPDX-License-Identifier: Apache-2.0",
-        "# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>",
-        "# Credential-discipline baseline: accepted forbidden credential literals.",
-        "# Each line: <relpath-from-tests>::<qualname>\\t<allowed-count>.",
-        "# Shrink this file with neutral placeholders or '# credential-ok: <reason>'.",
-        "# Regenerate with: python -m tests.credential_discipline --update-baseline",
-        "",
-    ]
-    body = [f"{site}\t{counts[site]}" for site in sorted(counts)]
-    path.write_text("\n".join(header + body) + "\n", encoding="utf-8")
-
-
-def unapproved(root: Path = TESTS_ROOT, baseline: dict[str, int] | None = None) -> list[Violation]:
-    """Return violations beyond the baseline allowance, sorted by file then line."""
-    allowed = load_baseline() if baseline is None else baseline
-    by_site: dict[str, list[Violation]] = {}
-    for v in scan_tree(root):
-        by_site.setdefault(v.site, []).append(v)
-    extra: list[Violation] = []
-    for site, found in by_site.items():
-        budget = allowed.get(site, 0)
-        if len(found) > budget:
-            # Report the excess (the newest-by-line ones beyond the grandfathered count).
-            extra.extend(sorted(found, key=lambda v: v.lineno)[budget:])
-    return sorted(extra, key=lambda v: (v.path, v.lineno))
-
-
-def stale_baseline_sites(
-    root: Path = TESTS_ROOT,
-    baseline: dict[str, int] | None = None,
-) -> dict[str, tuple[int, int]]:
-    """Return baseline sites whose current count is lower than their allowance."""
-    allowed = load_baseline() if baseline is None else baseline
-    current = _counts_by_site(scan_tree(root))
-    return {
-        site: (budget, current.get(site, 0))
-        for site, budget in sorted(allowed.items())
-        if current.get(site, 0) < budget
-    }
-
-
 def _main(argv: list[str]) -> int:
-    if "--update-baseline" in argv:
-        counts = _counts_by_site(scan_tree())
-        save_baseline(counts)
-        print(f"baseline updated: {sum(counts.values())} credential(s) grandfathered across {len(counts)} site(s)")
-        return 0
-    bad = unapproved()
+    if argv:
+        print("usage: python -m tests.credential_discipline", file=sys.stderr)
+        return 2
+    if _OBSOLETE_BASELINE_PATH.exists():
+        print(f"{_OBSOLETE_BASELINE_PATH}: obsolete credential baseline is not allowed", file=sys.stderr)
+        return 1
+    bad = scan_tree()
     for v in bad:
         print(str(v))
-    stale = stale_baseline_sites()
-    for site, (budget, current) in stale.items():
-        print(f"{site}: stale baseline allowance {budget}, current count {current}")
     print(f"\n{len(bad)} unapproved credential(s)")
-    print(f"{len(stale)} stale baseline site(s)")
-    return 1 if bad or stale else 0
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":
-    import sys
-
     raise SystemExit(_main(sys.argv[1:]))

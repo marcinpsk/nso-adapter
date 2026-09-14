@@ -33,7 +33,7 @@ def load_persistent_subscriber() -> tuple[object, Callable[..., Awaitable[None]]
 
 async def test_persistent_subscriber_reconnects_after_clean_eof(monkeypatch: pytest.MonkeyPatch):
     module, persistent_subscriber = load_persistent_subscriber()
-    subscriber = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    subscriber = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     stop_event = asyncio.Event()
     second_call_started = asyncio.Event()
     wait_for_calls: list[float] = []
@@ -75,7 +75,7 @@ async def test_idle_timeout_reconnects_fast_and_resets_backoff(monkeypatch: pyte
     module, persistent_subscriber = load_persistent_subscriber()
     from nso_adapter.notifications.sse_subscriber import SseIdleTimeout
 
-    subscriber = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    subscriber = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     stop_event = asyncio.Event()
     wait_for_calls: list[float] = []
     attempts = 0
@@ -119,7 +119,7 @@ async def test_idle_timeout_reconnects_fast_and_resets_backoff(monkeypatch: pyte
 
 async def test_persistent_subscriber_retries_after_transport_error(monkeypatch: pytest.MonkeyPatch):
     module, persistent_subscriber = load_persistent_subscriber()
-    subscriber = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    subscriber = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     stop_event = asyncio.Event()
     wait_for_calls: list[float] = []
     attempts = 0
@@ -167,7 +167,7 @@ async def test_persistent_subscriber_retries_after_transport_error(monkeypatch: 
 
 async def test_persistent_subscriber_caps_exponential_backoff(monkeypatch: pytest.MonkeyPatch):
     module, persistent_subscriber = load_persistent_subscriber()
-    subscriber = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    subscriber = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     stop_event = asyncio.Event()
     wait_for_calls: list[float] = []
 
@@ -200,7 +200,7 @@ async def test_persistent_subscriber_returns_when_stopped_during_backoff(
     monkeypatch: pytest.MonkeyPatch,
 ):
     module, persistent_subscriber = load_persistent_subscriber()
-    subscriber = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    subscriber = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     stop_event = asyncio.Event()
     wait_for_calls: list[float] = []
 
@@ -227,7 +227,7 @@ async def test_persistent_subscriber_returns_when_stopped_during_backoff(
 
 async def test_persistent_subscriber_returns_after_stop_event_during_active_stream():
     _, persistent_subscriber = load_persistent_subscriber()
-    subscriber = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    subscriber = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     stop_event = asyncio.Event()
     stream_started = asyncio.Event()
 
