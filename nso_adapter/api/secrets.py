@@ -12,12 +12,13 @@ Neither is the REFERENCE, nor any component of it. ``vault_ref`` and the
 field, so a caller that pastes a secret into one would read it back out of the
 answer and out of every log that recorded the answer. Every response and every
 record carries an adapter-minted ``operation_id`` instead: it joins the record
-to the answer, and it is ours. What Vault itself reports back (field names,
-fingerprints, KV v2 versions) is not a caller echo and still travels.
+to the answer, and it is ours. Verification returns only a fixed projection of
+Vault state. It never returns caller-controlled field names.
 """
 
 from __future__ import annotations
 
+from typing import Literal
 from uuid import uuid4
 
 import anyio.to_thread
@@ -69,9 +70,10 @@ class SecretVerifyRequest(BaseModel):
 
 class SecretVerifyOut(BaseModel):
     operation_id: str
-    exists: bool
-    fields: list[str]
-    hashes: dict[str, str]
+    status: Literal["present", "missing_path", "missing_field"]
+    fingerprint: str | None
+    has_auth: bool
+    has_priv: bool
     version: int | None
 
 
@@ -184,24 +186,36 @@ async def set_secret(body: SecretWriteRequest, request: Request) -> SecretWriteO
     responses={**RESP_401, **RESP_400, **RESP_422_VALIDATION, **RESP_501, **RESP_502},
 )
 async def verify_secret(body: SecretVerifyRequest, request: Request) -> SecretVerifyOut:
-    """Resolve a ref and return field names + fingerprints — never the values."""
+    """Resolve a ref and return its fixed verification projection."""
     provider = _vault_provider(request)
     ref = _parse_ref(body.vault_ref)
 
-    data, version = await _vault_op(lambda: provider.read_path_meta(ref.mount, ref.path))
-    if ref.key is not None:
-        data = {ref.key: data[ref.key]} if ref.key in data else {}
-    if not data:
+    result = await _vault_op(lambda: provider.read_path_meta(ref.mount, ref.path))
+    fingerprint = None
+    has_auth = False
+    has_priv = False
+    if result is None:
+        status: Literal["present", "missing_path", "missing_field"] = "missing_path"
         version = None
+    else:
+        data, version = result
+        if ref.key is None:
+            status = "present"
+            has_auth = "auth" in data
+            has_priv = "priv" in data
+        elif ref.key in data:
+            status = "present"
+            fingerprint = secret_fingerprint(data[ref.key])
+        else:
+            status = "missing_field"
     operation_id = _operation_id()
-    # The field names and fingerprints are what VAULT holds, not what the caller sent, and the
-    # verify exists to report them. Nothing of the submitted ref is echoed.
-    logger.info("secrets.verify", operation_id=operation_id, exists=bool(data), version=version)
+    logger.info("secrets.verify", operation_id=operation_id, status=status, version=version)
     return SecretVerifyOut(
         operation_id=operation_id,
-        exists=bool(data),
-        fields=sorted(data),
-        hashes={field: secret_fingerprint(value) for field, value in data.items()},
+        status=status,
+        fingerprint=fingerprint,
+        has_auth=has_auth,
+        has_priv=has_priv,
         version=version,
     )
 

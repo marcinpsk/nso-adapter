@@ -35,6 +35,7 @@ class _FakeKvV2:
         self.read_mounts: list[str] = []
         self.write_calls: list[tuple[str, str, dict]] = []
         self.versions: dict[str, int] = {}
+        self.omit_metadata: set[str] = set()
 
     def read_secret_version(self, *, mount_point, path, raise_on_deleted_version):
         self.read_paths.append(path)
@@ -46,12 +47,10 @@ class _FakeKvV2:
             raise _FakeForbidden()
         if path not in self._store:
             raise _FakeInvalidPath(path)
-        return {
-            "data": {
-                "data": dict(self._store[path]),
-                "metadata": {"version": self.versions.get(path, 1)},
-            }
-        }
+        data = {"data": dict(self._store[path])}
+        if path not in self.omit_metadata:
+            data["metadata"] = {"version": self.versions.get(path, 1)}
+        return {"data": data}
 
     def create_or_update_secret(self, *, mount_point, path, secret):
         # Mirrors real KV v2 semantics: the write REPLACES the whole data dict.
@@ -158,6 +157,16 @@ def test_get_unknown_field_on_cached_path_refuses(fake_hvac):
     with pytest.raises(SecretResolutionError, match="not at the referenced path"):
         provider.get("credentials/svc#missing")
     assert kv.read_paths == ["credentials/svc"]  # no second read for the cached path
+
+
+def test_read_path_metadata_distinguishes_absence_from_an_unversioned_empty_path(fake_hvac):
+    _, store, kv = fake_hvac
+    store["credentials/empty"] = {}
+    kv.omit_metadata.add("credentials/empty")
+    provider = _provider()
+
+    assert provider.read_path_meta("secret", "credentials/missing") is None
+    assert provider.read_path_meta("secret", "credentials/empty") == ({}, None)
 
 
 def test_get_reauthenticates_on_forbidden(fake_hvac):

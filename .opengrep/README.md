@@ -45,9 +45,10 @@ so an HTTP exception cannot repeat a request URL or server text. The behavioral
 and AST regressions in `tests/core/test_importer_failure_sinks.py` remain
 authoritative for the classification contract and complete Python syntax.
 
-`nso-api-validation-error-raw-exception-renderer` rejects exception rendering
-and formatted values in device validation responses. These responses use
-authored text so caller-controlled NSO instance names do not return on the wire.
+`nso-api-validation-error-raw-exception-renderer` rejects every supported raw
+renderer in device validation responses. `nso-api-validation-error-raw-data-alias`
+tracks request and exception values through aliases to the same response field.
+These responses use authored text so caller-controlled values do not return on the wire.
 
 `nso-api-unknown-request-renderer` tracks the submitted removal scope into
 any `api_error` in `action_force_removal`. It covers direct, formatted, converted, and aliased

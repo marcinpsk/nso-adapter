@@ -82,15 +82,37 @@ def authored_outcome_details(logger, reason):
     logger.warning("family.outcome.read_record_failed", detail=format(reason))
 
 
-def validation_error_messages(api_error, exc):
+async def validation_error_messages(api_error, exc, body):
     # ruleid: nso-api-validation-error-raw-exception-renderer
     api_error(422, "validation_error", str(exc))
     # ruleid: nso-api-validation-error-raw-exception-renderer
     api_error(422, "validation_error", repr(exc))
     # ruleid: nso-api-validation-error-raw-exception-renderer
     api_error(422, "validation_error", f"Invalid request: {exc}")
+    # ruleid: nso-api-validation-error-raw-exception-renderer
+    api_error(422, "validation_error", "Invalid request: %s" % exc)
+    # ruleid: nso-api-validation-error-raw-exception-renderer
+    api_error(422, "validation_error", "Invalid request: {}".format(exc))
+    # ruleid: nso-api-validation-error-raw-exception-renderer
+    api_error(422, "validation_error", format(exc))
+    # ruleid: nso-api-validation-error-raw-exception-renderer
+    api_error(422, "validation_error", "Invalid request: " + str(exc))
+    request_alias = body.device_name
+    # ruleid: nso-api-validation-error-raw-data-alias
+    api_error(422, "validation_error", request_alias)
+    try:
+        validate()
+    except ValueError as caught:
+        exception_alias = caught
+        # ruleid: nso-api-validation-error-raw-data-alias
+        api_error(422, "validation_error", exception_alias)
+        # ok: nso-api-validation-error-raw-data-alias
+        api_error(422, "validation_error", caught.public_message)
     # ok: nso-api-validation-error-raw-exception-renderer
     api_error(422, "validation_error", "The request is invalid")
+    authored_message = "The requested NSO instance is not configured"
+    # ok: nso-api-validation-error-raw-exception-renderer
+    api_error(422, "validation_error", authored_message)
 
 
 async def action_force_removal(device_id, body, db):

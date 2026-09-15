@@ -82,7 +82,9 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
             self.violations.append(lineno)
 
     def _assignment(self, targets: list[ast.expr], value: ast.expr) -> None:
-        aliases_exception = isinstance(value, ast.Name) and value.id in self.aliases
+        aliases_exception = not _is_closed_exception_classification(value) and any(
+            isinstance(part, ast.Name) and part.id in self.aliases for part in ast.walk(value)
+        )
         for target in targets:
             if not isinstance(target, ast.Name):
                 continue
@@ -113,6 +115,13 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
             self.visit(node.value)
             self._assignment([node.target], node.value)
 
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:  # noqa: N802 - ast visitor API
+        self.visit(node.value)
+        target_was_alias = isinstance(node.target, ast.Name) and node.target.id in self.aliases
+        self._assignment([node.target], node.value)
+        if target_was_alias and isinstance(node.target, ast.Name):
+            self.aliases.add(node.target.id)
+
     def visit_If(self, node: ast.If) -> None:  # noqa: N802 - ast visitor API
         self.visit(node.test)
         incoming = self.aliases.copy()
@@ -137,11 +146,7 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
             self.aliases.discard(handler_name)
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 - ast visitor API
-        if (
-            isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "logger"
-        ):
+        if isinstance(node.func, ast.Attribute) and _is_logger_receiver(node.func.value):
             if node.func.attr == "exception":
                 self._record_violation(node.lineno)
             for argument in node.args:
@@ -163,6 +168,18 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
                 ):
                     self._record_violation(node.lineno)
         self.generic_visit(node)
+
+
+def _is_logger_receiver(node: ast.expr) -> bool:
+    """Return whether a call receiver is the module logger or one of its bound loggers."""
+    if isinstance(node, ast.Name):
+        return node.id == "logger"
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "bind"
+        and _is_logger_receiver(node.func.value)
+    )
 
 
 def _raw_log_exception_renderers(source: str) -> list[int]:
@@ -251,6 +268,22 @@ except Exception as caught:
     logger.warning("event", detail=alias)
 """
     assert _raw_log_exception_renderers(source) == [5]
+
+
+def test_raw_exception_log_guard_rejects_bound_logger_calls() -> None:
+    source = 'logger.bind(component="sync").warning("event", detail=exc)'
+    assert _raw_log_exception_renderers(source) == [1]
+
+
+def test_raw_exception_log_guard_tracks_rendered_and_augmented_aliases() -> None:
+    source = """\
+detail = str(exc)
+logger.warning("event", detail=detail)
+detail = "authored detail"
+detail += str(exc)
+logger.warning("event", detail=detail)
+"""
+    assert _raw_log_exception_renderers(source) == [2, 5]
 
 
 def test_raw_exception_log_guard_preserves_aliases_from_conditional_branches() -> None:
@@ -347,6 +380,7 @@ def test_review_guards_cover_each_authored_error_boundary() -> None:
         "nso_adapter/api/vlan.py",
         "review-patterns.py",
     }
+    assert set(rules["nso-api-validation-error-raw-data-alias"]["paths"]["include"]) == validation_paths
     outcome_paths = set(rules["nso-outcome-raw-exception-renderer"]["paths"]["include"])
     alias_paths = set(rules["nso-outcome-raw-exception-alias-renderer"]["paths"]["include"])
     assert alias_paths == outcome_paths

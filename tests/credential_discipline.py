@@ -82,7 +82,7 @@ def _constant_string(node: ast.AST) -> str | None:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     if isinstance(node, ast.FormattedValue):
-        if node.conversion == -1 and node.format_spec is None:
+        if node.conversion in (-1, ord("s")) and node.format_spec is None:
             return _constant_string(node.value)
         return None
     if isinstance(node, ast.JoinedStr):

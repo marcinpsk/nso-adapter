@@ -230,8 +230,7 @@ async def _resolve_lost_insert(
         logger.warning(
             "device.onboard_refused",
             reason="onboarded_elsewhere",
-            nso_instance=nso_instance,
-            nso_device=nso_device_name,
+            device_id=winner.id,
             linked_netbox_device_id=winner.netbox_device_id,
             requested_netbox_device_id=netbox_device_id,
         )
@@ -300,8 +299,7 @@ async def onboard_device(
             logger.warning(
                 "device.onboard_refused",
                 reason="onboarded_elsewhere",
-                nso_instance=nso_instance,
-                nso_device=nso_device_name,
+                device_id=existing.id,
                 linked_netbox_device_id=existing.netbox_device_id,
                 requested_netbox_device_id=netbox_device_id,
             )
@@ -553,10 +551,9 @@ async def _link_existing_under_claim(
         return None
     # Snapshotted: ending the transaction below expires the instance, and an implicit lazy
     # load on an async session raises MissingGreenlet instead of the intended error.
-    linked_to, nso_device_name, nso_instance = (
+    linked_to, nso_device_name = (
         existing.netbox_device_id,
         existing.nso_device_name,
-        existing.nso_instance,
     )
 
     # Already linked to THIS NetBox device → idempotent no-op; nothing to write.
@@ -570,8 +567,7 @@ async def _link_existing_under_claim(
         logger.warning(
             "device.onboard_refused",
             reason="onboarded_elsewhere",
-            nso_instance=nso_instance,
-            nso_device=nso_device_name,
+            device_id=device_id,
             linked_netbox_device_id=linked_to,
             requested_netbox_device_id=netbox_device_id,
         )
@@ -910,13 +906,13 @@ async def rekey_device(
             Device.id != device.id,
         )
     )
-    if dup.scalar_one_or_none():
+    conflicting = dup.scalar_one_or_none()
+    if conflicting is not None:
         logger.warning(
             "device.rekey_refused",
             reason="identity_claimed",
             device_id=device_id,
-            nso_instance=target_instance,
-            nso_device=target_name,
+            conflicting_device_id=conflicting.id,
         )
         raise DeviceIdentityRefused(_IDENTITY_CLAIMED, reason="identity_claimed")
 

@@ -290,7 +290,7 @@ async def test_set_secret_local_provider_501(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_verify_returns_fields_and_hashes_never_values(vault_client):
+async def test_verify_v3_returns_only_fixed_role_presence(vault_client):
     client, store, kv = vault_client
     store["netbox/snmp/v3/monitor"] = {"auth": "hunter2", "priv": "hunter3"}
     kv.versions["netbox/snmp/v3/monitor"] = 2
@@ -301,26 +301,38 @@ async def test_verify_returns_fields_and_hashes_never_values(vault_client):
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["exists"] is True
-    assert sorted(body["fields"]) == ["auth", "priv"]
-    assert body["hashes"] == {"auth": _h("hunter2"), "priv": _h("hunter3")}
-    assert body["version"] == 2
+    operation_id = body.pop("operation_id")
+    assert UUID(operation_id).hex == operation_id
+    assert body == {
+        "status": "present",
+        "fingerprint": None,
+        "has_auth": True,
+        "has_priv": True,
+        "version": 2,
+    }
     assert_text_free_of(resp.text, ["hunter2", "hunter3"])
 
 
 @pytest.mark.anyio
-async def test_verify_keyed_ref_restricts_to_that_field(vault_client):
-    client, store, _ = vault_client
-    store["netbox/snmp/community/abc"] = {"community": "s3cr3t", "note": "x"}
+async def test_verify_keyed_ref_returns_a_scalar_fingerprint_without_the_field_name(vault_client):
+    client, store, kv = vault_client
+    path = "netbox/snmp/community/abc"
+    key = "placeholder-selected-field"
+    store[path] = {key: "placeholder-selected-value", "placeholder-sibling-field": "placeholder-sibling-value"}
+    kv.versions[path] = 4
 
-    resp = await client.post(
-        "/api/v1/secrets/verify", json={"vault_ref": "network/netbox/snmp/community/abc#community"}, headers=AUTH
-    )
+    resp = await client.post("/api/v1/secrets/verify", json={"vault_ref": f"network/{path}#{key}"}, headers=AUTH)
 
     body = resp.json()
-    assert body["exists"] is True
-    assert body["fields"] == ["community"]
-    assert body["hashes"] == {"community": _h("s3cr3t")}
+    assert body["status"] == "present"
+    assert body["fingerprint"] == _h("placeholder-selected-value")
+    assert body["has_auth"] is False
+    assert body["has_priv"] is False
+    assert body["version"] == 4
+    assert_text_free_of(
+        resp.text,
+        [key, "placeholder-selected-value", "placeholder-sibling-field", "placeholder-sibling-value"],
+    )
 
 
 @pytest.mark.anyio
@@ -342,13 +354,46 @@ async def test_vault_permission_denied_returns_structured_502(vault_client):
 
 
 @pytest.mark.anyio
-async def test_verify_missing_path_exists_false(vault_client):
-    client, _, _ = vault_client
+async def test_verify_distinguishes_a_missing_path_from_a_missing_selected_field(vault_client):
+    client, store, kv = vault_client
+    store["present/path"] = {"another-field": "placeholder-value"}
+    kv.versions["present/path"] = 7
+
+    missing_field = await client.post(
+        "/api/v1/secrets/verify",
+        json={"vault_ref": "network/present/path#missing-selected-field"},
+        headers=AUTH,
+    )
     resp = await client.post("/api/v1/secrets/verify", json={"vault_ref": "network/nope/ghost"}, headers=AUTH)
+
+    assert missing_field.status_code == 200
+    assert missing_field.json()["status"] == "missing_field"
+    assert missing_field.json()["version"] == 7
     assert resp.status_code == 200
     body = resp.json()
-    assert body["exists"] is False
-    assert body["fields"] == []
+    assert body["status"] == "missing_path"
+    assert body["fingerprint"] is None
+    assert body["version"] is None
+
+
+@pytest.mark.anyio
+async def test_verify_treats_successful_empty_and_unversioned_paths_as_present(vault_client):
+    client, store, kv = vault_client
+    store["empty/path"] = {}
+    kv.omit_metadata.add("empty/path")
+    store["unrelated/path"] = {"placeholder-field": "placeholder-value"}
+
+    empty = await client.post("/api/v1/secrets/verify", json={"vault_ref": "network/empty/path"}, headers=AUTH)
+    unrelated = await client.post("/api/v1/secrets/verify", json={"vault_ref": "network/unrelated/path"}, headers=AUTH)
+
+    assert empty.json()["status"] == "present"
+    assert empty.json()["version"] is None
+    assert empty.json()["has_auth"] is False
+    assert empty.json()["has_priv"] is False
+    assert unrelated.json()["status"] == "present"
+    assert unrelated.json()["has_auth"] is False
+    assert unrelated.json()["has_priv"] is False
+    assert_text_free_of(unrelated.text, ["placeholder-field", "placeholder-value"])
 
 
 # ── POST /api/v1/devices/{id}/secrets/harvest-community ─────────────────────
@@ -694,7 +739,7 @@ async def test_the_secrets_write_description_promises_exactly_what_it_answers(va
 
 @pytest.mark.anyio
 async def test_a_SUCCESSFUL_verify_echoes_no_REFERENCE_COMPONENT_anywhere(vault_client):
-    """The verify echoed the submitted ref too; what VAULT holds is not a caller echo."""
+    """The fixed result carries no submitted ref component, field name, or secret value."""
     from structlog.testing import capture_logs
 
     from tests._secret_discipline import assert_records_free_of
@@ -707,16 +752,24 @@ async def test_a_SUCCESSFUL_verify_echoes_no_REFERENCE_COMPONENT_anywhere(vault_
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["exists"] is True
-    assert body["hashes"] == {_REF_KEY: _h("placeholder-secret")}, "what Vault holds is the point of the verify"
+    assert body["status"] == "present"
+    assert body["fingerprint"] == _h("placeholder-secret"), "the selected value is verified without its name"
     assert_records_free_of(logs, _REF_LOCATORS)
-    assert_text_free_of(
-        resp.text,
-        [_REF, _REF_PATH, _REF_MOUNT, "placeholder-path", "placeholder-leaf", "placeholder-secret"],
-    )
+    assert_text_free_of(resp.text, _REF_LOCATORS)
     verified = [record for record in logs if record["event"] == "secrets.verify"]
     assert verified, "the verify was not reported at all"
     assert verified[0]["operation_id"] == body["operation_id"], "the record must join to the answer"
+
+
+def test_secret_verify_openapi_exposes_only_the_fixed_result_shape():
+    schema = create_app().openapi()["components"]["schemas"]["SecretVerifyOut"]
+    expected = {"operation_id", "status", "fingerprint", "has_auth", "has_priv", "version"}
+
+    assert set(schema["properties"]) == expected
+    assert set(schema["required"]) == expected
+    assert not {"exists", "fields", "hashes"} & set(schema["properties"])
+    assert all("additionalProperties" not in property_schema for property_schema in schema["properties"].values())
+    assert all(property_schema.get("type") != "array" for property_schema in schema["properties"].values())
 
 
 @pytest.mark.anyio

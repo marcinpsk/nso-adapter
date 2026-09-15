@@ -53,7 +53,7 @@ def _as_invocation(decorator: ast.expr) -> ast.expr:
     return ast.copy_location(ast.Call(func=decorator, args=[], keywords=[]), decorator)
 
 
-def _definition_time_nodes(node: ast.AST) -> list[ast.AST]:
+def _definition_time_nodes(node: ast.AST, *, annotations_eager: bool) -> list[ast.AST]:
     """The parts of a function definition the interpreter evaluates where it is WRITTEN.
 
     Decorators and default expressions run at definition time, so one written in a handler
@@ -63,10 +63,22 @@ def _definition_time_nodes(node: ast.AST) -> list[ast.AST]:
     args = node.args
     defaults = [default for default in (*args.defaults, *args.kw_defaults) if default is not None]
     decorators = [_as_invocation(decorator) for decorator in getattr(node, "decorator_list", ())]
-    return [*decorators, *defaults]
+    annotations = _annotation_nodes(node) if annotations_eager else []
+    return [*decorators, *defaults, *annotations]
 
 
-def _executes_in_handler(handler: ast.ExceptHandler) -> Iterator[ast.AST]:
+def _annotation_nodes(node: ast.AST) -> list[ast.AST]:
+    """Return parameter and return annotations in interpreter evaluation order."""
+    annotations: list[ast.AST] = []
+    arguments = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs, node.args.vararg, node.args.kwarg)
+    annotations.extend(argument.annotation for argument in arguments if argument and argument.annotation is not None)
+    returns = getattr(node, "returns", None)
+    if returns is not None:
+        annotations.append(returns)
+    return annotations
+
+
+def _executes_in_handler(handler: ast.ExceptHandler, *, annotations_eager: bool) -> Iterator[ast.AST]:
     """Every node that RUNS while *handler* is active.
 
     A nested function or lambda BODY does not: defining it executes nothing there, and
@@ -78,7 +90,7 @@ def _executes_in_handler(handler: ast.ExceptHandler) -> Iterator[ast.AST]:
     while stack:
         node = stack.pop()
         if isinstance(node, _FUNCTION_NODES):
-            stack.extend(_definition_time_nodes(node))
+            stack.extend(_definition_time_nodes(node, annotations_eager=annotations_eager))
             continue
         if isinstance(node, ast.GeneratorExp):
             stack.append(node.generators[0].iter)
@@ -131,8 +143,9 @@ class _LexicalIndex:
     not guess from a same-spelled definition in another scope.
     """
 
-    def __init__(self, tree: ast.Module):
+    def __init__(self, tree: ast.Module, *, annotations_eager: bool):
         self.tree = tree
+        self.annotations_eager = annotations_eager
         self.scope_of: dict[ast.AST, ast.AST] = {tree: tree}
         self.parent: dict[ast.AST, ast.AST] = {}
         self.scope_parent: dict[ast.AST, ast.AST | None] = {tree: None}
@@ -190,7 +203,10 @@ class _LexicalIndex:
     def _walk_function(self, node: _Function, scope: ast.AST) -> None:
         self._assign(scope, node.name, node)
         self.functions.append(node)
-        for expression in (*node.decorator_list, *node.args.defaults, *node.args.kw_defaults):
+        expressions = [*node.decorator_list, *node.args.defaults, *node.args.kw_defaults]
+        if self.annotations_eager:
+            expressions.extend(_annotation_nodes(node))
+        for expression in expressions:
             if expression is not None:
                 self._walk(expression, scope, node)
         self.scope_parent[node] = scope
@@ -207,7 +223,10 @@ class _LexicalIndex:
         self._walk_function(node, scope)
 
     def _walk_Lambda(self, node: ast.Lambda, scope: ast.AST) -> None:
-        for expression in (*node.args.defaults, *node.args.kw_defaults):
+        expressions = [*node.args.defaults, *node.args.kw_defaults]
+        if self.annotations_eager:
+            expressions.extend(_annotation_nodes(node))
+        for expression in expressions:
             if expression is not None:
                 self._walk(expression, scope, node)
         self.scope_parent[node] = scope
@@ -476,13 +495,13 @@ class _LexicalIndex:
         return self._binding(expression.id, self.scope(expression)) is _NONE
 
 
-def _executes_during_call(node: _Function) -> Iterator[ast.AST]:
+def _executes_during_call(node: _Function, *, annotations_eager: bool) -> Iterator[ast.AST]:
     """Yield nodes executed by a call, pruning only deferred function bodies."""
     stack: list[ast.AST] = list(node.body)
     while stack:
         child = stack.pop()
         if isinstance(child, _FUNCTION_NODES):
-            stack.extend(_definition_time_nodes(child))
+            stack.extend(_definition_time_nodes(child, annotations_eager=annotations_eager))
             continue
         yield child
         stack.extend(ast.iter_child_nodes(child))
@@ -510,7 +529,9 @@ def _call_raises_now(call: ast.Call, *, awaited: bool, index: _LexicalIndex, hel
 def _always_raising_helpers(tree: ast.Module, index: _LexicalIndex) -> set[_Function]:
     """Return exact function definitions whose supported invocation always raises."""
     candidates: list[tuple[_Function, list[ast.AST]]] = [
-        (node, list(_executes_during_call(node))) for node in index.functions if node.body and index.classifiable(node)
+        (node, list(_executes_during_call(node, annotations_eager=index.annotations_eager)))
+        for node in index.functions
+        if node.body and index.classifiable(node)
     ]
     helpers = {
         node
@@ -554,13 +575,19 @@ def _attaches_context(node: ast.Raise, index: _LexicalIndex) -> bool:
 def scan_source(source: str, path: str) -> list[str]:
     """Every context-attaching site that RUNS inside an except handler, as ``path:line``."""
     tree = ast.parse(source, filename=path)
-    index = _LexicalIndex(tree)
+    annotations_eager = not any(
+        isinstance(statement, ast.ImportFrom)
+        and statement.module == "__future__"
+        and any(alias.name == "annotations" for alias in statement.names)
+        for statement in tree.body
+    )
+    index = _LexicalIndex(tree, annotations_eager=annotations_eager)
     helpers = _always_raising_helpers(tree, index)
     lines: set[int] = set()
     for handler in ast.walk(tree):
         if not isinstance(handler, ast.ExceptHandler):
             continue
-        for node in _executes_in_handler(handler):
+        for node in _executes_in_handler(handler, annotations_eager=annotations_eager):
             if isinstance(node, ast.Raise) and _attaches_context(node, index):
                 lines.add(node.lineno)
             elif isinstance(node, ast.Call) and _call_raises_now(
@@ -661,7 +688,10 @@ def _runtime_context(source: str) -> BaseException | None:
     namespace: dict = {"Boom": _Boom, "trigger": _trigger}
     raised: BaseException | None = None
     try:
-        exec(compile(source, "runtime.py", "exec"), namespace)  # noqa: S102, the behaviour IS the test
+        exec(  # noqa: S102, the behaviour IS the test
+            compile(source, "runtime.py", "exec", dont_inherit=True),
+            namespace,
+        )
     except _Boom as exc:
         raised = exc
     assert raised is not None, "the snippet did not raise Boom"
@@ -726,6 +756,19 @@ _DECORATOR_CALLS_A_RAISING_HELPER = (
     "    def later():\n"
     "        pass\n"
 )
+_EAGER_ANNOTATION_CALLS_A_RAISING_HELPER = (
+    "def _refuse():\n"
+    "    raise Boom()\n"
+    "\n"
+    "try:\n"
+    "    trigger()\n"
+    "except ValueError:\n"
+    "    def later(value: _refuse()) -> _refuse():\n"
+    "        pass\n"
+)
+_POSTPONED_ANNOTATION_DOES_NOT_CALL_HELPER = (
+    "from __future__ import annotations\n" + _EAGER_ANNOTATION_CALLS_A_RAISING_HELPER
+)
 
 
 def test_flags_a_helper_whose_raise_says_FROM_NONE() -> None:
@@ -744,6 +787,22 @@ def test_flags_a_raising_call_in_a_DECORATOR_evaluated_by_the_definition() -> No
     """So does a decorator expression."""
     assert isinstance(_runtime_context(_DECORATOR_CALLS_A_RAISING_HELPER), ValueError)
     assert scan_source(_DECORATOR_CALLS_A_RAISING_HELPER, "t.py") == ["t.py:7"]
+
+
+def test_flags_a_raising_call_in_an_EAGER_ANNOTATION() -> None:
+    """Parameter and return annotations execute with the definition in eager modules."""
+    assert isinstance(_runtime_context(_EAGER_ANNOTATION_CALLS_A_RAISING_HELPER), ValueError)
+    assert scan_source(_EAGER_ANNOTATION_CALLS_A_RAISING_HELPER, "t.py") == ["t.py:7"]
+
+
+def test_POSTPONED_ANNOTATIONS_do_not_execute_or_create_false_positives() -> None:
+    """Future annotations are stored instead of evaluating their expressions."""
+    namespace = {"Boom": _Boom, "trigger": _trigger}
+    exec(  # noqa: S102, the behaviour IS the test
+        compile(_POSTPONED_ANNOTATION_DOES_NOT_CALL_HELPER, "runtime.py", "exec", dont_inherit=True),
+        namespace,
+    )
+    assert scan_source(_POSTPONED_ANNOTATION_DOES_NOT_CALL_HELPER, "t.py") == []
 
 
 _BARE_DECORATOR_IS_A_RAISING_HELPER = (

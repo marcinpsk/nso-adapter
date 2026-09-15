@@ -7515,26 +7515,36 @@
       },
       "SecretVerifyOut": {
         "properties": {
-          "exists": {
-            "title": "Exists",
+          "fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fingerprint"
+          },
+          "has_auth": {
+            "title": "Has Auth",
             "type": "boolean"
           },
-          "fields": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Fields",
-            "type": "array"
-          },
-          "hashes": {
-            "additionalProperties": {
-              "type": "string"
-            },
-            "title": "Hashes",
-            "type": "object"
+          "has_priv": {
+            "title": "Has Priv",
+            "type": "boolean"
           },
           "operation_id": {
             "title": "Operation Id",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "present",
+              "missing_path",
+              "missing_field"
+            ],
+            "title": "Status",
             "type": "string"
           },
           "version": {
@@ -7551,9 +7561,10 @@
         },
         "required": [
           "operation_id",
-          "exists",
-          "fields",
-          "hashes",
+          "status",
+          "fingerprint",
+          "has_auth",
+          "has_priv",
           "version"
         ],
         "title": "SecretVerifyOut",
@@ -15545,7 +15556,7 @@
     },
     "/api/v1/secrets/verify": {
       "post": {
-        "description": "Resolve a ref and return field names + fingerprints \u2014 never the values.",
+        "description": "Resolve a ref and return its fixed verification projection.",
         "operationId": "verify_secret_api_v1_secrets_verify_post",
         "requestBody": {
           "content": {

@@ -78,15 +78,13 @@ async def test_onboard_duplicate_nso_device_returns_409(adapter_client_with_nso)
     assert resp.json()["error"]["code"] == "conflict"
 
 
-async def test_onboard_conflict_does_not_name_the_netbox_device_it_is_linked_to(adapter_client_with_nso):
-    """The 409 answered the link the adapter holds, which the caller never sent.
-
-    A caller that guesses NSO node names could read the NetBox inventory back out of the
-    refusals. The answer states the refusal and its reason; the link stays in the log.
-    """
+async def test_onboard_conflict_log_uses_adapter_ids_not_caller_names(adapter_client_with_nso):
+    """The refusal log keeps stable adapter ids and omits caller-controlled NSO names."""
     from structlog.testing import capture_logs
 
-    await seed_device(nso_instance="nso-dev", nso_device_name="placeholder-linked-node", netbox_device_id=46231)
+    existing_id = await seed_device(
+        nso_instance="nso-dev", nso_device_name="placeholder-linked-node", netbox_device_id=46231
+    )
 
     with capture_logs() as logs:
         resp = await adapter_client_with_nso.post(
@@ -107,18 +105,24 @@ async def test_onboard_conflict_does_not_name_the_netbox_device_it_is_linked_to(
     assert "46231" not in resp.text, "the answer names the NetBox device the adapter is linked to"
     refused = [record for record in logs if record["event"] == "device.onboard_refused"]
     assert refused, "the operator was told nothing"
+    assert refused[0]["device_id"] == existing_id
     assert refused[0]["linked_netbox_device_id"] == 46231, "the operator must still see the link"
+    assert "nso_instance" not in refused[0]
+    assert "nso_device" not in refused[0]
+    assert "nso_device_name" not in refused[0]
 
 
-async def test_rekey_conflict_does_not_name_the_stored_identity(adapter_client_with_nso):
-    """A PATCH may name only the instance, so the refused pair is half the stored row."""
+async def test_rekey_conflict_log_uses_adapter_ids_not_caller_names(adapter_client_with_nso):
+    """The refusal identifies both adapter rows without repeating the requested identity."""
     from structlog.testing import capture_logs
 
     # An instance dropped from config still keys stored rows; re-keying one onto nso-dev collides.
     device_id = await seed_device(
         nso_instance="nso-retired", nso_device_name="placeholder-stored-node", netbox_device_id=46331
     )
-    await seed_device(nso_instance="nso-dev", nso_device_name="placeholder-stored-node", netbox_device_id=46332)
+    conflicting_id = await seed_device(
+        nso_instance="nso-dev", nso_device_name="placeholder-stored-node", netbox_device_id=46332
+    )
 
     with capture_logs() as logs:
         resp = await adapter_client_with_nso.patch(
@@ -135,7 +139,11 @@ async def test_rekey_conflict_does_not_name_the_stored_identity(adapter_client_w
     assert "placeholder-stored-node" not in resp.text, "the answer repeats the identity the row holds"
     refused = [record for record in logs if record["event"] == "device.rekey_refused"]
     assert refused, "the operator was told nothing"
-    assert refused[0]["nso_device"] == "placeholder-stored-node"
+    assert refused[0]["device_id"] == device_id
+    assert refused[0]["conflicting_device_id"] == conflicting_id
+    assert "nso_instance" not in refused[0]
+    assert "nso_device" not in refused[0]
+    assert "nso_device_name" not in refused[0]
 
 
 async def test_onboard_unknown_instance_returns_422(adapter_client):

@@ -137,7 +137,7 @@ class VaultSecretsProvider:
             self._authenticate()
             return operation()
 
-    def _read_raw_meta(self, mount: str, path: str) -> tuple[dict[str, str], int | None]:
+    def _read_raw_meta(self, mount: str, path: str) -> tuple[dict[str, str], int | None] | None:
         assert self._client is not None
         try:
             secret = self._client.secrets.kv.v2.read_secret_version(
@@ -146,19 +146,20 @@ class VaultSecretsProvider:
                 raise_on_deleted_version=True,
             )
         except hvac.exceptions.InvalidPath:
-            return {}, None
+            return None
         version = secret["data"].get("metadata", {}).get("version")
         return dict(secret["data"]["data"]), int(version) if version is not None else None
 
     def _read_raw(self, mount: str, path: str) -> dict[str, str]:
-        return self._read_raw_meta(mount, path)[0]
+        result = self._read_raw_meta(mount, path)
+        return result[0] if result is not None else {}
 
     def read_path(self, mount: str, path: str) -> dict[str, str]:
         """Read all fields at ``mount/path`` (KV v2); ``{}`` when the path doesn't exist."""
         return self._with_reauth(lambda: self._read_raw(mount, path))
 
-    def read_path_meta(self, mount: str, path: str) -> tuple[dict[str, str], int | None]:
-        """Read fields + current KV v2 version at ``mount/path``; ``({}, None)`` when absent."""
+    def read_path_meta(self, mount: str, path: str) -> tuple[dict[str, str], int | None] | None:
+        """Read fields and the current KV v2 version, or ``None`` when the path is absent."""
         return self._with_reauth(lambda: self._read_raw_meta(mount, path))
 
     def write_path(self, mount: str, path: str, data: dict[str, str], merge: bool = True) -> int:

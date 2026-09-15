@@ -84,6 +84,47 @@ rules:
       - pattern: api_error(..., "validation_error", str($EXCEPTION), ...)
       - pattern: api_error(..., "validation_error", repr($EXCEPTION), ...)
       - pattern: api_error(..., "validation_error", f"...{$VALUE}...", ...)
+      - pattern: api_error(..., "validation_error", $FORMAT % $VALUE, ...)
+      - pattern: api_error(..., "validation_error", $FORMAT.format(...), ...)
+      - pattern: api_error(..., "validation_error", format($VALUE), ...)
+      - pattern: api_error(..., "validation_error", $LEFT + $RIGHT, ...)
+  - id: nso-api-validation-error-raw-data-alias
+    languages: [python]
+    severity: ERROR
+    message: Use an authored validation message instead of request or exception data.
+    mode: taint
+    paths:
+      include:
+        - nso_adapter/api/devices.py
+        - nso_adapter/api/lag_config.py
+        - nso_adapter/api/vlan.py
+        - review-patterns.py
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  def $FUNCTION(..., $REQUEST, ...):
+                    ...
+              - pattern-inside: |
+                  async def $FUNCTION(..., $REQUEST, ...):
+                    ...
+          - metavariable-regex:
+              metavariable: $REQUEST
+              regex: ^(body|payload)$
+          - pattern: $REQUEST.$FIELD
+      - patterns:
+          - pattern-inside: |
+              try:
+                ...
+              except $TYPE as $EXCEPTION:
+                ...
+          - pattern: $EXCEPTION
+    pattern-sanitizers:
+      - pattern: $EXCEPTION.public_message
+    pattern-sinks:
+      - patterns:
+          - pattern: api_error(..., "validation_error", $MESSAGE, ...)
+          - focus-metavariable: $MESSAGE
   - id: nso-api-unknown-request-renderer
     languages: [python]
     severity: ERROR

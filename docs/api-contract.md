@@ -1220,6 +1220,75 @@ holds an unrelated row carrying `route_id = R` — and the deletion partition's 
 would bind that row as genuine and authorize removing it. Advancing the pk sequence past this
 value is what closes that. `null` on both means the adapter holds nothing, which is not `0`.
 
+## Secrets
+
+Vault references use `mount/path` for a path or `mount/path#key` for one field.
+The adapter never returns a reference, field name, or secret value. Each successful
+operation returns an adapter-generated `operation_id` that identifies its safe log record.
+
+### `POST /api/v1/secrets` → `200 | 400 | 401 | 422 | 501 | 502`
+
+Merge fields into a Vault KV v2 path. A keyed reference requires `values` to contain
+exactly that key.
+
+```json
+{
+  "vault_ref": "network/netbox/snmp/v3/placeholder-user",
+  "values": {"auth": "placeholder-secret", "priv": "placeholder-secret"}
+}
+```
+
+```json
+{"operation_id": "placeholder-operation", "version": 4}
+```
+
+### `POST /api/v1/secrets/verify` → `200 | 400 | 401 | 422 | 501 | 502`
+
+Return a fixed projection of the selected Vault state.
+
+```json
+{"vault_ref": "network/netbox/snmp/community/placeholder#community"}
+```
+
+```json
+{
+  "operation_id": "placeholder-operation",
+  "status": "present",
+  "fingerprint": "0123456789abcdef",
+  "has_auth": false,
+  "has_priv": false,
+  "version": 4
+}
+```
+
+`status` is one of `present`, `missing_path`, or `missing_field`:
+
+- A keyed reference returns `present` and its scalar `fingerprint` when the key exists.
+  Its `has_auth` and `has_priv` values are false.
+- A keyed reference to an existing path without that key returns `missing_field`.
+  It retains the path's current `version`.
+- An unkeyed reference to any readable path returns `present`, including an empty or
+  unversioned path. Its `fingerprint` is null. `has_auth` and `has_priv` state whether
+  the fixed `auth` and `priv` keys exist.
+- An absent path returns `missing_path`, a null `fingerprint`, false role flags, and a
+  null `version`.
+
+### `POST /api/v1/devices/{id}/secrets/harvest-community` → `200 | 400 | 401 | 404 | 409 | 422 | 501 | 502`
+
+Find one community by its read-mirror fingerprint and store it at a keyed Vault reference.
+The response contains only the adapter operation id, fingerprint, new Vault version, and
+the device-held non-secret access metadata.
+
+```json
+{
+  "operation_id": "placeholder-operation",
+  "secret_hash": "0123456789abcdef",
+  "version": 4,
+  "access": "RO",
+  "acl": null
+}
+```
+
 ## SNMP Configuration (M11)
 
 ### `GET /api/v1/devices/{id}/snmp-config` → `200 | 404`
