@@ -5,10 +5,20 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
+
+
+def test_mapping_conflict_reasons_are_part_of_the_api_contract():
+    contract = (Path(__file__).resolve().parents[2] / "docs" / "api-contract.md").read_text(encoding="utf-8")
+    onboard = contract.split("### `POST /api/v1/devices`", 1)[1].split("\n### ", 1)[0]
+    rekey = contract.split("### `PATCH /api/v1/devices/{id}`", 1)[1].split("\n### ", 1)[0]
+
+    assert "`netbox_device_claimed`" in onboard
+    assert "`identity_claimed`" in rekey
 
 
 # ── POST /api/v1/devices (onboard) ──────────────────────────────────────────
@@ -43,7 +53,13 @@ async def test_onboard_duplicate_netbox_id_returns_409(adapter_client_with_nso):
         headers=AUTH,
     )
     assert resp.status_code == 409
-    assert resp.json()["error"]["code"] == "conflict"
+    error = resp.json()["error"]
+    assert error == {
+        "code": "conflict",
+        "message": "The requested NetBox device is already onboarded",
+        "detail": {"reason": "netbox_device_claimed"},
+    }
+    assert "100" not in resp.text
 
 
 async def test_onboard_duplicate_nso_device_returns_409(adapter_client_with_nso):
@@ -62,6 +78,74 @@ async def test_onboard_duplicate_nso_device_returns_409(adapter_client_with_nso)
     assert resp.json()["error"]["code"] == "conflict"
 
 
+async def test_onboard_conflict_log_uses_adapter_ids_not_caller_names(adapter_client_with_nso):
+    """The refusal log keeps stable adapter ids and omits caller-controlled NSO names."""
+    from structlog.testing import capture_logs
+
+    existing_id = await seed_device(
+        nso_instance="nso-dev", nso_device_name="placeholder-linked-node", netbox_device_id=46231
+    )
+
+    with capture_logs() as logs:
+        resp = await adapter_client_with_nso.post(
+            "/api/v1/devices",
+            json={
+                "nso_instance": "nso-dev",
+                "nso_device_name": "placeholder-linked-node",
+                "netbox_device_id": 46232,
+            },
+            headers=AUTH,
+        )
+
+    assert resp.status_code == 409, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "conflict"
+    assert error["message"] == "The NSO device is already onboarded to a different NetBox device"
+    assert error["detail"] == {"reason": "onboarded_elsewhere"}
+    assert "46231" not in resp.text, "the answer names the NetBox device the adapter is linked to"
+    refused = [record for record in logs if record["event"] == "device.onboard_refused"]
+    assert refused, "the operator was told nothing"
+    assert refused[0]["device_id"] == existing_id
+    assert refused[0]["linked_netbox_device_id"] == 46231, "the operator must still see the link"
+    assert "nso_instance" not in refused[0]
+    assert "nso_device" not in refused[0]
+    assert "nso_device_name" not in refused[0]
+
+
+async def test_rekey_conflict_log_uses_adapter_ids_not_caller_names(adapter_client_with_nso):
+    """The refusal identifies both adapter rows without repeating the requested identity."""
+    from structlog.testing import capture_logs
+
+    # An instance dropped from config still keys stored rows; re-keying one onto nso-dev collides.
+    device_id = await seed_device(
+        nso_instance="nso-retired", nso_device_name="placeholder-stored-node", netbox_device_id=46331
+    )
+    conflicting_id = await seed_device(
+        nso_instance="nso-dev", nso_device_name="placeholder-stored-node", netbox_device_id=46332
+    )
+
+    with capture_logs() as logs:
+        resp = await adapter_client_with_nso.patch(
+            f"/api/v1/devices/{device_id}",
+            json={"nso_instance": "nso-dev"},
+            headers=AUTH,
+        )
+
+    assert resp.status_code == 409, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "conflict"
+    assert error["message"] == "The target NSO identity is already claimed by another device"
+    assert error["detail"] == {"reason": "identity_claimed"}
+    assert "placeholder-stored-node" not in resp.text, "the answer repeats the identity the row holds"
+    refused = [record for record in logs if record["event"] == "device.rekey_refused"]
+    assert refused, "the operator was told nothing"
+    assert refused[0]["device_id"] == device_id
+    assert refused[0]["conflicting_device_id"] == conflicting_id
+    assert "nso_instance" not in refused[0]
+    assert "nso_device" not in refused[0]
+    assert "nso_device_name" not in refused[0]
+
+
 async def test_onboard_unknown_instance_returns_422(adapter_client):
     """POST with an NSO instance not in config → 422 validation_error.
 
@@ -73,7 +157,10 @@ async def test_onboard_unknown_instance_returns_422(adapter_client):
         headers=AUTH,
     )
     assert resp.status_code == 422
-    assert resp.json()["error"]["code"] == "validation_error"
+    error = resp.json()["error"]
+    assert error["code"] == "validation_error"
+    assert error["message"] == "The requested NSO instance is not configured"
+    assert "nonexistent-nso" not in resp.text
 
 
 async def test_onboard_requires_auth(adapter_client):
@@ -146,7 +233,10 @@ async def test_rekey_device_unknown_instance_returns_422(adapter_client):
         headers=AUTH,
     )
     assert resp.status_code == 422
-    assert resp.json()["error"]["code"] == "validation_error"
+    error = resp.json()["error"]
+    assert error["code"] == "validation_error"
+    assert error["message"] == "The requested NSO instance is not configured"
+    assert "nonexistent-nso" not in resp.text
 
 
 async def test_rekey_requires_auth(adapter_client):

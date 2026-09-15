@@ -47,6 +47,7 @@ from nso_adapter.core.static_route_plan import (
     recorded_static_route_apply_mode,
 )
 from nso_adapter.nso.apply import NsoApplyError
+from nso_adapter.nso.client import failure_detail
 from nso_adapter.store.models import (
     DbInterface,
     Device,
@@ -211,7 +212,8 @@ async def _static_route_device_state(client, device) -> tuple[str, dict]:
         # carry on to the bookkeeping under ownership it no longer has.
         raise
     except Exception as exc:  # noqa: BLE001 — a read-side failure is inconclusive, never a green
-        logger.warning("static_route.device_state_read_failed", device_id=device.id, error=repr(exc))
+        # Metadata only: any exception from the reader can repeat what the server said.
+        logger.warning("static_route.device_state_read_failed", device_id=device.id, error=failure_detail(exc))
         return "error", {}
 
 

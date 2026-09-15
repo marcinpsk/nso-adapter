@@ -19,6 +19,9 @@ from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
     Freshness,
     Present,
+    ReadFailure,
+    ReadFailureCode,
+    ReadOperation,
     Unavailable,
     UnavailableReason,
 )
@@ -58,6 +61,16 @@ async def test_record_read_outcome_phase1_flushed_in_session(adapter_client):
         assert row.read_outcome == "present"
         assert row.read_reason is None
         assert row.freshness == "fresh"
+        assert row.read_failures is None
+        assert (
+            await db.scalar(
+                select(RefreshOutcome.id).where(
+                    RefreshOutcome.id == attempt_id,
+                    RefreshOutcome.read_failures.is_(None),
+                )
+            )
+            == attempt_id
+        )
         assert row.result is None and row.completed_at is None  # phase 2 not recorded
         # no pointer until an attempt terminalizes
         ptr = (
@@ -73,11 +86,23 @@ async def test_record_read_outcome_phase1_flushed_in_session(adapter_client):
 
 @pytest.mark.anyio
 async def test_unavailable_read_reason_recorded(adapter_client):
-    """An unavailable read records its reason; record_result commits it so a fresh session sees it."""
+    """An unavailable read records its authored classification in a fresh session."""
     device_id = await seed_device(nso_device_name="oc-unavail", netbox_device_id=8802)
+    failure = ReadFailure(
+        operation=ReadOperation.section_get,
+        device="oc-unavail",
+        family="bgp-config",
+        error_type="HTTPStatusError",
+        http_status=503,
+        code=ReadFailureCode.section_status_error,
+    )
     async with session() as db:
         attempt_id = await outcome_store.record_read_outcome(
-            db, device_id, "bgp", Unavailable(UnavailableReason.export_down), refresh_source="sse"
+            db,
+            device_id,
+            "bgp",
+            Unavailable(UnavailableReason.export_down, failure=failure),
+            refresh_source="sse",
         )
         await outcome_store.record_result(db, attempt_id, result="kept", succeeded=False, row_count=None)
     async with session() as db:
@@ -85,6 +110,15 @@ async def test_unavailable_read_reason_recorded(adapter_client):
     assert row.read_outcome == "unavailable"
     assert row.read_reason == "export_down"
     assert row.freshness is None
+    assert row.read_failures == [
+        {
+            "read_operation": "section_get",
+            "component_family": "bgp-config",
+            "error_type": "HTTPStatusError",
+            "http_status": 503,
+            "failure_code": "section_status_error",
+        }
+    ]
 
 
 @pytest.mark.anyio
@@ -333,7 +367,7 @@ async def test_get_current_outcome_returns_newest_terminal(adapter_client):
             db,
             device_id,
             "static_route",
-            Unavailable(UnavailableReason.export_down, "boom"),
+            Unavailable(UnavailableReason.export_down),
             refresh_source="poll",
         )
         await outcome_store.record_result(db, a2, result="kept", succeeded=False)

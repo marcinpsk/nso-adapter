@@ -29,7 +29,7 @@ def _make_client() -> NsoClient:
         password_ref="NSO_PASSWORD",
         host_header=None,
     )
-    return NsoClient(cfg, "admin", "secret")
+    return NsoClient(cfg, "placeholder-user", "secret")
 
 
 class EnvelopeTransport(httpx.AsyncBaseTransport):
@@ -44,7 +44,7 @@ class EnvelopeTransport(httpx.AsyncBaseTransport):
         self,
         *,
         device_status: int = 200,
-        device_body: dict | None = None,
+        device_body: object | None = None,
         container_status: int = 200,
         action_status: int = 200,
         action_body: dict | None = None,
@@ -128,8 +128,10 @@ async def test_section_404_with_healthy_container_is_device_absent(patch_client)
 async def test_section_404_with_dead_container_raises_export_unavailable(patch_client):
     client = _make_client()
     with patch_client(client, EnvelopeTransport(device_status=404, container_status=404)):
-        with pytest.raises(NsoExportUnavailableError):
-            await client.get_device_state_section("sw01", "ospf-config")
+        with pytest.raises(NsoExportUnavailableError) as caught:
+            await client.get_device_state_section("placeholder-secret-device", "ospf-config")
+
+    assert "placeholder-secret" not in str(caught.value)
 
 
 async def test_section_5xx_raises(patch_client):
@@ -168,8 +170,11 @@ async def test_doc_404_with_healthy_container_is_device_absent(patch_client):
 async def test_doc_404_with_dead_container_raises_export_unavailable(patch_client):
     client = _make_client()
     with patch_client(client, EnvelopeTransport(device_status=404, container_status=404)):
-        with pytest.raises(NsoExportUnavailableError):
-            await client.get_device_state_doc("sw01")
+        with pytest.raises(NsoExportUnavailableError) as caught:
+            await client.get_device_state_doc("placeholder-secret-device")
+
+    assert "placeholder-secret" not in str(caught.value)
+    assert caught.value.__context__ is None, "the malformed response must not stay attached"
 
 
 # ── run_device_state_read ────────────────────────────────────────────────────────────
@@ -231,20 +236,24 @@ async def test_section_and_doc_run_on_the_blanket_timeout(patch_client):
     "body",
     [
         {},  # empty document
+        [],  # valid JSON, wrong top-level type
+        None,  # invalid empty JSON body
         {"network-state-export:device": []},  # empty device list
         {"wrong-namespace:device": [{"device-name": "sw01"}]},  # wrong namespace
         {"network-state-export:device": [{"device-name": "OTHER"}]},  # mismatched device
         {"network-state-export:device": [{"device-name": "sw01"}, {"device-name": "sw02"}]},  # multiple
     ],
-    ids=["empty-doc", "empty-list", "wrong-ns", "mismatch", "multiple"],
+    ids=["empty-doc", "top-level-list", "invalid-json", "empty-list", "wrong-ns", "mismatch", "multiple"],
 )
 async def test_doc_malformed_200_raises_never_absence(patch_client, body):
     """None is RESERVED for the confirmed-404 branch: a truncated/mangled 200 classified
     as device absence would clear every pop-policy family downstream."""
     client = _make_client()
     with patch_client(client, EnvelopeTransport(device_body=body)):
-        with pytest.raises(NsoExportUnavailableError):
-            await client.get_device_state_doc("sw01")
+        with pytest.raises(NsoReadContractError) as caught:
+            await client.get_device_state_doc("placeholder-secret-device")
+
+    assert "placeholder-secret" not in str(caught.value)
 
 
 # ── READSEM 1328: run_device_state_read certifies the snapshot before any consumer walks it ──

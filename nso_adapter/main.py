@@ -71,8 +71,8 @@ from nso_adapter.core.scheduler import start_scheduler, stop_scheduler
 from nso_adapter.core.worker import start_workers, stop_workers
 from nso_adapter.notifications.persistent_subscriber import persistent_subscriber
 from nso_adapter.notifications.sse_subscriber import SSESubscriber
-from nso_adapter.nso.client import NsoClient
-from nso_adapter.secrets import make_provider
+from nso_adapter.nso.client import NsoClient, failure_detail
+from nso_adapter.secrets import make_provider, resolve_secret
 from nso_adapter.store.db import get_engine, init_db, session
 
 logger = structlog.get_logger(__name__)
@@ -158,7 +158,7 @@ def _init_secrets(app: FastAPI, cfg, env):
     # vault_ref into the sha256 the device export keys it by (CR-A17) — same module-level
     # registry pattern as the NSO / NetBox clients in core.importer.
     register_secrets_provider(provider)
-    app.state.adapter_token = provider.get(cfg.api.adapter_token_ref)
+    app.state.adapter_token = resolve_secret(provider, cfg.api.adapter_token_ref, slot="api.adapter_token_ref")
     return provider
 
 
@@ -174,16 +174,25 @@ async def _init_database(cfg) -> None:
     # the row, so this takes its read path.
     from nso_adapter.store.meta import ensure_store_meta
 
-    await ensure_store_meta()
-    logger.info("db.ready", url=cfg.database_url)
+    incarnation, _born = await ensure_store_meta()
+    # The URL carries the store password. The incarnation is the adapter's own identity for
+    # the store it just bound, which is what a reader of a readiness record needs.
+    logger.info("db.ready", incarnation=incarnation)
+
+
+def _instance_credentials(provider, inst) -> tuple[str, str]:
+    """Resolve one NSO instance's credential pair, naming the config slot that failed."""
+    return (
+        resolve_secret(provider, inst.username_ref, slot=f"nso_instances[{inst.name}].username_ref"),
+        resolve_secret(provider, inst.password_ref, slot=f"nso_instances[{inst.name}].password_ref"),
+    )
 
 
 def _build_nso_clients(cfg, provider) -> dict[str, NsoClient]:
     """Construct and register one NsoClient per configured instance, resolving creds via the provider."""
     nso_clients: dict[str, NsoClient] = {}
     for inst in cfg.nso_instances:
-        username = provider.get(inst.username_ref)
-        password = provider.get(inst.password_ref)
+        username, password = _instance_credentials(provider, inst)
         client = NsoClient(inst, username, password)
         nso_clients[inst.name] = client
         register_nso_client(inst.name, client)
@@ -195,7 +204,7 @@ def _build_netbox_client(app: FastAPI, cfg, provider):
     """Build the pooled NetBox client, stash it on ``app.state`` and register it with the importer."""
     from nso_adapter.bindings.netbox.client import NetboxClient
 
-    netbox_token = provider.get(cfg.netbox.api_token_ref)
+    netbox_token = resolve_secret(provider, cfg.netbox.api_token_ref, slot="netbox.api_token_ref")
     netbox_client = NetboxClient(
         url=cfg.netbox.base_url,
         token=netbox_token,
@@ -248,7 +257,7 @@ class _DeviceRefreshCoalescer:
                 except asyncio.CancelledError:
                     raise  # shutdown: no respawn, no dirty consumption
                 except Exception as exc:  # noqa: BLE001 — fallthrough: the dirty check still runs
-                    logger.warning("sse.coalesced_refresh_failed", device_id=device_id, error=repr(exc))
+                    logger.warning("sse.coalesced_refresh_failed", device_id=device_id, error=failure_detail(exc))
                 if st["dirty"]:  # synchronous check-and-transition — no awaits between
                     st["dirty"] = False
                     continue
@@ -275,9 +284,7 @@ class _DeviceRefreshCoalescer:
             try:
                 await nb_client.notify_sync_complete(netbox_device_id)
             except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "sse.notify_failed", netbox_device_id=netbox_device_id, error=str(exc) or type(exc).__name__
-                )
+                logger.warning("sse.notify_failed", netbox_device_id=netbox_device_id, error=failure_detail(exc))
 
 
 async def _dispatch_netconf_change(
@@ -326,8 +333,11 @@ def _make_sse_event_handler(
 
     def _on_done(task: asyncio.Task) -> None:
         dispatch_tasks.discard(task)
-        if not task.cancelled() and task.exception() is not None:
-            logger.warning("sse.dispatch_failed", error=repr(task.exception()))
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning("sse.dispatch_failed", error=failure_detail(exc))
 
     if coalescer is None:
         coalescer = _DeviceRefreshCoalescer(clients, dispatch_tasks, _on_done)
@@ -359,8 +369,7 @@ def _start_sse_streams(
     if not cfg.scheduler.enable_nso_streams:
         return sse_tasks
     for inst in cfg.nso_instances:
-        username = provider.get(inst.username_ref)
-        password = provider.get(inst.password_ref)
+        username, password = _instance_credentials(provider, inst)
         subscriber = SSESubscriber(
             base_url=inst.base_url,
             auth=(username, password),
@@ -377,7 +386,7 @@ def _start_sse_streams(
             )
         )
         sse_tasks.append(task)
-        logger.info("sse.stream.started", instance=inst.name, url=stream_url)
+        logger.info("sse.stream.started", instance=inst.name)
     return sse_tasks
 
 

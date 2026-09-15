@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
-"""Zizmor consumers must execute the locked uv dependency."""
+"""Local lint consumers must resolve their declared tools."""
 
 from __future__ import annotations
 
 import re
 import shlex
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -13,6 +14,7 @@ import yaml
 ROOT = Path(__file__).parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 PRE_COMMIT = ROOT / ".pre-commit-config.yaml"
+REVIEW_PATTERNS = ROOT / "scripts" / "check-review-patterns"
 
 _REMOTE_ZIZMOR_HOOK = "https://github.com/zizmorcore/zizmor-pre-commit"
 _ZIZMOR_UV_PREFIX = ["uv", "run", "--locked", "--native-tls", "--", "zizmor"]
@@ -68,3 +70,16 @@ def test_zizmor_consumers_share_locked_uv_dependency():
     assert ci_command[-1] == "."
     collections = {token.removeprefix("--collect=") for token in ci_command if token.startswith("--collect=")}
     assert collections == _ZIZMOR_COLLECTIONS
+
+
+def test_review_pattern_hook_explains_its_opengrep_prerequisite() -> None:
+    result = subprocess.run(
+        ["/usr/bin/bash", str(REVIEW_PATTERNS), "scan"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin"},
+    )
+
+    assert result.returncode == 127
+    assert result.stderr.strip() == "OpenGrep is required. Install it or set OPENGREP_BIN. See README.md."

@@ -118,6 +118,102 @@ def test_db_migrate_rejects_a_non_postgresql_url_before_touching_the_database(tm
     assert "Running upgrade" not in output, f"alembic started the chain before the check:\n{output}"
 
 
+def test_db_migrate_survives_a_percent_in_the_password_and_prints_no_credential():
+    """A ``%`` in the password must not break migrations, and must not reach the output.
+
+    ``Config.set_main_option`` hands the URL to ConfigParser, which interpolates it. An
+    unescaped ``%`` raised ``ValueError: invalid interpolation syntax`` before anything
+    connected, and that message quotes the whole credential-bearing URL. The entrypoint
+    runs before uvicorn, so the traceback is the container log.
+
+    Driven as the real subprocess the entrypoint runs. The refused connection is the proof
+    that configuration finished: the run got all the way to the database.
+    """
+    password = "pw%40placeholder-secret"
+    proc = subprocess.run(
+        [sys.executable, "-m", "nso_adapter.db_migrate"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        # Port 1 refuses instantly, so the connection attempt itself is the observable step.
+        env={
+            "PATH": "/usr/bin:/bin",
+            "DATABASE_URL": f"postgresql+asyncpg://placeholder_user:{password}@127.0.0.1:1/nso_placeholder",
+        },
+    )
+    output = proc.stdout + proc.stderr
+
+    if "invalid interpolation syntax" in output:
+        raise AssertionError("the percent sign broke migration configuration")
+    if "OperationalError" not in output:
+        raise AssertionError("the migration runner did not reach the database")
+    for leaked in (password, "pw%%40", "placeholder-secret", "placeholder_user"):
+        if leaked in output:
+            raise AssertionError("the migration runner printed credential material")
+
+
+def _unsafe_migration_diagnostic_lines(target: ast.FunctionDef) -> list[int]:
+    rendered = []
+    for node in ast.walk(target):
+        diagnostic: ast.AST | None = None
+        if isinstance(node, ast.Assert):
+            diagnostic = node
+        elif (
+            isinstance(node, ast.Raise)
+            and isinstance(node.exc, ast.Call)
+            and isinstance(node.exc.func, ast.Name)
+            and node.exc.func.id == "AssertionError"
+        ):
+            diagnostic = node.exc
+        if diagnostic is None:
+            continue
+        names = {child.id for child in ast.walk(diagnostic) if isinstance(child, ast.Name)}
+        if names & {"output", "password", "leaked"}:
+            rendered.append(node.lineno)
+    return rendered
+
+
+def test_migration_output_assertions_never_render_captured_output_or_credentials():
+    """A failed secrecy assertion must not publish the captured subprocess output."""
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    target = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "test_db_migrate_survives_a_percent_in_the_password_and_prints_no_credential"
+    )
+    rendered = _unsafe_migration_diagnostic_lines(target)
+    assert rendered == [], f"unsafe assertion diagnostics at lines {rendered}"
+
+
+def test_migration_output_guard_rejects_rendered_assertion_errors():
+    tree = ast.parse(
+        """\
+def check(output):
+    if output:
+        raise AssertionError(f"captured output: {output}")
+"""
+    )
+    target = tree.body[0]
+    assert isinstance(target, ast.FunctionDef)
+
+    assert _unsafe_migration_diagnostic_lines(target) == [3]
+
+
+def test_migration_output_guard_rejects_an_assertion_that_evaluates_output():
+    tree = ast.parse(
+        """\
+def check(output):
+    assert "secret" not in output, "the migration runner printed credential material"
+"""
+    )
+    target = tree.body[0]
+    assert isinstance(target, ast.FunctionDef)
+
+    assert _unsafe_migration_diagnostic_lines(target) == [2]
+
+
 def test_db_migrate_and_init_db_share_one_validator():
     """Both entry points must reject identically — two copies would drift."""
     from nso_adapter.store.db import require_postgresql_url

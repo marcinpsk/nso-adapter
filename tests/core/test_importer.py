@@ -78,7 +78,7 @@ def test_attrs_to_interface_list_description_and_enabled():
             {"interface-name": "GigabitEthernet0/2", "enabled": False},
         ],
     }
-    result = _attrs_to_interface_list(entry)
+    result = _attrs_to_interface_list(entry, device_id=1)
     assert len(result) == 2
     ge01 = next(i for i in result if i.name == "GigabitEthernet0/1")
     assert ge01.nso.description == "uplink"
@@ -105,7 +105,7 @@ def test_attrs_to_interface_list_m27r_logical_fields():
             {"interface-name": "1/1/c1", "enabled": True, "kind": "physical"},
         ],
     }
-    result = _attrs_to_interface_list(entry)
+    result = _attrs_to_interface_list(entry, device_id=1)
     logical = next(i for i in result if i.name == "LAG99:10")
     assert logical.kind == "logical"
     assert logical.parent_binding == "lag-99"
@@ -118,11 +118,11 @@ def test_attrs_to_interface_list_m27r_logical_fields():
 
 
 def test_attrs_to_interface_list_returns_empty_on_none():
-    assert _attrs_to_interface_list(None) == []
+    assert _attrs_to_interface_list(None, device_id=1) == []
 
 
 def test_attrs_to_interface_list_returns_empty_when_no_interface_key():
-    assert _attrs_to_interface_list({"device-name": "sw01"}) == []
+    assert _attrs_to_interface_list({"device-name": "sw01"}, device_id=1) == []
 
 
 def test_attrs_to_interface_list_skips_malformed_entry():
@@ -134,16 +134,70 @@ def test_attrs_to_interface_list_skips_malformed_entry():
             {"interface-name": "GigabitEthernet0/2", "enabled": False},
         ]
     }
-    result = _attrs_to_interface_list(entry)
+    result = _attrs_to_interface_list(entry, device_id=1)
     assert len(result) == 2
     assert result[0].name == "GigabitEthernet0/1"
     assert result[1].name == "GigabitEthernet0/2"
 
 
+async def test_a_MALFORMED_attrs_entry_puts_no_payload_in_the_record(db_session: AsyncSession, adapter_client):
+    """The skip logged the whole entry, which is the device's own data.
+
+    An entry missing ``interface-name`` still carries whatever leaves the NED emitted, so
+    ``entry=<the entry>`` published all of them. The missing field, the family, and the stable
+    stored identifier say everything an operator can act on.
+    """
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
+    device = Device(
+        nso_instance="nso-dev",
+        nso_device_name="sw-attrs-sink",
+        ned_id="cisco-ios-cli-6.95",
+        netbox_device_id=41,
+    )
+    db_session.add(device)
+    await db_session.commit()
+
+    nso_client = _make_nso_client(
+        {
+            "device-name": "sw-attrs-sink",
+            "interface": [
+                {"interface-name": "GigabitEthernet0/1", "enabled": True},
+                {"description": "placeholder-server-text", "enabled": True},  # no interface-name
+            ],
+        }
+    )
+
+    from nso_adapter.core import importer as imp
+
+    imp._nso_clients["nso-dev"] = nso_client
+    imp._netbox_client = None
+
+    with (
+        patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})),
+        capture_logs() as logs,
+    ):
+        await sync_device(device.id, db_session)
+
+    skipped = [record for record in logs if record["event"] == "interface_attributes.entry_skipped"]
+    assert skipped == [
+        {
+            "event": "interface_attributes.entry_skipped",
+            "log_level": "warning",
+            "device_id": device.id,
+            "family": "interface-attributes",
+            "missing_field": "interface-name",
+        }
+    ]
+    assert_records_free_of(logs, ["placeholder-server-text"])
+
+
 def test_attrs_to_interface_list_enabled_absent_yields_none():
     """When NSO package omits 'enabled', the domain object carries None — not True/False."""
     entry = {"interface": [{"interface-name": "GigabitEthernet0/1", "description": "uplink"}]}
-    result = _attrs_to_interface_list(entry)
+    result = _attrs_to_interface_list(entry, device_id=1)
     assert len(result) == 1
     assert result[0].nso.enabled is None
 
@@ -1142,6 +1196,8 @@ async def test_sync_device_updates_ned_when_changed_in_nso(db_session: AsyncSess
     NED change on the device was never picked up (found via nso-vendor-test on the Arrcus dev 23:
     NSO reported arcos-v8.1.2X-nc-1.0 while the adapter still held arrcus-arcos-nc-8.1.3).
     """
+    from structlog.testing import capture_logs
+
     from nso_adapter.core import importer as imp
 
     device = Device(
@@ -1156,11 +1212,22 @@ async def test_sync_device_updates_ned_when_changed_in_nso(db_session: AsyncSess
     imp._nso_clients["nso-dev"] = client
     imp._netbox_client = None
 
-    with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
+    with (
+        patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})),
+        capture_logs() as logs,
+    ):
         await sync_device(device.id, db_session)
 
     await db_session.refresh(device)
     assert device.ned_id == "arcos-v8.1.2X-nc-1.0"  # re-learned, not stuck on the old value
+    changed = next(record for record in logs if record["event"] == "importer.ned_id.changed")
+    assert changed == {
+        "event": "importer.ned_id.changed",
+        "log_level": "info",
+        "device_id": device.id,
+        "old": "arrcus-arcos-nc-8.1.3",
+        "new": "arcos-v8.1.2X-nc-1.0",
+    }
 
 
 async def test_sync_device_keeps_ned_when_nso_read_returns_nothing(db_session: AsyncSession):
@@ -2100,3 +2167,108 @@ async def test_from_outcomes_lock_discipline(db_session: AsyncSession, monkeypat
     ok = await refresh_redistribution_from_outcomes(db_session, device, outcomes, refresh_source="sync", own_lock=False)
     assert ok is True
     assert acquired == [], "own_lock=False must not touch the lock registry"
+
+
+# ── the kept-NED record carries no server text ──────────────────────
+
+
+async def test_ned_id_read_failure_record_names_the_read_and_not_what_the_server_said(
+    db_session: AsyncSession,
+):
+    """A failed ned-id read on a device whose NED is known logged ``repr(exc)``.
+
+    httpx builds an HTTPStatusError message out of the server's REASON PHRASE and the
+    request URL, so a 503 from a proxy put both in ``importer.ned_id.read_failed``. The
+    record must carry the stored identifier, the read, the exception type, and the
+    numeric status, and nothing the caller or server wrote.
+
+    Drives the real NsoClient over a real transport, so the message is the one httpx
+    really builds. A stubbed exception would only repeat the test's own text.
+    """
+    import httpx
+    from structlog.testing import capture_logs
+
+    from nso_adapter.config import NsoInstanceConfig
+    from nso_adapter.core.importer import _resolve_ned_id
+    from tests._secret_discipline import assert_records_free_of
+
+    device = Device(
+        nso_instance="nso-dev", nso_device_name="sw-nedreason", ned_id="cisco-ios-cli-6.95", netbox_device_id=20
+    )
+    db_session.add(device)
+    await db_session.commit()
+
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(503, extensions={"reason_phrase": b"placeholder-proxy-detail"})
+    )
+    instance = NsoInstanceConfig(
+        name="nso-dev",
+        base_url="http://placeholder-nso.internal:8080",
+        username_ref="NSO_USERNAME",
+        password_ref="NSO_PASSWORD",
+    )
+    client = NsoClient(instance, "placeholder-user", "placeholder-password")
+    client._client = lambda timeout=None: httpx.AsyncClient(transport=transport, base_url=instance.base_url)
+
+    with capture_logs() as logs:
+        await _resolve_ned_id(db_session, device, client)  # must not raise: the NED is known
+
+    await db_session.refresh(device)
+    assert device.ned_id == "cisco-ios-cli-6.95", "a transient read must not clobber the known NED"
+    assert_records_free_of(
+        logs,
+        ["placeholder-proxy-detail", "placeholder-nso.internal", device.nso_instance, device.nso_device_name],
+    )
+    record = next(r for r in logs if r["event"] == "importer.ned_id.read_failed")
+    assert record == {
+        "event": "importer.ned_id.read_failed",
+        "log_level": "warning",
+        "device_id": device.id,
+        "kept": "cisco-ios-cli-6.95",
+        "read_operation": "ned_id_get",
+        "error_type": "HTTPStatusError",
+        "http_status": 503,
+    }
+
+
+async def test_ned_id_read_failure_records_use_stable_device_ids(db_session: AsyncSession):
+    """Two devices with the same NSO name remain distinct without logging raw identities."""
+    import httpx
+    from structlog.testing import capture_logs
+
+    from nso_adapter.config import NsoInstanceConfig
+    from nso_adapter.core.importer import _resolve_ned_id
+    from tests._secret_discipline import assert_records_free_of
+
+    records = []
+    device_ids = []
+    for instance_name in ("nso-east", "nso-west"):
+        device = Device(
+            nso_instance=instance_name,
+            nso_device_name="sw-twins",
+            ned_id="cisco-ios-cli-6.95",
+            netbox_device_id=None,
+        )
+        db_session.add(device)
+        await db_session.commit()
+        device_ids.append(device.id)
+
+        transport = httpx.MockTransport(lambda request: httpx.Response(503))
+        instance = NsoInstanceConfig(
+            name=instance_name,
+            base_url=f"http://placeholder-{instance_name}.internal:8080",
+            username_ref="NSO_USERNAME",
+            password_ref="NSO_PASSWORD",
+        )
+        client = NsoClient(instance, "placeholder-user", "placeholder-password")
+        client._client = lambda timeout=None, t=transport, i=instance: httpx.AsyncClient(
+            transport=t, base_url=i.base_url
+        )
+
+        with capture_logs() as logs:
+            await _resolve_ned_id(db_session, device, client)
+        records.append(next(r for r in logs if r["event"] == "importer.ned_id.read_failed"))
+
+    assert records[0] != records[1], "two instances' failures collapsed into one record"
+    assert [record["device_id"] for record in records] == device_ids
+    assert_records_free_of(records, ["sw-twins", "nso-east", "nso-west"])

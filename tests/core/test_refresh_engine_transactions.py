@@ -179,7 +179,7 @@ def _family_specs() -> tuple[FamilySpec, ...]:
 _PRESENT_DATA = {
     "lag": {"lag": [{"name": "ae1", "lag-id": 1}]},
     "logging": {"host": [{"address": "198.18.0.10"}]},
-    "snmp": {"community": [{"name": "sha256:placeholder", "access": "RO"}]},
+    "snmp": {"community": [{"name": "aaaabbbbccccdddd", "access": "RO"}]},
     "bgp": {"router": [{"asn": "64512"}]},
     "svi": {"interface": [{"interface-name": "Vlan100", "vlan-id": 100}]},
     "subinterface": {

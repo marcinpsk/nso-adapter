@@ -24,7 +24,8 @@ if not _db_url:
 require_postgresql_url(_db_url, label="DATABASE_URL")
 # Convert the async driver to the sync driver alembic uses.
 _db_url = _db_url.replace("postgresql+asyncpg", "postgresql+psycopg2")
-config.set_main_option("sqlalchemy.url", _db_url)
+# set_main_option feeds ConfigParser, which interpolates: a literal % must be doubled.
+config.set_main_option("sqlalchemy.url", _db_url.replace("%", "%%"))
 
 
 def run_migrations_offline() -> None:

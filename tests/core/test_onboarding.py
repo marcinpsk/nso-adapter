@@ -68,6 +68,37 @@ async def test_onboard_raises_for_duplicate_nso_device_name(adapter_client_with_
             await onboard_device(db, "nso-dev", "taken-name", 201)
 
 
+async def test_claimed_onboard_refusal_names_no_netbox_link(adapter_client_with_nso):
+    """The provision path refuses under the claim, and that refusal reached the job result.
+
+    Its message named the NetBox device the row is linked to, which the request never sent
+    and the job record then persisted. The refusal states the reason; the link is logged.
+    """
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.claim import ClaimRegistration
+    from nso_adapter.core.onboarding import DeviceIdentityRefused, onboard_device
+    from tests.conftest import seed_device
+
+    await seed_device(nso_instance="nso-dev", nso_device_name="placeholder-claimed-node", netbox_device_id=46431)
+
+    async with session() as db:
+        with capture_logs() as logs, pytest.raises(DeviceIdentityRefused) as caught:
+            await onboard_device(
+                db,
+                "nso-dev",
+                "placeholder-claimed-node",
+                46432,
+                reg=ClaimRegistration(run_attempt=1),
+            )
+
+    assert str(caught.value) == "The NSO device is already onboarded to a different NetBox device"
+    assert caught.value.reason == "onboarded_elsewhere"
+    assert "46431" not in str(caught.value), "the refusal names the link the adapter holds"
+    refused = [record for record in logs if record["event"] == "device.onboard_refused"]
+    assert refused and refused[0]["linked_netbox_device_id"] == 46431
+
+
 async def test_onboard_adopts_unlinked_existing_device(adapter_client_with_nso):
     """A device provisioned INTO NSO without a NetBox link (netbox_device_id IS NULL) must be
     ADOPTED when the operator later marks it managed: onboard_device fills the mapping in on the
@@ -92,6 +123,44 @@ async def test_onboard_adopts_unlinked_existing_device(adapter_client_with_nso):
         rows = (await db.execute(select(Device).where(Device.nso_device_name == "preprovisioned"))).scalars().all()
         assert len(rows) == 1
         assert rows[0].netbox_device_id == 77
+
+
+async def test_onboard_existing_adoption_reports_a_late_netbox_conflict(adapter_client_with_nso):
+    """A competing owner committed after the pre-check produces the public conflict."""
+    from nso_adapter.core.onboarding import onboard_device
+    from tests.conftest import seed_device
+
+    existing_id = await seed_device(
+        nso_instance="nso-dev",
+        nso_device_name="existing-adoption-winner",
+        netbox_device_id=None,
+    )
+    owner_id = None
+    async with session() as db:
+        original_commit = db.commit
+
+        async def commit_after_the_target_is_claimed():
+            nonlocal owner_id
+            owner_id = await seed_device(
+                nso_instance="nso-dev",
+                nso_device_name="existing-adoption-owner",
+                netbox_device_id=78,
+            )
+            db.commit = original_commit
+            await original_commit()
+
+        db.commit = commit_after_the_target_is_claimed
+        with pytest.raises(LookupError, match="NetBox device 78 is already onboarded") as caught:
+            await onboard_device(db, "nso-dev", "existing-adoption-winner", 78)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert owner_id is not None
+    async with session() as db:
+        existing = await db.get(Device, existing_id)
+        owner = await db.get(Device, owner_id)
+        assert existing is not None and existing.netbox_device_id is None
+        assert owner is not None and owner.netbox_device_id == 78
 
 
 async def test_onboard_is_idempotent_for_same_link(adapter_client_with_nso):
@@ -122,7 +191,124 @@ async def test_onboard_resolves_a_lost_insert_race(adapter_client_with_nso):
     INSERT land first, and the rival would then block on OUR uncommitted key instead of
     racing us to it.
     """
+    from structlog.testing import capture_logs
+
     from nso_adapter.core.onboarding import onboard_device
+    from tests._secret_discipline import assert_records_free_of
+    from tests.conftest import seed_device
+
+    submitted_name = "placeholder-caller-raced-device"
+    async with session() as db:
+        original_flush = db.flush
+        winner_id = {}
+
+        async def flush_after_a_competing_insert():
+            if not winner_id:
+                winner_id["id"] = await seed_device(
+                    nso_instance="nso-dev", nso_device_name=submitted_name, netbox_device_id=91
+                )
+            db.flush = original_flush
+            await original_flush()
+
+        db.flush = flush_after_a_competing_insert
+        with capture_logs() as logs:
+            device = await onboard_device(db, "nso-dev", submitted_name, 91)
+        assert device.id == winner_id["id"]  # the winner's row, not a second one
+    assert_records_free_of(logs, [submitted_name])
+
+    async with session() as db:
+        rows = (await db.execute(select(Device).where(Device.nso_device_name == submitted_name))).scalars().all()
+        assert len(rows) == 1  # exactly one survivor
+
+
+async def test_onboard_adopts_an_unlinked_lost_insert_winner(adapter_client_with_nso):
+    """The losing insert must complete the requested link on an unlinked winner."""
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.onboarding import onboard_device
+    from nso_adapter.store.models import MappingStatus
+    from tests._secret_discipline import assert_records_free_of
+    from tests.conftest import seed_device
+
+    submitted_name = "placeholder-caller-unlinked-device"
+    async with session() as db:
+        original_flush = db.flush
+        winner_id = {}
+
+        async def flush_after_an_unlinked_competing_insert():
+            if not winner_id:
+                winner_id["id"] = await seed_device(
+                    nso_instance="nso-dev",
+                    nso_device_name=submitted_name,
+                    netbox_device_id=None,
+                )
+            db.flush = original_flush
+            await original_flush()
+
+        db.flush = flush_after_an_unlinked_competing_insert
+        with capture_logs() as logs:
+            device = await onboard_device(db, "nso-dev", submitted_name, 190)
+
+        assert device.id == winner_id["id"]
+        assert device.netbox_device_id == 190
+        assert device.mapping_status is MappingStatus.mapped
+    assert_records_free_of(logs, [submitted_name])
+
+    async with session() as db:
+        rows = (await db.execute(select(Device).where(Device.nso_device_name == submitted_name))).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].netbox_device_id == 190
+
+
+async def test_onboard_reports_a_late_netbox_conflict_after_losing_the_insert(adapter_client_with_nso):
+    """A target claimed after the adoption pre-check must retain the public conflict contract."""
+    from nso_adapter.core.onboarding import onboard_device
+    from tests.conftest import seed_device
+
+    async with session() as db:
+        original_flush = db.flush
+        original_commit = db.commit
+        winner_id = {}
+        owner_id = {}
+
+        async def flush_after_an_unlinked_competing_insert():
+            if not winner_id:
+                winner_id["id"] = await seed_device(
+                    nso_instance="nso-dev",
+                    nso_device_name="late-conflict-winner",
+                    netbox_device_id=None,
+                )
+            db.flush = original_flush
+            await original_flush()
+
+        async def commit_after_the_target_is_claimed():
+            if not owner_id:
+                owner_id["id"] = await seed_device(
+                    nso_instance="nso-dev",
+                    nso_device_name="late-conflict-owner",
+                    netbox_device_id=193,
+                )
+            db.commit = original_commit
+            await original_commit()
+
+        db.flush = flush_after_an_unlinked_competing_insert
+        db.commit = commit_after_the_target_is_claimed
+        with pytest.raises(LookupError, match="NetBox device 193 is already onboarded") as caught:
+            await onboard_device(db, "nso-dev", "late-conflict-winner", 193)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+    async with session() as db:
+        winner = await db.get(Device, winner_id["id"])
+        owner = await db.get(Device, owner_id["id"])
+        assert winner is not None and winner.netbox_device_id is None
+        assert owner is not None and owner.netbox_device_id == 193
+
+
+async def test_onboard_same_identity_race_reports_identity_refusal(adapter_client_with_nso):
+    """The losing request must report that the NSO identity belongs to another link."""
+    from nso_adapter.core.onboarding import DeviceIdentityRefused, onboard_device
     from tests.conftest import seed_device
 
     async with session() as db:
@@ -132,18 +318,19 @@ async def test_onboard_resolves_a_lost_insert_race(adapter_client_with_nso):
         async def flush_after_a_competing_insert():
             if not winner_id:
                 winner_id["id"] = await seed_device(
-                    nso_instance="nso-dev", nso_device_name="raced-rtr", netbox_device_id=91
+                    nso_instance="nso-dev",
+                    nso_device_name="raced-identity",
+                    netbox_device_id=192,
                 )
             db.flush = original_flush
             await original_flush()
 
         db.flush = flush_after_a_competing_insert
-        device = await onboard_device(db, "nso-dev", "raced-rtr", 91)
-        assert device.id == winner_id["id"]  # the winner's row, not a second one
+        with pytest.raises(DeviceIdentityRefused) as caught:
+            await onboard_device(db, "nso-dev", "raced-identity", 191)
 
-    async with session() as db:
-        rows = (await db.execute(select(Device).where(Device.nso_device_name == "raced-rtr"))).scalars().all()
-        assert len(rows) == 1  # exactly one survivor
+    assert caught.value.reason == "onboarded_elsewhere"
+    assert str(caught.value) == "The NSO device is already onboarded to a different NetBox device"
 
 
 async def test_duplicate_nso_identity_is_rejected_by_the_database(adapter_client_with_nso):
@@ -657,3 +844,40 @@ async def test_set_scope_empty_list_clears_scope(adapter_client_with_nso):
         device = await db.get(Device, device_id)
         result = await set_scope(db, device, [])
         assert result == []
+
+
+# ── _seed_onboarding_failover: the persisted step carries no store diagnostics ──
+
+
+async def test_failover_seed_failure_step_classifies_the_store_error(adapter_client_with_nso, monkeypatch):
+    """A failed seed reports the failure TYPE, never the driver's repr.
+
+    The step is best-effort, so it is persisted and served rather than raised. A SQLAlchemy
+    error repeats the statement it ran and the parameters it bound, and this row's parameters
+    are the device's management addresses.
+    """
+    from nso_adapter.config import get_config
+    from nso_adapter.core.onboarding import _seed_onboarding_failover
+
+    monkeypatch.setattr(get_config().scheduler, "enable_failover", True)
+    absent_device_id = 987654321  # no devices row, so the seed's INSERT violates its FK
+
+    async with session() as db:
+        step = await _seed_onboarding_failover(db, absent_device_id, "198.51.100.10", "203.0.113.10", "primary")
+
+    assert step == {"step": "failover_seed", "status": "failed", "detail": "IntegrityError"}
+
+
+async def test_failover_seed_success_step_is_unchanged(adapter_client_with_nso, monkeypatch):
+    """The ok path still reports the address it seeded: only the failure branch changed."""
+    from nso_adapter.config import get_config
+    from nso_adapter.core.onboarding import _seed_onboarding_failover, onboard_device
+
+    monkeypatch.setattr(get_config().scheduler, "enable_failover", True)
+
+    async with session() as db:
+        device = await onboard_device(db, "nso-dev", f"seed-{uuid4().hex[:8]}", int(uuid4().int % 10**8))
+        await db.commit()
+        step = await _seed_onboarding_failover(db, device.id, "198.51.100.10", "203.0.113.10", "oob")
+
+    assert step == {"step": "failover_seed", "status": "ok", "detail": "oob"}

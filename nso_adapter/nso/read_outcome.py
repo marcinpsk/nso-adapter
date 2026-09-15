@@ -30,7 +30,10 @@ not carry. Classification is therefore a direct mapping, no inference:
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass, field
+from collections.abc import Iterable
+from dataclasses import dataclass, field, replace
+
+import httpx
 
 
 class Freshness(str, enum.Enum):
@@ -53,6 +56,22 @@ class Present:
 
     data: dict
     freshness: Freshness = Freshness.fresh
+    failures: tuple[ReadFailure, ...] = field(default_factory=tuple, compare=False)
+
+    @classmethod
+    def composite(
+        cls,
+        data: dict,
+        freshness: Freshness,
+        component_outcomes: Iterable[ReadOutcome],
+    ) -> Present:
+        """Build an authoritative composite and retain each failed component classification."""
+        failures = tuple(
+            outcome.failure
+            for outcome in component_outcomes
+            if isinstance(outcome, Unavailable) and outcome.failure is not None
+        )
+        return cls(data, freshness, failures)
 
 
 @dataclass(frozen=True)
@@ -60,19 +79,121 @@ class AbsentAuthoritative:
     """The device is genuinely absent from a healthy export → clear the mirror."""
 
 
+#: The family slot of a read that asked for the WHOLE device envelope, not one family.
+#: :meth:`ReadFailure.for_family` narrows it when the fan-out serves a single family.
+WHOLE_DEVICE = "device-state"
+
+
+class ReadOperation(str, enum.Enum):
+    """WHICH read failed. Ours, never derived from what the server answered."""
+
+    section_get = "section_get"  # GET one family's envelope section
+    doc_get = "doc_get"  # GET the whole device-state envelope entry
+    device_state_read = "device_state_read"  # POST device-state-read run (the extraction action)
+    section_classify = "section_classify"  # the served section itself broke the read contract
+
+
+class ReadFailureCode(str, enum.Enum):
+    """The authored reason a read could not be served, beyond what raised.
+
+    Closed set. Each member names one way the read contract broke, so an operator can tell a
+    device-reported extract error from a malformed body from a failed heal.
+    """
+
+    section_status_error = "section_status_error"  # the section declared status=error
+    section_status_unrecognized = "section_status_unrecognized"  # the status leaf is not in the wire set
+    section_malformed = "section_malformed"  # a 200 doc served a non-dict where a section belongs
+    heal_action_failed = "heal_action_failed"  # the not-ready heal action could not re-serve the family
+    action_section_missing = "action_section_missing"  # the action output has no section for the family
+    action_returned_not_ready = "action_returned_not_ready"  # the action answered a non-terminal status
+    action_output_not_atomic = "action_output_not_atomic"  # the action output is not a certified snapshot
+
+
+@dataclass(frozen=True)
+class ReadFailure:
+    """The AUTHORED classification of ONE failed read. Every field is ours; none is the server's.
+
+    An operator has to tell a 401 from a 503 and a device-reported extract error from a
+    malformed body, so a bare exception TYPE is not a classification. ``http_status`` carries
+    the numeric status whenever the failure was an HTTP answer, and ``code`` carries the
+    contract reason whenever the server answered a 200 the reader had to refuse. Neither the
+    server's reason phrase, body, URL nor exception text is ever kept.
+    """
+
+    operation: ReadOperation
+    device: str
+    family: str
+    error_type: str | None = None  # the raised type, when the read raised
+    http_status: int | None = None  # the numeric status, when the server answered one
+    code: ReadFailureCode | None = None  # the contract reason, when the read broke a rule
+
+    def for_family(self, family: str) -> ReadFailure:
+        """Narrow a whole-device read failure to the family it is being reported for."""
+        return replace(self, family=family)
+
+    def log_fields(self) -> dict[str, object]:
+        """Render the classification as record fields, the only shape any sink prints."""
+        return {
+            "family": self.family,
+            "read_operation": self.operation.value,
+            "error_type": self.error_type,
+            "http_status": self.http_status,
+            "failure_code": self.code.value if self.code is not None else None,
+        }
+
+    def persistence_fields(self) -> dict[str, str | int | None]:
+        """Render the explicit authored subset stored with a read attempt."""
+        return {
+            "read_operation": self.operation.value,
+            "component_family": self.family,
+            "error_type": self.error_type,
+            "http_status": self.http_status,
+            "failure_code": self.code.value if self.code is not None else None,
+        }
+
+
+def http_status_of(exc: BaseException) -> int | None:
+    """Return the numeric status the server answered, or None when the failure carries none.
+
+    The ONE rule for taking a status off a raised read: only :class:`httpx.HTTPStatusError`
+    carries one, and only the number is taken. The exception's message is built from the
+    server's reason phrase and the request URL, so nothing else of it may travel.
+    """
+    return exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+
+
+def read_failure_from_exception(
+    exc: BaseException,
+    *,
+    operation: ReadOperation,
+    device: str,
+    family: str,
+) -> ReadFailure:
+    """Classify a read that RAISED: the type always, plus the numeric status the server answered."""
+    return ReadFailure(
+        operation=operation,
+        device=device,
+        family=family,
+        error_type=type(exc).__name__,
+        http_status=http_status_of(exc),
+    )
+
+
 @dataclass(frozen=True)
 class Unavailable:
     """No authoritative answer → keep the last-known mirror rows."""
 
     reason: UnavailableReason
-    # Diagnostic only (exception repr); excluded from equality so tests can assert on reason alone.
-    detail: str = field(default="", compare=False)
+    # The AUTHORED classification of the failure, never server or exception text: it reaches
+    # the operator log. None for a DECLARED state (unsupported / not-ready / device-absent),
+    # which is not a failure. Excluded from equality so tests can assert on reason alone.
+    failure: ReadFailure | None = field(default=None, compare=False)
 
 
 ReadOutcome = Present | AbsentAuthoritative | Unavailable
 
 
-def classify_envelope_section(section: dict | None) -> ReadOutcome:
+def classify_envelope_section(section: dict | None, *, device: str, family: str) -> ReadOutcome:
     """Classify one device-state envelope section into a :data:`ReadOutcome` (READSEM S3/S5).
 
     The envelope carries the ground truth the legacy wire could not: a per-family
@@ -88,7 +209,9 @@ def classify_envelope_section(section: dict | None) -> ReadOutcome:
     * ``not-ready`` → :class:`Unavailable`(``not_ready``): no record under the current
       mount (post-reload, NED remount). The engine escalates to ``device-state-read run``
       exactly once — the envelope itself never extracts.
-    * ``error`` → :class:`Unavailable`(``read_error``) with the wire's ``error-reason``.
+    * ``error`` → :class:`Unavailable`(``read_error``) with an authored
+      :class:`ReadFailureCode`. The wire's ``error-reason`` is the server's own text, so it
+      is classified, never carried.
 
     ``section is None`` is DEVICE-level absence (the client already confirmed the
     ``device-state`` container is alive): the device is genuinely unknown to NSO. READSEM S5
@@ -111,6 +234,10 @@ def classify_envelope_section(section: dict | None) -> ReadOutcome:
         return Unavailable(UnavailableReason.unsupported)
     if status == "not-ready":
         return Unavailable(UnavailableReason.not_ready)
-    if status == "error":
-        return Unavailable(UnavailableReason.read_error, detail=str(section.get("error-reason") or ""))
-    return Unavailable(UnavailableReason.read_error, detail=f"unrecognized envelope status {status!r}")
+    # The error-reason is the server's own text and can name a community-keyed path, so the
+    # refusal carries the authored code instead. The status leaf is the server's too.
+    code = ReadFailureCode.section_status_error if status == "error" else ReadFailureCode.section_status_unrecognized
+    return Unavailable(
+        UnavailableReason.read_error,
+        failure=ReadFailure(operation=ReadOperation.section_classify, device=device, family=family, code=code),
+    )

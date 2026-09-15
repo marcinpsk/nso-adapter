@@ -91,7 +91,7 @@ def _client_with(transport: _RecordingTransport) -> NsoClient:
         password_ref="NSO_PASSWORD",
         host_header=None,
     )
-    client = NsoClient(cfg, "admin", "secret")
+    client = NsoClient(cfg, "placeholder-user", "secret")
     client._client = lambda timeout=None: httpx.AsyncClient(transport=transport, base_url="http://nso")
     return client
 

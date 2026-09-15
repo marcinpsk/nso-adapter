@@ -7,12 +7,14 @@ the configured mount (e.g. ``credentials/svc-netbox-nso#netbox_token``).
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import hvac
+import structlog
 
-logger = logging.getLogger(__name__)
+from nso_adapter.secrets.base import SecretResolutionError, selected_secret_value
+
+logger = structlog.get_logger(__name__)
 
 
 class VaultSecretsProvider:
@@ -46,7 +48,7 @@ class VaultSecretsProvider:
         self._verify_ssl = verify_ssl
         self._client: hvac.Client | None = None
         # Per-path cache: {path: {field: value}}
-        self._cache: dict[str, dict[str, str]] = {}
+        self._cache: dict[str, dict[str, object]] = {}
 
     def _authenticate(self) -> None:
         kwargs: dict[str, Any] = {
@@ -61,21 +63,26 @@ class VaultSecretsProvider:
         client.token = resp["auth"]["client_token"]
         self._client = client
         self._cache.clear()
-        logger.info("Vault AppRole login succeeded")
+        logger.info("vault.approle_login")
 
-    def _fetch_path(self, path: str) -> dict[str, str]:
+    def _fetch_path(self, path: str) -> dict[str, object]:
         assert self._client is not None
         secret = self._client.secrets.kv.v2.read_secret_version(
             mount_point=self._mount,
             path=path,
             raise_on_deleted_version=True,
         )
-        data: dict[str, str] = secret["data"]["data"]
+        data: dict[str, object] = secret["data"]["data"]
         self._cache[path] = data
         return data
 
     def get(self, reference: str) -> str:
         """Resolve a ``path#field`` reference.
+
+        Every refusal is classified WITHOUT the reference. A reference names a mount, a path
+        and a field; this method runs on the startup path, so whatever it raises lands in the
+        startup diagnostics, and hvac's own text repeats the request URL on top of that. The
+        caller stamps the configuration slot (:func:`nso_adapter.secrets.base.resolve_secret`).
 
         Args:
             reference: Vault KV path and field separated by ``#``,
@@ -83,27 +90,37 @@ class VaultSecretsProvider:
 
         """
         if "#" not in reference:
-            raise ValueError(f"Invalid Vault reference {reference!r} — expected 'path#field' format")
+            raise SecretResolutionError("the reference is not in 'path#field' form")
         path, _, field = reference.partition("#")
 
         # Check per-path cache first
-        if path in self._cache:
-            if field in self._cache[path]:
-                return self._cache[path][field]
-            raise KeyError(f"Field {field!r} not found at {self._mount}/{path}")
+        cached = self._cache.get(path)
+        if cached is not None:
+            value = selected_secret_value(cached, field)
+            if value is not None:
+                return value
+            raise SecretResolutionError("the referenced field is not at the referenced path")
 
-        if self._client is None:
-            self._authenticate()
+        failure = None
         try:
-            data = self._fetch_path(path)
-        except hvac.exceptions.Forbidden:
-            logger.warning("Vault token expired, re-authenticating")
-            self._authenticate()
-            data = self._fetch_path(path)
+            if self._client is None:
+                self._authenticate()
+            try:
+                data = self._fetch_path(path)
+            except hvac.exceptions.Forbidden:
+                logger.warning("vault.reauthenticating", cause="forbidden")
+                self._authenticate()
+                data = self._fetch_path(path)
+        except Exception as exc:  # noqa: BLE001, every Vault failure is one classified refusal
+            failure = SecretResolutionError(f"the Vault read failed ({type(exc).__name__})")
+        # Raised outside the handler: hvac's exception would otherwise ride on __context__.
+        if failure is not None:
+            raise failure
 
-        if field not in data:
-            raise KeyError(f"Field {field!r} not found at {self._mount}/{path}")
-        return data[field]
+        value = selected_secret_value(data, field)
+        if value is None:
+            raise SecretResolutionError("the referenced field is not at the referenced path")
+        return value
 
     # ── mount-explicit read/write (SNMP secrets endpoints) ────────────────────
     #
@@ -118,11 +135,11 @@ class VaultSecretsProvider:
         try:
             return operation()
         except hvac.exceptions.Forbidden:
-            logger.warning("Vault token expired, re-authenticating")
+            logger.warning("vault.reauthenticating", cause="forbidden")
             self._authenticate()
             return operation()
 
-    def _read_raw_meta(self, mount: str, path: str) -> tuple[dict[str, str], int | None]:
+    def _read_raw_meta(self, mount: str, path: str) -> tuple[dict[str, object], int | None] | None:
         assert self._client is not None
         try:
             secret = self._client.secrets.kv.v2.read_secret_version(
@@ -131,19 +148,20 @@ class VaultSecretsProvider:
                 raise_on_deleted_version=True,
             )
         except hvac.exceptions.InvalidPath:
-            return {}, None
+            return None
         version = secret["data"].get("metadata", {}).get("version")
         return dict(secret["data"]["data"]), int(version) if version is not None else None
 
-    def _read_raw(self, mount: str, path: str) -> dict[str, str]:
-        return self._read_raw_meta(mount, path)[0]
+    def _read_raw(self, mount: str, path: str) -> dict[str, object]:
+        result = self._read_raw_meta(mount, path)
+        return result[0] if result is not None else {}
 
-    def read_path(self, mount: str, path: str) -> dict[str, str]:
+    def read_path(self, mount: str, path: str) -> dict[str, object]:
         """Read all fields at ``mount/path`` (KV v2); ``{}`` when the path doesn't exist."""
         return self._with_reauth(lambda: self._read_raw(mount, path))
 
-    def read_path_meta(self, mount: str, path: str) -> tuple[dict[str, str], int | None]:
-        """Read fields + current KV v2 version at ``mount/path``; ``({}, None)`` when absent."""
+    def read_path_meta(self, mount: str, path: str) -> tuple[dict[str, object], int | None] | None:
+        """Read fields and the current KV v2 version, or ``None`` when the path is absent."""
         return self._with_reauth(lambda: self._read_raw_meta(mount, path))
 
     def write_path(self, mount: str, path: str, data: dict[str, str], merge: bool = True) -> int:

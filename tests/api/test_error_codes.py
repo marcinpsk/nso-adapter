@@ -13,11 +13,13 @@ call sites ⊆ ERROR_CODES ⊆ api-contract.md.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from pathlib import Path
-from typing import get_args
+from types import NoneType, UnionType
+from typing import Annotated, TypeAliasType, Union, get_args, get_origin
 
 import pytest
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator
 
 from nso_adapter.api.errors import ERROR_CODES, ErrorCode, api_error
 from tests.conftest import VALID_TOKEN, push_seq
@@ -27,6 +29,43 @@ AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _PKG_DIR = _REPO_ROOT / "nso_adapter"
 _CONTRACT_DOC = _REPO_ROOT / "docs" / "api-contract.md"
+
+type _SecretMapAlias = dict[str, SecretStr]
+type _CyclicSecretMapAlias = _CyclicSecretMapAlias
+
+
+def _is_secret_map_annotation(annotation: object) -> bool:
+    """Recognize a secret map after removing validation-path-transparent wrappers."""
+
+    def classify(candidate: object, seen_aliases: frozenset[int]) -> bool:
+        if isinstance(candidate, TypeAliasType):
+            identity = id(candidate)
+            if identity in seen_aliases:
+                return False
+            return classify(candidate.__value__, seen_aliases | {identity})
+
+        origin = get_origin(candidate)
+        arguments = get_args(candidate)
+        if origin is dict:
+            return arguments == (str, SecretStr)
+        if origin is Annotated:
+            return bool(arguments) and classify(arguments[0], seen_aliases)
+        if origin in (Union, UnionType) and len(arguments) == 2 and NoneType in arguments:
+            wrapped = arguments[0] if arguments[1] is NoneType else arguments[1]
+            return classify(wrapped, seen_aliases)
+        return False
+
+    return classify(annotation, frozenset())
+
+
+def _secret_map_locations(models: Iterable[type[BaseModel]]) -> set[tuple[str, ...]]:
+    """Find request fields whose validation locations contain caller-chosen secret keys."""
+    return {
+        ("body", name)
+        for model in models
+        for name, field in model.model_fields.items()
+        if _is_secret_map_annotation(field.annotation)
+    }
 
 
 # ---------------------------------------------------------------- envelope on 422
@@ -300,3 +339,67 @@ def test_version_single_source_matches_pyproject():
 
     pyproject = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text())
     assert pyproject["project"]["version"] == __version__
+
+
+def test_secret_maps_are_registered_for_loc_redaction():
+    """Every ``dict[str, SecretStr]`` request field must be in ``DYNAMIC_KEY_LOCATIONS``.
+
+    Pydantic reports a failing map entry at ``("body", <field>, <key>)``, and the key is a
+    name the caller chose. A new secret map added without registering it would put that key
+    straight into the 422, so the set is derived here from the app's own models.
+    """
+    import importlib
+    import pkgutil
+
+    import nso_adapter.api
+    from nso_adapter.api.errors import DYNAMIC_KEY_LOCATIONS
+
+    models: list[type[BaseModel]] = []
+    for module in pkgutil.iter_modules(nso_adapter.api.__path__):
+        for member in vars(importlib.import_module(f"nso_adapter.api.{module.name}")).values():
+            if isinstance(member, type) and issubclass(member, BaseModel):
+                models.append(member)
+
+    found = _secret_map_locations(models)
+
+    assert found, "no secret map was found at all; the introspection stopped matching"
+    assert found <= DYNAMIC_KEY_LOCATIONS, (
+        "a request field keyed by a caller-chosen name is not registered for loc redaction: "
+        f"{sorted(found - DYNAMIC_KEY_LOCATIONS)}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("annotation", "expected"),
+    [
+        (dict[str, SecretStr], True),
+        (dict[str, SecretStr] | None, True),
+        (Union[dict[str, SecretStr], None], True),  # noqa: UP007 - exercise typing.Union
+        (Annotated[dict[str, SecretStr], "marker"], True),
+        (Annotated[dict[str, SecretStr] | None, "marker"], True),
+        (_SecretMapAlias, True),
+        (_SecretMapAlias | None, True),
+        (_CyclicSecretMapAlias, False),
+        (dict[str, SecretStr] | int, False),
+        (
+            Union[  # noqa: UP007 - exercise a non-transparent typing.Union
+                dict[str, SecretStr],
+                Annotated[dict[str, SecretStr], Field(min_length=2)],
+                None,
+            ],
+            False,
+        ),
+        (list[dict[str, SecretStr]], False),
+        (dict[int, SecretStr], False),
+        (dict[str, str], False),
+    ],
+)
+def test_secret_map_annotation_recognizes_only_transparent_wrappers(annotation, expected):
+    assert _is_secret_map_annotation(annotation) is expected
+
+
+def test_secret_map_location_discovery_uses_the_wrapped_annotation_predicate():
+    class WrappedSecretMapRequest(BaseModel):
+        values: _SecretMapAlias | None = None
+
+    assert _secret_map_locations([WrappedSecretMapRequest]) == {("body", "values")}

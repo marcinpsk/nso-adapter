@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
+from nso_adapter.secrets.refs import require_secret_fingerprint
 from nso_adapter.store.models import Device, SnmpCommunity, SnmpHost, SnmpSystemInfo, SnmpV3User
 
 logger = structlog.get_logger(__name__)
@@ -42,15 +43,16 @@ async def _upsert_snmp_config(
 ) -> None:
     """Full-replace all SNMP rows for *device* from *entry*."""
     now = datetime.now(UTC)
+    communities = [(require_secret_fingerprint(comm.get("name")), comm) for comm in as_list(entry.get("community"))]
 
     await _delete_snmp_rows(db, device)
 
     # as_list guards the RESTCONF singleton-rendered-as-bare-dict case for each child list.
-    for comm in as_list(entry.get("community")):
+    for community_hash, comm in communities:
         db.add(
             SnmpCommunity(
                 device_id=device.id,
-                community_hash=comm.get("name", ""),
+                community_hash=community_hash,
                 access=comm.get("access", "RO"),
                 acl=comm.get("acl") or None,
                 last_refreshed_at=now,

@@ -388,8 +388,8 @@ async def adapter_client_with_nso(store_engine, pg_url, tmp_path, monkeypatch):
     that the target NSO instance exists in the adapter config.
     """
     _write_config(tmp_path, monkeypatch, database_url=pg_url, nso_instances=NSO_DEV_INSTANCE)
-    monkeypatch.setenv("NSO_USERNAME", "admin")
-    monkeypatch.setenv("NSO_PASSWORD", "admin")
+    monkeypatch.setenv("NSO_USERNAME", "placeholder-user")
+    monkeypatch.setenv("NSO_PASSWORD", "placeholder-password")
 
     from nso_adapter.config import reset_config
 

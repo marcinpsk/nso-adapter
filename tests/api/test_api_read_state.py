@@ -97,7 +97,7 @@ async def test_inline_read_state_on_family_get(adapter_client):
     a1 = await _terminalize(
         device_id,
         "static_route",
-        Unavailable(UnavailableReason.export_down, "boom"),
+        Unavailable(UnavailableReason.export_down),
         result="kept",
         succeeded=False,
         rows=None,

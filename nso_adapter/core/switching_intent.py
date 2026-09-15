@@ -15,6 +15,7 @@ promotes it, so the encoding context is the one read then and not the one read h
 
 from __future__ import annotations
 
+import enum
 from collections import Counter
 from collections.abc import Sequence
 from copy import deepcopy
@@ -47,8 +48,42 @@ SWITCHPORT_STREAM = "switchport"
 DELETION_GROUPS = ("delete_origin", "detach", "owned_content")
 
 
+class SwitchingRefusal(str, enum.Enum):
+    """Why a preparation is refused. Closed set: the API answers one fixed message per member."""
+
+    delete_origin_unsupported = "delete_origin_unsupported"
+    backfill_only_unsupported = "backfill_only_unsupported"
+    repeated_root = "repeated_root"
+    root_still_present = "root_still_present"
+    root_not_authorized = "root_not_authorized"
+
+
+#: The authored answer for each reason. None of them repeats a root the caller sent.
+_REFUSAL_MESSAGES: dict[SwitchingRefusal, str] = {
+    SwitchingRefusal.delete_origin_unsupported: (
+        "delete_origin is not valid here: name the roots to retract in deleted_roots"
+    ),
+    SwitchingRefusal.backfill_only_unsupported: "backfill_only is not valid on a switching snapshot",
+    SwitchingRefusal.repeated_root: "deleted_roots repeats a root",
+    SwitchingRefusal.root_still_present: "a deleted root is still present in this snapshot",
+    SwitchingRefusal.root_not_authorized: "a deleted root is not authorized on this device",
+}
+
+
 class SwitchingRequestRefused(ValueError):
-    """A preparation the adapter refuses before it writes anything."""
+    """A preparation the adapter refuses before it writes anything.
+
+    ``str()`` names the offending roots, for the operator; the API answers
+    :attr:`public_message`, which states the reason and repeats no request value.
+    """
+
+    def __init__(self, reason: SwitchingRefusal, detail: str | None = None) -> None:
+        super().__init__(detail if detail is not None else _REFUSAL_MESSAGES[reason])
+        self.reason = reason
+
+    @property
+    def public_message(self) -> str:
+        return _REFUSAL_MESSAGES[self.reason]
 
 
 def _unset(value: str | None) -> str | None:
@@ -172,9 +207,9 @@ def _refuse_unsupported_request_modes() -> None:
     from nso_adapter.core.request_flags import BACKFILL_ONLY, DELETE_ORIGIN
 
     if DELETE_ORIGIN.get():
-        raise SwitchingRequestRefused("delete_origin is not valid here: name the roots to retract in deleted_roots")
+        raise SwitchingRequestRefused(SwitchingRefusal.delete_origin_unsupported)
     if BACKFILL_ONLY.get():
-        raise SwitchingRequestRefused("backfill_only is not valid on a switching snapshot")
+        raise SwitchingRequestRefused(SwitchingRefusal.backfill_only_unsupported)
 
 
 def _root_names(fragment: dict, table: str) -> set[str]:
@@ -244,11 +279,13 @@ async def _prepare_snapshot(
     marked = list(deleted_roots)
     duplicates = sorted(root for root, count in Counter(marked).items() if count > 1)
     if duplicates:
-        raise SwitchingRequestRefused(f"deleted_roots repeats a root: {duplicates}")
+        raise SwitchingRequestRefused(SwitchingRefusal.repeated_root, f"deleted_roots repeats a root: {duplicates}")
     store_only = STORE_ONLY.get()
     kept = sorted(set(marked) & desired_roots)
     if kept:
-        raise SwitchingRequestRefused(f"a deleted root is still present in this snapshot: {kept}")
+        raise SwitchingRequestRefused(
+            SwitchingRefusal.root_still_present, f"a deleted root is still present in this snapshot: {kept}"
+        )
 
     await lock_projection(db, device_id)
     root_table, child_table = stream_tables(stream)
@@ -261,7 +298,9 @@ async def _prepare_snapshot(
     authorized = (row.authorized_document if row is not None else None) or {}
     unauthorized = sorted(set(marked) - _root_names(authorized, root_table))
     if unauthorized:
-        raise SwitchingRequestRefused(f"a deleted root is not authorized on this device: {unauthorized}")
+        raise SwitchingRequestRefused(
+            SwitchingRefusal.root_not_authorized, f"a deleted root is not authorized on this device: {unauthorized}"
+        )
 
     revision = await note_write(db, device_id, stream, push_seq=None)
     count, removed = await replace()
@@ -501,8 +540,9 @@ __all__ = [
     "LagBundleSnapshot",
     "LagMemberSnapshot",
     "PreparedSnapshot",
-    "SwitchportSnapshot",
+    "SwitchingRefusal",
     "SwitchingRequestRefused",
+    "SwitchportSnapshot",
     "encode_lag_section",
     "encode_switchport_section",
     "replace_lag_snapshot",

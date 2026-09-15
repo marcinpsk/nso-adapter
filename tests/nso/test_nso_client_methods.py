@@ -9,12 +9,21 @@ and check_sync without hitting a real NSO instance.
 from __future__ import annotations
 
 import json
+from typing import cast
 
 import httpx
 import pytest
 
 from nso_adapter.config import NsoInstanceConfig
-from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.client import (
+    NsoActionFailedError,
+    NsoActionFailureKind,
+    NsoClient,
+    NsoExportUnavailableError,
+    NsoReadContractError,
+    failure_detail,
+)
+from nso_adapter.nso.read_outcome import Unavailable, UnavailableReason
 
 
 def _make_cfg(base_url: str = "http://nso:8080", ca_cert=None, host_header=None):
@@ -31,7 +40,7 @@ def _make_cfg(base_url: str = "http://nso:8080", ca_cert=None, host_header=None)
 
 
 def _make_client(base_url: str = "http://nso:8080", host_header=None) -> NsoClient:
-    return NsoClient(_make_cfg(base_url, host_header=host_header), "admin", "secret")
+    return NsoClient(_make_cfg(base_url, host_header=host_header), "placeholder-user", "secret")
 
 
 class MockTransport(httpx.AsyncBaseTransport):
@@ -344,7 +353,7 @@ async def test_fetch_host_keys_failed_result_raises(patch_client):
     client = _make_client()
     payload = {"tailf-ncs:output": {"result": "failed", "info": "connection refused"}}
     with patch_client(client, 200, payload):  # noqa: SIM117
-        with pytest.raises(RuntimeError, match="did not store a key"):
+        with pytest.raises(RuntimeError, match="did not report a stored key"):
             await client.fetch_host_keys("core-rtr-01")
 
 
@@ -353,7 +362,7 @@ async def test_fetch_host_keys_no_fingerprint_raises(patch_client):
     client = _make_client()
     payload = {"tailf-ncs:output": {"result": "updated"}}
     with patch_client(client, 200, payload):  # noqa: SIM117
-        with pytest.raises(RuntimeError, match="did not store a key"):
+        with pytest.raises(RuntimeError, match="reported a stored key with no fingerprint"):
             await client.fetch_host_keys("core-rtr-01")
 
 
@@ -555,6 +564,31 @@ async def test_service_instance_state_accepts_the_short_root_spelling(patch_clie
     assert state.status == "present"
 
 
+async def test_a_MISMATCHED_device_echo_never_reaches_the_refusal_record(patch_client):
+    """The echo is the server's own value, and the reader logged it verbatim.
+
+    A device-intent instance answering ``{"device": "<secret>"}`` put that value into
+    ``nso.service_instance_inconclusive``. The authored reason tells the operator that the
+    identity did not match without repeating either device string.
+    """
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
+    requested = "placeholder-requested-device"
+    echoed = "placeholder-secret-echo"
+    client = _make_client()
+    with patch_client(client, 200, {_SR_ROOT: [{**_ENTRY, "device": echoed}]}), capture_logs() as logs:
+        state = await client.service_instance_state(requested)
+
+    assert (state.status, state.entry) == ("inconclusive", None), "a wrong-device echo is never a read"
+    refused = [record for record in logs if record["event"] == "nso.service_instance_inconclusive"]
+    assert refused, "the refusal was not reported at all"
+    assert "device" not in refused[0]
+    assert refused[0]["reason"] == "the instance echoes a different device"
+    assert_records_free_of(logs, [requested, echoed])
+
+
 async def test_service_instance_state_raises_on_a_server_error(patch_client):
     """A 500 is neither an absence nor a certified read — it must not be swallowed."""
     client = _make_client()
@@ -583,3 +617,104 @@ async def test_service_instance_state_refuses_an_instance_it_did_not_ask_for(pat
         state = await client.service_instance_state("rtr")
     assert state.status == "inconclusive", label
     assert state.entry is None
+
+
+# ── device-state-read: a non-mapping output can never reach a consumer ────────
+
+
+@pytest.mark.parametrize("output", [["static-route"], "static-route", 7])
+async def test_run_device_state_read_refuses_a_non_mapping_output(patch_client, output):
+    """The certification runs BEFORE the return, so no caller is handed a non-mapping.
+
+    Every consumer reads ``output.get(...)`` straight after the call. What keeps that from
+    being an AttributeError is this refusal, so it belongs to the client, once, rather than
+    to each consumer.
+    """
+    client = _make_client()
+    with patch_client(client, 200, {"network-state-export:output": output}):  # noqa: SIM117
+        with pytest.raises(NsoReadContractError, match="did not certify an atomic snapshot"):
+            await client.run_device_state_read("core-rtr-01", ["static-route"])
+
+
+async def test_the_not_ready_escalation_classifies_a_non_mapping_output(patch_client):
+    """The refusal raises INSIDE the escalation's try, so the family is classified, not crashed."""
+    from nso_adapter.core.refresh_engine import _escalate_not_ready
+    from nso_adapter.store.models import Device
+
+    client = _make_client()
+    device = Device(nso_instance="nso-dev", nso_device_name="core-rtr-01")
+    with patch_client(client, 200, {"network-state-export:output": ["static-route"]}):
+        outcome = await _escalate_not_ready(device, client, "static-route")
+
+    assert isinstance(outcome, Unavailable)
+    assert outcome.reason is UnavailableReason.read_error
+    assert outcome.failure is not None
+    assert outcome.failure.error_type == "NsoReadContractError"
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_kind"),
+    [
+        (
+            {"tailf-ncs:output": {"result": "failed", "info": "refused by 203.0.113.9"}},
+            NsoActionFailureKind.host_key_not_stored,
+        ),
+        (
+            {"tailf-ncs:output": {"result": "updated"}},
+            NsoActionFailureKind.host_key_fingerprint_missing,
+        ),
+    ],
+)
+async def test_the_host_key_refusal_names_only_the_failure_kind(patch_client, payload, expected_kind):
+    """The failure kind is ours to print; request and action values are not.
+
+    ``failure_detail`` repeats an AUTHORED failure verbatim, and what makes that safe is
+    exactly what the message may hold: the action and the failure kind only.
+    """
+    client = _make_client()
+    requested_device = "requested-device-placeholder-secret"
+    with patch_client(client, 200, payload):  # noqa: SIM117
+        with pytest.raises(NsoActionFailedError) as caught:
+            await client.fetch_host_keys(requested_device)
+
+    detail = failure_detail(caught.value)
+    assert caught.value.kind is expected_kind
+    assert detail == f"NsoActionFailedError({expected_kind.value!r})"
+    assert requested_device not in detail, "the request value must not reach a persistent failure sink"
+    assert "refused by" not in detail and "203.0.113.9" not in detail, "the action's own words never travel"
+
+
+@pytest.mark.parametrize("error_type", [NsoReadContractError, NsoExportUnavailableError])
+def test_failure_detail_does_not_preserve_read_exception_messages(error_type):
+    detail = failure_detail(error_type("placeholder-secret caller text"))
+
+    assert detail == error_type.__name__
+    assert "placeholder-secret" not in detail
+
+
+@pytest.mark.parametrize(
+    "counterfeit",
+    [
+        "fetch-host-keys did not report a stored key",
+        type("SecretString", (str,), {})("placeholder-secret"),
+    ],
+)
+def test_action_failure_rejects_counterfeit_kinds(counterfeit):
+    with pytest.raises(TypeError, match="kind must be an NsoActionFailureKind"):
+        NsoActionFailedError(cast(NsoActionFailureKind, counterfeit))
+
+
+def test_action_failure_with_tampered_kind_fails_closed():
+    failure = NsoActionFailedError(NsoActionFailureKind.host_key_not_stored)
+    object.__setattr__(failure, "kind", "placeholder-secret")
+
+    assert failure_detail(failure) == "NsoActionFailedError"
+
+
+def test_action_failure_subclass_has_no_diagnostic_authority():
+    class SecretActionFailure(NsoActionFailedError):
+        pass
+
+    failure = SecretActionFailure(NsoActionFailureKind.host_key_not_stored)
+
+    assert failure_detail(failure) == "SecretActionFailure"

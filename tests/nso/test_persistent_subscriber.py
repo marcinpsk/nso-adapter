@@ -15,6 +15,7 @@ from nso_adapter.notifications.sse_subscriber import SSESubscriber
 pytestmark = pytest.mark.asyncio
 
 STREAM_URL = "http://nso:8080/restconf/streams/NETCONF/json"
+SECRET_STREAM_URL = f"{STREAM_URL}?access_token=placeholder-stream-secret"
 OnEvent = Callable[[str, dict | None], None]
 
 
@@ -33,7 +34,7 @@ def load_persistent_subscriber() -> tuple[object, Callable[..., Awaitable[None]]
 
 async def test_persistent_subscriber_reconnects_after_clean_eof(monkeypatch: pytest.MonkeyPatch):
     module, persistent_subscriber = load_persistent_subscriber()
-    subscriber = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    subscriber = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     stop_event = asyncio.Event()
     second_call_started = asyncio.Event()
     wait_for_calls: list[float] = []
@@ -75,7 +76,7 @@ async def test_idle_timeout_reconnects_fast_and_resets_backoff(monkeypatch: pyte
     module, persistent_subscriber = load_persistent_subscriber()
     from nso_adapter.notifications.sse_subscriber import SseIdleTimeout
 
-    subscriber = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    subscriber = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     stop_event = asyncio.Event()
     wait_for_calls: list[float] = []
     attempts = 0
@@ -102,39 +103,55 @@ async def test_idle_timeout_reconnects_fast_and_resets_backoff(monkeypatch: pyte
     monkeypatch.setattr(module.asyncio, "wait_for", fake_wait_for)
     monkeypatch.setattr(subscriber, "subscribe", subscribe_side_effect)
 
-    task = asyncio.create_task(
-        persistent_subscriber(
-            subscriber, STREAM_URL, lambda raw, parsed: None, stop_event=stop_event, initial_delay_s=5.0
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        task = asyncio.create_task(
+            persistent_subscriber(
+                subscriber,
+                SECRET_STREAM_URL,
+                lambda raw, parsed: None,
+                stop_event=stop_event,
+                initial_delay_s=5.0,
+            )
         )
-    )
-    # plain await: asyncio.wait_for is monkeypatched module-wide above
-    await task
+        # plain await: asyncio.wait_for is monkeypatched module-wide above
+        await task
 
     assert attempts == 3
     # idle cycle: SHORT jitter (~1s), not the 5s initial backoff; the following REAL
     # error then waits the RESET initial delay (5s), not a doubled one.
     assert wait_for_calls[0] <= 1.5, f"idle reconnect must be fast, got {wait_for_calls[0]}"
     assert wait_for_calls[1] == 5.0, f"backoff must reset after a healthy idle cycle, got {wait_for_calls[1]}"
+    record = next(record for record in logs if record["event"] == "sse.idle_reconnect")
+    assert "placeholder-stream-secret" not in str(record)
 
 
 async def test_persistent_subscriber_retries_after_transport_error(monkeypatch: pytest.MonkeyPatch):
     module, persistent_subscriber = load_persistent_subscriber()
-    subscriber = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    subscriber = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     stop_event = asyncio.Event()
     wait_for_calls: list[float] = []
     attempts = 0
+    request = httpx.Request("GET", "https://placeholder.invalid/stream?token=placeholder-secret")
+    response = httpx.Response(503, request=request)
+    failure = httpx.HTTPStatusError(
+        "placeholder-secret-reason for the requested stream",
+        request=request,
+        response=response,
+    )
 
     async def subscribe_side_effect(
         stream_url: str, on_event: OnEvent, duration: float, idle_read_timeout_s: float | None = 90.0
     ) -> None:
         nonlocal attempts
         attempts += 1
-        assert stream_url == STREAM_URL
+        assert stream_url == SECRET_STREAM_URL
         assert duration == float("inf")
         # s3-13: the finite idle watchdog is threaded through to subscribe().
         assert idle_read_timeout_s == 90.0
         if attempts == 1:
-            raise httpx.RequestError("boom")
+            raise failure
         stop_event.set()
 
     async def fake_wait_for(awaitable: Awaitable[object], timeout: float) -> object:
@@ -146,15 +163,22 @@ async def test_persistent_subscriber_retries_after_transport_error(monkeypatch: 
     monkeypatch.setattr(module.asyncio, "wait_for", fake_wait_for)
     subscriber.subscribe = AsyncMock(side_effect=subscribe_side_effect)
 
-    await persistent_subscriber(subscriber, STREAM_URL, lambda *_: None, stop_event=stop_event)
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        await persistent_subscriber(subscriber, SECRET_STREAM_URL, lambda *_: None, stop_event=stop_event)
 
     assert attempts == 2
     assert wait_for_calls == [5.0]
+    record = next(record for record in logs if record["event"] == "sse.reconnect_after_error")
+    assert record["error"] == "HTTPStatusError (HTTP 503)"
+    assert "placeholder-secret" not in str(record)
+    assert "placeholder-stream-secret" not in str(record)
 
 
 async def test_persistent_subscriber_caps_exponential_backoff(monkeypatch: pytest.MonkeyPatch):
     module, persistent_subscriber = load_persistent_subscriber()
-    subscriber = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    subscriber = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     stop_event = asyncio.Event()
     wait_for_calls: list[float] = []
 
@@ -187,7 +211,7 @@ async def test_persistent_subscriber_returns_when_stopped_during_backoff(
     monkeypatch: pytest.MonkeyPatch,
 ):
     module, persistent_subscriber = load_persistent_subscriber()
-    subscriber = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    subscriber = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     stop_event = asyncio.Event()
     wait_for_calls: list[float] = []
 
@@ -214,7 +238,7 @@ async def test_persistent_subscriber_returns_when_stopped_during_backoff(
 
 async def test_persistent_subscriber_returns_after_stop_event_during_active_stream():
     _, persistent_subscriber = load_persistent_subscriber()
-    subscriber = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    subscriber = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     stop_event = asyncio.Event()
     stream_started = asyncio.Event()
 

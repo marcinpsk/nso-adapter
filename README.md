@@ -25,3 +25,10 @@ plus a full-replace intent store with a durable apply worker, post-apply dry-run
 verification, periodic + SSE-triggered sync, and an intent-summary endpoint
 for split-brain detection. `docs/api-contract.md` is kept in lock-step with
 the implemented surface.
+
+## Development
+
+The custom review-pattern pre-commit hooks require the `opengrep` executable on
+`PATH`. Follow the [official OpenGrep installation instructions](https://github.com/opengrep/opengrep/blob/main/INSTALL.md),
+or set `OPENGREP_BIN` to an installed executable. These checks run in local
+pre-commit only. GitHub Actions and the pre-push stage do not run OpenGrep.
