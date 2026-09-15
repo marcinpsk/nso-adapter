@@ -381,3 +381,19 @@ def raw_diagnostic_identifiers(logger, device, stream_url):
     logger.info("family.refresh.done", device_id=device.id)
     # ok: nso-diagnostic-raw-identifier
     logger.info("sse_event", bytes=128)
+
+
+async def legacy_query_api(session, model, select):
+    # ruleid: nso-store-legacy-query-api
+    session.query(model).all()
+    # ok: nso-store-legacy-query-api
+    return await session.scalars(select(model))
+
+
+async def raw_string_statement(conn, op, text):
+    # ruleid: nso-store-execute-raw-string
+    await conn.execute("SELECT 1")
+    # ok: nso-store-execute-raw-string
+    await conn.execute(text("SELECT 1"))
+    # ok: nso-store-execute-raw-string
+    op.execute("ALTER TYPE jobtype ADD VALUE IF NOT EXISTS 'sync_now'")

@@ -246,3 +246,18 @@ rules:
       - pattern: logger.$LEVEL(..., stream=stream_url, ...)
       - pattern: logger.$LEVEL(..., stream_url=stream_url, ...)
       - pattern: logger.$LEVEL(..., url=stream_url, ...)
+  - id: nso-store-legacy-query-api
+    languages: [python]
+    severity: ERROR
+    message: Query the store with select() and execute()/scalars(); Session.query is the removed 1.x API.
+    pattern: $SESSION.query(...)
+  - id: nso-store-execute-raw-string
+    languages: [python]
+    severity: ERROR
+    message: Wrap SQL in text(); SQLAlchemy 2 raises ObjectNotExecutableError on a bare string.
+    patterns:
+      - pattern-either:
+          - pattern: $CONN.execute("...", ...)
+          - pattern: $CONN.execute(f"...", ...)
+      # Alembic's op.execute takes raw DDL by design.
+      - pattern-not: op.execute(...)
