@@ -56,6 +56,8 @@ def aliased_outcome_error(logger, failure_detail, http_status_of):
         logger.warning("family.outcome.read_record_failed", message=f"failure: {alias}")
         # ruleid: nso-outcome-raw-exception-alias-renderer
         logger.warning("family.outcome.read_record_failed", exc_info=alias)
+        # ruleid: nso-outcome-raw-exception-alias-renderer
+        logger.warning(f"family outcome failed: {alias}")
         # ok: nso-outcome-raw-exception-alias-renderer
         logger.warning("family.outcome.read_record_failed", reason=failure_detail(caught))
         # ok: nso-outcome-raw-exception-alias-renderer
@@ -368,9 +370,15 @@ def returned_classification(exc):
     return type(exc).__name__
 
 
-def raw_diagnostic_identifiers(logger, device, stream_url):
+def raw_diagnostic_identifiers(logger, device, device_name, nso_instance, stream_url):
     # ruleid: nso-diagnostic-raw-identifier
     logger.info("family.refresh.done", device_name=device.nso_device_name)
+    # ruleid: nso-diagnostic-raw-identifier
+    logger.info("family.refresh.done", device_name=device_name)
+    # ruleid: nso-diagnostic-raw-identifier
+    logger.warning("family.refresh.failed", device=device_name)
+    # ruleid: nso-diagnostic-raw-identifier
+    logger.warning("family.refresh.failed", nso_instance=nso_instance)
     # ruleid: nso-diagnostic-raw-identifier
     logger.info("sse_event", stream=stream_url)
     # ruleid: nso-diagnostic-raw-identifier

@@ -91,7 +91,7 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-def _attrs_to_interface_list(data: dict | None, *, device_name: str) -> list[Interface]:
+def _attrs_to_interface_list(data: dict | None, *, device_id: int) -> list[Interface]:
     """Convert NSO package interface-attributes oper-data to domain Interface objects.
 
     Skips malformed entries (missing ``interface-name``) with a warning log.
@@ -107,7 +107,7 @@ def _attrs_to_interface_list(data: dict | None, *, device_name: str) -> list[Int
             # the record names the field that is missing and the read it came from.
             logger.warning(
                 "interface_attributes.entry_skipped",
-                device_name=device_name,
+                device_id=device_id,
                 family="interface-attributes",
                 missing_field="interface-name",
             )
@@ -717,8 +717,7 @@ async def _resolve_ned_id(db: AsyncSession, device: Device, client: NsoClient) -
             # so the classification travels and the exception's own text never does.
             logger.warning(
                 "importer.ned_id.read_failed",
-                nso_instance=device.nso_instance,
-                device=device.nso_device_name,
+                device_id=device.id,
                 kept=device.ned_id,
                 read_operation="ned_id_get",
                 error_type=type(exc).__name__,
@@ -728,7 +727,7 @@ async def _resolve_ned_id(db: AsyncSession, device: Device, client: NsoClient) -
         learned = ""  # nothing to fall back on → the unmatched path below
     if learned:
         if device.ned_id != learned:
-            logger.info("importer.ned_id.changed", device=device.nso_device_name, old=device.ned_id, new=learned)
+            logger.info("importer.ned_id.changed", device_id=device.id, old=device.ned_id, new=learned)
             device.ned_id = learned
             # Persist the corrected NED now, so a device whose later sync steps fail (e.g. an
             # unsupported NED with no reader) still self-heals its ned_id on any sync attempt.
@@ -1057,7 +1056,7 @@ async def _consume_interface_attributes(
                 return _AttrsSyncResult(True, 0, 0, 0)
         savepoint = await db.begin_nested()
         if isinstance(outcome, Present):
-            interfaces = _attrs_to_interface_list(outcome.data, device_name=device.nso_device_name)
+            interfaces = _attrs_to_interface_list(outcome.data, device_id=device_id)
             scope_result = await db.execute(select(ManagedScope).where(ManagedScope.device_id == device_id))
             scope_attrs = [scope.attribute for scope in scope_result.scalars().all()]
 
@@ -1310,7 +1309,7 @@ async def _detect_drift_attributes(
         family_name="interface_attributes",
     )
     if isinstance(attrs_outcome, Present):
-        interfaces = _attrs_to_interface_list(attrs_outcome.data, device_name=device.nso_device_name)
+        interfaces = _attrs_to_interface_list(attrs_outcome.data, device_id=device_id)
     else:
         assert isinstance(attrs_outcome, Unavailable)
         logger.warning(

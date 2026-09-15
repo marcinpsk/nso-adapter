@@ -197,7 +197,6 @@ async def refresh_redistribution_from_outcomes(
                 db, device, outcomes, refresh_source=refresh_source, own_lock=False
             )
 
-    name = device.nso_device_name
     device_id = device.id
     source_epoch = device.source_epoch
     now = datetime.now(UTC)
@@ -205,7 +204,7 @@ async def refresh_redistribution_from_outcomes(
     # Tier 1 — any confirmed export outage aborts the whole refresh, rows untouched.
     outage = _first_with_reason(outcomes.values(), UnavailableReason.export_down)
     if outage is not None:
-        logger.warning("redistribution.refresh.degraded", device_id=device_id, device_name=name)
+        logger.warning("redistribution.refresh.degraded", device_id=device_id)
         selected = await _record_composite(
             db,
             device,
@@ -281,7 +280,6 @@ async def refresh_redistribution_from_outcomes(
         _tier2_span(
             db,
             device,
-            name,
             outcomes,
             now,
             refresh_source,
@@ -298,7 +296,6 @@ async def refresh_redistribution_from_outcomes(
 async def _tier2_span(
     db: AsyncSession,
     device: Device,
-    name: str,
     outcomes: dict[str, ReadOutcome],
     now: datetime,
     refresh_source: str,
@@ -317,7 +314,6 @@ async def _tier2_span(
     rebuilt, superseded = await _commit_partitions(
         db,
         device,
-        name,
         outcomes,
         now,
         refresh_source,
@@ -330,7 +326,6 @@ async def _tier2_span(
     logger.info(
         "redistribution.refresh.done",
         device_id=device_id,
-        device_name=name,
         row_count=len(rebuilt),
         refresh_source=refresh_source,
     )
@@ -340,7 +335,6 @@ async def _tier2_span(
 async def _commit_partitions(
     db: AsyncSession,
     device: Device,
-    name: str,
     outcomes: dict[str, ReadOutcome],
     now: datetime,
     refresh_source: str,
@@ -371,7 +365,7 @@ async def _commit_partitions(
             return [], True
     savepoint = await db.begin_nested()
     try:
-        rebuilt = await _rebuild_partitions(db, device_id, name, outcomes, now, refresh_source)
+        rebuilt = await _rebuild_partitions(db, device_id, outcomes, now, refresh_source)
         # First-wins in-refresh dedup: a duplicate identity tuple in the export would
         # otherwise IntegrityError on commit (uq_deviceredistribution_identity).
         seen: set[tuple[str, str, str, str]] = set()
@@ -493,7 +487,6 @@ async def _record_composite(
 async def _rebuild_partitions(
     db: AsyncSession,
     device_id: int,
-    name: str,
     outcomes: dict[str, ReadOutcome],
     now: datetime,
     refresh_source: str,
@@ -515,14 +508,12 @@ async def _rebuild_partitions(
             logger.info(
                 "redistribution.refresh.component_unsupported",
                 device_id=device_id,
-                device_name=name,
                 protocol=proto,
             )
         else:
             logger.warning(
                 "redistribution.refresh.component_kept",
                 device_id=device_id,
-                device_name=name,
                 protocol=proto,
                 reason=outcome.reason.value,
             )

@@ -111,8 +111,8 @@ DEVICE_INTENT_ROOT = "device-intent:device-intent"
 DEVICE_INTENT_PATH = f"/restconf/data/{DEVICE_INTENT_ROOT}"
 
 
-def _inconclusive(device_name: str, reason: str) -> ServiceInstanceState:
-    logger.warning("nso.service_instance_inconclusive", service=DEVICE_INTENT_PATH, device=device_name, reason=reason)
+def _inconclusive(reason: str) -> ServiceInstanceState:
+    logger.warning("nso.service_instance_inconclusive", service=DEVICE_INTENT_PATH, reason=reason)
     return ServiceInstanceState("inconclusive", None)
 
 
@@ -350,7 +350,7 @@ class NsoClient:
             except Exception:
                 data = None
             if not isinstance(data, dict):
-                return _inconclusive(device_name, "unparseable body")
+                return _inconclusive("unparseable body")
             entries = data.get(DEVICE_INTENT_ROOT)
             if entries is None:
                 entries = data.get(DEVICE_INTENT_ROOT.split(":", 1)[-1])
@@ -360,13 +360,13 @@ class NsoClient:
                 # picking [0] would compute retention and collateral from another device's
                 # instance — a PUT that omits this device's real rows.
                 got = len(entries) if isinstance(entries, list) else "no recognized root"
-                return _inconclusive(device_name, f"expected one instance, got {got}")
+                return _inconclusive(f"expected one instance, got {got}")
             entry = entries[0]
             if not isinstance(entry, dict) or not entry:
-                return _inconclusive(device_name, "empty instance entry")
+                return _inconclusive("empty instance entry")
             if entry.get("device") != device_name:
                 # The echo is the server's own value: name the mismatch, never what it sent.
-                return _inconclusive(device_name, "the instance echoes a different device")
+                return _inconclusive("the instance echoes a different device")
             return ServiceInstanceState("present", entry)
 
     # ── device-state envelope (READSEM S3) — status-declared per-family reads ─────────

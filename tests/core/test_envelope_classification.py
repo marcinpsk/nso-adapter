@@ -54,7 +54,7 @@ class TestStatusMapping:
         assert outcome == Unavailable(UnavailableReason.not_ready)
 
     def test_error_classifies_the_failure_and_drops_the_wire_reason(self):
-        """The error-reason is the server's own text and reaches the operator log. Classify it."""
+        """Classify the error. The server's error-reason must not reach diagnostic sinks."""
         outcome = classify_envelope_section({"status": "error", "error-reason": "extract boom"}, **_ASKED)
         assert isinstance(outcome, Unavailable)
         assert outcome.reason is UnavailableReason.read_error

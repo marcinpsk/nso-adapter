@@ -919,7 +919,9 @@ async def test_a_RETRIED_action_keeps_the_FIRST_failure_off_the_second_chain(ada
 
     assert slept.await_count == 1, "the backed-off second attempt must still run"
     assert caught.value.response.status_code == 503, "the SECOND attempt's failure propagates"
-    assert exception_chain(caught.value) == [caught.value], "the first attempt is still on the chain"
+    assert exception_chain(caught.value) == [caught.value], (
+        "the first attempt must not remain on the second failure's chain"
+    )
     assert_chain_free_of(caught.value, _STEP_SECRETS)
 
 

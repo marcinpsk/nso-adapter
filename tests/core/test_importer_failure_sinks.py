@@ -38,6 +38,10 @@ _GUARDED_LOG_SINKS = (
         Path(__file__).resolve().parents[2] / "nso_adapter" / "core" / name
         for name in ("generation.py", "refresh_engine.py", "redistribution.py")
     ),
+    *(
+        Path(__file__).resolve().parents[2] / "nso_adapter" / "notifications" / name
+        for name in ("persistent_subscriber.py", "sse_subscriber.py")
+    ),
 )
 
 
@@ -229,6 +233,11 @@ def test_raw_exception_log_guard_accepts_classified_positional_detail() -> None:
     assert _raw_log_exception_renderers('logger.warning("event", failure_detail(exc))') == []
 
 
+def test_subscriber_modules_are_in_the_positional_exception_guard() -> None:
+    guarded_names = {path.name for path in _GUARDED_LOG_SINKS}
+    assert {"persistent_subscriber.py", "sse_subscriber.py"} <= guarded_names
+
+
 @pytest.mark.parametrize(
     "source",
     [
@@ -367,6 +376,7 @@ def test_guarded_modules_are_documented() -> None:
     coverage = _COVERAGE_DOC.read_text(encoding="utf-8").split("## Coverage", maxsplit=1)[1]
     for path in (_IMPORTER, *_GUARDED_LOG_SINKS):
         assert path.name in coverage, f"{path.name} is missing from the OpenGrep coverage documentation"
+    assert "`nso-diagnostic-raw-identifier`" in coverage
     assert "any `api_error` in `action_force_removal`" in coverage
     assert "no endpoint error response returns the submitted scope" in coverage
 
@@ -385,6 +395,12 @@ def test_review_guards_cover_each_authored_error_boundary() -> None:
     alias_paths = set(rules["nso-outcome-raw-exception-alias-renderer"]["paths"]["include"])
     assert alias_paths == outcome_paths
     assert "nso_adapter/core/generation.py" in outcome_paths
+    identifier_paths = set(rules["nso-diagnostic-raw-identifier"]["paths"]["include"])
+    assert {
+        "nso_adapter/core/importer.py",
+        "nso_adapter/core/redistribution.py",
+        "nso_adapter/nso/client.py",
+    } <= identifier_paths
 
 
 def _binds_formatter_name(node: ast.AST) -> bool:

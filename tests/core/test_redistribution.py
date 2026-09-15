@@ -15,7 +15,7 @@ from nso_adapter.core.redistribution import refresh_redistribution_for_device, r
 from nso_adapter.nso.client import NsoExportUnavailableError
 from nso_adapter.nso.read_outcome import Freshness, Present, Unavailable, UnavailableReason
 from nso_adapter.store.models import Device, DeviceRedistribution
-from tests._secret_discipline import assert_text_free_of
+from tests._secret_discipline import assert_records_free_of, assert_text_free_of
 from tests.conftest import seed_device, session
 
 
@@ -76,6 +76,58 @@ async def test_superseded_export_outage_does_not_degrade_newer_winner(adapter_cl
         )
 
     assert ok is True
+
+
+@pytest.mark.anyio
+async def test_redistribution_diagnostics_omit_the_nso_device_name(adapter_client):
+    """Every redistribution outcome uses the stored ID, not the submitted NSO name."""
+    from structlog.testing import capture_logs
+
+    device_name = "placeholder-redistribution-device"
+    device_id = await seed_device(nso_device_name=device_name, netbox_device_id=7698)
+    present = Present({}, Freshness.fresh)
+    async with _device_session(device_id) as (db, device):
+        with capture_logs() as logs:
+            await refresh_redistribution_from_outcomes(
+                db,
+                device,
+                {
+                    "ospf": Unavailable(UnavailableReason.export_down),
+                    "isis": present,
+                    "bgp": present,
+                },
+                refresh_source="test",
+                own_lock=False,
+            )
+            await refresh_redistribution_from_outcomes(
+                db,
+                device,
+                {protocol: present for protocol in ("ospf", "isis", "bgp")},
+                refresh_source="test",
+                own_lock=False,
+            )
+            await refresh_redistribution_from_outcomes(
+                db,
+                device,
+                {
+                    "ospf": present,
+                    "isis": Unavailable(UnavailableReason.unsupported),
+                    "bgp": Unavailable(UnavailableReason.read_error),
+                },
+                refresh_source="test",
+                own_lock=False,
+            )
+
+    expected_events = {
+        "redistribution.refresh.degraded",
+        "redistribution.refresh.done",
+        "redistribution.refresh.component_unsupported",
+        "redistribution.refresh.component_kept",
+    }
+    records = [record for record in logs if record["event"] in expected_events]
+    assert {record["event"] for record in records} == expected_events
+    assert all(record["device_id"] == device_id for record in records)
+    assert_records_free_of(records, [device_name])
 
 
 @pytest.mark.anyio
