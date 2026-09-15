@@ -257,15 +257,19 @@ rules:
   - id: nso-store-legacy-query-api
     languages: [python]
     severity: ERROR
-    message: Query the store with select() and execute()/scalars(); Session.query is the removed 1.x API.
+    message: Query the store with select() and execute()/scalars(); Session.query is the legacy API.
     pattern: $SESSION.query(...)
   - id: nso-store-execute-raw-string
     languages: [python]
     severity: ERROR
-    message: Wrap SQL in text(); SQLAlchemy 2 raises ObjectNotExecutableError on a bare string.
+    message: Wrap plain SQL strings in text() or call exec_driver_sql(); Connection.execute rejects raw strings in SQLAlchemy 2.
     patterns:
       - pattern-either:
           - pattern: $CONN.execute("...", ...)
           - pattern: $CONN.execute(f"...", ...)
+          - pattern: $CONN.execute("..." + $VALUE, ...)
+          - pattern: $CONN.execute($VALUE + "...", ...)
+          - pattern: $CONN.execute("..." % $VALUE, ...)
+          - pattern: $CONN.execute($FORMAT.format(...), ...)
       # Alembic's op.execute takes raw DDL by design.
       - pattern-not: op.execute(...)

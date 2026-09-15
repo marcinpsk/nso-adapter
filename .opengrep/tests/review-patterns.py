@@ -398,10 +398,20 @@ async def legacy_query_api(session, model, select):
     return await session.scalars(select(model))
 
 
-async def raw_string_statement(conn, op, text):
+async def raw_string_statement(conn, op, query, table, value, text):
     # ruleid: nso-store-execute-raw-string
     await conn.execute("SELECT 1")
+    # ruleid: nso-store-execute-raw-string
+    await conn.execute("SELECT * FROM " + table)
+    # ruleid: nso-store-execute-raw-string
+    await conn.execute("SELECT * FROM %s" % table)
+    # ruleid: nso-store-execute-raw-string
+    await conn.execute(query.format(value))
     # ok: nso-store-execute-raw-string
     await conn.execute(text("SELECT 1"))
+    # ok: nso-store-execute-raw-string
+    await conn.execute(text("SELECT * FROM " + table))
+    # ok: nso-store-execute-raw-string
+    await conn.exec_driver_sql("SELECT * FROM " + table)
     # ok: nso-store-execute-raw-string
     op.execute("ALTER TYPE jobtype ADD VALUE IF NOT EXISTS 'sync_now'")
