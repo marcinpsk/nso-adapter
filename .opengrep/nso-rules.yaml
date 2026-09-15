@@ -230,3 +230,19 @@ rules:
           - pattern: return format($EXCEPTION)
           - pattern: return str($EXCEPTION.$ATTRIBUTE)
           - pattern: return repr($EXCEPTION.$ATTRIBUTE)
+  - id: nso-diagnostic-raw-identifier
+    languages: [python]
+    severity: ERROR
+    message: Log a stable internal identifier instead of a caller-provided device name or stream URL.
+    paths:
+      include:
+        - nso_adapter/main.py
+        - nso_adapter/core/refresh_engine.py
+        - nso_adapter/notifications/sse_subscriber.py
+        - nso_adapter/notifications/persistent_subscriber.py
+        - review-patterns.py
+    pattern-either:
+      - pattern: logger.$LEVEL(..., device_name=$DEVICE.nso_device_name, ...)
+      - pattern: logger.$LEVEL(..., stream=stream_url, ...)
+      - pattern: logger.$LEVEL(..., stream_url=stream_url, ...)
+      - pattern: logger.$LEVEL(..., url=stream_url, ...)

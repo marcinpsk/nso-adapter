@@ -386,7 +386,7 @@ def _start_sse_streams(
             )
         )
         sse_tasks.append(task)
-        logger.info("sse.stream.started", instance=inst.name, url=stream_url)
+        logger.info("sse.stream.started", instance=inst.name)
     return sse_tasks
 
 

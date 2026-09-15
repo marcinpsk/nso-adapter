@@ -444,19 +444,27 @@ async def test_start_sse_streams_enabled_spawns_one_task_per_instance(monkeypatc
     monkeypatch.setattr("nso_adapter.main.persistent_subscriber", fake_persistent_subscriber)
 
     inst = _instance("nso-dev")
+    inst.base_url = "http://placeholder-user:placeholder-stream-secret@nso.invalid/"
+    expected_stream_url = "http://placeholder-user:placeholder-stream-secret@nso.invalid/restconf/streams/NETCONF/json"
     cfg = SimpleNamespace(scheduler=_scheduler(enable_nso_streams=True), nso_instances=[inst])
     nso_clients = {"nso-dev": object()}
     stop = asyncio.Event()
 
-    tasks = _start_sse_streams(cfg, _Provider(), nso_clients, stop, set())
-    try:
-        assert len(tasks) == 1
-        await asyncio.sleep(0)  # let the subscriber coroutine start
-        assert seen and seen[0][0] == "http://nso-dev:8080/restconf/streams/NETCONF/json"
-    finally:
-        stop.set()
-        for t in tasks:
-            await asyncio.wait_for(t, timeout=1.0)
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        tasks = _start_sse_streams(cfg, _Provider(), nso_clients, stop, set())
+        try:
+            assert len(tasks) == 1
+            await asyncio.sleep(0)  # let the subscriber coroutine start
+            assert seen and seen[0][0] == expected_stream_url
+        finally:
+            stop.set()
+            for t in tasks:
+                await asyncio.wait_for(t, timeout=1.0)
+
+    record = next(record for record in logs if record["event"] == "sse.stream.started")
+    assert "placeholder-stream-secret" not in str(record)
 
 
 # --------------------------------------------------------------------------- #

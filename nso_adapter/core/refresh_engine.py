@@ -280,7 +280,6 @@ async def classify_envelope_family_read(
         logger.info(
             f"{family_name}.refresh.not_ready_escalating",
             device_id=device.id,
-            device_name=device.nso_device_name,
         )
         outcome = await _escalate_not_ready(device, nso_client, wire_name)
     return outcome
@@ -508,7 +507,6 @@ async def _apply_outcome(
             logger.info(
                 f"{spec.name}.refresh.done",
                 device_id=device.id,
-                device_name=device.nso_device_name,
                 row_count=row_count,
                 freshness=outcome.freshness.value,
                 refresh_source=refresh_source,
@@ -532,7 +530,6 @@ async def _apply_outcome(
             logger.info(
                 f"{spec.name}.refresh.cleared",
                 device_id=device.id,
-                device_name=device.nso_device_name,
                 refresh_source=refresh_source,
             )
             return True
@@ -549,7 +546,6 @@ async def _apply_outcome(
         logger.info(
             f"{spec.name}.refresh.not_authoritative",
             device_id=device.id,
-            device_name=device.nso_device_name,
             reason=outcome.reason.value,
             refresh_source=refresh_source,
         )

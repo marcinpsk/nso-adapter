@@ -17,9 +17,14 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import select
 
-from nso_adapter.core.refresh_engine import run_family_refresh, run_family_refresh_from_section
+from nso_adapter.core.refresh_engine import (
+    run_family_refresh,
+    run_family_refresh_from_outcome,
+    run_family_refresh_from_section,
+)
 from nso_adapter.core.static_route import STATIC_ROUTE_SPEC
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
+from nso_adapter.nso.read_outcome import AbsentAuthoritative, Unavailable, UnavailableReason
 from nso_adapter.store.models import Device, DeviceStaticRoute, RefreshOutcome
 from tests.conftest import seed_device, session
 
@@ -193,6 +198,42 @@ async def test_not_ready_escalates_to_the_action_and_uses_its_section(adapter_cl
         assert ok is True
         assert await _routes(db, device_id) == ["172.16.0.0/12"]
         client.run_device_state_read.assert_awaited_once_with("eng-env-notready", ["static-route"])
+
+
+@pytest.mark.anyio
+async def test_refresh_events_do_not_log_the_nso_device_name(adapter_client):
+    """Refresh diagnostics identify the stored row, not its caller-provided name."""
+    from structlog.testing import capture_logs
+
+    device_name = "placeholder-device-secret"
+    device_id = await seed_device(nso_device_name=device_name, netbox_device_id=9724)
+    async with _device_session(device_id) as (db, device):
+        with capture_logs() as logs:
+            client = _client(
+                section={"status": "not-ready"},
+                action_output={"atomic": True, "static-route": OK_SECTION},
+            )
+            assert await run_family_refresh(db, device, client, ENV_SPEC) is True
+            assert await run_family_refresh_from_outcome(db, device, ENV_SPEC, AbsentAuthoritative()) is True
+            assert (
+                await run_family_refresh_from_outcome(
+                    db,
+                    device,
+                    ENV_SPEC,
+                    Unavailable(UnavailableReason.not_authoritative),
+                )
+                is True
+            )
+
+    expected_events = {
+        "static_route.refresh.not_ready_escalating",
+        "static_route.refresh.done",
+        "static_route.refresh.cleared",
+        "static_route.refresh.not_authoritative",
+    }
+    records = [record for record in logs if record["event"] in expected_events]
+    assert {record["event"] for record in records} == expected_events
+    assert all(device_name not in str(record) for record in records)
 
 
 @pytest.mark.anyio

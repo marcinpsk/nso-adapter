@@ -144,6 +144,7 @@ def patch_subscriber_sse(sub: SSESubscriber, events: list[str], status: int = 20
 
 
 STREAM_URL = "http://nso:8080/restconf/streams/NETCONF/json"
+SECRET_STREAM_URL = f"{STREAM_URL}?access_token=placeholder-stream-secret"
 
 
 # ── subscribe ─────────────────────────────────────────────────────────────────
@@ -198,14 +199,15 @@ async def test_post_header_idle_raises_sse_idle_timeout():
     )
     try:
         with capture_logs() as logs, pytest.raises(SseIdleTimeout, match="idle watchdog") as caught:
-            await sub.subscribe(STREAM_URL, lambda raw, parsed: None, duration=5.0, idle_read_timeout_s=0.5)
+            await sub.subscribe(SECRET_STREAM_URL, lambda raw, parsed: None, duration=5.0, idle_read_timeout_s=0.5)
     finally:
         sub._client = original
 
     record = next(record for record in logs if record["event"] == "sse_idle_timeout")
     assert record["error"] == "ReadTimeout"
     assert "placeholder-secret" not in str(record)
-    assert_chain_free_of(caught.value, ["placeholder-secret", STREAM_URL])
+    assert "placeholder-stream-secret" not in str(record)
+    assert_chain_free_of(caught.value, ["placeholder-secret", SECRET_STREAM_URL])
 
 
 async def test_pre_header_read_timeout_stays_a_transport_error():
@@ -222,7 +224,7 @@ async def test_pre_header_read_timeout_stays_a_transport_error():
     )
     try:
         with capture_logs() as logs, pytest.raises(httpx.ReadTimeout):
-            await sub.subscribe(STREAM_URL, lambda raw, parsed: None, duration=5.0, idle_read_timeout_s=0.5)
+            await sub.subscribe(SECRET_STREAM_URL, lambda raw, parsed: None, duration=5.0, idle_read_timeout_s=0.5)
     except SseIdleTimeout:  # pragma: no cover - the failure mode under test
         raise AssertionError("pre-header ReadTimeout must not classify as idle")
     finally:
@@ -231,6 +233,7 @@ async def test_pre_header_read_timeout_stays_a_transport_error():
     record = next(record for record in logs if record["event"] == "sse_subscribe_error")
     assert record["error"] == "ReadTimeout"
     assert "placeholder-secret" not in str(record)
+    assert "placeholder-stream-secret" not in str(record)
 
 
 async def test_subscribe_calls_on_event_for_each_sse_block():
@@ -301,13 +304,14 @@ async def test_subscribe_raises_on_http_error():
     )
     try:
         with capture_logs() as logs, pytest.raises(httpx.HTTPStatusError):
-            await sub.subscribe(STREAM_URL, lambda *_: None, duration=5.0)
+            await sub.subscribe(SECRET_STREAM_URL, lambda *_: None, duration=5.0)
     finally:
         sub._client = original
 
     record = next(record for record in logs if record["event"] == "sse_subscribe_error")
     assert record["error"] == "HTTPStatusError (HTTP 503)"
     assert "placeholder-secret" not in str(record)
+    assert "placeholder-stream-secret" not in str(record)
 
 
 async def test_subscribe_empty_stream_calls_no_events():
@@ -356,13 +360,14 @@ async def test_subscribe_does_not_log_raw_body():
     payload = json.dumps({"secret-leaf": "hunter2"})
     sub = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     with capture_logs() as logs, patch_subscriber_sse(sub, [payload]):
-        await sub.subscribe(STREAM_URL, lambda *_: None, duration=5.0)
+        await sub.subscribe(SECRET_STREAM_URL, lambda *_: None, duration=5.0)
 
     event_logs = [event for event in logs if event.get("event", "").startswith("sse_event")]
     assert event_logs
     for event in event_logs:
         assert "raw" not in event
         assert "hunter2" not in str(list(event.values()))
+        assert "placeholder-stream-secret" not in str(event)
 
 
 async def test_subscribe_idle_read_timeout_unwedges_half_open_connection():
@@ -432,7 +437,13 @@ async def test_subscribe_completes_on_timeout():
 
     sub._client = _mock
     try:
+        from structlog.testing import capture_logs
+
         # duration=0.05 → wait_for times out; subscribe() should return without raising
-        await sub.subscribe(STREAM_URL, lambda *_: None, duration=0.05)
+        with capture_logs() as logs:
+            await sub.subscribe(SECRET_STREAM_URL, lambda *_: None, duration=0.05)
     finally:
         sub._client = original
+
+    record = next(record for record in logs if record["event"] == "sse_subscribe_complete")
+    assert "placeholder-stream-secret" not in str(record)

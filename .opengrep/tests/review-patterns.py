@@ -366,3 +366,18 @@ def returned_exception_property_details(exc):
 def returned_classification(exc):
     # ok: nso-failure-detail-raw-exception-renderer
     return type(exc).__name__
+
+
+def raw_diagnostic_identifiers(logger, device, stream_url):
+    # ruleid: nso-diagnostic-raw-identifier
+    logger.info("family.refresh.done", device_name=device.nso_device_name)
+    # ruleid: nso-diagnostic-raw-identifier
+    logger.info("sse_event", stream=stream_url)
+    # ruleid: nso-diagnostic-raw-identifier
+    logger.info("sse.reconnect_after_error", stream_url=stream_url)
+    # ruleid: nso-diagnostic-raw-identifier
+    logger.info("sse.stream.started", url=stream_url)
+    # ok: nso-diagnostic-raw-identifier
+    logger.info("family.refresh.done", device_id=device.id)
+    # ok: nso-diagnostic-raw-identifier
+    logger.info("sse_event", bytes=128)
