@@ -134,7 +134,6 @@ class ReadFailure:
     def log_fields(self) -> dict[str, object]:
         """Render the classification as record fields, the only shape any sink prints."""
         return {
-            "device_name": self.device,
             "family": self.family,
             "read_operation": self.operation.value,
             "error_type": self.error_type,

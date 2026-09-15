@@ -383,7 +383,7 @@ async def run_family_refresh_from_outcome(
         return await _apply_outcome(db, device, spec, outcome, refresh_source)
 
 
-def _failure_fields(device: Device, spec: FamilySpec, failure: ReadFailure | None) -> dict[str, object]:
+def _failure_fields(spec: FamilySpec, failure: ReadFailure | None) -> dict[str, object]:
     """Build the record fields for a kept read: the authored classification, or the bare ask.
 
     ``failure`` is None only for a DECLARED state the engine still keeps rows on (a
@@ -391,7 +391,7 @@ def _failure_fields(device: Device, spec: FamilySpec, failure: ReadFailure | Non
     so there is nothing to classify beyond what was asked for.
     """
     if failure is None:
-        return {"device_name": device.nso_device_name, "family": spec.wire_name}
+        return {"family": spec.wire_name}
     return failure.log_fields()
 
 
@@ -560,7 +560,7 @@ async def _apply_outcome(
         f"{spec.name}.refresh.unavailable",
         device_id=device.id,
         reason=outcome.reason.value,
-        **_failure_fields(device, spec, outcome.failure),
+        **_failure_fields(spec, outcome.failure),
     )
     selected = await _record_result(db, device, spec, attempt_id, result="kept", succeeded=False, row_count=None)
     return selected is False

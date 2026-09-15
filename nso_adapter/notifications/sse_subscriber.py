@@ -115,6 +115,7 @@ class SSESubscriber:
                             on_event(raw, parsed)
                             current_block = []
 
+        idle_timeout = False
         try:
             await asyncio.wait_for(_run(), timeout=duration)
         except TimeoutError:
@@ -127,9 +128,12 @@ class SSESubscriber:
             # diagnostic field in both paths.
             if established:
                 logger.info("sse_idle_timeout", stream=stream_url, error=failure_detail(exc))
-                raise SseIdleTimeout("idle watchdog") from exc
-            logger.warning("sse_subscribe_error", stream=stream_url, error=failure_detail(exc))
-            raise
+                idle_timeout = True
+            else:
+                logger.warning("sse_subscribe_error", stream=stream_url, error=failure_detail(exc))
+                raise
         except (httpx.HTTPStatusError, httpx.RequestError) as exc:
             logger.warning("sse_subscribe_error", stream=stream_url, error=failure_detail(exc))
             raise
+        if idle_timeout:
+            raise SseIdleTimeout("idle watchdog")

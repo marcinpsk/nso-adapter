@@ -164,11 +164,13 @@ def test_get_rejects_a_non_string_selected_field_without_rejecting_its_siblings(
     _, store, _ = fake_hvac
     store["credentials/svc"] = cast(
         dict[str, str],
-        {"netbox_token": 42, "placeholder-metadata": 7},
+        {"netbox_token": 42, "placeholder-metadata": 7, "user": "placeholder-user"},
     )
+    provider = _provider()
 
     with pytest.raises(SecretResolutionError, match="selected secret field is not a string"):
-        _provider().get("credentials/svc#netbox_token")
+        provider.get("credentials/svc#netbox_token")
+    assert provider.get("credentials/svc#user") == "placeholder-user"
 
 
 def test_read_path_metadata_distinguishes_absence_from_an_unversioned_empty_path(fake_hvac):

@@ -573,10 +573,17 @@ def _attaches_context(node: ast.Raise, index: _LexicalIndex) -> bool:
     return isinstance(cause, ast.Name) and index.is_none(cause)
 
 
-def scan_source(source: str, path: str) -> list[str]:
+def scan_source(
+    source: str,
+    path: str,
+    *,
+    default_annotations_eager: bool | None = None,
+) -> list[str]:
     """Every context-attaching site that RUNS inside an except handler, as ``path:line``."""
     tree = ast.parse(source, filename=path)
-    annotations_eager = sys.version_info < (3, 14) and not any(
+    if default_annotations_eager is None:
+        default_annotations_eager = sys.version_info < (3, 14)
+    annotations_eager = default_annotations_eager and not any(
         isinstance(statement, ast.ImportFrom)
         and statement.module == "__future__"
         and any(alias.name == "annotations" for alias in statement.names)
@@ -605,13 +612,22 @@ def scan_source(source: str, path: str) -> list[str]:
 
 
 def test_no_raise_inside_an_except_handler_keeps_the_caught_exception_attached() -> None:
-    violations: list[str] = []
+    violations: set[str] = set()
     for path in sorted(_PACKAGE.rglob("*.py")):
-        violations.extend(scan_source(path.read_text(encoding="utf-8"), str(path.relative_to(_PACKAGE.parent))))
+        source = path.read_text(encoding="utf-8")
+        relative_path = str(path.relative_to(_PACKAGE.parent))
+        for default_annotations_eager in (True, False):
+            violations.update(
+                scan_source(
+                    source,
+                    relative_path,
+                    default_annotations_eager=default_annotations_eager,
+                )
+            )
     assert not violations, (
         "a plain `raise X` attaches the caught exception to __context__ and `from None` only "
         "hides it. Build the sanitized exception in the handler and raise it AFTER the "
-        "handler: " + ", ".join(violations)
+        "handler: " + ", ".join(sorted(violations))
     )
 
 
@@ -810,6 +826,15 @@ def test_DEFAULT_ANNOTATIONS_are_deferred_from_PYTHON_3_14(monkeypatch) -> None:
     monkeypatch.setattr(sys, "version_info", (3, 14))
 
     assert scan_source(_EAGER_ANNOTATION_CALLS_A_RAISING_HELPER, "t.py") == []
+
+
+def test_scanner_can_target_supported_eager_annotation_semantics() -> None:
+    """The package guard must check pre-3.14 semantics under every test interpreter."""
+    assert scan_source(
+        _EAGER_ANNOTATION_CALLS_A_RAISING_HELPER,
+        "t.py",
+        default_annotations_eager=True,
+    ) == ["t.py:7"]
 
 
 def test_POSTPONED_ANNOTATIONS_do_not_execute_or_create_false_positives() -> None:

@@ -25,7 +25,7 @@ from nso_adapter.store.models import (
     SnmpSystemInfoIntent,
     SnmpV3UserIntent,
 )
-from tests._secret_discipline import assert_chain_free_of
+from tests._secret_discipline import assert_chain_free_of, assert_text_free_of
 from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -95,7 +95,7 @@ async def test_put_rejects_a_community_vault_ref_the_writer_cannot_render(adapte
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=body, headers=AUTH | push_seq())
 
     assert resp.status_code == 422
-    assert bad_ref not in resp.text
+    assert_text_free_of(resp.text, [bad_ref])
     comms, _, _, _ = await _read_intent(device_id)
     assert comms == []  # nothing was stored
 

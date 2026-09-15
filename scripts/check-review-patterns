@@ -8,15 +8,23 @@ cd "$repo_root"
 scan_bin="${OPENGREP_BIN:-opengrep}"
 mode="${1:-scan}"
 if (( $# )); then shift; fi
+require_opengrep() {
+  if ! command -v "$scan_bin" >/dev/null 2>&1; then
+    echo "OpenGrep is required. Install it or set OPENGREP_BIN. See README.md." >&2
+    exit 127
+  fi
+}
 case "$mode" in
   scan)
     if (( $# == 0 )); then
       set -- nso_adapter
     fi
+    require_opengrep
     exec "$scan_bin" scan --config .opengrep/nso-rules.yaml --error -- "$@"
     ;;
   test)
     if (( $# )); then echo "test does not accept arguments" >&2; exit 2; fi
+    require_opengrep
     staging_dir="$(mktemp -d)"
     trap 'rm -rf "$staging_dir"' EXIT
     cp .opengrep/nso-rules.yaml "$staging_dir/review-patterns.yaml"

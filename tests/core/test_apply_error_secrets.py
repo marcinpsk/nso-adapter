@@ -841,8 +841,8 @@ async def test_an_auth_refusal_and_an_outage_do_not_classify_the_same(adapter_cl
         assert record["error_type"] == "HTTPStatusError"
         assert record["family"] == "static-route"
         assert record["failure_code"] is None, "an HTTP answer is not a contract refusal"
-    assert denied["device_name"] == "refresh-401"
-    assert outage["device_name"] == "refresh-503"
+    assert "device_name" not in denied
+    assert "device_name" not in outage
     assert_records_free_of(await _outcome_rows(denied_id), _HTTP_SECRETS)
     assert_records_free_of(await _outcome_rows(outage_id), _HTTP_SECRETS)
 

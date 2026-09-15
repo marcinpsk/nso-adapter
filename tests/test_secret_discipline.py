@@ -18,6 +18,7 @@ _NON_DISCLOSURE_TESTS = (
     _TEST_ROOT / "api" / "test_api.py",
     _TEST_ROOT / "api" / "test_api_lag_config.py",
     _TEST_ROOT / "api" / "test_api_secrets.py",
+    _TEST_ROOT / "api" / "test_api_snmp_intent.py",
     _TEST_ROOT / "core" / "test_action_apply_promotion.py",
     _TEST_ROOT / "core" / "test_redistribution.py",
     _TEST_ROOT / "test_secret_discipline.py",

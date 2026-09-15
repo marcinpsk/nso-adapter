@@ -177,7 +177,6 @@ async def _commit_adoption_or_conflict(db: AsyncSession, netbox_device_id: int) 
 async def _commit_lost_insert_adoption(
     db: AsyncSession,
     winner: Device,
-    nso_device_name: str,
     netbox_device_id: int,
 ) -> Device | LookupError:
     """Commit a lost-insert adoption or report a late NetBox ownership conflict."""
@@ -189,7 +188,6 @@ async def _commit_lost_insert_adoption(
     logger.info(
         "device.onboard_race_resolved",
         device_id=winner.id,
-        nso_device=nso_device_name,
         adopted=True,
     )
     return winner
@@ -225,7 +223,7 @@ async def _resolve_lost_insert(
             return LookupError(f"NetBox device {netbox_device_id} is already onboarded")
         winner.netbox_device_id = netbox_device_id
         winner.mapping_status = MappingStatus.mapped
-        return await _commit_lost_insert_adoption(db, winner, nso_device_name, netbox_device_id)
+        return await _commit_lost_insert_adoption(db, winner, netbox_device_id)
     if winner.netbox_device_id != netbox_device_id:
         logger.warning(
             "device.onboard_refused",
@@ -235,7 +233,7 @@ async def _resolve_lost_insert(
             requested_netbox_device_id=netbox_device_id,
         )
         return DeviceIdentityRefused(_ONBOARDED_ELSEWHERE, reason="onboarded_elsewhere")
-    logger.info("device.onboard_race_resolved", device_id=winner.id, nso_device=nso_device_name)
+    logger.info("device.onboard_race_resolved", device_id=winner.id)
     return winner
 
 

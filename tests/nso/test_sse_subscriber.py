@@ -189,6 +189,7 @@ async def test_post_header_idle_raises_sse_idle_timeout():
     from structlog.testing import capture_logs
 
     from nso_adapter.notifications.sse_subscriber import SseIdleTimeout
+    from tests._secret_discipline import assert_chain_free_of
 
     sub = SSESubscriber("http://nso:8080", ("placeholder-user", "secret"))
     original = sub._client
@@ -196,7 +197,7 @@ async def test_post_header_idle_raises_sse_idle_timeout():
         transport=_PostHeaderTimeoutTransport(), base_url="http://nso:8080"
     )
     try:
-        with capture_logs() as logs, pytest.raises(SseIdleTimeout, match="idle watchdog"):
+        with capture_logs() as logs, pytest.raises(SseIdleTimeout, match="idle watchdog") as caught:
             await sub.subscribe(STREAM_URL, lambda raw, parsed: None, duration=5.0, idle_read_timeout_s=0.5)
     finally:
         sub._client = original
@@ -204,6 +205,7 @@ async def test_post_header_idle_raises_sse_idle_timeout():
     record = next(record for record in logs if record["event"] == "sse_idle_timeout")
     assert record["error"] == "ReadTimeout"
     assert "placeholder-secret" not in str(record)
+    assert_chain_free_of(caught.value, ["placeholder-secret", STREAM_URL])
 
 
 async def test_pre_header_read_timeout_stays_a_transport_error():
