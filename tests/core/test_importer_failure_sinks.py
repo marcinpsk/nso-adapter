@@ -41,12 +41,30 @@ _GUARDED_LOG_SINKS = (
 )
 
 
-def _is_classified_failure_detail(value: ast.expr) -> bool:
-    """Return whether the expression uses the approved failure classifier."""
-    return (
+def _is_closed_exception_classification(value: ast.expr) -> bool:
+    """Return whether the expression keeps only an approved closed classification."""
+    if (
         isinstance(value, ast.Call)
         and isinstance(value.func, ast.Name)
         and value.func.id == "failure_detail"
+        and len(value.args) == 1
+        and not value.keywords
+    ):
+        return True
+    if (
+        isinstance(value, ast.Attribute)
+        and value.attr == "__name__"
+        and isinstance(value.value, ast.Call)
+        and isinstance(value.value.func, ast.Name)
+        and value.value.func.id == "type"
+        and len(value.value.args) == 1
+        and not value.value.keywords
+    ):
+        return True
+    return (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "http_status_of"
         and len(value.args) == 1
         and not value.keywords
     )
@@ -127,7 +145,7 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
             if node.func.attr == "exception":
                 self._record_violation(node.lineno)
             for argument in node.args:
-                if not _is_classified_failure_detail(argument) and any(
+                if not _is_closed_exception_classification(argument) and any(
                     isinstance(part, ast.Name) and part.id in self.aliases for part in ast.walk(argument)
                 ):
                     self._record_violation(node.lineno)
@@ -138,12 +156,11 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
                     and keyword.value.value is True
                 ):
                     self._record_violation(node.lineno)
-                elif keyword.arg == "detail":
-                    if not _is_classified_failure_detail(keyword.value) and any(
-                        isinstance(part, ast.Name) and part.id in self.aliases for part in ast.walk(keyword.value)
-                    ):
-                        self._record_violation(node.lineno)
-                elif keyword.arg == "error" and not _is_classified_failure_detail(keyword.value):
+                elif keyword.arg == "error" and not _is_closed_exception_classification(keyword.value):
+                    self._record_violation(node.lineno)
+                elif not _is_closed_exception_classification(keyword.value) and any(
+                    isinstance(part, ast.Name) and part.id in self.aliases for part in ast.walk(keyword.value)
+                ):
                     self._record_violation(node.lineno)
         self.generic_visit(node)
 
@@ -193,6 +210,34 @@ def test_raw_exception_log_guard_rejects_positional_renderers(source: str) -> No
 
 def test_raw_exception_log_guard_accepts_classified_positional_detail() -> None:
     assert _raw_log_exception_renderers('logger.warning("event", failure_detail(exc))') == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'logger.warning("event", reason=exc)',
+        'logger.warning("event", message=f"failed: {exc}")',
+        'logger.warning("event", exc_info=exc)',
+    ],
+)
+def test_raw_exception_log_guard_rejects_aliases_in_every_structured_field(source: str) -> None:
+    assert _raw_log_exception_renderers(source) == [1]
+
+
+@pytest.mark.parametrize("field", ["reason", "message", "exc_info"])
+def test_raw_exception_log_guard_accepts_classified_structured_fields(field: str) -> None:
+    assert _raw_log_exception_renderers(f'logger.warning("event", {field}=failure_detail(exc))') == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'logger.warning("event", error_type=type(exc).__name__)',
+        'logger.warning("event", http_status=http_status_of(exc))',
+    ],
+)
+def test_raw_exception_log_guard_accepts_closed_exception_classifications(source: str) -> None:
+    assert _raw_log_exception_renderers(source) == []
 
 
 def test_raw_exception_log_guard_tracks_simple_aliases() -> None:
@@ -303,6 +348,8 @@ def test_review_guards_cover_each_authored_error_boundary() -> None:
         "review-patterns.py",
     }
     outcome_paths = set(rules["nso-outcome-raw-exception-renderer"]["paths"]["include"])
+    alias_paths = set(rules["nso-outcome-raw-exception-alias-renderer"]["paths"]["include"])
+    assert alias_paths == outcome_paths
     assert "nso_adapter/core/generation.py" in outcome_paths
 
 

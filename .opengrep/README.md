@@ -37,7 +37,8 @@ for its configuration names and workflow skip conditions.
 ## Coverage
 
 `nso-outcome-raw-exception-renderer` rejects traceback logging and raw exception
-fields. It covers `nso_adapter/main.py`, `core/importer.py`, `core/generation.py`,
+values in every positional or structured log field. It covers `nso_adapter/main.py`,
+`core/importer.py`, `core/generation.py`,
 both SSE subscriber modules, and the outcome bookkeeping logs in
 `refresh_engine.py` and `redistribution.py`. These logs must use `failure_detail`
 so an HTTP exception cannot repeat a request URL or server text. The behavioral

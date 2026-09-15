@@ -44,6 +44,16 @@ rules:
     severity: ERROR
     message: Classify an aliased outcome failure with failure_detail instead of rendering it.
     mode: taint
+    paths:
+      include:
+        - nso_adapter/main.py
+        - nso_adapter/core/generation.py
+        - nso_adapter/core/importer.py
+        - nso_adapter/core/refresh_engine.py
+        - nso_adapter/core/redistribution.py
+        - nso_adapter/notifications/sse_subscriber.py
+        - nso_adapter/notifications/persistent_subscriber.py
+        - review-patterns.py
     pattern-sources:
       - patterns:
           - pattern-inside: |
@@ -54,9 +64,11 @@ rules:
           - pattern: $EXCEPTION
     pattern-sanitizers:
       - pattern: failure_detail(...)
+      - pattern: type(...).__name__
+      - pattern: http_status_of(...)
     pattern-sinks:
       - patterns:
-          - pattern: logger.$LEVEL(..., detail=$DETAIL, ...)
+          - pattern: logger.$LEVEL(..., $FIELD=$DETAIL, ...)
           - focus-metavariable: $DETAIL
   - id: nso-api-validation-error-raw-exception-renderer
     languages: [python]

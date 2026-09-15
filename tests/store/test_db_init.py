@@ -158,7 +158,7 @@ def _unsafe_migration_diagnostic_lines(target: ast.FunctionDef) -> list[int]:
     for node in ast.walk(target):
         diagnostic: ast.AST | None = None
         if isinstance(node, ast.Assert):
-            diagnostic = node.msg
+            diagnostic = node
         elif (
             isinstance(node, ast.Raise)
             and isinstance(node.exc, ast.Call)
@@ -201,7 +201,7 @@ def check(output):
     assert _unsafe_migration_diagnostic_lines(target) == [3]
 
 
-def test_migration_output_guard_accepts_an_authored_assertion_message():
+def test_migration_output_guard_rejects_an_assertion_that_evaluates_output():
     tree = ast.parse(
         """\
 def check(output):
@@ -211,7 +211,7 @@ def check(output):
     target = tree.body[0]
     assert isinstance(target, ast.FunctionDef)
 
-    assert _unsafe_migration_diagnostic_lines(target) == []
+    assert _unsafe_migration_diagnostic_lines(target) == [2]
 
 
 def test_db_migrate_and_init_db_share_one_validator():

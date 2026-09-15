@@ -43,13 +43,25 @@ def classified_outcome_errors(logger, exc, failure_detail):
     logger.warning("family.outcome.read_record_failed", detail=failure_detail(exc))
 
 
-def aliased_outcome_error(logger, failure_detail):
+def aliased_outcome_error(logger, failure_detail, http_status_of):
     try:
         work()
     except Exception as caught:
         alias = caught
         # ruleid: nso-outcome-raw-exception-alias-renderer
         logger.warning("family.outcome.read_record_failed", detail=alias)
+        # ruleid: nso-outcome-raw-exception-alias-renderer
+        logger.warning("family.outcome.read_record_failed", reason=alias)
+        # ruleid: nso-outcome-raw-exception-alias-renderer
+        logger.warning("family.outcome.read_record_failed", message=f"failure: {alias}")
+        # ruleid: nso-outcome-raw-exception-alias-renderer
+        logger.warning("family.outcome.read_record_failed", exc_info=alias)
+        # ok: nso-outcome-raw-exception-alias-renderer
+        logger.warning("family.outcome.read_record_failed", reason=failure_detail(caught))
+        # ok: nso-outcome-raw-exception-alias-renderer
+        logger.warning("family.outcome.read_record_failed", error_type=type(caught).__name__)
+        # ok: nso-outcome-raw-exception-alias-renderer
+        logger.warning("family.outcome.read_record_failed", http_status=http_status_of(caught))
         alias = "authored detail"
         # ok: nso-outcome-raw-exception-alias-renderer
         logger.warning("family.outcome.read_record_failed", detail=alias)
