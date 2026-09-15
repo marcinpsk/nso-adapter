@@ -352,6 +352,23 @@ async def test_verify_rejects_a_non_string_vault_field_as_a_sanitized_502(vault_
 
 
 @pytest.mark.anyio
+async def test_verify_ignores_a_non_string_sibling_when_the_selected_field_is_valid(vault_client):
+    client, store, _ = vault_client
+    path = "netbox/snmp/community/with-metadata"
+    key = "placeholder-selected-field"
+    store[path] = cast(
+        dict[str, str],
+        {key: "placeholder-selected-value", "placeholder-metadata": 42},
+    )
+
+    resp = await client.post("/api/v1/secrets/verify", json={"vault_ref": f"network/{path}#{key}"}, headers=AUTH)
+
+    assert resp.status_code == 200
+    assert resp.json()["fingerprint"] == _h("placeholder-selected-value")
+    assert_text_free_of(resp.text, [path, key, "placeholder-metadata", "placeholder-selected-value"])
+
+
+@pytest.mark.anyio
 async def test_vault_permission_denied_returns_structured_502(vault_client):
     """A Vault policy denial (403 that survives re-auth) must map to a structured
     error, not an unhandled 500 — live-observed on a path outside the AppRole's

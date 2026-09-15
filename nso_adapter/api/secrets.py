@@ -40,6 +40,7 @@ from nso_adapter.api.errors import (
 )
 from nso_adapter.core import snmp_harvest
 from nso_adapter.core.importer import get_nso_client
+from nso_adapter.secrets.base import SecretResolutionError
 from nso_adapter.secrets.refs import (
     SECRET_FINGERPRINT_PATTERN,
     VaultRef,
@@ -190,7 +191,15 @@ async def verify_secret(body: SecretVerifyRequest, request: Request) -> SecretVe
     provider = _vault_provider(request)
     ref = _parse_ref(body.vault_ref)
 
-    result = await _vault_op(lambda: provider.read_path_meta(ref.mount, ref.path))
+    def _read_for_verification() -> tuple[dict[str, str], int | None] | None:
+        result = provider.read_path_meta(ref.mount, ref.path)
+        if result is not None and ref.key is not None:
+            data, _ = result
+            if ref.key in data and not isinstance(data[ref.key], str):
+                raise SecretResolutionError("the selected Vault field is not a string")
+        return result
+
+    result = await _vault_op(_read_for_verification)
     fingerprint = None
     has_auth = False
     has_priv = False

@@ -65,15 +65,6 @@ class VaultSecretsProvider:
         self._cache.clear()
         logger.info("vault.approle_login")
 
-    @staticmethod
-    def _validated_fields(data: object) -> dict[str, str]:
-        """Validate Vault's untrusted JSON against the provider's string field contract."""
-        if not isinstance(data, dict) or any(
-            not isinstance(field, str) or not isinstance(value, str) for field, value in data.items()
-        ):
-            raise SecretResolutionError("the Vault path does not contain only string fields and values")
-        return dict(data)
-
     def _fetch_path(self, path: str) -> dict[str, str]:
         assert self._client is not None
         secret = self._client.secrets.kv.v2.read_secret_version(
@@ -81,7 +72,7 @@ class VaultSecretsProvider:
             path=path,
             raise_on_deleted_version=True,
         )
-        data = self._validated_fields(secret["data"]["data"])
+        data: dict[str, str] = secret["data"]["data"]
         self._cache[path] = data
         return data
 
@@ -157,8 +148,7 @@ class VaultSecretsProvider:
         except hvac.exceptions.InvalidPath:
             return None
         version = secret["data"].get("metadata", {}).get("version")
-        data = self._validated_fields(secret["data"]["data"])
-        return data, int(version) if version is not None else None
+        return dict(secret["data"]["data"]), int(version) if version is not None else None
 
     def _read_raw(self, mount: str, path: str) -> dict[str, str]:
         result = self._read_raw_meta(mount, path)
