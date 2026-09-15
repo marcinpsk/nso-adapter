@@ -31,6 +31,7 @@ against real ``__context__`` behaviour instead of against a claim about it.
 from __future__ import annotations
 
 import ast
+import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -575,7 +576,7 @@ def _attaches_context(node: ast.Raise, index: _LexicalIndex) -> bool:
 def scan_source(source: str, path: str) -> list[str]:
     """Every context-attaching site that RUNS inside an except handler, as ``path:line``."""
     tree = ast.parse(source, filename=path)
-    annotations_eager = not any(
+    annotations_eager = sys.version_info < (3, 14) and not any(
         isinstance(statement, ast.ImportFrom)
         and statement.module == "__future__"
         and any(alias.name == "annotations" for alias in statement.names)
@@ -789,10 +790,26 @@ def test_flags_a_raising_call_in_a_DECORATOR_evaluated_by_the_definition() -> No
     assert scan_source(_DECORATOR_CALLS_A_RAISING_HELPER, "t.py") == ["t.py:7"]
 
 
-def test_flags_a_raising_call_in_an_EAGER_ANNOTATION() -> None:
-    """Parameter and return annotations execute with the definition in eager modules."""
-    assert isinstance(_runtime_context(_EAGER_ANNOTATION_CALLS_A_RAISING_HELPER), ValueError)
-    assert scan_source(_EAGER_ANNOTATION_CALLS_A_RAISING_HELPER, "t.py") == ["t.py:7"]
+def test_DEFAULT_ANNOTATIONS_match_the_running_interpreter() -> None:
+    """Default annotations are eager before Python 3.14 and deferred from Python 3.14."""
+    if sys.version_info < (3, 14):
+        assert isinstance(_runtime_context(_EAGER_ANNOTATION_CALLS_A_RAISING_HELPER), ValueError)
+        expected = ["t.py:7"]
+    else:
+        namespace = {"Boom": _Boom, "trigger": _trigger}
+        exec(  # noqa: S102, the behaviour IS the test
+            compile(_EAGER_ANNOTATION_CALLS_A_RAISING_HELPER, "runtime.py", "exec", dont_inherit=True),
+            namespace,
+        )
+        expected = []
+    assert scan_source(_EAGER_ANNOTATION_CALLS_A_RAISING_HELPER, "t.py") == expected
+
+
+def test_DEFAULT_ANNOTATIONS_are_deferred_from_PYTHON_3_14(monkeypatch) -> None:
+    """The scanner must model a target runtime even when this test runs on an older Python."""
+    monkeypatch.setattr(sys, "version_info", (3, 14))
+
+    assert scan_source(_EAGER_ANNOTATION_CALLS_A_RAISING_HELPER, "t.py") == []
 
 
 def test_POSTPONED_ANNOTATIONS_do_not_execute_or_create_false_positives() -> None:

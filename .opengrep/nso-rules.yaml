@@ -120,7 +120,13 @@ rules:
                 ...
           - pattern: $EXCEPTION
     pattern-sanitizers:
-      - pattern: $EXCEPTION.public_message
+      - patterns:
+          - pattern-inside: |
+              try:
+                ...
+              except $TYPE as $EXCEPTION:
+                ...
+          - pattern: $EXCEPTION.public_message
     pattern-sinks:
       - patterns:
           - pattern: api_error(..., "validation_error", $MESSAGE, ...)

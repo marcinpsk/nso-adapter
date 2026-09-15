@@ -15,6 +15,7 @@ import hashlib
 import json
 import threading
 import types
+from typing import cast
 from unittest.mock import AsyncMock, patch
 from uuid import UUID
 
@@ -333,6 +334,21 @@ async def test_verify_keyed_ref_returns_a_scalar_fingerprint_without_the_field_n
         resp.text,
         [key, "placeholder-selected-value", "placeholder-sibling-field", "placeholder-sibling-value"],
     )
+
+
+@pytest.mark.anyio
+async def test_verify_rejects_a_non_string_vault_field_as_a_sanitized_502(vault_client):
+    """Vault is an external boundary, so its response cannot rely on type annotations."""
+    client, store, _ = vault_client
+    path = "netbox/snmp/community/malformed"
+    key = "placeholder-selected-field"
+    store[path] = cast(dict[str, str], {key: 42})
+
+    resp = await client.post("/api/v1/secrets/verify", json={"vault_ref": f"network/{path}#{key}"}, headers=AUTH)
+
+    assert resp.status_code == 502
+    assert resp.json()["error"]["code"] == "vault_error"
+    assert_text_free_of(resp.text, [path, key])
 
 
 @pytest.mark.anyio

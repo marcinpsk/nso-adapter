@@ -100,6 +100,8 @@ async def validation_error_messages(api_error, exc, body):
     request_alias = body.device_name
     # ruleid: nso-api-validation-error-raw-data-alias
     api_error(422, "validation_error", request_alias)
+    # ruleid: nso-api-validation-error-raw-data-alias
+    api_error(422, "validation_error", body.public_message)
     try:
         validate()
     except ValueError as caught:
