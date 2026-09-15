@@ -49,14 +49,13 @@ class NsoActionFailedError(RuntimeError):
 
 
 class NsoReadContractError(RuntimeError):
-    """A ``device-state-read`` action response that the server did not certify (READSEM 1328).
+    """A device-state response that violates the certified read contract (READSEM 1328).
 
-    The action's contract is a single ATOMIC, device-scoped snapshot whose every section carries a
-    TERMINAL status (``ok|unsupported|error`` — never ``stale``/``not-ready``). A response that is
-    non-atomic, echoes the wrong device, or carries a non-terminal/malformed section is a
-    version-skew / proxy-garbage failure, NOT authoritative data. Raised so every consumer — the
-    not-ready escalation, the atomic importer, and the apply/removal verifiers — abstains and KEEPS
-    rows rather than materializing a fabricated section (an ok-empty one would wipe a pop family).
+    The action response must be one atomic, device-scoped snapshot whose every section carries a
+    terminal status (``ok|unsupported|error``, never ``stale`` or ``not-ready``). The record-served
+    document response must contain exactly the requested device. A non-atomic response, a wrong
+    device, or a malformed section is a version-skew or proxy-garbage failure, not authoritative
+    data. Raised so every consumer abstains and keeps rows instead of materializing fabricated data.
     """
 
 
@@ -421,7 +420,12 @@ class NsoClient:
                 probe.raise_for_status()
                 return None
             resp.raise_for_status()
-            data = resp.json()
+            try:
+                data = resp.json()
+            except ValueError:
+                data = None
+            if not isinstance(data, dict):
+                raise NsoReadContractError("device-state GET returned a malformed body")
             entries = data.get("network-state-export:device") or data.get("device", [])
             # A 200 whose body lacks exactly this device is a MALFORMED response (truncated
             # doc, wrong namespace, proxy garbage) - never device absence. None is reserved
@@ -433,7 +437,7 @@ class NsoClient:
                 or not isinstance(entries[0], dict)
                 or entries[0].get("device-name") != device_name
             ):
-                raise NsoExportUnavailableError("device-state GET returned a malformed body")
+                raise NsoReadContractError("device-state GET returned a malformed body")
             return entries[0]
 
     async def run_device_state_read(

@@ -59,6 +59,10 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
         self.aliases = {"exc"}
         self.violations: list[int] = []
 
+    def _record_violation(self, lineno: int) -> None:
+        if lineno not in self.violations:
+            self.violations.append(lineno)
+
     def _assignment(self, targets: list[ast.expr], value: ast.expr) -> None:
         aliases_exception = isinstance(value, ast.Name) and value.id in self.aliases
         for target in targets:
@@ -121,21 +125,26 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
             and node.func.value.id == "logger"
         ):
             if node.func.attr == "exception":
-                self.violations.append(node.lineno)
+                self._record_violation(node.lineno)
+            for argument in node.args:
+                if not _is_classified_failure_detail(argument) and any(
+                    isinstance(part, ast.Name) and part.id in self.aliases for part in ast.walk(argument)
+                ):
+                    self._record_violation(node.lineno)
             for keyword in node.keywords:
                 if (
                     keyword.arg == "exc_info"
                     and isinstance(keyword.value, ast.Constant)
                     and keyword.value.value is True
                 ):
-                    self.violations.append(keyword.value.lineno)
+                    self._record_violation(node.lineno)
                 elif keyword.arg == "detail":
                     if not _is_classified_failure_detail(keyword.value) and any(
                         isinstance(part, ast.Name) and part.id in self.aliases for part in ast.walk(keyword.value)
                     ):
-                        self.violations.append(keyword.value.lineno)
+                        self._record_violation(node.lineno)
                 elif keyword.arg == "error" and not _is_classified_failure_detail(keyword.value):
-                    self.violations.append(keyword.value.lineno)
+                    self._record_violation(node.lineno)
         self.generic_visit(node)
 
 
@@ -167,6 +176,23 @@ logger.warning("event", detail=failure_detail(exc))
 logger.warning("event", error=failure_detail(exc))
 """
     assert _raw_log_exception_renderers(source) == list(range(1, 16))
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'logger.warning(f"failed: {exc}")',
+        'logger.warning("failed: {}".format(exc))',
+        'logger.warning("failed: %s" % exc)',
+        'logger.warning("failed: %s", exc)',
+    ],
+)
+def test_raw_exception_log_guard_rejects_positional_renderers(source: str) -> None:
+    assert _raw_log_exception_renderers(source) == [1]
+
+
+def test_raw_exception_log_guard_accepts_classified_positional_detail() -> None:
+    assert _raw_log_exception_renderers('logger.warning("event", failure_detail(exc))') == []
 
 
 def test_raw_exception_log_guard_tracks_simple_aliases() -> None:
@@ -263,6 +289,8 @@ def test_guarded_modules_are_documented() -> None:
     coverage = _COVERAGE_DOC.read_text(encoding="utf-8").split("## Coverage", maxsplit=1)[1]
     for path in (_IMPORTER, *_GUARDED_LOG_SINKS):
         assert path.name in coverage, f"{path.name} is missing from the OpenGrep coverage documentation"
+    assert "any `api_error` in `action_force_removal`" in coverage
+    assert "no endpoint error response returns the submitted scope" in coverage
 
 
 def test_review_guards_cover_each_authored_error_boundary() -> None:
@@ -529,3 +557,25 @@ async def test_a_non_terminal_action_section_never_reaches_the_split(adapter_cli
     assert outcome.reason is UnavailableReason.read_error
     assert outcome.failure.error_type == "NsoReadContractError"
     assert outcome.failure.operation is ReadOperation.device_state_read
+
+
+async def test_a_malformed_record_document_is_a_read_error_not_an_export_outage(adapter_client):
+    """A malformed HTTP 200 is a contract failure, not a missing export container."""
+    from nso_adapter.core.importer import _fetch_projection
+    from nso_adapter.nso.read_outcome import ReadOperation, Unavailable, UnavailableReason
+    from tests.nso.test_device_state_client import EnvelopeTransport, _make_client
+
+    device_id = await seed_device(nso_device_name="malformed-record-document")
+    client = _make_client()
+    transport = EnvelopeTransport(device_body={})
+    client._client = lambda timeout=None: httpx.AsyncClient(transport=transport, base_url="http://nso:8080")
+
+    async with _device_session(device_id) as (_db, device):
+        sections, outcome, failures = await _fetch_projection(client, device, ["static-route"])
+
+    assert sections == {}
+    assert failures == {}
+    assert isinstance(outcome, Unavailable)
+    assert outcome.reason is UnavailableReason.read_error
+    assert outcome.failure.error_type == "NsoReadContractError"
+    assert outcome.failure.operation is ReadOperation.doc_get

@@ -312,7 +312,7 @@ def test_a_MISSING_field_refuses_without_the_mount_the_path_or_the_key(fake_hvac
     assert_text_free_of(caught.value, _STARTUP_PARTS)
     assert "not at the referenced path" in str(caught.value), "the caller must still learn WHAT failed"
     assert_chain_free_of(caught.value, _STARTUP_PARTS)
-    assert exception_chain(caught.value) == [caught.value], "an upstream exception is still attached"
+    assert exception_chain(caught.value) == [caught.value], "an upstream exception must not stay attached"
 
 
 def test_an_INVALID_reference_refuses_without_the_input(fake_hvac):
@@ -344,7 +344,7 @@ def test_a_VAULT_OUTAGE_refuses_by_type_and_attaches_no_hvac_exception(fake_hvac
     assert "the Vault read failed (RuntimeError)" in str(caught.value), "the TYPE tells an outage from a miss"
     assert_text_free_of(caught.value, _STARTUP_PARTS)
     assert_chain_free_of(caught.value, _STARTUP_PARTS)
-    assert exception_chain(caught.value) == [caught.value], "the hvac exception is still on the chain"
+    assert exception_chain(caught.value) == [caught.value], "the hvac exception must not stay on the chain"
 
 
 def test_a_FAILED_STARTUP_resolution_names_the_CONFIG_SLOT(fake_hvac):

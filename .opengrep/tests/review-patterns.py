@@ -109,7 +109,7 @@ async def action_force_removal(device_id, body, db):
     try:
         work()
     except OperationSectionAbsent as absent:
-        # ok: nso-api-unknown-request-renderer
+        # ruleid: nso-api-unknown-request-renderer
         api_error(
             400,
             "bad_request",
@@ -137,6 +137,30 @@ def safe_generic_conflicts(api_error):
     try:
         rekey()
     except LookupError:
+        # ok: nso-api-conflict-handler-contract
+        refused = api_error(
+            409,
+            "conflict",
+            _DEVICE_IDENTITY_CLAIMED_MESSAGE,
+            {"reason": "identity_claimed"},
+        )
+
+
+def safe_bound_generic_conflicts(api_error):
+    try:
+        onboard()
+    except LookupError as exc:
+        # ok: nso-api-conflict-handler-contract
+        refused = api_error(
+            409,
+            "conflict",
+            _NETBOX_DEVICE_CLAIMED_MESSAGE,
+            {"reason": "netbox_device_claimed"},
+        )
+
+    try:
+        rekey()
+    except LookupError as exc:
         # ok: nso-api-conflict-handler-contract
         refused = api_error(
             409,

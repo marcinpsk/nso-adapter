@@ -81,9 +81,14 @@ def _constant_string(node: ast.AST) -> str | None:
     """Return the value of a statically constant string expression."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
+    if isinstance(node, ast.FormattedValue):
+        if node.conversion == -1 and node.format_spec is None:
+            return _constant_string(node.value)
+        return None
     if isinstance(node, ast.JoinedStr):
-        if all(isinstance(value, ast.Constant) and isinstance(value.value, str) for value in node.values):
-            return "".join(value.value for value in node.values)
+        parts = [_constant_string(value) for value in node.values]
+        if all(part is not None for part in parts):
+            return "".join(part for part in parts if part is not None)
         return None
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
         left = _constant_string(node.left)

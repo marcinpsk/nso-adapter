@@ -99,6 +99,7 @@ def test_flags_credential_literals_in_lambda_defaults(statement):
     "statement",
     [
         'password = f"admin"',
+        "password = f\"{'admin'}\"",
         'password = "ad" + "min"',
         'username = "".join(("ad", "min"))',
         'username = "ADMIN".lower()',

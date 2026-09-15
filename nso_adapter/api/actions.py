@@ -203,8 +203,8 @@ async def action_force_removal(
         refusal = api_error(
             400,
             "bad_request",
-            f"Nothing is authorized for {body.scope!r} on this device, so there is nothing to flush",
-            {"scope": body.scope, "reason": absent.reason},
+            "Nothing is authorized for this removal scope on this device, so there is nothing to flush",
+            {"reason": absent.reason},
         )
     if refusal is not None:
         raise refusal

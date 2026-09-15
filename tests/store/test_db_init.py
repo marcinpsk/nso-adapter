@@ -153,6 +153,27 @@ def test_db_migrate_survives_a_percent_in_the_password_and_prints_no_credential(
             raise AssertionError("the migration runner printed credential material")
 
 
+def _unsafe_migration_diagnostic_lines(target: ast.FunctionDef) -> list[int]:
+    rendered = []
+    for node in ast.walk(target):
+        diagnostic: ast.AST | None = None
+        if isinstance(node, ast.Assert):
+            diagnostic = node.msg
+        elif (
+            isinstance(node, ast.Raise)
+            and isinstance(node.exc, ast.Call)
+            and isinstance(node.exc.func, ast.Name)
+            and node.exc.func.id == "AssertionError"
+        ):
+            diagnostic = node.exc
+        if diagnostic is None:
+            continue
+        names = {child.id for child in ast.walk(diagnostic) if isinstance(child, ast.Name)}
+        if names & {"output", "password", "leaked"}:
+            rendered.append(node.lineno)
+    return rendered
+
+
 def test_migration_output_assertions_never_render_captured_output_or_credentials():
     """A failed secrecy assertion must not publish the captured subprocess output."""
     tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
@@ -162,14 +183,35 @@ def test_migration_output_assertions_never_render_captured_output_or_credentials
         if isinstance(node, ast.FunctionDef)
         and node.name == "test_db_migrate_survives_a_percent_in_the_password_and_prints_no_credential"
     )
-    rendered = []
-    for node in ast.walk(target):
-        if isinstance(node, ast.Assert):
-            names = {child.id for child in ast.walk(node) if isinstance(child, ast.Name)}
-            if names & {"output", "password", "leaked"}:
-                rendered.append(node.lineno)
-
+    rendered = _unsafe_migration_diagnostic_lines(target)
     assert rendered == [], f"unsafe assertion diagnostics at lines {rendered}"
+
+
+def test_migration_output_guard_rejects_rendered_assertion_errors():
+    tree = ast.parse(
+        """\
+def check(output):
+    if output:
+        raise AssertionError(f"captured output: {output}")
+"""
+    )
+    target = tree.body[0]
+    assert isinstance(target, ast.FunctionDef)
+
+    assert _unsafe_migration_diagnostic_lines(target) == [3]
+
+
+def test_migration_output_guard_accepts_an_authored_assertion_message():
+    tree = ast.parse(
+        """\
+def check(output):
+    assert "secret" not in output, "the migration runner printed credential material"
+"""
+    )
+    target = tree.body[0]
+    assert isinstance(target, ast.FunctionDef)
+
+    assert _unsafe_migration_diagnostic_lines(target) == []
 
 
 def test_db_migrate_and_init_db_share_one_validator():

@@ -224,17 +224,23 @@ async def test_action_force_removal_refuses_a_family_nothing_authorized(adapter_
     a document that carries no such section. Creating the generation anyway would delete the
     carrier and record nothing, so the request is refused before any job exists.
     """
-    from nso_adapter.api.actions import ForceRemovalBody, action_force_removal
-
     device_id = await _seed_device("actions-frm-05", 1344)
-    async with session() as db:
-        try:
-            await action_force_removal(device_id=device_id, body=ForceRemovalBody(scope="isis"), db=db)
-        except Exception as exc:
-            assert getattr(exc, "status_code", None) == 400
-            assert exc.detail["error"]["detail"] == {"scope": "isis", "reason": "no_authorized_section"}
-        else:
-            raise AssertionError("a flush of a never-authorized family must be refused")
+    submitted = "isis"
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/force-removal",
+        json={"scope": submitted},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == {
+        "code": "bad_request",
+        "message": "Nothing is authorized for this removal scope on this device, so there is nothing to flush",
+        "detail": {"reason": "no_authorized_section"},
+    }
+    if submitted in response.text:
+        raise AssertionError("the response returned the submitted removal scope")
     async with session() as db:
         jobs = (await db.execute(select(Job).where(Job.device_id == device_id))).scalars().all()
         assert list(jobs) == [], "the refusal must leave no job behind"

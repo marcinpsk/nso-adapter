@@ -89,9 +89,6 @@ rules:
           - pattern: body.scope
     pattern-sinks:
       - patterns:
-          - pattern-inside: |
-              if body.scope not in valid_removal_scopes():
-                ...
           - pattern: api_error(...)
   - id: nso-api-conflict-handler-contract
     languages: [python]
@@ -127,6 +124,26 @@ rules:
           try:
             ...
           except LookupError:
+            refused = api_error(
+                409,
+                "conflict",
+                _DEVICE_IDENTITY_CLAIMED_MESSAGE,
+                {"reason": "identity_claimed"},
+            )
+      - pattern-not: |
+          try:
+            ...
+          except LookupError as $EXCEPTION:
+            refused = api_error(
+                409,
+                "conflict",
+                _NETBOX_DEVICE_CLAIMED_MESSAGE,
+                {"reason": "netbox_device_claimed"},
+            )
+      - pattern-not: |
+          try:
+            ...
+          except LookupError as $EXCEPTION:
             refused = api_error(
                 409,
                 "conflict",

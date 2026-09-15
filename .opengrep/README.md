@@ -48,11 +48,11 @@ authoritative for the classification contract and complete Python syntax.
 and formatted values in device validation responses. These responses use
 authored text so caller-controlled NSO instance names do not return on the wire.
 
-`nso-api-unknown-request-renderer` tracks the submitted removal scope into any
-error built in the invalid-scope branch. It covers direct, formatted, converted,
-and aliased values while allowing the later response to return a validated
-scope. `nso-api-conflict-handler-contract` permits only the two complete generic
-conflict handlers. Each uses its authored message and matching stable reason.
+`nso-api-unknown-request-renderer` tracks the submitted removal scope into
+any `api_error` in `action_force_removal`. It covers direct, formatted, converted, and aliased
+values. The rule makes sure that no endpoint error response returns the submitted scope.
+`nso-api-conflict-handler-contract` permits only the two complete generic conflict
+handlers. Each uses its authored message and matching stable reason.
 
 `nso-failure-detail-raw-exception-renderer` rejects common direct string,
 representation, interpolation, and formatting of the shared formatter
