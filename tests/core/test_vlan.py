@@ -240,6 +240,46 @@ async def test_refresh_switchport_links_vlans(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_refresh_switchport_rejects_an_empty_tagged_vlan_list_without_clearing_rows(adapter_client):
+    """A malformed falsy wire value must fail before replacing the stored VLAN links."""
+    device_id = await seed_device(nso_device_name="vsw-empty-tagged", netbox_device_id=1313)
+    async with _device_session(device_id) as (db, device):
+        nso = AsyncMock()
+        sections = _serve_sections(nso)
+        sections["vlan-database"] = {
+            "status": "ok",
+            "vlan": [{"vlan-id": 10, "name": "A"}, {"vlan-id": 20, "name": "B"}],
+        }
+        await refresh_vlan_database_for_device(db, device, nso)
+        sections["switchport"] = {
+            "status": "ok",
+            "interface": [{"interface-name": "Gi0/1", "mode": "trunk", "tagged-vlans": "10,20"}],
+        }
+        await refresh_switchport_for_device(db, device, nso)
+
+        sections["switchport"] = {
+            "status": "ok",
+            "interface": [{"interface-name": "Gi0/1", "mode": "trunk", "tagged-vlans": []}],
+        }
+        with pytest.raises(ValueError, match=r"^tagged-vlans must be a string \(type list\)$"):
+            await refresh_switchport_for_device(db, device, nso)
+
+        tagged = (
+            (
+                await db.execute(
+                    select(DeviceVlan.vlan_id)
+                    .join(DeviceSwitchportTaggedVlan, DeviceSwitchportTaggedVlan.vlan_id == DeviceVlan.id)
+                    .join(DeviceSwitchport, DeviceSwitchport.id == DeviceSwitchportTaggedVlan.switchport_id)
+                    .where(DeviceSwitchport.device_id == device.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert sorted(tagged) == [10, 20], "the rejected refresh must preserve the last valid links"
+
+
+@pytest.mark.anyio
 async def test_refresh_vlan_database_authoritative_empty_prunes_all(adapter_client):
     """An authoritatively-empty read (status=ok, no vlan list — RESTCONF omits empties) prunes
     every VLAN row for this pop family. (Device-absence, section None, now KEEPS — READSEM S5.)"""

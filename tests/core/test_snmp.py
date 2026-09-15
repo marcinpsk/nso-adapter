@@ -193,7 +193,7 @@ async def test_refresh_full_replaces_existing_rows(adapter_client):
             "name": "snmp-replace-sw01",
             "community": [
                 {"name": "1111222233334444", "access": "RO"},
-                {"name": "5555666677778888", "access": "RW"},
+                {"name": "55556666777788aa", "access": "RW"},
             ],
         }
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")

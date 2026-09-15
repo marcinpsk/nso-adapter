@@ -188,7 +188,8 @@ async def _upsert_switchports(
         await db.flush()
         # rebuild tagged-vlan join rows
         await db.execute(delete(DeviceSwitchportTaggedVlan).where(DeviceSwitchportTaggedVlan.switchport_id == row.id))
-        for tv in parse_vlan_string(item.get("tagged-vlans") or item.get("tagged_vlans")):
+        raw_tagged = item["tagged-vlans"] if "tagged-vlans" in item else item.get("tagged_vlans")
+        for tv in parse_vlan_string(raw_tagged):
             vlan = vlan_by_vid.get(tv)
             if vlan is not None:
                 db.add(DeviceSwitchportTaggedVlan(switchport_id=row.id, vlan_id=vlan.id))

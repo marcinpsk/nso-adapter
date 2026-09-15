@@ -687,6 +687,9 @@ async def test_the_secrets_write_description_promises_exactly_what_it_answers(va
     assert "fingerprint" not in description.lower(), (
         "the description promises a fingerprint the write does not answer; it answers " + ", ".join(sorted(answered))
     )
+    missing = {field for field in answered if field not in description}
+    assert not missing, f"the description omits response fields: {sorted(missing)}"
+    assert "Vault path" in description, "the description no longer says where the merge-write occurs"
 
 
 @pytest.mark.anyio
@@ -768,7 +771,7 @@ async def test_a_MALFORMED_ref_is_answered_with_the_broken_RULE_not_the_input(va
     with pytest.raises(ApiError) as caught:
         _parse_ref(malformed)
     assert_chain_free_of(caught.value, [malformed, "placeholder-path", "placeholder-secret"])
-    assert exception_chain(caught.value) == [caught.value], "the parser exception is still attached"
+    assert exception_chain(caught.value) == [caught.value], "the parser exception must not stay attached"
 
 
 @pytest.mark.anyio
@@ -807,4 +810,4 @@ async def test_an_UNREGISTERED_instance_answers_502_with_nothing_attached(vault_
     assert_text_free_of(resp.text, ["nso-not-registered"])
     assert built, "the refusal never went through api_error"
     refusal = built[-1]
-    assert exception_chain(refusal) == [refusal], "the registry exception is still attached to the 502"
+    assert exception_chain(refusal) == [refusal], "the registry exception must not stay attached to the 502"
