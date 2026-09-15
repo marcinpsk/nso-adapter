@@ -10,6 +10,7 @@ which would fabricate any attribute and let a broken read path stay green.
 from __future__ import annotations
 
 import types
+from typing import cast
 
 import pytest
 
@@ -157,6 +158,17 @@ def test_get_unknown_field_on_cached_path_refuses(fake_hvac):
     with pytest.raises(SecretResolutionError, match="not at the referenced path"):
         provider.get("credentials/svc#missing")
     assert kv.read_paths == ["credentials/svc"]  # no second read for the cached path
+
+
+def test_get_rejects_a_non_string_selected_field_without_rejecting_its_siblings(fake_hvac):
+    _, store, _ = fake_hvac
+    store["credentials/svc"] = cast(
+        dict[str, str],
+        {"netbox_token": 42, "placeholder-metadata": 7},
+    )
+
+    with pytest.raises(SecretResolutionError, match="selected secret field is not a string"):
+        _provider().get("credentials/svc#netbox_token")
 
 
 def test_read_path_metadata_distinguishes_absence_from_an_unversioned_empty_path(fake_hvac):

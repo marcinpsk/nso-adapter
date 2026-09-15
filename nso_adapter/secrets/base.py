@@ -8,6 +8,7 @@ A reference is a provider-specific string:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Protocol, runtime_checkable
 
 
@@ -36,6 +37,16 @@ class SecretResolutionError(RuntimeError):
         super().__init__(f"{slot}: {reason}" if slot is not None else reason)
         self.reason = reason
         self.slot = slot
+
+
+def selected_secret_value(fields: Mapping[str, object], key: str) -> str | None:
+    """Return one selected string field, or reject a present value of another type."""
+    if key not in fields:
+        return None
+    value = fields[key]
+    if not isinstance(value, str):
+        raise SecretResolutionError("the selected secret field is not a string")
+    return value
 
 
 def resolve_secret(provider: SecretsProvider, reference: str, *, slot: str) -> str:

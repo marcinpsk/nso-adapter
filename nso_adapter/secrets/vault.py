@@ -12,7 +12,7 @@ from typing import Any
 import hvac
 import structlog
 
-from nso_adapter.secrets.base import SecretResolutionError
+from nso_adapter.secrets.base import SecretResolutionError, selected_secret_value
 
 logger = structlog.get_logger(__name__)
 
@@ -48,7 +48,7 @@ class VaultSecretsProvider:
         self._verify_ssl = verify_ssl
         self._client: hvac.Client | None = None
         # Per-path cache: {path: {field: value}}
-        self._cache: dict[str, dict[str, str]] = {}
+        self._cache: dict[str, dict[str, object]] = {}
 
     def _authenticate(self) -> None:
         kwargs: dict[str, Any] = {
@@ -65,14 +65,14 @@ class VaultSecretsProvider:
         self._cache.clear()
         logger.info("vault.approle_login")
 
-    def _fetch_path(self, path: str) -> dict[str, str]:
+    def _fetch_path(self, path: str) -> dict[str, object]:
         assert self._client is not None
         secret = self._client.secrets.kv.v2.read_secret_version(
             mount_point=self._mount,
             path=path,
             raise_on_deleted_version=True,
         )
-        data: dict[str, str] = secret["data"]["data"]
+        data: dict[str, object] = secret["data"]["data"]
         self._cache[path] = data
         return data
 
@@ -96,8 +96,9 @@ class VaultSecretsProvider:
         # Check per-path cache first
         cached = self._cache.get(path)
         if cached is not None:
-            if field in cached:
-                return cached[field]
+            value = selected_secret_value(cached, field)
+            if value is not None:
+                return value
             raise SecretResolutionError("the referenced field is not at the referenced path")
 
         failure = None
@@ -116,9 +117,10 @@ class VaultSecretsProvider:
         if failure is not None:
             raise failure
 
-        if field not in data:
+        value = selected_secret_value(data, field)
+        if value is None:
             raise SecretResolutionError("the referenced field is not at the referenced path")
-        return data[field]
+        return value
 
     # ── mount-explicit read/write (SNMP secrets endpoints) ────────────────────
     #
@@ -137,7 +139,7 @@ class VaultSecretsProvider:
             self._authenticate()
             return operation()
 
-    def _read_raw_meta(self, mount: str, path: str) -> tuple[dict[str, str], int | None] | None:
+    def _read_raw_meta(self, mount: str, path: str) -> tuple[dict[str, object], int | None] | None:
         assert self._client is not None
         try:
             secret = self._client.secrets.kv.v2.read_secret_version(
@@ -150,15 +152,15 @@ class VaultSecretsProvider:
         version = secret["data"].get("metadata", {}).get("version")
         return dict(secret["data"]["data"]), int(version) if version is not None else None
 
-    def _read_raw(self, mount: str, path: str) -> dict[str, str]:
+    def _read_raw(self, mount: str, path: str) -> dict[str, object]:
         result = self._read_raw_meta(mount, path)
         return result[0] if result is not None else {}
 
-    def read_path(self, mount: str, path: str) -> dict[str, str]:
+    def read_path(self, mount: str, path: str) -> dict[str, object]:
         """Read all fields at ``mount/path`` (KV v2); ``{}`` when the path doesn't exist."""
         return self._with_reauth(lambda: self._read_raw(mount, path))
 
-    def read_path_meta(self, mount: str, path: str) -> tuple[dict[str, str], int | None] | None:
+    def read_path_meta(self, mount: str, path: str) -> tuple[dict[str, object], int | None] | None:
         """Read fields and the current KV v2 version, or ``None`` when the path is absent."""
         return self._with_reauth(lambda: self._read_raw_meta(mount, path))
 

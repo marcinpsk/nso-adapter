@@ -40,7 +40,7 @@ from nso_adapter.api.errors import (
 )
 from nso_adapter.core import snmp_harvest
 from nso_adapter.core.importer import get_nso_client
-from nso_adapter.secrets.base import SecretResolutionError
+from nso_adapter.secrets.base import selected_secret_value
 from nso_adapter.secrets.refs import (
     SECRET_FINGERPRINT_PATTERN,
     VaultRef,
@@ -191,15 +191,15 @@ async def verify_secret(body: SecretVerifyRequest, request: Request) -> SecretVe
     provider = _vault_provider(request)
     ref = _parse_ref(body.vault_ref)
 
-    def _read_for_verification() -> tuple[dict[str, str], int | None] | None:
+    def _read_for_verification() -> tuple[tuple[dict[str, object], int | None] | None, str | None]:
         result = provider.read_path_meta(ref.mount, ref.path)
+        selected = None
         if result is not None and ref.key is not None:
             data, _ = result
-            if ref.key in data and not isinstance(data[ref.key], str):
-                raise SecretResolutionError("the selected Vault field is not a string")
-        return result
+            selected = selected_secret_value(data, ref.key)
+        return result, selected
 
-    result = await _vault_op(_read_for_verification)
+    result, selected = await _vault_op(_read_for_verification)
     fingerprint = None
     has_auth = False
     has_priv = False
@@ -212,9 +212,9 @@ async def verify_secret(body: SecretVerifyRequest, request: Request) -> SecretVe
             status = "present"
             has_auth = "auth" in data
             has_priv = "priv" in data
-        elif ref.key in data:
+        elif selected is not None:
             status = "present"
-            fingerprint = secret_fingerprint(data[ref.key])
+            fingerprint = secret_fingerprint(selected)
         else:
             status = "missing_field"
     operation_id = _operation_id()
