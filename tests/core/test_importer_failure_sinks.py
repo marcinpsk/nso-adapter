@@ -36,7 +36,7 @@ _GUARDED_LOG_SINKS = (
     Path(__file__).resolve().parents[2] / "nso_adapter" / "main.py",
     *(
         Path(__file__).resolve().parents[2] / "nso_adapter" / "core" / name
-        for name in ("generation.py", "refresh_engine.py", "redistribution.py")
+        for name in ("generation.py", "refresh_engine.py", "redistribution.py", "removal.py")
     ),
     *(
         Path(__file__).resolve().parents[2] / "nso_adapter" / "notifications" / name
@@ -74,6 +74,63 @@ def _is_closed_exception_classification(value: ast.expr) -> bool:
     )
 
 
+class _ScopeBindingCollector(ast.NodeVisitor):
+    """Collect names bound in one lexical scope without entering child scopes."""
+
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+
+    def visit_Name(self, node: ast.Name) -> None:  # noqa: N802 - ast visitor API
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.names.add(node.id)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:  # noqa: N802 - ast visitor API
+        if node.name is not None:
+            self.names.add(node.name)
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802 - ast visitor API
+        self.names.add(node.name)
+
+    visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802 - ast visitor API
+        self.names.add(node.name)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802 - ast visitor API
+        return
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:  # noqa: N802 - ast visitor API
+        return
+
+    visit_SetComp = visit_ListComp  # type: ignore[assignment]
+    visit_GeneratorExp = visit_ListComp  # type: ignore[assignment]
+    visit_DictComp = visit_ListComp  # type: ignore[assignment]
+
+
+def _scope_bound_names(nodes: list[ast.AST]) -> set[str]:
+    collector = _ScopeBindingCollector()
+    for node in nodes:
+        collector.visit(node)
+    return collector.names
+
+
+def _statement_may_raise(statement: ast.stmt) -> bool:
+    if isinstance(statement, (ast.Pass, ast.Break, ast.Continue)):
+        return False
+    if isinstance(statement, (ast.Try, ast.TryStar)):
+        return False
+    if isinstance(statement, ast.Assign):
+        return not isinstance(statement.value, ast.Constant) or not all(
+            isinstance(target, ast.Name) for target in statement.targets
+        )
+    return (
+        not isinstance(statement, ast.AnnAssign)
+        or not isinstance(statement.target, ast.Name)
+        or not isinstance(statement.value, ast.Constant)
+    )
+
+
 class _RawLogExceptionVisitor(ast.NodeVisitor):
     """Track exception aliases through control flow while visiting log calls."""
 
@@ -83,6 +140,8 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
         self._try_handler_inputs: list[set[str]] = []
         self._loop_break_aliases: list[list[set[str]]] = []
         self._loop_continue_aliases: list[list[set[str]]] = []
+        self._class_enclosing_aliases: list[set[str]] = []
+        self._try_exception_inputs: list[set[str]] = []
 
     def _record_violation(self, lineno: int) -> None:
         if lineno not in self.violations:
@@ -90,8 +149,11 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
 
     def _visit_statements(self, statements: list[ast.stmt]) -> bool:
         for statement in statements:
-            for handler_input in self._try_handler_inputs:
-                handler_input.update(self.aliases)
+            if _statement_may_raise(statement):
+                if self._try_handler_inputs:
+                    self._try_handler_inputs[-1].update(self.aliases)
+                if self._try_exception_inputs:
+                    self._try_exception_inputs[-1].update(self.aliases)
             if self.visit(statement) is False:
                 return False
         return True
@@ -169,20 +231,80 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
         for target in targets:
             self._bind_assignment_target(target, value)
 
+    @staticmethod
+    def _argument_names(arguments: ast.arguments) -> set[str]:
+        return (
+            {argument.arg for argument in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)}
+            | ({arguments.vararg.arg} if arguments.vararg is not None else set())
+            | ({arguments.kwarg.arg} if arguments.kwarg is not None else set())
+        )
+
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        for expression in (
+            *node.decorator_list,
+            *node.args.defaults,
+            *(default for default in node.args.kw_defaults if default is not None),
+        ):
+            self.visit(expression)
         outer_aliases = self.aliases
         outer_handler_inputs = self._try_handler_inputs
-        self.aliases = {"exc"}
+        outer_exception_inputs = self._try_exception_inputs
+        outer_class_enclosing_aliases = self._class_enclosing_aliases
+        enclosing_aliases = self._class_enclosing_aliases[-1] if self._class_enclosing_aliases else outer_aliases
+        local_names = _scope_bound_names(list(node.body)) | self._argument_names(node.args)
+        self.aliases = (enclosing_aliases - local_names) | {"exc"}
         self._try_handler_inputs = []
+        self._try_exception_inputs = []
+        self._class_enclosing_aliases = []
         self._visit_statements(node.body)
+        self._class_enclosing_aliases = outer_class_enclosing_aliases
+        self._try_exception_inputs = outer_exception_inputs
         self._try_handler_inputs = outer_handler_inputs
         self.aliases = outer_aliases
+        self.aliases.discard(node.name)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802 - ast visitor API
         self._visit_function(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:  # noqa: N802 - ast visitor API
         self._visit_function(node)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802 - ast visitor API
+        for expression in (*node.args.defaults, *(value for value in node.args.kw_defaults if value is not None)):
+            self.visit(expression)
+        outer_aliases = self.aliases
+        outer_handler_inputs = self._try_handler_inputs
+        outer_exception_inputs = self._try_exception_inputs
+        outer_class_enclosing_aliases = self._class_enclosing_aliases
+        enclosing_aliases = self._class_enclosing_aliases[-1] if self._class_enclosing_aliases else outer_aliases
+        local_names = _scope_bound_names([node.body]) | self._argument_names(node.args)
+        self.aliases = (enclosing_aliases - local_names) | {"exc"}
+        self._try_handler_inputs = []
+        self._try_exception_inputs = []
+        self._class_enclosing_aliases = []
+        self.visit(node.body)
+        self._class_enclosing_aliases = outer_class_enclosing_aliases
+        self._try_exception_inputs = outer_exception_inputs
+        self._try_handler_inputs = outer_handler_inputs
+        self.aliases = outer_aliases
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802 - ast visitor API
+        for expression in (*node.decorator_list, *node.bases, *(keyword.value for keyword in node.keywords)):
+            self.visit(expression)
+        outer_aliases = self.aliases
+        outer_handler_inputs = self._try_handler_inputs
+        outer_exception_inputs = self._try_exception_inputs
+        class_enclosing_aliases = self._class_enclosing_aliases[-1] if self._class_enclosing_aliases else outer_aliases
+        self.aliases = class_enclosing_aliases.copy()
+        self._try_handler_inputs = []
+        self._try_exception_inputs = []
+        self._class_enclosing_aliases.append(class_enclosing_aliases.copy())
+        self._visit_statements(node.body)
+        self._class_enclosing_aliases.pop()
+        self._try_exception_inputs = outer_exception_inputs
+        self._try_handler_inputs = outer_handler_inputs
+        self.aliases = outer_aliases
+        self.aliases.discard(node.name)
 
     def visit_Assign(self, node: ast.Assign) -> None:  # noqa: N802 - ast visitor API
         self.visit(node.value)
@@ -357,35 +479,106 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
         self.aliases = surviving
         return falls_through
 
-    def visit_Try(self, node: ast.Try) -> None:  # noqa: N802 - ast visitor API
+    def _visit_try_handlers(
+        self, handlers: list[ast.ExceptHandler], handler_input: set[str]
+    ) -> tuple[list[set[str]], set[str]]:
+        normal_states: list[set[str]] = []
+        exceptional_aliases: set[str] = set()
+        for handler in handlers:
+            self.aliases = handler_input.copy()
+            handler_exception_input: set[str] = set()
+            self._try_exception_inputs.append(handler_exception_input)
+            handler_falls_through = self.visit(handler) is not False
+            self._try_exception_inputs.pop()
+            if handler.name is not None:
+                handler_exception_input.discard(handler.name)
+            exceptional_aliases |= handler_exception_input
+            if handler_falls_through:
+                normal_states.append(self.aliases.copy())
+        return normal_states, exceptional_aliases
+
+    def _visit_try(self, node: ast.Try | ast.TryStar) -> bool:
+        break_bucket = self._loop_break_aliases[-1] if self._loop_break_aliases else None
+        continue_bucket = self._loop_continue_aliases[-1] if self._loop_continue_aliases else None
+        break_start = len(break_bucket) if break_bucket is not None else 0
+        continue_start = len(continue_bucket) if continue_bucket is not None else 0
         incoming = self.aliases.copy()
         handler_input = incoming.copy()
 
         self.aliases = incoming.copy()
         self._try_handler_inputs.append(handler_input)
-        self._visit_statements(node.body)
-        self._try_handler_inputs.pop()
-        body_aliases = self.aliases.copy()
+        body_exception_input: set[str] = set()
+        self._try_exception_inputs.append(body_exception_input)
+        body_falls_through = self._visit_statements(node.body)
+        self._try_exception_inputs.pop()
+        handler_input = self._try_handler_inputs.pop()
+        normal_states: list[set[str]] = []
+        exceptional_aliases: set[str] = set()
+        if not any(handler.type is None for handler in node.handlers):
+            exceptional_aliases |= body_exception_input
 
-        self.aliases = body_aliases.copy()
-        self._visit_statements(node.orelse)
-        surviving = self.aliases.copy()
+        if body_falls_through:
+            else_exception_input: set[str] = set()
+            self._try_exception_inputs.append(else_exception_input)
+            else_falls_through = self._visit_statements(node.orelse)
+            self._try_exception_inputs.pop()
+            exceptional_aliases |= else_exception_input
+            if else_falls_through:
+                normal_states.append(self.aliases.copy())
 
-        for handler in node.handlers:
-            self.aliases = handler_input.copy()
-            self.visit(handler)
-            surviving |= self.aliases
+        handler_states, handler_exception_aliases = self._visit_try_handlers(node.handlers, handler_input)
+        normal_states.extend(handler_states)
+        exceptional_aliases |= handler_exception_aliases
 
-        self.aliases = surviving
-        self._visit_statements(node.finalbody)
+        break_aliases = break_bucket[break_start:] if break_bucket is not None else []
+        continue_aliases = continue_bucket[continue_start:] if continue_bucket is not None else []
+        if break_bucket is not None:
+            del break_bucket[break_start:]
+        if continue_bucket is not None:
+            del continue_bucket[continue_start:]
 
-    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:  # noqa: N802 - ast visitor API
+        normal_falls_through = False
+        normal_aliases: set[str] = set()
+        if normal_states:
+            self.aliases = set().union(*normal_states)
+            normal_falls_through = self._visit_statements(node.finalbody)
+            if normal_falls_through:
+                normal_aliases = self.aliases.copy()
+
+        propagated_exception_aliases: set[str] = set()
+        if exceptional_aliases:
+            self.aliases = exceptional_aliases
+            if self._visit_statements(node.finalbody):
+                propagated_exception_aliases = self.aliases.copy()
+        if propagated_exception_aliases and self._try_exception_inputs:
+            self._try_exception_inputs[-1].update(propagated_exception_aliases)
+        if propagated_exception_aliases and self._try_handler_inputs:
+            self._try_handler_inputs[-1].update(propagated_exception_aliases)
+
+        for bucket, states in ((break_bucket, break_aliases), (continue_bucket, continue_aliases)):
+            if bucket is None or not states:
+                continue
+            self.aliases = set().union(*states)
+            if self._visit_statements(node.finalbody):
+                bucket.append(self.aliases.copy())
+
+        self.aliases = normal_aliases
+        return normal_falls_through
+
+    def visit_Try(self, node: ast.Try) -> bool:  # noqa: N802 - ast visitor API
+        return self._visit_try(node)
+
+    def visit_TryStar(self, node: ast.TryStar) -> bool:  # noqa: N802 - ast visitor API
+        return self._visit_try(node)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> bool:  # noqa: N802 - ast visitor API
         handler_name = node.name
         if handler_name is not None:
             self.aliases.add(handler_name)
-        self._visit_statements(node.body)
+        falls_through = self._visit_statements(node.body)
         if handler_name is not None:
             self.aliases.discard(handler_name)
+        return falls_through
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 - ast visitor API
         if isinstance(node.func, ast.Attribute) and _is_logger_receiver(node.func.value):
@@ -686,6 +879,42 @@ detail = exc
 for item in items:
     detail = "authored detail"
     {exit_statement}
+else:
+    detail = "also authored"
+logger.warning("event", detail=detail)
+"""
+
+    assert _raw_log_exception_renderers(source) == []
+
+
+@pytest.mark.parametrize("handler_keyword", ["except", "except*"])
+@pytest.mark.parametrize("exit_statement", ["break", "continue"])
+def test_raw_exception_log_guard_checks_finally_for_loop_exit(handler_keyword: str, exit_statement: str) -> None:
+    source = f"""\
+for item in items:
+    detail = "authored detail"
+    try:
+        if condition:
+            detail = exc
+            {exit_statement}
+    {handler_keyword} Exception:
+        detail = "authored detail"
+    finally:
+        logger.warning("event", detail=detail)
+"""
+
+    assert _raw_log_exception_renderers(source) == [10]
+
+
+def test_raw_exception_log_guard_finally_can_replace_a_pending_loop_exit() -> None:
+    source = """\
+detail = exc
+for item in items:
+    try:
+        break
+    finally:
+        detail = "authored detail"
+        continue
 else:
     detail = "also authored"
 logger.warning("event", detail=detail)
@@ -999,6 +1228,7 @@ def test_review_guards_cover_each_authored_error_boundary() -> None:
     alias_paths = set(rules["nso-outcome-raw-exception-alias-renderer"]["paths"]["include"])
     assert alias_paths == outcome_paths
     assert "nso_adapter/core/generation.py" in outcome_paths
+    assert "nso_adapter/core/removal.py" in outcome_paths
     identifier_paths = set(rules["nso-diagnostic-raw-identifier"]["paths"]["include"])
     assert {
         "nso_adapter/core/importer.py",
