@@ -5,7 +5,7 @@ rules:
     languages: [python]
     severity: ERROR
     message: Classify the outcome failure with failure_detail instead of rendering the exception.
-    paths:
+    paths: &outcome_log_paths
       include:
         - nso_adapter/main.py
         - nso_adapter/core/generation.py
@@ -45,17 +45,7 @@ rules:
     severity: ERROR
     message: Classify an aliased outcome failure with failure_detail instead of rendering it.
     mode: taint
-    paths:
-      include:
-        - nso_adapter/main.py
-        - nso_adapter/core/generation.py
-        - nso_adapter/core/importer.py
-        - nso_adapter/core/removal.py
-        - nso_adapter/core/refresh_engine.py
-        - nso_adapter/core/redistribution.py
-        - nso_adapter/notifications/sse_subscriber.py
-        - nso_adapter/notifications/persistent_subscriber.py
-        - review-patterns.py
+    paths: *outcome_log_paths
     pattern-sources:
       - patterns:
           - pattern-inside: |
@@ -75,6 +65,71 @@ rules:
       - patterns:
           - pattern: logger.$LEVEL(..., $DETAIL, ...)
           - focus-metavariable: $DETAIL
+  - id: nso-outcome-with-exit-raw-exception-alias-renderer
+    languages: [python]
+    severity: ERROR
+    message: Classify an aliased outcome failure preserved by a context manager exit.
+    paths: *outcome_log_paths
+    patterns:
+      - pattern-inside: |
+          try:
+            ...
+          except $TYPE as $EXCEPTION:
+            ...
+      - pattern-either:
+          - pattern-inside: |
+              try:
+                ...
+                with ...:
+                  ...
+                  $ALIAS = $EXCEPTION
+              except ...:
+                pass
+              else:
+                ...
+              ...
+          - pattern-inside: |
+              try:
+                ...
+                async with ...:
+                  ...
+                  $ALIAS = $EXCEPTION
+              except ...:
+                pass
+              else:
+                ...
+              ...
+      - pattern-either:
+          - pattern: logger.$LEVEL(..., $FIELD=$ALIAS, ...)
+          - pattern: logger.$LEVEL(..., $ALIAS, ...)
+      - pattern-not-inside: |
+          try:
+            ...
+            with ...:
+              ...
+              $ALIAS = $EXCEPTION
+              ...
+              $ALIAS = "..."
+              ...
+          except ...:
+            pass
+          else:
+            ...
+          ...
+      - pattern-not-inside: |
+          try:
+            ...
+            async with ...:
+              ...
+              $ALIAS = $EXCEPTION
+              ...
+              $ALIAS = "..."
+              ...
+          except ...:
+            pass
+          else:
+            ...
+          ...
   - id: nso-api-validation-error-raw-exception-renderer
     languages: [python]
     severity: ERROR

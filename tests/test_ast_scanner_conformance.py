@@ -21,7 +21,10 @@ from tests.test_secret_discipline import _non_disclosure_assertion_lines
 ROOT = Path(__file__).parents[1]
 OPENGREP = shutil.which("opengrep")
 OPENGREP_RULES = ROOT / ".opengrep" / "nso-rules.yaml"
-OPENGREP_EXCEPTION_RULE = "nso-outcome-raw-exception-alias-renderer"
+OPENGREP_EXCEPTION_RULES = {
+    "nso-outcome-raw-exception-alias-renderer",
+    "nso-outcome-with-exit-raw-exception-alias-renderer",
+}
 
 
 @dataclass(frozen=True)
@@ -211,6 +214,11 @@ CASES = (
         "control-handler-exceptional-finally-state",
         "value = CLEAN\nclass Nested:\n    try:\n        work()\n    except:\n        value = SOURCE\n        work_again()\n        value = CLEAN\n    finally:\n        SINK",
         "value = CLEAN\nclass Nested:\n    try:\n        work()\n    except:\n        value = CLEAN\n        work_again()\n    finally:\n        SINK",
+    ),
+    ConformanceCase(
+        "control-with-exit-post-body-state",
+        "class Nested:\n    value = CLEAN\n    try:\n        with context():\n            value = SOURCE\n    except Exception:\n        pass\n    else:\n        value = CLEAN\n    SINK",
+        "class Nested:\n    value = CLEAN\n    try:\n        with context():\n            value = CLEAN\n    except Exception:\n        pass\n    else:\n        value = CLEAN\n    SINK",
     ),
     ConformanceCase(
         "control-nested-try-exception-propagation",
@@ -418,7 +426,7 @@ def opengrep_verdicts(tmp_path_factory: pytest.TempPathFactory) -> set[tuple[str
     return {
         line_owners[finding["start"]["line"]]
         for finding in report["results"]
-        if finding["check_id"].endswith(OPENGREP_EXCEPTION_RULE)
+        if any(finding["check_id"].endswith(rule) for rule in OPENGREP_EXCEPTION_RULES)
     }
 
 
