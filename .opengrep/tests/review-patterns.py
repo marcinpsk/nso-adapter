@@ -371,7 +371,7 @@ def returned_classification(exc):
 
 
 def raw_diagnostic_identifiers(logger, device, device_name, nso_instance, stream_url):
-    # ruleid: nso-diagnostic-raw-identifier
+    # ruleid: nso-diagnostic-raw-identifier, nso-diagnostic-raw-identifier-alias
     logger.info("family.refresh.done", device_name=device.nso_device_name)
     # ruleid: nso-diagnostic-raw-identifier
     logger.info("family.refresh.done", device_name=device_name)
@@ -379,16 +379,36 @@ def raw_diagnostic_identifiers(logger, device, device_name, nso_instance, stream
     logger.warning("family.refresh.failed", device=device_name)
     # ruleid: nso-diagnostic-raw-identifier
     logger.warning("family.refresh.failed", nso_instance=nso_instance)
-    # ruleid: nso-diagnostic-raw-identifier
+    # ruleid: nso-diagnostic-raw-identifier, nso-diagnostic-raw-identifier-alias
     logger.info("sse_event", stream=stream_url)
-    # ruleid: nso-diagnostic-raw-identifier
+    # ruleid: nso-diagnostic-raw-identifier, nso-diagnostic-raw-identifier-alias
     logger.info("sse.reconnect_after_error", stream_url=stream_url)
-    # ruleid: nso-diagnostic-raw-identifier
+    # ruleid: nso-diagnostic-raw-identifier, nso-diagnostic-raw-identifier-alias
     logger.info("sse.stream.started", url=stream_url)
     # ok: nso-diagnostic-raw-identifier
     logger.info("family.refresh.done", device_id=device.id)
     # ok: nso-diagnostic-raw-identifier
     logger.info("sse_event", bytes=128)
+
+
+def aliased_raw_diagnostic_identifiers(logger, device, body, stream_url):
+    device_name = device.nso_device_name
+    # ruleid: nso-diagnostic-raw-identifier-alias
+    logger.info("family.refresh.done", context=device_name)
+    ned_id = device.ned_id
+    # ruleid: nso-diagnostic-raw-identifier-alias
+    logger.info("family.refresh.done", context=ned_id)
+    sw_version = device.sw_version
+    # ruleid: nso-diagnostic-raw-identifier-alias
+    logger.info("family.refresh.done", context=sw_version)
+    request_name = body.nso_device_name
+    # ruleid: nso-diagnostic-raw-identifier-alias
+    logger.info("family.refresh.done", context=request_name)
+    stream = stream_url
+    # ruleid: nso-diagnostic-raw-identifier-alias
+    logger.info("sse.stream.started", context=stream)
+    # ok: nso-diagnostic-raw-identifier-alias
+    logger.info("family.refresh.done", device_id=device.id)
 
 
 async def legacy_query_api(session, model, select):

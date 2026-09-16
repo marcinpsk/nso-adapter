@@ -45,11 +45,19 @@ so an HTTP exception cannot repeat a request URL or server text. The behavioral
 and AST regressions in `tests/core/test_importer_failure_sinks.py` remain
 authoritative for the classification contract and complete Python syntax.
 
-`nso-diagnostic-raw-identifier` rejects direct or aliased `device_name`,
-`device`, and `nso_instance` fields in the guarded importer, redistribution,
-client, refresh, startup, and subscriber diagnostics. It also rejects raw SSE
-stream URL fields. These records use `device_id` when a stored device exists and
-omit the external identifier otherwise.
+`nso-diagnostic-raw-identifier` rejects `device_name`, `device`, and
+`nso_instance` fields in the guarded importer, redistribution, client, refresh,
+capability, startup, and subscriber diagnostics. It also rejects raw SSE stream
+URL fields. It matches the keyword name, so it sees only a value written
+directly into the field.
+
+`nso-diagnostic-raw-identifier-alias` covers the flow the keyword rule cannot
+see: a taint rule carrying `nso_device_name`, `ned_id`, `sw_version` and the SSE
+stream URL through a local alias into any logger field, whatever that field is
+named. Both rules guard the same module list.
+
+These records use `device_id` when a stored device exists and omit the external
+identifier otherwise.
 
 `nso-api-validation-error-raw-exception-renderer` rejects every supported raw
 renderer in device validation responses. `nso-api-validation-error-raw-data-alias`
