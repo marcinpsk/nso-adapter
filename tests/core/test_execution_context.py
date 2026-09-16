@@ -1110,10 +1110,15 @@ def test_hydration_refuses_a_recorded_clear_the_documents_own_rows_do_not_descri
     recorded_prefix = "198.18.9.0/24"
     with pytest.raises(ValueError) as exc_info:
         hydrate_static_route_removal_plan(_document({**good, "key": ["", recorded_prefix, "198.18.1.1"]}))
-    assert str(exc_info.value) == (
-        "recorded static-route clear for row 11 names key ['', '198.18.9.0/24', '198.18.1.1'], "
-        "which is not the ['', '198.18.0.0/24', '198.18.1.1'] that row renders"
-    )
+    from tests._secret_discipline import assert_chain_free_of
+
+    assert_chain_free_of(exc_info.value, [recorded_prefix, row["prefix"]])
+    assert str(exc_info.value) == "recorded static-route clear for row 11 does not match the row's rendered key"
+
+    with pytest.raises(ValueError) as malformed_key:
+        hydrate_static_route_removal_plan(_document({**good, "key": ["", recorded_prefix]}))
+    assert_chain_free_of(malformed_key.value, [recorded_prefix])
+    assert str(malformed_key.value) == "a static-route execution key must contain three values"
     with pytest.raises(ValueError, match="wire-unset"):
         hydrate_static_route_removal_plan(_document({**good, "fields": ["tag"]}))
 
