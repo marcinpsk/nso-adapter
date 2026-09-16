@@ -124,6 +124,22 @@ def _constant_strings(node: ast.AST, aliases: dict[str, set[str]] | None = None)
     return None
 
 
+def _match_capture_names(pattern: ast.pattern) -> set[str]:
+    names: set[str] = set()
+    for part in ast.walk(pattern):
+        if isinstance(part, (ast.MatchAs, ast.MatchStar)) and part.name is not None:
+            names.add(part.name)
+        elif isinstance(part, ast.MatchMapping) and part.rest is not None:
+            names.add(part.rest)
+    return names
+
+
+def _pattern_is_irrefutable(pattern: ast.pattern) -> bool:
+    if isinstance(pattern, ast.MatchAs):
+        return pattern.pattern is None or _pattern_is_irrefutable(pattern.pattern)
+    return isinstance(pattern, ast.MatchOr) and any(_pattern_is_irrefutable(part) for part in pattern.patterns)
+
+
 class _Scanner(ast.NodeVisitor):
     """Collect credential literals with their lexical scope."""
 
@@ -134,6 +150,9 @@ class _Scanner(ast.NodeVisitor):
         self._scope: list[str] = []
         self._constant_scopes: list[dict[str, set[str]]] = [{}]
         self._hits: dict[tuple[int, int], Violation] = {}
+        self._try_handler_inputs: list[dict[str, set[str]]] = []
+        self._loop_break_states: list[list[dict[str, set[str]]]] = []
+        self._loop_continue_states: list[list[dict[str, set[str]]]] = []
 
     @property
     def hits(self) -> list[Violation]:
@@ -208,6 +227,37 @@ class _Scanner(ast.NodeVisitor):
         else:
             aliases[target.id] = literals
 
+    def _copy_constants(self) -> dict[str, set[str]]:
+        return {name: values.copy() for name, values in self._constant_scopes[-1].items()}
+
+    @staticmethod
+    def _merge_constants(*states: dict[str, set[str]]) -> dict[str, set[str]]:
+        merged: dict[str, set[str]] = {}
+        for state in states:
+            for name, values in state.items():
+                merged.setdefault(name, set()).update(values)
+        return merged
+
+    def _record_handler_input(self) -> None:
+        for index, handler_input in enumerate(self._try_handler_inputs):
+            self._try_handler_inputs[index] = self._merge_constants(handler_input, self._constant_scopes[-1])
+
+    def _visit_statements(self, statements: list[ast.stmt]) -> bool:
+        for statement in statements:
+            self._record_handler_input()
+            if self.visit(statement) is False:
+                return False
+        return True
+
+    def _clear_target(self, target: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            self._constant_scopes[-1].pop(target.id, None)
+        elif isinstance(target, (ast.List, ast.Tuple)):
+            for element in target.elts:
+                self._clear_target(element)
+        elif isinstance(target, ast.Starred):
+            self._clear_target(target.value)
+
     def _assignment(self, target: ast.AST, value: ast.AST, statement: ast.AST) -> None:
         if isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
             for item, supplied in zip(target.elts, value.elts):
@@ -243,25 +293,192 @@ class _Scanner(ast.NodeVisitor):
                 aliases.pop(node.target.id, None)
         self.generic_visit(node)
 
-    def visit_If(self, node: ast.If) -> None:
+    def visit_If(self, node: ast.If) -> bool:
         self.visit(node.test)
         incoming = {name: values.copy() for name, values in self._constant_scopes[-1].items()}
 
         self._constant_scopes[-1] = {name: values.copy() for name, values in incoming.items()}
-        for statement in node.body:
-            self.visit(statement)
-        body_aliases = self._constant_scopes[-1]
+        body_falls_through = self._visit_statements(node.body)
+        body_state = self._constant_scopes[-1]
 
         self._constant_scopes[-1] = {name: values.copy() for name, values in incoming.items()}
-        for statement in node.orelse:
-            self.visit(statement)
-        else_aliases = self._constant_scopes[-1]
+        else_falls_through = self._visit_statements(node.orelse)
+        else_state = self._constant_scopes[-1]
 
-        merged: dict[str, set[str]] = {}
-        for aliases in (body_aliases, else_aliases):
-            for name, values in aliases.items():
-                merged.setdefault(name, set()).update(values)
-        self._constant_scopes[-1] = merged
+        fallthrough_states = []
+        if body_falls_through:
+            fallthrough_states.append(body_state)
+        if else_falls_through:
+            fallthrough_states.append(else_state)
+        self._constant_scopes[-1] = self._merge_constants(*fallthrough_states)
+        return body_falls_through or else_falls_through
+
+    def _visit_loop(self, node: ast.For | ast.AsyncFor | ast.While) -> bool:
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            self.visit(node.iter)
+        else:
+            self.visit(node.test)
+        incoming = self._copy_constants()
+        loop_inputs = incoming
+        break_states: list[dict[str, set[str]]] = []
+        max_passes = len({part.id for part in ast.walk(node) if isinstance(part, ast.Name)}) + 2
+
+        for _ in range(max_passes):
+            self._constant_scopes[-1] = {name: values.copy() for name, values in loop_inputs.items()}
+            if isinstance(node, (ast.For, ast.AsyncFor)):
+                self._clear_target(node.target)
+
+            self._loop_break_states.append([])
+            self._loop_continue_states.append([])
+            body_falls_through = self._visit_statements(node.body)
+            continue_states = self._loop_continue_states.pop()
+            break_states.extend(self._loop_break_states.pop())
+
+            next_states = [incoming]
+            if body_falls_through:
+                next_states.append(self._copy_constants())
+            next_states.extend(continue_states)
+            merged = self._merge_constants(loop_inputs, *next_states)
+            if merged == loop_inputs:
+                break
+            loop_inputs = merged
+
+        self._constant_scopes[-1] = loop_inputs
+        else_falls_through = self._visit_statements(node.orelse)
+        exit_states = break_states
+        if else_falls_through:
+            exit_states.append(self._copy_constants())
+        self._constant_scopes[-1] = self._merge_constants(*exit_states)
+        return True
+
+    def visit_For(self, node: ast.For) -> bool:
+        return self._visit_loop(node)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> bool:
+        return self._visit_loop(node)
+
+    def visit_While(self, node: ast.While) -> bool:
+        return self._visit_loop(node)
+
+    def visit_Break(self, node: ast.Break) -> bool:
+        if self._loop_break_states:
+            self._loop_break_states[-1].append(self._copy_constants())
+        return False
+
+    def visit_Continue(self, node: ast.Continue) -> bool:
+        if self._loop_continue_states:
+            self._loop_continue_states[-1].append(self._copy_constants())
+        return False
+
+    def visit_Match(self, node: ast.Match) -> bool:
+        self.visit(node.subject)
+        incoming = self._copy_constants()
+        subject_values = _constant_strings(node.subject, incoming)
+        case_states: list[dict[str, set[str]]] = []
+        exhaustive = False
+        falls_through = False
+
+        for case in node.cases:
+            self._constant_scopes[-1] = {name: values.copy() for name, values in incoming.items()}
+            for name in _match_capture_names(case.pattern):
+                if subject_values is None:
+                    self._constant_scopes[-1].pop(name, None)
+                else:
+                    self._constant_scopes[-1][name] = subject_values.copy()
+            if case.guard is not None:
+                self.visit(case.guard)
+            case_falls_through = self._visit_statements(case.body)
+            if case_falls_through:
+                case_states.append(self._copy_constants())
+                falls_through = True
+            exhaustive |= case.guard is None and _pattern_is_irrefutable(case.pattern)
+
+        if not exhaustive:
+            case_states.append(incoming)
+            falls_through = True
+        self._constant_scopes[-1] = self._merge_constants(*case_states)
+        return falls_through
+
+    def _visit_with(self, node: ast.With | ast.AsyncWith) -> bool:
+        for item in node.items:
+            self._record_handler_input()
+            self.visit(item.context_expr)
+            self._record_handler_input()
+            if item.optional_vars is not None:
+                self._clear_target(item.optional_vars)
+        falls_through = self._visit_statements(node.body)
+        self._record_handler_input()
+        return falls_through
+
+    def visit_With(self, node: ast.With) -> bool:
+        return self._visit_with(node)
+
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> bool:
+        return self._visit_with(node)
+
+    def _visit_try(self, node: ast.Try | ast.TryStar) -> bool:
+        break_bucket = self._loop_break_states[-1] if self._loop_break_states else None
+        continue_bucket = self._loop_continue_states[-1] if self._loop_continue_states else None
+        break_start = len(break_bucket) if break_bucket is not None else 0
+        continue_start = len(continue_bucket) if continue_bucket is not None else 0
+        incoming = self._copy_constants()
+        handler_input = incoming
+
+        self._constant_scopes[-1] = {name: values.copy() for name, values in incoming.items()}
+        self._try_handler_inputs.append(handler_input)
+        body_falls_through = self._visit_statements(node.body)
+        handler_input = self._try_handler_inputs.pop()
+        normal_states: list[dict[str, set[str]]] = []
+
+        if body_falls_through:
+            if self._visit_statements(node.orelse):
+                normal_states.append(self._copy_constants())
+
+        for handler in node.handlers:
+            self._constant_scopes[-1] = {name: values.copy() for name, values in handler_input.items()}
+            if self.visit(handler) is not False:
+                normal_states.append(self._copy_constants())
+
+        break_states = break_bucket[break_start:] if break_bucket is not None else []
+        continue_states = continue_bucket[continue_start:] if continue_bucket is not None else []
+        if break_bucket is not None:
+            del break_bucket[break_start:]
+        if continue_bucket is not None:
+            del continue_bucket[continue_start:]
+
+        normal_falls_through = False
+        normal_state: dict[str, set[str]] = {}
+        if normal_states:
+            self._constant_scopes[-1] = self._merge_constants(*normal_states)
+            normal_falls_through = self._visit_statements(node.finalbody)
+            if normal_falls_through:
+                normal_state = self._copy_constants()
+
+        for bucket, states in ((break_bucket, break_states), (continue_bucket, continue_states)):
+            if bucket is None or not states:
+                continue
+            self._constant_scopes[-1] = self._merge_constants(*states)
+            if self._visit_statements(node.finalbody):
+                bucket.append(self._copy_constants())
+
+        self._constant_scopes[-1] = normal_state
+        return normal_falls_through
+
+    def visit_Try(self, node: ast.Try) -> bool:
+        return self._visit_try(node)
+
+    def visit_TryStar(self, node: ast.TryStar) -> bool:
+        return self._visit_try(node)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> bool:
+        if node.type is not None:
+            self.visit(node.type)
+        if node.name is not None:
+            self._constant_scopes[-1].pop(node.name, None)
+        falls_through = self._visit_statements(node.body)
+        if node.name is not None:
+            self._constant_scopes[-1].pop(node.name, None)
+        return falls_through
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self._assignment(node.target, node.value, node)

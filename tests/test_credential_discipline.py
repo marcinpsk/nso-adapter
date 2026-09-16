@@ -152,6 +152,259 @@ def test_conditional_reassignment_preserves_the_tainted_path():
 
 
 @pytest.mark.parametrize(
+    ("source", "expected_line"),
+    [
+        (
+            'value = "admin"\nfor item in items:\n    value = item\nusername = value\n',
+            4,
+        ),
+        (
+            'async def check():\n    value = "admin"\n    async for item in items:\n        value = item\n    username = value\n',
+            5,
+        ),
+        (
+            'value = "admin"\nwhile condition:\n    value = supplied\nusername = value\n',
+            4,
+        ),
+    ],
+)
+def test_loop_zero_iteration_paths_preserve_constant_aliases(source, expected_line):
+    hits = scan_source(source, "t.py")
+
+    assert len(hits) == 1
+    assert hits[0].lineno == expected_line
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            'value = "admin"\nfor item in items:\n    value = "placeholder-user"\n'
+            'else:\n    value = "other-user"\nusername = value\n'
+        ),
+        (
+            'async def check():\n    value = "admin"\n    async for item in items:\n'
+            '        value = "placeholder-user"\n    else:\n        value = "other-user"\n    username = value\n'
+        ),
+        (
+            'value = "admin"\nwhile condition:\n    value = "placeholder-user"\n'
+            'else:\n    value = "other-user"\nusername = value\n'
+        ),
+    ],
+)
+def test_loop_paths_that_all_clear_constant_aliases_are_accepted(source):
+    assert scan_source(source, "t.py") == []
+
+
+def test_later_loop_iterations_observe_constants_assigned_by_the_body():
+    source = 'value = supplied\nfor item in items:\n    username = value\n    value = "admin"\n'
+
+    hits = scan_source(source, "t.py")
+
+    assert len(hits) == 1
+    assert hits[0].lineno == 3
+
+
+def test_each_loop_iteration_can_clear_an_incoming_constant_before_a_sink():
+    source = 'value = "admin"\nfor item in items:\n    value = supplied\n    username = value\n'
+
+    assert scan_source(source, "t.py") == []
+
+
+@pytest.mark.parametrize("handler_keyword", ["except", "except*"])
+def test_try_handler_paths_preserve_constant_aliases(handler_keyword):
+    source = f'value = "admin"\ntry:\n    value = supplied\n{handler_keyword} Exception:\n    pass\nusername = value\n'
+
+    hits = scan_source(source, "t.py")
+
+    assert len(hits) == 1
+    assert hits[0].lineno == 6
+
+
+def test_try_else_paths_preserve_constant_aliases():
+    source = (
+        'value = supplied\ntry:\n    value = "admin"\n'
+        "except Exception:\n    value = supplied\nelse:\n    pass\nusername = value\n"
+    )
+
+    hits = scan_source(source, "t.py")
+
+    assert len(hits) == 1
+    assert hits[0].lineno == 8
+
+
+def test_try_paths_that_all_clear_constant_aliases_are_accepted():
+    source = (
+        'value = "admin"\ntry:\n    value = supplied\n'
+        "except Exception:\n    value = supplied\nelse:\n    value = supplied\nusername = value\n"
+    )
+
+    assert scan_source(source, "t.py") == []
+
+
+def test_try_finally_reassignment_clears_every_surviving_path():
+    source = (
+        'value = "admin"\ntry:\n    work()\nexcept Exception:\n    pass\n'
+        "finally:\n    value = supplied\nusername = value\n"
+    )
+
+    assert scan_source(source, "t.py") == []
+
+
+def test_match_case_paths_preserve_constant_aliases():
+    source = (
+        'value = "admin"\nmatch subject:\n    case 1:\n        value = supplied\n'
+        "    case 2:\n        pass\nusername = value\n"
+    )
+
+    hits = scan_source(source, "t.py")
+
+    assert len(hits) == 1
+    assert hits[0].lineno == 7
+
+
+def test_exhaustive_match_paths_that_all_clear_constant_aliases_are_accepted():
+    source = (
+        'value = "admin"\nmatch subject:\n    case 1:\n        value = supplied\n'
+        '    case _:\n        value = "placeholder-user"\nusername = value\n'
+    )
+
+    assert scan_source(source, "t.py") == []
+
+
+def test_match_capture_patterns_bind_constant_aliases():
+    source = 'value = "admin"\nmatch value:\n    case captured:\n        username = captured\n'
+
+    hits = scan_source(source, "t.py")
+
+    assert len(hits) == 1
+    assert hits[0].lineno == 4
+
+
+def test_irrefutable_match_captures_can_clear_old_constant_aliases():
+    source = 'captured = "admin"\nmatch supplied:\n    case captured:\n        pass\nusername = captured\n'
+
+    assert scan_source(source, "t.py") == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            'value = supplied\ntry:\n    with context():\n        value = "admin"\n'
+            "        work()\n        value = supplied\nexcept Exception:\n    pass\nusername = value\n"
+        ),
+        (
+            "async def check():\n    value = supplied\n    try:\n        async with context():\n"
+            '            value = "admin"\n            await work()\n            value = supplied\n'
+            "    except Exception:\n        pass\n    username = value\n"
+        ),
+    ],
+)
+def test_with_body_failure_paths_preserve_constant_aliases(source):
+    hits = scan_source(source, "t.py")
+
+    assert len(hits) == 1
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'value = "admin"\nwith context() as value:\n    username = value\n',
+        ('async def check():\n    value = "admin"\n    async with context() as value:\n        username = value\n'),
+    ],
+)
+def test_with_targets_clear_old_constant_aliases(source):
+    assert scan_source(source, "t.py") == []
+
+
+def test_with_failure_paths_that_all_clear_constant_aliases_are_accepted():
+    source = (
+        'value = "admin"\ntry:\n    with context():\n        value = supplied\n'
+        "        work()\nexcept Exception:\n    value = supplied\nusername = value\n"
+    )
+
+    assert scan_source(source, "t.py") == []
+
+
+def test_with_exit_failure_preserves_the_post_body_constant_state():
+    source = (
+        'value = supplied\ntry:\n    with context():\n        value = "admin"\n'
+        "except Exception:\n    pass\nelse:\n    value = supplied\nusername = value\n"
+    )
+
+    hits = scan_source(source, "t.py")
+
+    assert len(hits) == 1
+    assert hits[0].lineno == 9
+
+
+def test_with_exit_paths_that_all_clear_constant_aliases_are_accepted():
+    source = (
+        'value = "admin"\ntry:\n    with context():\n        value = supplied\n'
+        "except Exception:\n    value = supplied\nelse:\n    value = supplied\nusername = value\n"
+    )
+
+    assert scan_source(source, "t.py") == []
+
+
+def test_break_paths_preserve_constants_that_bypass_loop_else():
+    source = (
+        'value = supplied\nfor item in items:\n    if condition:\n        value = "admin"\n'
+        "        break\n    value = supplied\nelse:\n    value = supplied\nusername = value\n"
+    )
+
+    hits = scan_source(source, "t.py")
+
+    assert len(hits) == 1
+    assert hits[0].lineno == 9
+
+
+def test_continue_paths_feed_constants_into_later_loop_iterations():
+    source = (
+        'value = supplied\nfor item in items:\n    username = value\n    value = "admin"\n'
+        "    continue\n    value = supplied\n"
+    )
+
+    hits = scan_source(source, "t.py")
+
+    assert len(hits) == 1
+    assert hits[0].lineno == 3
+
+
+@pytest.mark.parametrize("exit_statement", ["break", "continue"])
+def test_loop_exit_paths_that_all_clear_constant_aliases_are_accepted(exit_statement):
+    source = f"""\
+value = "admin"
+for item in items:
+    value = supplied
+    {exit_statement}
+    value = "admin"
+else:
+    value = supplied
+username = value
+"""
+
+    assert scan_source(source, "t.py") == []
+
+
+@pytest.mark.parametrize("exit_statement", ["break", "continue"])
+def test_finally_reassignment_clears_saved_loop_exit_states(exit_statement):
+    source = f"""\
+value = supplied
+for item in items:
+    try:
+        value = "admin"
+        {exit_statement}
+    finally:
+        value = supplied
+username = value
+"""
+
+    assert scan_source(source, "t.py") == []
+
+
+@pytest.mark.parametrize(
     "source",
     [
         'def first():\n    placeholder = "admin"\ndef second():\n    username = placeholder\n',
