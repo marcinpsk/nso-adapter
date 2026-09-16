@@ -54,7 +54,7 @@ class CutoverBlocked(RuntimeError):
     def __init__(self, parked: list[ParkedCarrier]):
         self.parked = parked
         named = ", ".join(
-            f"device {carrier.device_id} tombstone {carrier.tombstone_id} keys {list(carrier.keys)}"
+            f"device {carrier.device_id} tombstone {carrier.tombstone_id} has {len(carrier.keys)} parked key(s)"
             for carrier in parked
         )
         super().__init__(f"{len(parked)} static-route carrier(s) are parked and must drain first: {named}")

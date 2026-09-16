@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import pytest
 
+from tests._secret_discipline import assert_chain_free_of
 from tests.conftest import seed_device, session
 from tests.core.removal_helpers import authorize_static_route, seed_tomb
 from tests.core.test_static_route_put import A, B, seed_rows
@@ -20,12 +21,14 @@ async def test_cutover_refusal_identifies_each_parked_carrier():
     internal_prefix = "198.18.77.0/24"
     internal_next_hop = "198.18.78.1"
 
-    refusal = CutoverBlocked([ParkedCarrier(7, 9, ((internal_vrf, internal_prefix, internal_next_hop),))])
+    parked = [ParkedCarrier(7, 9, ((internal_vrf, internal_prefix, internal_next_hop),))]
+    refusal = CutoverBlocked(parked)
 
     assert str(refusal) == (
-        "1 static-route carrier(s) are parked and must drain first: "
-        "device 7 tombstone 9 keys [('internal-vrf-key', '198.18.77.0/24', '198.18.78.1')]"
+        "1 static-route carrier(s) are parked and must drain first: device 7 tombstone 9 has 1 parked key(s)"
     )
+    assert refusal.parked == parked
+    assert_chain_free_of(refusal, [internal_vrf, internal_prefix, internal_next_hop])
 
 
 async def _job(job_id: int):
