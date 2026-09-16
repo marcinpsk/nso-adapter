@@ -157,7 +157,7 @@ async def test_snmp_rejections_keep_no_resolved_secret_or_vault_reference(
         )
     }
     with pytest.raises(NsoApplyError) as caught:
-        await apply_device_intent(client, _DEVICE, containers)
+        await apply_device_intent(client, _DEVICE, containers, device_id=device_id)
     job = await _run(device_id, client, monkeypatch)
     async with session() as db:
         stored = await db.get(SnmpCommunityIntent, row.id)
@@ -194,7 +194,7 @@ async def test_verification_delta_keeps_no_secret_in_logs_or_errors(adapter_clie
 
     client = _client_with(httpx.MockTransport(respond))
     with pytest.raises(NsoApplyError) as caught:
-        await apply_device_intent(client, _DEVICE, {"ospf": {"auth-key": _SECRET}})
+        await apply_device_intent(client, _DEVICE, {"ospf": {"auth-key": _SECRET}}, device_id=device_id)
     job = await _run(device_id, client, monkeypatch)
     async with session() as db:
         stored = await db.get(OspfInterfaceIntent, row.id)

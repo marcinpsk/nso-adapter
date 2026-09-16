@@ -476,13 +476,8 @@ async def test_a_running_provision_still_refuses_a_second_one(adapter_client):
     assert created is False and second.id == first.id
 
 
-async def test_provision_admission_retries_when_the_winner_finishes(adapter_client, rival_engine):
+async def test_provision_admission_retries_when_the_winner_finishes(adapter_client, rival_engine, debug_logs):
     """Zero rows plus no active job is a finished winner, not "blocked" — admit a fresh one."""
-    import logging
-
-    import structlog
-    from structlog.testing import capture_logs
-
     from nso_adapter.core import jobs as jobs_mod
     from nso_adapter.domain.diagnostics import device_ref
     from nso_adapter.store.models import Job, JobStatus
@@ -507,18 +502,12 @@ async def test_provision_admission_retries_when_the_winner_finishes(adapter_clie
     jobs_mod.get_active_provision_job = _finish_then_look
     try:
         async with session() as db:
-            previous = structlog.get_config().copy()
-            structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG))
-            try:
-                with capture_logs() as logs:
-                    second, created = await jobs_mod.enqueue_provision_job({**_PROVISION, "address": "10.0.0.1"}, db)
-            finally:
-                structlog.configure(**previous)
+            second, created = await jobs_mod.enqueue_provision_job({**_PROVISION, "address": "10.0.0.1"}, db)
     finally:
         jobs_mod.get_active_provision_job = original
 
     assert created is True and second.id != first.id
-    record = next(record for record in logs if record["event"] == "job.provision_admission.winner_finished")
+    record = next(record for record in debug_logs if record["event"] == "job.provision_admission.winner_finished")
     assert record["device_ref"] == device_ref(_PROVISION["nso_instance"], _PROVISION["device_name"])
     assert "device_name" not in record
     assert_records_free_of([record], [_PROVISION["device_name"]])
