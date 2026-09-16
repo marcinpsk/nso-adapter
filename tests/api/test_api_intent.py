@@ -105,11 +105,19 @@ async def test_put_intent_unknown_interface_lands(adapter_client):
     silently dropped (the old behaviour lost it with only a warning)."""
     device_id = await seed_device(nso_instance="nso-dev", nso_device_name="intent-greenfield", netbox_device_id=502)
 
-    resp = await adapter_client.put(
-        f"/api/v1/devices/{device_id}/intent",
-        json={"attributes": [{"interface": "ae99.999", "attribute": "description", "intent_value": "greenfield"}]},
-        headers=AUTH | push_seq(),
-    )
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
+    interface_name = "ae99.999"
+    with capture_logs() as logs:
+        resp = await adapter_client.put(
+            f"/api/v1/devices/{device_id}/intent",
+            json={
+                "attributes": [{"interface": interface_name, "attribute": "description", "intent_value": "greenfield"}]
+            },
+            headers=AUTH | push_seq(),
+        )
     assert resp.status_code == 200
     assert resp.json()["attribute_count"] == 1  # landed, not skipped
 
@@ -117,7 +125,12 @@ async def test_put_intent_unknown_interface_lands(adapter_client):
     get_resp = await adapter_client.get(f"/api/v1/devices/{device_id}/intent", headers=AUTH)
     attrs = get_resp.json()["attributes"]
     assert len(attrs) == 1
-    assert attrs[0]["interface"] == "ae99.999" and attrs[0]["intent_value"] == "greenfield"
+    assert attrs[0]["interface"] == interface_name and attrs[0]["intent_value"] == "greenfield"
+
+    record = next(record for record in logs if record["event"] == "intent.put.greenfield_interface")
+    assert record["device_id"] == device_id
+    assert "interface" not in record
+    assert_records_free_of([record], [interface_name])
 
     # the materialised interface carries an accepted attr_state (apply-eligible, not inert)
     from sqlalchemy import select
@@ -125,7 +138,7 @@ async def test_put_intent_unknown_interface_lands(adapter_client):
     async with session() as db:
         iface = (
             await db.execute(
-                select(DbInterface).where(DbInterface.device_id == device_id, DbInterface.name == "ae99.999")
+                select(DbInterface).where(DbInterface.device_id == device_id, DbInterface.name == interface_name)
             )
         ).scalar_one()
         state = (

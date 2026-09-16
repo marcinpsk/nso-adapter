@@ -21,6 +21,7 @@ from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ,
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.core.request_flags import STORE_ONLY, PendingClearProvenance
+from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.store.models import (
     DbInterface,
     Device,
@@ -176,7 +177,7 @@ async def put_intent(
             db.add(iface)
             await db.flush()  # assign id before the intent + attr_state FK it
             ifaces[item.interface] = iface
-            logger.info("intent.put.greenfield_interface", device_id=device_id, interface=item.interface)
+            logger.info("intent.put.greenfield_interface", **device_fields(device_id=device_id))
         value = str(item.intent_value) if item.intent_value is not None else None
         row = InterfaceIntent(
             interface_id=iface.id,
