@@ -10,6 +10,7 @@ import shlex
 import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).parents[1]
@@ -26,6 +27,44 @@ _MISSING_OPENGREP = "opengrep-that-this-test-never-installs"
 _REMOTE_ZIZMOR_HOOK = "https://github.com/zizmorcore/zizmor-pre-commit"
 _ZIZMOR_UV_PREFIX = ["uv", "run", "--locked", "--native-tls", "--", "zizmor"]
 _ZIZMOR_COLLECTIONS = {"workflows", "actions", "dependabot"}
+_EXPECTED_PARTIAL_PATHS = {
+    "nso_adapter/core/failover.py",
+    "nso_adapter/core/refresh_engine.py",
+}
+
+
+def _write_opengrep_stub(
+    tmp_path: Path,
+    partial_paths: set[str],
+    *,
+    results: list[dict[str, object]] | None = None,
+    exit_code: int = 0,
+) -> tuple[Path, Path]:
+    payload = {
+        "errors": [
+            {
+                "path": path,
+                "type": ["PartialParsing", []],
+            }
+            for path in sorted(partial_paths)
+        ],
+        "results": results or [],
+    }
+    stub = tmp_path / "opengrep-stub"
+    invocations = tmp_path / "invocations"
+    stub.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"with Path({str(invocations)!r}).open('a', encoding='utf-8') as stream:\n"
+        "    stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        f"print(json.dumps({payload!r}))\n"
+        f"raise SystemExit({exit_code})\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub, invocations
 
 
 def _ci_zizmor_command() -> list[str]:
@@ -113,3 +152,89 @@ def test_the_opengrep_prerequisite_holds_where_opengrep_is_on_the_path(tmp_path)
 
     assert result.returncode == 127
     assert result.stderr.strip() == "OpenGrep is required. Install it or set OPENGREP_BIN. See README.md."
+
+
+@pytest.mark.parametrize(
+    ("partial_paths", "changed_path", "heading"),
+    [
+        (
+            _EXPECTED_PARTIAL_PATHS | {"scratch/new-pep695.py"},
+            "scratch/new-pep695.py",
+            "New partially analysed files:",
+        ),
+        (
+            _EXPECTED_PARTIAL_PATHS - {"nso_adapter/core/refresh_engine.py"},
+            "nso_adapter/core/refresh_engine.py",
+            "Expected partially analysed files no longer reported:",
+        ),
+    ],
+)
+def test_review_pattern_scan_rejects_partial_parse_drift(
+    tmp_path: Path,
+    partial_paths: set[str],
+    changed_path: str,
+    heading: str,
+) -> None:
+    stub, _invocations = _write_opengrep_stub(tmp_path, partial_paths)
+
+    result = subprocess.run(
+        ["/usr/bin/bash", str(REVIEW_PATTERNS), "scan"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ | {"OPENGREP_BIN": str(stub)},
+    )
+
+    assert result.returncode != 0
+    assert "kb #1718" in result.stderr
+    assert heading in result.stderr
+    assert changed_path in result.stderr
+    for unchanged_path in _EXPECTED_PARTIAL_PATHS & partial_paths:
+        assert unchanged_path not in result.stderr
+
+
+def test_review_pattern_scan_accepts_the_pinned_partial_paths(tmp_path: Path) -> None:
+    stub, _invocations = _write_opengrep_stub(tmp_path, _EXPECTED_PARTIAL_PATHS)
+
+    result = subprocess.run(
+        ["/usr/bin/bash", str(REVIEW_PATTERNS), "scan"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ | {"OPENGREP_BIN": str(stub)},
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "OpenGrep partial-parse pin matches exactly (2 files)."
+    assert not result.stderr
+
+
+def test_review_pattern_scan_renders_findings_from_one_json_scan(tmp_path: Path) -> None:
+    message = "Keep this finding text intact: punctuation!"
+    stub, invocations = _write_opengrep_stub(
+        tmp_path,
+        _EXPECTED_PARTIAL_PATHS,
+        results=[
+            {
+                "path": "review-patterns.py",
+                "start": {"line": 17},
+                "check_id": "nso-test-rule",
+                "extra": {"message": message},
+            }
+        ],
+        exit_code=1,
+    )
+
+    result = subprocess.run(
+        ["/usr/bin/bash", str(REVIEW_PATTERNS), "scan"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ | {"OPENGREP_BIN": str(stub)},
+    )
+
+    assert result.returncode == 1
+    assert f"review-patterns.py:17  nso-test-rule  {message}" in result.stdout
+    calls = invocations.read_text(encoding="utf-8").splitlines()
+    assert len(calls) == 1
+    assert "--json" in calls[0]
