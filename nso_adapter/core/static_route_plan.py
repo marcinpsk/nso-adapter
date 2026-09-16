@@ -648,14 +648,16 @@ def _certify_clears(document: dict, clears: tuple[SrClear, ...]) -> None:
 
 
 def _sr_key(value) -> Triple:
-    """Return the execution key *value* names.
+    """Return the execution key *value* names, naming a malformed one.
 
     The length is checked here because ``as_triple`` UNPACKS: a two-element key raised
-    "not enough values to unpack" instead of the authored document diagnostic.
+    "not enough values to unpack" and said nothing about the document that carried it.
     """
+    # The shape is diagnostic, the contents are route identities: report the count, never the values.
     key = as_triple(value) if isinstance(value, (list, tuple)) and len(value) == 3 else None
     if key is None:
-        raise ValueError("a static-route execution key must contain three values")
+        arrived = len(value) if isinstance(value, (list, tuple)) else type(value).__name__
+        raise ValueError(f"a static-route execution key must contain three values; got {arrived}")
     return key
 
 
