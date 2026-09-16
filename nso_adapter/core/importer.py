@@ -718,7 +718,6 @@ async def _resolve_ned_id(db: AsyncSession, device: Device, client: NsoClient) -
             logger.warning(
                 "importer.ned_id.read_failed",
                 device_id=device.id,
-                kept=device.ned_id,
                 read_operation="ned_id_get",
                 error_type=type(exc).__name__,
                 http_status=http_status_of(exc),
@@ -727,7 +726,7 @@ async def _resolve_ned_id(db: AsyncSession, device: Device, client: NsoClient) -
         learned = ""  # nothing to fall back on → the unmatched path below
     if learned:
         if device.ned_id != learned:
-            logger.info("importer.ned_id.changed", device_id=device.id, old=device.ned_id, new=learned)
+            logger.info("importer.ned_id.changed", device_id=device.id, ned_changed=True)
             device.ned_id = learned
             # Persist the corrected NED now, so a device whose later sync steps fail (e.g. an
             # unsupported NED with no reader) still self-heals its ned_id on any sync attempt.

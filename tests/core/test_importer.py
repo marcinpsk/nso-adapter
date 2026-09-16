@@ -1199,6 +1199,7 @@ async def test_sync_device_updates_ned_when_changed_in_nso(db_session: AsyncSess
     from structlog.testing import capture_logs
 
     from nso_adapter.core import importer as imp
+    from tests._secret_discipline import assert_records_free_of
 
     device = Device(
         nso_instance="nso-dev", nso_device_name="sw-rened", ned_id="arrcus-arcos-nc-8.1.3", netbox_device_id=16
@@ -1221,12 +1222,12 @@ async def test_sync_device_updates_ned_when_changed_in_nso(db_session: AsyncSess
     await db_session.refresh(device)
     assert device.ned_id == "arcos-v8.1.2X-nc-1.0"  # re-learned, not stuck on the old value
     changed = next(record for record in logs if record["event"] == "importer.ned_id.changed")
+    assert_records_free_of([changed], ["sw-rened", "arrcus-arcos-nc-8.1.3", "arcos-v8.1.2X-nc-1.0"])
     assert changed == {
         "event": "importer.ned_id.changed",
         "log_level": "info",
         "device_id": device.id,
-        "old": "arrcus-arcos-nc-8.1.3",
-        "new": "arcos-v8.1.2X-nc-1.0",
+        "ned_changed": True,
     }
 
 
@@ -2169,7 +2170,7 @@ async def test_from_outcomes_lock_discipline(db_session: AsyncSession, monkeypat
     assert acquired == [], "own_lock=False must not touch the lock registry"
 
 
-# ── the kept-NED record carries no server text ──────────────────────
+# ── the failed NED-read record carries no provider text ─────────────
 
 
 async def test_ned_id_read_failure_record_names_the_read_and_not_what_the_server_said(
@@ -2179,7 +2180,7 @@ async def test_ned_id_read_failure_record_names_the_read_and_not_what_the_server
 
     httpx builds an HTTPStatusError message out of the server's REASON PHRASE and the
     request URL, so a 503 from a proxy put both in ``importer.ned_id.read_failed``. The
-    record must carry the stored identifier, the read, the exception type, and the
+    record must carry the stable device id, the read, the exception type, and the
     numeric status, and nothing the caller or server wrote.
 
     Drives the real NsoClient over a real transport, so the message is the one httpx
@@ -2217,14 +2218,19 @@ async def test_ned_id_read_failure_record_names_the_read_and_not_what_the_server
     assert device.ned_id == "cisco-ios-cli-6.95", "a transient read must not clobber the known NED"
     assert_records_free_of(
         logs,
-        ["placeholder-proxy-detail", "placeholder-nso.internal", device.nso_instance, device.nso_device_name],
+        [
+            "placeholder-proxy-detail",
+            "placeholder-nso.internal",
+            device.nso_instance,
+            device.nso_device_name,
+            device.ned_id,
+        ],
     )
     record = next(r for r in logs if r["event"] == "importer.ned_id.read_failed")
     assert record == {
         "event": "importer.ned_id.read_failed",
         "log_level": "warning",
         "device_id": device.id,
-        "kept": "cisco-ios-cli-6.95",
         "read_operation": "ned_id_get",
         "error_type": "HTTPStatusError",
         "http_status": 503,

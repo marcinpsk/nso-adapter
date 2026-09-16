@@ -203,7 +203,7 @@ async def report_read_capability(body: ReadCapabilityReport, db: AsyncSession = 
     if not ned_id:
         raise api_error(409, "no_ned_id", "Device has no learned NED id yet — sync or probe it first")
     count = await capability.record_read_capability(db, ned_id, sw_version, [el.model_dump() for el in body.elements])
-    logger.info("capability.read_report", device=body.nso_device_name, ned_id=ned_id, sw_version=sw_version, rows=count)
+    logger.info("capability.read_report", device_id=device.id, rows=count)
     return {"ned_id": ned_id, "sw_version": sw_version, "count": count}
 
 

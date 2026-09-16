@@ -236,21 +236,34 @@ async def _seed_device_with_key(name: str, ned: str = _NED, sw: str = "17.15.4c"
 async def test_read_capability_report_records_rows_under_the_device_key(adapter_client_with_nso):  # noqa: F811
     """The harness posts per-scope read states by NSO device name; the adapter resolves the
     (ned, sw) key from the device row and the rows come back via GET /capability."""
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
     device_id = await _seed_device_with_key("rg03")
 
-    resp = await adapter_client_with_nso.post(
-        "/api/v1/devices/read-capability/report",
-        headers=AUTH,
-        json={
-            "nso_device_name": "rg03",
-            "elements": [
-                {"scope": "bgp", "status": "native", "detail": "read 11 item(s) on rg03"},
-                {"scope": "isis", "status": "unknown", "detail": "reads empty on rg03"},
-            ],
-        },
-    )
+    with capture_logs() as logs:
+        resp = await adapter_client_with_nso.post(
+            "/api/v1/devices/read-capability/report",
+            headers=AUTH,
+            json={
+                "nso_device_name": "rg03",
+                "elements": [
+                    {"scope": "bgp", "status": "native", "detail": "read 11 item(s) on rg03"},
+                    {"scope": "isis", "status": "unknown", "detail": "reads empty on rg03"},
+                ],
+            },
+        )
     assert resp.status_code == 200
     assert resp.json() == {"ned_id": _NED, "sw_version": "17.15.4c", "count": 2}
+    record = next(record for record in logs if record["event"] == "capability.read_report")
+    assert_records_free_of([record], ["rg03", _NED, "17.15.4c"])
+    assert record == {
+        "event": "capability.read_report",
+        "log_level": "info",
+        "device_id": device_id,
+        "rows": 2,
+    }
 
     resp = await adapter_client_with_nso.get(f"/api/v1/devices/{device_id}/capability", headers=AUTH)
     body = resp.json()
