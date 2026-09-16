@@ -282,11 +282,13 @@ netbox:
   api_token_ref: "NETBOX_TOKEN"
 api:
   adapter_token_ref: "ADAPTER_TOKEN"
+diagnostic_key_ref: "DIAGNOSTIC_KEY"
 database_url: {database_url}
 """
     )
     monkeypatch.setenv("CONFIG_FILE", str(cfg_file))
     monkeypatch.setenv("ADAPTER_TOKEN", VALID_TOKEN)
+    monkeypatch.setenv("DIAGNOSTIC_KEY", "placeholder-diagnostic-key")
     monkeypatch.setenv("NETBOX_TOKEN", "nb-test-token")
     return cfg_file
 
