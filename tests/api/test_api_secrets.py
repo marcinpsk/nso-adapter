@@ -64,6 +64,7 @@ netbox:
   api_token_ref: "NETBOX_TOKEN"
 api:
   adapter_token_ref: "ADAPTER_TOKEN"
+diagnostic_key_ref: "DIAGNOSTIC_KEY"
 database_url: {pg_url}
 """
     cfg_file = tmp_path / "config.yaml"
@@ -77,7 +78,11 @@ database_url: {pg_url}
 
     store: dict[str, dict[str, str]] = {
         # the provider's own startup refs live in the configured mount
-        "credentials/svc": {"adapter_token": VALID_TOKEN, "netbox_token": "nb-test-token"},
+        "credentials/svc": {
+            "adapter_token": VALID_TOKEN,
+            "diagnostic_key": "placeholder-diagnostic-key",
+            "netbox_token": "nb-test-token",
+        },
     }
     kv = _FakeKvV2(store)
     state: dict[str, list] = {"logins": [], "clients": []}
@@ -93,11 +98,13 @@ database_url: {pg_url}
     )
     monkeypatch.setattr("nso_adapter.secrets.vault.hvac", fake_hvac)
 
-    # The startup adapter_token/NSO/netbox refs resolve through the FAKE Vault:
-    # point them at the seeded credentials path (provider "path#field" dialect).
+    # Point all startup refs at the fake Vault's seeded credentials path.
     cfg_text = cfg_text.replace('api_token_ref: "NETBOX_TOKEN"', 'api_token_ref: "credentials/svc#netbox_token"')
     cfg_text = cfg_text.replace(
         'adapter_token_ref: "ADAPTER_TOKEN"', 'adapter_token_ref: "credentials/svc#adapter_token"'
+    )
+    cfg_text = cfg_text.replace(
+        'diagnostic_key_ref: "DIAGNOSTIC_KEY"', 'diagnostic_key_ref: "credentials/svc#diagnostic_key"'
     )
     cfg_text = cfg_text.replace("username_ref: NSO_USERNAME", 'username_ref: "credentials/svc#adapter_token"')
     cfg_text = cfg_text.replace("password_ref: NSO_PASSWORD", 'password_ref: "credentials/svc#adapter_token"')

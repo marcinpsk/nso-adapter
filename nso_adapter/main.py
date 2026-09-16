@@ -148,8 +148,9 @@ def _preserve_exact_openapi_integer_bounds(app: FastAPI) -> None:
 
 
 def _init_secrets(app: FastAPI, cfg, env):
-    """Build the secrets provider, stashing it and the resolved adapter token on ``app.state``."""
+    """Build the secrets provider and resolve process-wide startup secrets."""
     from nso_adapter.core.snmp_verify import register_secrets_provider
+    from nso_adapter.domain.diagnostics import register_device_ref_key
 
     provider = make_provider(cfg, env)
     app.state.secrets = provider
@@ -159,6 +160,8 @@ def _init_secrets(app: FastAPI, cfg, env):
     # registry pattern as the NSO / NetBox clients in core.importer.
     register_secrets_provider(provider)
     app.state.adapter_token = resolve_secret(provider, cfg.api.adapter_token_ref, slot="api.adapter_token_ref")
+    diagnostic_key = resolve_secret(provider, cfg.diagnostic_key_ref, slot="diagnostic_key_ref")
+    register_device_ref_key(diagnostic_key)
     return provider
 
 

@@ -347,11 +347,13 @@ netbox:
   api_token_ref: "NETBOX_TOKEN"
 api:
   adapter_token_ref: "ADAPTER_TOKEN"
+diagnostic_key_ref: "DIAGNOSTIC_KEY"
 database_url: {SPIKE_DB_URL}
 """
     )
     os.environ["CONFIG_FILE"] = str(cfg)
     os.environ["ADAPTER_TOKEN"] = VALID_TOKEN
+    os.environ["DIAGNOSTIC_KEY"] = "placeholder-diagnostic-key"
     os.environ["NETBOX_TOKEN"] = "nb-spike-token"  # noqa: S105 — throwaway local token
 
     from nso_adapter.config import reset_config
