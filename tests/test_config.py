@@ -14,6 +14,7 @@ def test_example_config_uses_postgresql():
     example = yaml.safe_load((Path(__file__).parents[1] / "config.yaml.example").read_text())
 
     assert example["database_url"].startswith("postgresql+asyncpg://")
+    assert example["diagnostic_key_ref"].endswith("#diagnostic_key")
 
 
 def test_get_config_loads_yaml(tmp_path, monkeypatch):
@@ -32,6 +33,7 @@ netbox:
   api_token_ref: "NETBOX_TOKEN"
 api:
   adapter_token_ref: "ADAPTER_TOKEN"
+diagnostic_key_ref: "DIAGNOSTIC_KEY"
 database_url: postgresql+asyncpg://adapter:adapter@db/adapter_test
 """)
     monkeypatch.setenv("CONFIG_FILE", str(cfg_file))
@@ -42,6 +44,7 @@ database_url: postgresql+asyncpg://adapter:adapter@db/adapter_test
     assert cfg.nso_instances[0].username_ref == "NSO_USERNAME"
     assert cfg.netbox.base_url == "http://netbox.local"
     assert cfg.api.adapter_token_ref == "ADAPTER_TOKEN"
+    assert cfg.diagnostic_key_ref == "DIAGNOSTIC_KEY"
     assert cfg.secrets.provider == "local"
 
 
@@ -63,6 +66,7 @@ netbox:
   api_token_ref: "NETBOX_TOKEN"
 api:
   adapter_token_ref: "ADAPTER_TOKEN"
+diagnostic_key_ref: "DIAGNOSTIC_KEY"
 database_url: postgresql+asyncpg://adapter:adapter@db/adapter_test
 """)
     monkeypatch.setenv("CONFIG_FILE", str(cfg_file))
@@ -86,6 +90,7 @@ netbox:
   api_token_ref: "NETBOX_TOKEN"
 api:
   adapter_token_ref: "ADAPTER_TOKEN"
+diagnostic_key_ref: "DIAGNOSTIC_KEY"
 """)
     monkeypatch.setenv("CONFIG_FILE", str(cfg_file))
     reset_config()
