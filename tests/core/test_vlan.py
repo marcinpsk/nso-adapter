@@ -54,6 +54,12 @@ def test_tagged_vlan_parser_rejects_non_wire_shapes(raw):
         parse_vlan_string(raw)
 
 
+@pytest.mark.parametrize("raw", ["10,,20", "10,20,"])
+def test_tagged_vlan_parser_rejects_empty_chunks(raw):
+    with pytest.raises(ValueError, match="^tagged-vlans contains an invalid VLAN range$"):
+        parse_vlan_string(raw)
+
+
 @pytest.mark.anyio
 async def test_refresh_vlan_database_upserts_and_prunes(adapter_client):
     device_id = await seed_device(nso_device_name="vsw", netbox_device_id=1300)
@@ -262,6 +268,49 @@ async def test_refresh_switchport_rejects_an_empty_tagged_vlan_list_without_clea
             "interface": [{"interface-name": "Gi0/1", "mode": "trunk", "tagged-vlans": []}],
         }
         with pytest.raises(ValueError, match=r"^tagged-vlans must be a string \(type list\)$"):
+            await refresh_switchport_for_device(db, device, nso)
+
+        tagged = (
+            (
+                await db.execute(
+                    select(DeviceVlan.vlan_id)
+                    .join(DeviceSwitchportTaggedVlan, DeviceSwitchportTaggedVlan.vlan_id == DeviceVlan.id)
+                    .join(DeviceSwitchport, DeviceSwitchport.id == DeviceSwitchportTaggedVlan.switchport_id)
+                    .where(DeviceSwitchport.device_id == device.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert sorted(tagged) == [10, 20], "the rejected refresh must preserve the last valid links"
+
+
+@pytest.mark.parametrize("tagged_vlans", ["not-a-vlan", "10,not-a-vlan"])
+@pytest.mark.anyio
+async def test_refresh_switchport_rejects_invalid_tagged_vlan_chunks_without_clearing_rows(
+    adapter_client, tagged_vlans
+):
+    """A malformed provider string must fail before replacing the stored VLAN links."""
+    device_id = await seed_device(nso_device_name="vsw-invalid-tagged", netbox_device_id=1314)
+    async with _device_session(device_id) as (db, device):
+        nso = AsyncMock()
+        sections = _serve_sections(nso)
+        sections["vlan-database"] = {
+            "status": "ok",
+            "vlan": [{"vlan-id": 10, "name": "A"}, {"vlan-id": 20, "name": "B"}],
+        }
+        await refresh_vlan_database_for_device(db, device, nso)
+        sections["switchport"] = {
+            "status": "ok",
+            "interface": [{"interface-name": "Gi0/1", "mode": "trunk", "tagged-vlans": "10,20"}],
+        }
+        await refresh_switchport_for_device(db, device, nso)
+
+        sections["switchport"] = {
+            "status": "ok",
+            "interface": [{"interface-name": "Gi0/1", "mode": "trunk", "tagged-vlans": tagged_vlans}],
+        }
+        with pytest.raises(ValueError, match="^tagged-vlans contains an invalid VLAN range$"):
             await refresh_switchport_for_device(db, device, nso)
 
         tagged = (

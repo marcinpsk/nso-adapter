@@ -28,6 +28,8 @@ from nso_adapter.store.models import (
 
 logger = structlog.get_logger(__name__)
 
+_INVALID_TAGGED_VLAN_RANGE = "tagged-vlans contains an invalid VLAN range"
+
 
 def _now():
     return datetime.now(UTC)
@@ -43,18 +45,23 @@ def parse_vlan_string(raw: str | None) -> list[int]:
     for chunk in raw.split(","):
         chunk = chunk.strip()
         if not chunk:
-            continue
+            # Empty chunks, including trailing commas, are malformed provider data.
+            raise ValueError(_INVALID_TAGGED_VLAN_RANGE)
+        unusable = None
         try:
             if "-" in chunk:
                 start, end = (int(x) for x in chunk.split("-", 1))
             else:
                 start = end = int(chunk)
         except ValueError:
-            continue
+            unusable = ValueError(_INVALID_TAGGED_VLAN_RANGE)
+        # Raise after the handler so the provider value is not retained as exception context.
+        if unusable is not None:
+            raise unusable
         # Bound to the legal 802.1Q range so a malformed upstream string
         # (e.g. "1-999999999") can't blow up memory via range expansion.
         if not (1 <= start <= end <= 4094):
-            continue
+            raise ValueError(_INVALID_TAGGED_VLAN_RANGE)
         vlans.update(range(start, end + 1))
     return sorted(vlans)
 
