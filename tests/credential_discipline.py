@@ -9,7 +9,7 @@ This scanner is deliberately aggressive. It flags case-insensitive admin literal
 in credential assignments, dictionary values, defaults, and keyword arguments.
 Positional string arguments and their tuple/list members are potential credentials,
 including client constructors, auth tuples, and environment setters. It does not
-resolve callable signatures or follow values through variables.
+resolve callable signatures. It follows constant strings within one lexical scope.
 
 There are two carve-outs:
 
@@ -29,6 +29,7 @@ import re
 import sys
 import tokenize
 from dataclasses import dataclass
+from itertools import product
 from pathlib import Path
 
 TESTS_ROOT = Path(__file__).resolve().parent
@@ -77,24 +78,26 @@ def _name(node: ast.AST) -> str:
     return ""
 
 
-def _constant_string(node: ast.AST) -> str | None:
-    """Return the value of a statically constant string expression."""
+def _constant_strings(node: ast.AST, aliases: dict[str, set[str]] | None = None) -> set[str] | None:
+    """Return every possible value of a statically constant string expression."""
+    if isinstance(node, ast.Name) and aliases is not None:
+        return aliases.get(node.id)
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
+        return {node.value}
     if isinstance(node, ast.FormattedValue):
         if node.conversion in (-1, ord("s")) and node.format_spec is None:
-            return _constant_string(node.value)
+            return _constant_strings(node.value, aliases)
         return None
     if isinstance(node, ast.JoinedStr):
-        parts = [_constant_string(value) for value in node.values]
+        parts = [_constant_strings(value, aliases) for value in node.values]
         if all(part is not None for part in parts):
-            return "".join(part for part in parts if part is not None)
+            return {"".join(values) for values in product(*(part for part in parts if part is not None))}
         return None
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left = _constant_string(node.left)
-        right = _constant_string(node.right)
+        left = _constant_strings(node.left, aliases)
+        right = _constant_strings(node.right, aliases)
         if left is not None and right is not None:
-            return left + right
+            return {first + second for first in left for second in right}
     if (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -102,9 +105,9 @@ def _constant_string(node: ast.AST) -> str | None:
         and not node.args
         and not node.keywords
     ):
-        value = _constant_string(node.func.value)
+        value = _constant_strings(node.func.value, aliases)
         if value is not None:
-            return value.lower()
+            return {item.lower() for item in value}
     if (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -113,10 +116,11 @@ def _constant_string(node: ast.AST) -> str | None:
         and len(node.args) == 1
         and isinstance(node.args[0], (ast.List, ast.Tuple))
     ):
-        separator = _constant_string(node.func.value)
-        parts = [_constant_string(item) for item in node.args[0].elts]
+        separator = _constant_strings(node.func.value, aliases)
+        parts = [_constant_strings(item, aliases) for item in node.args[0].elts]
         if separator is not None and all(part is not None for part in parts):
-            return separator.join(part for part in parts if part is not None)
+            choices = list(product(*(part for part in parts if part is not None)))
+            return {joiner.join(values) for joiner in separator for values in choices}
     return None
 
 
@@ -128,6 +132,7 @@ class _Scanner(ast.NodeVisitor):
         self._lines = src.splitlines()
         self._comments = _comment_lines(src)
         self._scope: list[str] = []
+        self._constant_scopes: list[dict[str, set[str]]] = [{}]
         self._hits: dict[tuple[int, int], Violation] = {}
 
     @property
@@ -144,20 +149,26 @@ class _Scanner(ast.NodeVisitor):
                 self._check_value(value, value)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self._scope.append(node.name)
         self._check_defaults(node.args)
+        self._scope.append(node.name)
+        self._constant_scopes.append({})
         self.generic_visit(node)
+        self._constant_scopes.pop()
         self._scope.pop()
 
     visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
         self._check_defaults(node.args)
+        self._constant_scopes.append({})
         self.generic_visit(node)
+        self._constant_scopes.pop()
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self._scope.append(node.name)
+        self._constant_scopes.append({})
         self.generic_visit(node)
+        self._constant_scopes.pop()
         self._scope.pop()
 
     def _is_marked(self, node: ast.AST) -> bool:
@@ -178,17 +189,31 @@ class _Scanner(ast.NodeVisitor):
         if isinstance(value, (ast.Tuple, ast.List)):
             for item in value.elts:
                 self._check_value(item, statement)
-        elif (literal := _constant_string(value)) is not None and literal.casefold() == "admin":
+        elif (literals := _constant_strings(value, self._constant_scopes[-1])) is not None and any(
+            literal.casefold() == "admin" for literal in literals
+        ):
             self._hits[(value.lineno, value.col_offset)] = Violation(
                 self._rel, value.lineno, ".".join(self._scope) or "<module>"
             )
+
+    def _track_constant(self, target: ast.AST, value: ast.AST) -> None:
+        if not isinstance(target, ast.Name):
+            return
+        aliases = self._constant_scopes[-1]
+        literals = _constant_strings(value, aliases)
+        if literals is None:
+            aliases.pop(target.id, None)
+        else:
+            aliases[target.id] = literals
 
     def _assignment(self, target: ast.AST, value: ast.AST, statement: ast.AST) -> None:
         if isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
             for item, supplied in zip(target.elts, value.elts):
                 self._assignment(item, supplied, statement)
-        elif _credential_name(_name(target)):
-            self._check_value(value, statement)
+        else:
+            if _credential_name(_name(target)):
+                self._check_value(value, statement)
+            self._track_constant(target, value)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         for target in node.targets:
@@ -199,6 +224,37 @@ class _Scanner(ast.NodeVisitor):
         if node.value is not None:
             self._assignment(node.target, node.value, node)
         self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        if isinstance(node.target, ast.Name):
+            aliases = self._constant_scopes[-1]
+            left = aliases.get(node.target.id)
+            right = _constant_strings(node.value, aliases)
+            if isinstance(node.op, ast.Add) and left is not None and right is not None:
+                aliases[node.target.id] = {first + second for first in left for second in right}
+            else:
+                aliases.pop(node.target.id, None)
+        self.generic_visit(node)
+
+    def visit_If(self, node: ast.If) -> None:
+        self.visit(node.test)
+        incoming = {name: values.copy() for name, values in self._constant_scopes[-1].items()}
+
+        self._constant_scopes[-1] = {name: values.copy() for name, values in incoming.items()}
+        for statement in node.body:
+            self.visit(statement)
+        body_aliases = self._constant_scopes[-1]
+
+        self._constant_scopes[-1] = {name: values.copy() for name, values in incoming.items()}
+        for statement in node.orelse:
+            self.visit(statement)
+        else_aliases = self._constant_scopes[-1]
+
+        merged: dict[str, set[str]] = {}
+        for aliases in (body_aliases, else_aliases):
+            for name, values in aliases.items():
+                merged.setdefault(name, set()).update(values)
+        self._constant_scopes[-1] = merged
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self._assignment(node.target, node.value, node)

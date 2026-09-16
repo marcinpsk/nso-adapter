@@ -1107,8 +1107,13 @@ def test_hydration_refuses_a_recorded_clear_the_documents_own_rows_do_not_descri
 
     with pytest.raises(ValueError, match="does not carry"):
         hydrate_static_route_removal_plan(_document({**good, "row_id": 12}))
-    with pytest.raises(ValueError, match="not the"):
-        hydrate_static_route_removal_plan(_document({**good, "key": ["", "198.18.9.0/24", "198.18.1.1"]}))
+    recorded_prefix = "198.18.9.0/24"
+    with pytest.raises(ValueError) as exc_info:
+        hydrate_static_route_removal_plan(_document({**good, "key": ["", recorded_prefix, "198.18.1.1"]}))
+    assert str(exc_info.value) == (
+        "recorded static-route clear for row 11 names key ['', '198.18.9.0/24', '198.18.1.1'], "
+        "which is not the ['', '198.18.0.0/24', '198.18.1.1'] that row renders"
+    )
     with pytest.raises(ValueError, match="wire-unset"):
         hydrate_static_route_removal_plan(_document({**good, "fields": ["tag"]}))
 

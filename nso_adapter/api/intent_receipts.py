@@ -133,7 +133,7 @@ async def list_intent_receipts(
         raise api_error(
             422,
             "validation_error",
-            f"Unknown intent section {section!r}",
+            "Unknown intent section",
             {"reason": "unknown_section", "sections": sorted(INTENT_STREAMS)},
         )
 

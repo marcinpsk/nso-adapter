@@ -281,7 +281,7 @@ async def onboard_device(
     cfg = get_config()
     known_instances = {inst.name for inst in cfg.nso_instances}
     if nso_instance not in known_instances:
-        raise ValueError(f"NSO instance {nso_instance!r} not found in config")
+        raise ValueError("NSO instance not found in config")
 
     if reg is not None:
         return await _onboard_under_claim(db, nso_instance, nso_device_name, netbox_device_id, reg, job_id)
@@ -457,7 +457,7 @@ async def _onboard_under_claim(
                 nso_device=nso_device_name,
                 waited_s=get_config().intent_claim_wait_seconds,
             )
-            raise ClaimUnavailableError(f"NSO device {nso_device_name!r} is claimed by another operation")
+            raise ClaimUnavailableError("NSO device is claimed by another operation")
         # Never past the deadline: the budget is the whole wait, polling included.
         await asyncio.sleep(min(CLAIM_WAIT_POLL_INTERVAL_S, max(0.0, deadline - time.monotonic())))
 
@@ -662,7 +662,7 @@ async def provision_nso_device(
 
     known = {inst.name for inst in get_config().nso_instances}
     if nso_instance not in known:
-        raise ValueError(f"NSO instance {nso_instance!r} not found in config")
+        raise ValueError("NSO instance not found in config")
 
     device_type = resolve_device_type(ned_id, ned_type)
 
@@ -921,7 +921,7 @@ async def rekey_device(
     known_instances = {inst.name for inst in cfg.nso_instances}
 
     if nso_instance is not None and nso_instance not in known_instances:
-        raise ValueError(f"NSO instance {nso_instance!r} not found in config")
+        raise ValueError("NSO instance not found in config")
 
     device_id = device.id
     for family in ALL_FAMILY_KEYS:

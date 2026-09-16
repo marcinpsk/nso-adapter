@@ -449,6 +449,94 @@ async def test_bgp_snapshot_hydrates_the_relationship_graph_for_the_writer(adapt
     }
 
 
+def test_duplicate_durable_identity_refusal_names_the_internal_identity():
+    from nso_adapter.core.projection import rows_by_intent_identity
+
+    internal_name = "internal-bundle-identity"
+    fragment = {
+        "lag_bundle_intent": [
+            {"id": 1, "name": internal_name},
+            {"id": 2, "name": internal_name},
+        ]
+    }
+
+    with pytest.raises(RuntimeError) as exc_info:
+        rows_by_intent_identity(fragment, "lag_bundle_intent")
+
+    assert str(exc_info.value) == (
+        "lag_bundle_intent projection contains duplicate durable identity ('internal-bundle-identity',)"
+    )
+
+
+def test_interface_eligibility_refusal_names_the_internal_attribute_key():
+    from nso_adapter.core.projection import InterfaceEligibilityUnresolved, build_interface_proof
+    from nso_adapter.store.models import DbInterface
+
+    internal_attribute = "internal-attribute-key"
+    tables = {"interface_intent": [{"interface_id": 7, "attribute": internal_attribute}]}
+    interface = DbInterface(
+        id=7,
+        device_id=1,
+        name="GigabitEthernet0/1",
+        kind=None,
+        parent_binding=None,
+        encap_tag=None,
+        vrf=None,
+        service=None,
+    )
+
+    with pytest.raises(InterfaceEligibilityUnresolved) as exc_info:
+        build_interface_proof("interface_config", tables, [interface], {})
+
+    assert str(exc_info.value) == (
+        "interface_config attribute eligibility is missing for interface 7 attribute 'internal-attribute-key'"
+    )
+
+
+def test_interface_fragment_conflict_names_the_internal_values():
+    from nso_adapter.core.projection import _merge_interface_records
+
+    internal_key = "internal-interface-key"
+    first_value = "internal-binding-first"
+    second_value = "internal-binding-second"
+    merged = {internal_key: {"parent_binding": first_value}}
+
+    with pytest.raises(ValueError) as exc_info:
+        _merge_interface_records(
+            "interface_config",
+            merged,
+            {"parent_binding": second_value},
+            internal_key,
+        )
+
+    assert str(exc_info.value) == (
+        "document section 'interface_config' interface internal-interface-key has conflicting "
+        "'parent_binding' values 'internal-binding-first' and 'internal-binding-second' across its fragments"
+    )
+
+
+def test_missing_projected_parent_refusal_names_the_internal_parent_reference():
+    from nso_adapter.core.projection import hydrate_section
+
+    internal_parent_id = "internal-parent-reference"
+    document = {
+        "lag": {
+            "_execution": {"context": {"ned_id": None, "dialect": "identity"}},
+            "lag_bundle_intent": [],
+            "lag_member_intent": [
+                {"id": 2, "lag_bundle_id": internal_parent_id, "interface_name": "GigabitEthernet0/1"}
+            ],
+        }
+    }
+
+    with pytest.raises(RuntimeError) as exc_info:
+        hydrate_section(document, "lag")
+
+    assert str(exc_info.value) == (
+        "lag_member_intent row references missing lag_bundle_intent id 'internal-parent-reference'"
+    )
+
+
 def test_bgp_hydration_resolves_parents_in_linear_work():
     """Parent lookup may inspect each peer a few times, but not once per peer AF."""
     from nso_adapter.core.projection import hydrate_section

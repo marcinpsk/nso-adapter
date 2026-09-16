@@ -46,7 +46,6 @@ from nso_adapter.nso.read_outcome import (  # noqa: F401 — Present used below
     classify_envelope_section,
     http_status_of,
     read_failure_from_exception,
-    section_absence_code,
 )
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.db import execute_dml
@@ -342,17 +341,19 @@ def _split_sections(
     """
     sections: dict[str, dict | None] = {}
     for wire in wire_names:
+        section_missing = wire not in served
         section = served.get(wire)
         if isinstance(section, dict):
             sections[wire] = section
             failures.pop(wire, None)
             continue
         sections[wire] = None
+        absent_from_action = section_missing and operation is ReadOperation.device_state_read
         failures[wire] = ReadFailure(
             operation=operation,
             device=device_name,
             family=wire,
-            code=section_absence_code(served, wire, operation=operation),
+            code=ReadFailureCode.action_section_missing if absent_from_action else ReadFailureCode.section_malformed,
         )
     return sections
 
@@ -739,8 +740,7 @@ async def _resolve_ned_id(db: AsyncSession, device: Device, client: NsoClient) -
     device.last_sync_at = _utcnow()
     device.last_sync_status = LastSyncStatus.failed
     await db.commit()
-    # The worker renders repr(exc); the stored id is the correlatable identity, the name is not ours.
-    raise ValueError(f"device {device.id} not found in NSO or has no NED ID")
+    raise ValueError("NSO device not found or has no NED ID")
 
 
 async def _ensure_netbox_interfaces(nb_client, device: Device, device_id: int, interfaces) -> dict[str, int]:

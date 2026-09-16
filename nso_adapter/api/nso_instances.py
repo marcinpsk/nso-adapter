@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404, RESP_502_NSO, api_error
+from nso_adapter.api.errors import RESP_401, RESP_404, RESP_502_NSO, ApiError, api_error
 from nso_adapter.config import get_config
 from nso_adapter.core.importer import get_nso_client
 from nso_adapter.nso.neds import extract_ned_id_from_device_dict, ned_family
@@ -91,13 +91,16 @@ async def list_instance_devices(instance_id: str, db: AsyncSession = Depends(get
     """
     cfg = get_config()
     if not any(inst.name == instance_id for inst in cfg.nso_instances):
-        raise api_error(404, "not_found", f"NSO instance '{instance_id}' not found")
+        raise api_error(404, "not_found", "NSO instance not found")
 
+    unavailable: ApiError | None = None
     try:
         client = get_nso_client(instance_id)
         device_list = await client.list_devices()
-    except Exception as exc:
-        raise api_error(502, "nso_unreachable", str(exc)) from exc
+    except Exception:
+        unavailable = api_error(502, "nso_unreachable", "NSO instance is unreachable")
+    if unavailable is not None:
+        raise unavailable
 
     # Build onboarded cross-reference in one DB query (not per item)
     rows = await db.execute(
@@ -150,12 +153,15 @@ async def list_instance_neds(instance_id: str):
     """
     cfg = get_config()
     if not any(inst.name == instance_id for inst in cfg.nso_instances):
-        raise api_error(404, "not_found", f"NSO instance '{instance_id}' not found")
+        raise api_error(404, "not_found", "NSO instance not found")
+    unavailable: ApiError | None = None
     try:
         client = get_nso_client(instance_id)
         neds = await client.list_ned_packages()
-    except Exception as exc:
-        raise api_error(502, "nso_unreachable", str(exc)) from exc
+    except Exception:
+        unavailable = api_error(502, "nso_unreachable", "NSO instance is unreachable")
+    if unavailable is not None:
+        raise unavailable
     for n in neds:
         n["platform"] = ned_family(n["ned_id"]) if n.get("ned_id") else None
     return neds

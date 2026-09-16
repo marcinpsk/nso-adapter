@@ -822,6 +822,16 @@ def test_clears_suppressed_matches_the_two_removal_modes():
     assert clears_suppressed({"retract_deferred": True}) is True
 
 
+def test_malformed_execution_key_error_names_the_internal_key_shape():
+    from nso_adapter.core.static_route_plan import _sr_key
+
+    internal_value = "internal-route-key"
+    with pytest.raises(ValueError, match="must contain three values") as caught:
+        _sr_key([internal_value])
+
+    assert str(caught.value) == "a static-route execution key must contain three values; got ['internal-route-key']"
+
+
 async def test_a_frozen_removal_plan_round_trips_its_clears(adapter_client):
     """Drift guard: what the creation-time classifier records is exactly what execution reads.
 

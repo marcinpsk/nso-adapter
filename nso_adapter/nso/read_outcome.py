@@ -127,6 +127,15 @@ class ReadFailure:
     http_status: int | None = None  # the numeric status, when the server answered one
     code: ReadFailureCode | None = None  # the contract reason, when the read broke a rule
 
+    def __repr__(self) -> str:
+        return (
+            f"ReadFailure(operation={self.operation!r}, device='<redacted>', family={self.family!r}, "
+            f"error_type={self.error_type!r}, http_status={self.http_status!r}, code={self.code!r})"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def for_family(self, family: str) -> ReadFailure:
         """Narrow a whole-device read failure to the family it is being reported for."""
         return replace(self, family=family)
