@@ -5,6 +5,10 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+
+from nso_adapter.core.importer import get_nso_client
+from nso_adapter.domain.diagnostics import device_ref
 from nso_adapter.nso.client import NsoClient
 from tests.conftest import VALID_TOKEN, seed_device
 
@@ -42,6 +46,31 @@ def _fake_nso(devices=_NSO_DEVICES):
     return m
 
 
+async def test_list_devices_exposes_correlatable_ref_for_unonboarded_device(
+    adapter_client_with_nso,
+    monkeypatch,
+):
+    name = "unonboarded-ref-rtr"
+
+    def handle(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"tailf-ncs:devices": {"device": [{"name": name}]}})
+
+    nso_client = get_nso_client("nso-dev")
+    monkeypatch.setattr(
+        nso_client,
+        "_client",
+        lambda timeout=None: httpx.AsyncClient(
+            transport=httpx.MockTransport(handle),
+            base_url="http://nso-dev:8080",
+        ),
+    )
+
+    resp = await adapter_client_with_nso.get("/api/v1/nso-instances/nso-dev/devices", headers=AUTH)
+
+    assert resp.status_code == 200
+    assert resp.json()[0]["device_ref"] == device_ref("nso-dev", name)
+
+
 async def test_list_devices_unknown_instance_returns_404(adapter_client_with_nso):
     """Instance ID not in the (real) config → 404."""
     resp = await adapter_client_with_nso.get("/api/v1/nso-instances/ghost-instance/devices", headers=AUTH)
@@ -59,6 +88,7 @@ async def test_list_devices_enriched_fields_present(adapter_client_with_nso):
     for item in items:
         for key in (
             "name",
+            "device_ref",
             "address",
             "ned_id",
             "platform",

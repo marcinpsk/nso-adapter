@@ -21,7 +21,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from tests.conftest import note_projection_write, seed_device, session
+from tests.conftest import VALID_TOKEN, note_projection_write, seed_device, session
 
 pytestmark = pytest.mark.anyio
 
@@ -522,6 +522,11 @@ async def test_provision_admission_exhaustion_does_not_repeat_the_device_name(ad
 
     device_name = "placeholder-provision-admission-device"
     params = {**_PROVISION, "device_name": device_name, "address": "198.18.0.1"}
+    device_id = await seed_device(
+        nso_instance=params["nso_instance"],
+        nso_device_name=device_name,
+        netbox_device_id=9750,
+    )
     async with session() as db:
         await jobs_mod.enqueue_provision_job(params, db)
 
@@ -535,7 +540,12 @@ async def test_provision_admission_exhaustion_does_not_repeat_the_device_name(ad
 
     assert_chain_free_of(caught.value, [device_name])
     record = next(record for record in logs if record["event"] == "job.provision_admission.retries_exhausted")
-    assert record["device_ref"] == device_ref(params["nso_instance"], device_name)
+    response = await adapter_client.get(
+        f"/api/v1/devices/{device_id}",
+        headers={"Authorization": f"Bearer {VALID_TOKEN}"},
+    )
+    assert response.status_code == 200
+    assert record["device_ref"] == response.json()["device_ref"] == device_ref(params["nso_instance"], device_name)
     assert "device_name" not in record
     assert_records_free_of([record], [device_name])
 
