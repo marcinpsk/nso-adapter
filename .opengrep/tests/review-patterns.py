@@ -680,6 +680,17 @@ def an_authored_family_name_is_ours(wire):
     raise NsoReadContractError(f"device-state-read section {wire!r} is not a dict")
 
 
+def query_predicate_is_not_a_device_name(logger, db, select, Device):
+    rows = db.execute(select(Device).where(Device.nso_device_name == "placeholder"))
+    for row in rows:
+        # ok: nso-diagnostic-raw-identifier-alias
+        logger.info("device.refreshed", device_id=row.id, netbox_device_id=row.netbox_device_id)
+        # ok: nso-diagnostic-raw-identifier-alias
+        logger.info("device.refreshed", instance=row.nso_instance)
+        # ruleid: nso-diagnostic-raw-identifier-alias
+        logger.info("device.refreshed", context=row.nso_device_name)
+
+
 async def legacy_query_api(session, model, select):
     # ruleid: nso-store-legacy-query-api
     session.query(model).all()
