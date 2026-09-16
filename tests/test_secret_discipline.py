@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from tests._ast_scanner_support import argument_names, statement_may_raise
 from tests._secret_discipline import assert_chain_free_of, exception_chain
 
 _SECRET = "placeholder-vault-secret"
@@ -203,23 +204,15 @@ class _ScopeFacts(ast.NodeVisitor):
         self._visit_comprehension(node)
 
 
-def _argument_names(arguments: ast.arguments) -> set[str]:
-    return (
-        {argument.arg for argument in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)}
-        | ({arguments.vararg.arg} if arguments.vararg is not None else set())
-        | ({arguments.kwarg.arg} if arguments.kwarg is not None else set())
-    )
-
-
 def _scope_facts(scope: ast.AST) -> _ScopeFacts:
     facts = _ScopeFacts()
     if isinstance(scope, ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
         if isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef):
-            facts.local_names.update(_argument_names(scope.args))
+            facts.local_names.update(argument_names(scope.args))
         for statement in scope.body:
             facts.visit(statement)
     elif isinstance(scope, ast.Lambda):
-        facts.local_names.update(_argument_names(scope.args))
+        facts.local_names.update(argument_names(scope.args))
         facts.visit(scope.body)
     return facts
 
@@ -238,22 +231,6 @@ def _binding_aliases(bindings: list[tuple[str, list[ast.AST]]], aliases: set[str
 
 def _resolve_bindings(bindings: list[tuple[str, list[ast.AST]]], aliases: set[str]) -> set[str]:
     return aliases | _binding_aliases(bindings, aliases)
-
-
-def _statement_may_raise(statement: ast.stmt) -> bool:
-    if isinstance(statement, (ast.Pass, ast.Break, ast.Continue)):
-        return False
-    if isinstance(statement, (ast.Try, ast.TryStar)):
-        return False
-    if isinstance(statement, ast.Assign):
-        return not isinstance(statement.value, ast.Constant) or not all(
-            isinstance(target, ast.Name) for target in statement.targets
-        )
-    return (
-        not isinstance(statement, ast.AnnAssign)
-        or not isinstance(statement.target, ast.Name)
-        or not isinstance(statement.value, ast.Constant)
-    )
 
 
 def _record_non_disclosure_assertions(assertions: list[ast.Assert], aliases: set[str], violations: list[int]) -> None:
@@ -413,7 +390,10 @@ def _resolve_class_with(
         if item.optional_vars is not None:
             target_aliases = _binding_aliases(_target_value_bindings(item.optional_vars, item.context_expr), incoming)
             incoming = incoming - _target_names(item.optional_vars) | target_aliases
-    return _resolve_class_statements(statement.body, incoming, enclosing_aliases, violations, observed_states)
+    aliases = _resolve_class_statements(statement.body, incoming, enclosing_aliases, violations, observed_states)
+    if observed_states is not None:
+        observed_states.append(aliases.copy())
+    return aliases
 
 
 def _resolve_class_statements(
@@ -424,7 +404,7 @@ def _resolve_class_statements(
     observed_states: list[set[str]] | None = None,
 ) -> set[str]:
     for statement in statements:
-        if observed_states is not None and _statement_may_raise(statement):
+        if observed_states is not None and statement_may_raise(statement):
             observed_states.append(aliases.copy())
         if isinstance(statement, ast.If):
             aliases = _resolve_class_if(statement, aliases, enclosing_aliases, violations, observed_states)

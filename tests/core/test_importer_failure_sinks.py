@@ -22,6 +22,13 @@ import pytest
 import yaml
 
 from nso_adapter.store.models import Device
+from tests._ast_scanner_support import (
+    argument_names,
+    match_capture_names,
+    pattern_is_irrefutable,
+    scope_bound_names,
+    statement_may_raise,
+)
 from tests.conftest import seed_device, session
 
 #: A URL and reason phrase a real NSO would put in the httpx message.
@@ -74,63 +81,6 @@ def _is_closed_exception_classification(value: ast.expr) -> bool:
     )
 
 
-class _ScopeBindingCollector(ast.NodeVisitor):
-    """Collect names bound in one lexical scope without entering child scopes."""
-
-    def __init__(self) -> None:
-        self.names: set[str] = set()
-
-    def visit_Name(self, node: ast.Name) -> None:  # noqa: N802 - ast visitor API
-        if isinstance(node.ctx, (ast.Store, ast.Del)):
-            self.names.add(node.id)
-
-    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:  # noqa: N802 - ast visitor API
-        if node.name is not None:
-            self.names.add(node.name)
-        self.generic_visit(node)
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802 - ast visitor API
-        self.names.add(node.name)
-
-    visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
-
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802 - ast visitor API
-        self.names.add(node.name)
-
-    def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802 - ast visitor API
-        return
-
-    def visit_ListComp(self, node: ast.ListComp) -> None:  # noqa: N802 - ast visitor API
-        return
-
-    visit_SetComp = visit_ListComp  # type: ignore[assignment]
-    visit_GeneratorExp = visit_ListComp  # type: ignore[assignment]
-    visit_DictComp = visit_ListComp  # type: ignore[assignment]
-
-
-def _scope_bound_names(nodes: list[ast.AST]) -> set[str]:
-    collector = _ScopeBindingCollector()
-    for node in nodes:
-        collector.visit(node)
-    return collector.names
-
-
-def _statement_may_raise(statement: ast.stmt) -> bool:
-    if isinstance(statement, (ast.Pass, ast.Break, ast.Continue)):
-        return False
-    if isinstance(statement, (ast.Try, ast.TryStar)):
-        return False
-    if isinstance(statement, ast.Assign):
-        return not isinstance(statement.value, ast.Constant) or not all(
-            isinstance(target, ast.Name) for target in statement.targets
-        )
-    return (
-        not isinstance(statement, ast.AnnAssign)
-        or not isinstance(statement.target, ast.Name)
-        or not isinstance(statement.value, ast.Constant)
-    )
-
-
 class _RawLogExceptionVisitor(ast.NodeVisitor):
     """Track exception aliases through control flow while visiting log calls."""
 
@@ -147,11 +97,14 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
         if lineno not in self.violations:
             self.violations.append(lineno)
 
+    def _record_handler_input(self) -> None:
+        if self._try_handler_inputs:
+            self._try_handler_inputs[-1].update(self.aliases)
+
     def _visit_statements(self, statements: list[ast.stmt]) -> bool:
         for statement in statements:
-            if _statement_may_raise(statement):
-                if self._try_handler_inputs:
-                    self._try_handler_inputs[-1].update(self.aliases)
+            if statement_may_raise(statement):
+                self._record_handler_input()
                 if self._try_exception_inputs:
                     self._try_exception_inputs[-1].update(self.aliases)
             if self.visit(statement) is False:
@@ -211,33 +164,9 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
         else:
             self.aliases.difference_update(names)
 
-    @staticmethod
-    def _pattern_names(pattern: ast.pattern) -> set[str]:
-        names: set[str] = set()
-        for part in ast.walk(pattern):
-            if isinstance(part, (ast.MatchAs, ast.MatchStar)) and part.name is not None:
-                names.add(part.name)
-            elif isinstance(part, ast.MatchMapping) and part.rest is not None:
-                names.add(part.rest)
-        return names
-
-    @classmethod
-    def _pattern_is_irrefutable(cls, pattern: ast.pattern) -> bool:
-        if isinstance(pattern, ast.MatchAs):
-            return pattern.pattern is None or cls._pattern_is_irrefutable(pattern.pattern)
-        return isinstance(pattern, ast.MatchOr) and any(cls._pattern_is_irrefutable(part) for part in pattern.patterns)
-
     def _assignment(self, targets: list[ast.expr], value: ast.expr) -> None:
         for target in targets:
             self._bind_assignment_target(target, value)
-
-    @staticmethod
-    def _argument_names(arguments: ast.arguments) -> set[str]:
-        return (
-            {argument.arg for argument in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)}
-            | ({arguments.vararg.arg} if arguments.vararg is not None else set())
-            | ({arguments.kwarg.arg} if arguments.kwarg is not None else set())
-        )
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         for expression in (
@@ -251,7 +180,7 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
         outer_exception_inputs = self._try_exception_inputs
         outer_class_enclosing_aliases = self._class_enclosing_aliases
         enclosing_aliases = self._class_enclosing_aliases[-1] if self._class_enclosing_aliases else outer_aliases
-        local_names = _scope_bound_names(list(node.body)) | self._argument_names(node.args)
+        local_names = scope_bound_names(list(node.body)) | argument_names(node.args)
         self.aliases = (enclosing_aliases - local_names) | {"exc"}
         self._try_handler_inputs = []
         self._try_exception_inputs = []
@@ -277,7 +206,7 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
         outer_exception_inputs = self._try_exception_inputs
         outer_class_enclosing_aliases = self._class_enclosing_aliases
         enclosing_aliases = self._class_enclosing_aliases[-1] if self._class_enclosing_aliases else outer_aliases
-        local_names = _scope_bound_names([node.body]) | self._argument_names(node.args)
+        local_names = scope_bound_names([node.body]) | argument_names(node.args)
         self.aliases = (enclosing_aliases - local_names) | {"exc"}
         self._try_handler_inputs = []
         self._try_exception_inputs = []
@@ -445,10 +374,14 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
 
     def _visit_with(self, node: ast.With | ast.AsyncWith) -> bool:
         for item in node.items:
+            self._record_handler_input()
             self.visit(item.context_expr)
+            self._record_handler_input()
             if item.optional_vars is not None:
                 self._bind_target_from_verdict(item.optional_vars, self._aliases_exception(item.context_expr))
-        return self._visit_statements(node.body)
+        falls_through = self._visit_statements(node.body)
+        self._record_handler_input()
+        return falls_through
 
     def visit_With(self, node: ast.With) -> bool:  # noqa: N802 - ast visitor API
         return self._visit_with(node)
@@ -465,14 +398,14 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
         falls_through = False
         for case in node.cases:
             self.aliases = incoming.copy()
-            self._bind_names(self._pattern_names(case.pattern), subject_aliases_exception)
+            self._bind_names(match_capture_names(case.pattern), subject_aliases_exception)
             if case.guard is not None:
                 self.visit(case.guard)
             case_falls_through = self._visit_statements(case.body)
             if case_falls_through:
                 surviving |= self.aliases
                 falls_through = True
-            exhaustive |= case.guard is None and self._pattern_is_irrefutable(case.pattern)
+            exhaustive |= case.guard is None and pattern_is_irrefutable(case.pattern)
         if not exhaustive:
             surviving |= incoming
             falls_through = True
@@ -1137,6 +1070,22 @@ def test_raw_exception_log_guard_preserves_taint_in_nested_statement_containers(
     source: str, expected_line: int
 ) -> None:
     assert _raw_log_exception_renderers(source) == [expected_line]
+
+
+def test_raw_exception_log_guard_preserves_the_post_with_body_state_for_exit_failures() -> None:
+    source = """\
+alias = "authored detail"
+try:
+    with context():
+        alias = exc
+except Exception:
+    pass
+else:
+    alias = "authored detail"
+logger.warning("event", detail=alias)
+"""
+
+    assert _raw_log_exception_renderers(source) == [9]
 
 
 def test_raw_exception_log_guard_does_not_leak_aliases_between_functions() -> None:

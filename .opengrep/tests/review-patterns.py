@@ -71,6 +71,112 @@ def aliased_outcome_error(logger, failure_detail, http_status_of):
         logger.warning("family.outcome.read_record_failed", detail=failure_detail(caught))
 
 
+def with_exit_aliased_outcome_error(logger, context):
+    try:
+        work()
+    except Exception as caught:
+        class Nested:
+            detail = "authored detail"
+            try:
+                with context():
+                    work()
+                    detail = caught
+            except Exception:
+                pass
+            else:
+                detail = "authored detail"
+            # ruleid: nso-outcome-with-exit-raw-exception-alias-renderer
+            logger.warning("family.outcome.read_record_failed", detail=detail)
+
+
+async def async_with_exit_aliased_outcome_error(logger, context):
+    try:
+        work()
+    except Exception as caught:
+        class Nested:
+            detail = "authored detail"
+            try:
+                async with context():
+                    await work()
+                    detail = caught
+            except Exception:
+                pass
+            else:
+                detail = "authored detail"
+            # ruleid: nso-outcome-with-exit-raw-exception-alias-renderer
+            logger.warning("family.outcome.read_record_failed", detail)
+
+
+def clean_with_exit_outcome_detail(logger, context):
+    try:
+        work()
+    except Exception as caught:
+        class Nested:
+            detail = "authored detail"
+            try:
+                with context():
+                    detail = "authored detail"
+            except Exception:
+                pass
+            else:
+                detail = "authored detail"
+            # ok: nso-outcome-with-exit-raw-exception-alias-renderer
+            logger.warning("family.outcome.read_record_failed", detail=detail)
+
+
+def overwritten_with_exit_outcome_detail(logger, context):
+    try:
+        work()
+    except Exception as caught:
+        class Nested:
+            detail = "authored detail"
+            try:
+                with context():
+                    detail = caught
+                    detail = "authored detail"
+            except Exception:
+                pass
+            else:
+                detail = "authored detail"
+            # ok: nso-outcome-with-exit-raw-exception-alias-renderer
+            logger.warning("family.outcome.read_record_failed", detail=detail)
+
+
+def repeatedly_tainted_with_exit_outcome_detail(logger, context):
+    try:
+        work()
+    except Exception as caught:
+        class Nested:
+            detail = "authored detail"
+            try:
+                with context():
+                    detail = caught
+                    detail = caught
+            except Exception:
+                pass
+            else:
+                detail = "authored detail"
+            # ruleid: nso-outcome-with-exit-raw-exception-alias-renderer
+            logger.warning("family.outcome.read_record_failed", detail=detail)
+
+
+def handled_with_exit_outcome_detail(logger, context):
+    try:
+        work()
+    except Exception as caught:
+        class Nested:
+            detail = "authored detail"
+            try:
+                with context():
+                    detail = caught
+            except Exception:
+                detail = "authored detail"
+            else:
+                detail = "authored detail"
+            # ok: nso-outcome-with-exit-raw-exception-alias-renderer
+            logger.warning("family.outcome.read_record_failed", detail=detail)
+
+
 def authored_outcome_details(logger, reason):
     # ok: nso-outcome-raw-exception-renderer
     logger.warning("family.outcome.read_record_failed", detail=f"Reason: {reason}")
