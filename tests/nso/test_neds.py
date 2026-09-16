@@ -109,9 +109,14 @@ def test_resolve_device_type_rejects_contradicting_request():
     import pytest
 
     from nso_adapter.nso.neds import resolve_device_type
+    from tests._secret_discipline import assert_chain_free_of
 
-    with pytest.raises(ValueError, match="contradicts"):
-        resolve_device_type("juniper-junos-nc-4.19", requested="cli")
+    ned_id = "placeholder-provider-nc-9.9"
+    requested = "placeholder-requested-type"
+    with pytest.raises(ValueError, match="contradicts") as caught:
+        resolve_device_type(ned_id, requested=requested)
+
+    assert_chain_free_of(caught.value, [ned_id, requested])
 
 
 def test_resolve_device_type_agreeing_request_ok():

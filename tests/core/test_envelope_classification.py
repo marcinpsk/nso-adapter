@@ -14,6 +14,7 @@ import pytest
 from nso_adapter.nso.read_outcome import (
     Freshness,
     Present,
+    ReadFailure,
     ReadFailureCode,
     ReadOperation,
     Unavailable,
@@ -23,6 +24,28 @@ from nso_adapter.nso.read_outcome import (
 from tests._secret_discipline import assert_text_free_of
 
 _ASKED = {"device": "rg03", "family": "static-route"}
+
+
+def test_read_failure_representations_redact_the_device_from_every_container():
+    device = "placeholder-distinctive-device"
+    failure = ReadFailure(
+        operation=ReadOperation.device_state_read,
+        device=device,
+        family="static-route",
+        error_type="NsoReadContractError",
+        http_status=503,
+        code=ReadFailureCode.action_output_not_atomic,
+    )
+    unavailable = Unavailable(UnavailableReason.read_error, failure)
+    present = Present.composite({}, Freshness.stale, [unavailable])
+
+    for rendered in (repr(failure), str(failure), repr(unavailable), str(unavailable), repr(present), str(present)):
+        assert_text_free_of(rendered, [device])
+
+    classification = repr(failure)
+    for field in ("device_state_read", "static-route", "NsoReadContractError", "503", "action_output_not_atomic"):
+        if field not in classification:
+            raise AssertionError("the read failure representation omits an authored classification field")
 
 
 class TestStatusMapping:

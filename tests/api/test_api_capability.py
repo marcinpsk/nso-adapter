@@ -277,12 +277,34 @@ async def test_read_capability_report_records_rows_under_the_device_key(adapter_
 
 @pytest.mark.asyncio
 async def test_read_capability_report_unknown_device_is_404(adapter_client_with_nso):  # noqa: F811
+    from tests._secret_discipline import assert_text_free_of
+
+    submitted = "placeholder-unknown-capability-device"
     resp = await adapter_client_with_nso.post(
         "/api/v1/devices/read-capability/report",
         headers=AUTH,
-        json={"nso_device_name": "no-such-device", "elements": [{"scope": "bgp", "status": "native"}]},
+        json={"nso_device_name": submitted, "elements": [{"scope": "bgp", "status": "native"}]},
     )
     assert resp.status_code == 404
+    assert_text_free_of(resp.text, [submitted])
+
+
+@pytest.mark.asyncio
+async def test_read_capability_report_ambiguous_device_does_not_echo_its_name(adapter_client_with_nso):  # noqa: F811
+    from tests._secret_discipline import assert_text_free_of
+
+    submitted = "placeholder-ambiguous-capability-device"
+    await seed_device(nso_instance="configured-primary", nso_device_name=submitted, netbox_device_id=8401)
+    await seed_device(nso_instance="configured-secondary", nso_device_name=submitted, netbox_device_id=8402)
+
+    resp = await adapter_client_with_nso.post(
+        "/api/v1/devices/read-capability/report",
+        headers=AUTH,
+        json={"nso_device_name": submitted, "elements": [{"scope": "bgp", "status": "native"}]},
+    )
+
+    assert resp.status_code == 409
+    assert_text_free_of(resp.text, [submitted])
 
 
 @pytest.mark.asyncio

@@ -27,21 +27,38 @@ _NON_DISCLOSURE_TESTS = (
     _TEST_ROOT / "core" / "test_envelope_classification.py",
     _TEST_ROOT / "core" / "test_redistribution.py",
     _TEST_ROOT / "core" / "test_refresh_engine_envelope.py",
+    _TEST_ROOT / "core" / "test_vlan.py",
     _TEST_ROOT / "test_secret_discipline.py",
     _TEST_ROOT / "test_vault_provider.py",
 )
 _INSPECTED_ATTRIBUTES = {"json", "read_failures", "text", "value"}
 
 
-def _reads_an_inspected_surface(node: ast.AST) -> bool:
+def _reads_an_inspected_surface(node: ast.AST, aliases: set[str] | None = None) -> bool:
+    aliases = aliases or set()
     return any(
         isinstance(part, ast.Attribute)
         and part.attr in _INSPECTED_ATTRIBUTES
         or isinstance(part, ast.Call)
         and isinstance(part.func, ast.Name)
         and part.func.id in {"repr", "str"}
+        or isinstance(part, ast.Name)
+        and part.id in aliases
         for part in ast.walk(node)
     )
+
+
+def _inspected_surface_aliases(tree: ast.AST) -> set[str]:
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        if value is None or not _reads_an_inspected_surface(value, aliases):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        aliases.update(target.id for target in targets if isinstance(target, ast.Name))
+    return aliases
 
 
 def _raised_with_context(inner: BaseException, outer: BaseException) -> BaseException:
@@ -108,13 +125,14 @@ def test_non_disclosure_checks_do_not_use_rewritten_assertions() -> None:
     violations = []
     for path in _NON_DISCLOSURE_TESTS:
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        aliases = _inspected_surface_aliases(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Assert):
                 continue
             comparisons = [part for part in ast.walk(node.test) if isinstance(part, ast.Compare)]
             if any(
                 any(isinstance(operator, ast.NotIn) for operator in comparison.ops)
-                and any(_reads_an_inspected_surface(value) for value in comparison.comparators)
+                and any(_reads_an_inspected_surface(value, aliases) for value in comparison.comparators)
                 for comparison in comparisons
             ):
                 violations.append(f"{path.relative_to(_TEST_ROOT.parent)}:{node.lineno}")

@@ -23,6 +23,24 @@ from tests.core.removal_helpers import authorize_stream
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 
+def test_action_apply_validation_does_not_repeat_an_unknown_stream():
+    from pydantic import ValidationError
+
+    from nso_adapter.api.actions import ActionApplyIn
+    from tests._secret_discipline import assert_chain_free_of
+
+    unknown_stream = "placeholder-caller-stream"
+    with pytest.raises(ValidationError) as caught:
+        ActionApplyIn.model_validate(
+            {
+                "apply_attempt_id": "00000000-0000-0000-0000-000000000001",
+                "selected": {unknown_stream: 1},
+            }
+        )
+
+    assert_chain_free_of(caught.value, [unknown_stream])
+
+
 async def _seed_device(nso_device_name: str, netbox_id: int) -> int:
     async with session() as db:
         d = Device(nso_instance="nso-dev", nso_device_name=nso_device_name, netbox_device_id=netbox_id)
@@ -264,13 +282,16 @@ async def test_action_apply_diff_forwards_outformat(adapter_client):
 
 async def test_action_apply_diff_rejects_unknown_outformat(adapter_client):
     from nso_adapter.api.actions import action_apply_diff
+    from tests._secret_discipline import assert_chain_free_of
 
     device_id = await _seed_device("actions-adiff-02", 1351)
+    submitted = "placeholder-submitted-outformat"
     async with session() as db:
         try:
-            await action_apply_diff(device_id=device_id, outformat="nonsense", db=db)
+            await action_apply_diff(device_id=device_id, outformat=submitted, db=db)
         except Exception as exc:
             assert getattr(exc, "status_code", None) == 400
+            assert_chain_free_of(exc, [submitted])
         else:
             raise AssertionError("invalid outformat must 400")
 

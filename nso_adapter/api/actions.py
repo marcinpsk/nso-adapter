@@ -68,7 +68,7 @@ class ActionApplyIn(BaseModel):
     neither stream carries a receipt.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     apply_attempt_id: UUID
     selected: dict[str, SelectedPushSequence]
@@ -81,7 +81,7 @@ class ActionApplyIn(BaseModel):
 
         unknown = set(selected) - projection_streams()
         if unknown:
-            raise ValueError(f"unknown projection streams: {sorted(unknown)}")
+            raise ValueError("selected contains an unknown projection stream")
         return canonical_selected(selected)
 
 
@@ -614,7 +614,7 @@ async def action_apply_diff(
     from nso_adapter.core.apply import collect_apply_diff
 
     if outformat not in ("native", "cli"):
-        raise api_error(400, "bad_request", f"Unknown outformat {outformat!r} (native|cli)")
+        raise api_error(400, "bad_request", "Unknown outformat; expected native or cli")
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")

@@ -270,8 +270,7 @@ async def harvest_community(
         raise api_error(
             409,
             "harvest_unsupported_ned",
-            f"NED {ned_id!r} is not harvest-capable (SR OS stores communities "
-            "hash2-obfuscated — live-confirmed; v3 secrets are never harvestable)",
+            "NED is not harvest-capable (SR OS stores communities hash2-obfuscated; v3 secrets are never harvestable)",
         )
 
     unavailable = None

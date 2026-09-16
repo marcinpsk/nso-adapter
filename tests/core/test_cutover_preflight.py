@@ -13,6 +13,21 @@ from tests.core.test_static_route_put import A, B, seed_rows
 pytestmark = pytest.mark.anyio
 
 
+async def test_cutover_refusal_identifies_each_parked_carrier():
+    from nso_adapter.core.cutover import CutoverBlocked, ParkedCarrier
+
+    internal_vrf = "internal-vrf-key"
+    internal_prefix = "198.18.77.0/24"
+    internal_next_hop = "198.18.78.1"
+
+    refusal = CutoverBlocked([ParkedCarrier(7, 9, ((internal_vrf, internal_prefix, internal_next_hop),))])
+
+    assert str(refusal) == (
+        "1 static-route carrier(s) are parked and must drain first: "
+        "device 7 tombstone 9 keys [('internal-vrf-key', '198.18.77.0/24', '198.18.78.1')]"
+    )
+
+
 async def _job(job_id: int):
     from nso_adapter.store.models import Job
 

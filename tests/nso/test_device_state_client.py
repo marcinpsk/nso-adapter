@@ -18,6 +18,7 @@ import pytest
 
 from nso_adapter.config import NsoInstanceConfig
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError, NsoReadContractError
+from tests._secret_discipline import assert_chain_free_of
 
 
 def _make_client() -> NsoClient:
@@ -265,19 +266,26 @@ def _action(output: dict) -> dict:
 
 async def test_action_non_atomic_response_is_a_contract_violation(patch_client):
     client = _make_client()
-    body = _action({"device-name": "sw01", "ospf-config": {"status": "ok"}})  # no atomic:true
+    submitted_device = "placeholder-non-atomic-device"
+    body = _action({"device-name": submitted_device, "ospf-config": {"status": "ok"}})  # no atomic:true
     with patch_client(client, EnvelopeTransport(action_body=body)):
-        with pytest.raises(NsoReadContractError):
-            await client.run_device_state_read("sw01", ["ospf-config"])
+        with pytest.raises(NsoReadContractError) as caught:
+            await client.run_device_state_read(submitted_device, ["ospf-config"])
+
+    assert_chain_free_of(caught.value, [submitted_device])
 
 
 async def test_action_wrong_device_echo_is_a_contract_violation(patch_client):
     """A version-skewed response for ANOTHER device must never be read as this device's state."""
     client = _make_client()
-    body = _action({"atomic": True, "device-name": "other", "ospf-config": {"status": "ok"}})
+    submitted_device = "placeholder-requested-device"
+    provider_device = "placeholder-provider-device"
+    body = _action({"atomic": True, "device-name": provider_device, "ospf-config": {"status": "ok"}})
     with patch_client(client, EnvelopeTransport(action_body=body)):
-        with pytest.raises(NsoReadContractError):
-            await client.run_device_state_read("sw01", ["ospf-config"])
+        with pytest.raises(NsoReadContractError) as caught:
+            await client.run_device_state_read(submitted_device, ["ospf-config"])
+
+    assert_chain_free_of(caught.value, [submitted_device, provider_device])
 
 
 async def test_action_missing_device_echo_is_a_contract_violation(patch_client):
