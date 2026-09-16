@@ -40,6 +40,7 @@ from nso_adapter.core.request_flags import (
     STORE_ONLY_PROVENANCE,
     request_marking,
 )
+from nso_adapter.nso.client import failure_detail
 
 logger = structlog.get_logger(__name__)
 
@@ -874,7 +875,7 @@ async def _sr_sync_from(client, device, result: dict, *, job_id: int) -> bool:
                 job_id=job_id,
                 device_id=device.id,
                 attempt=attempt,
-                error=repr(exc),
+                error=failure_detail(exc),
             )
     result["sync_from"] = "failed"
     return False
@@ -1732,7 +1733,7 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
                             job_id=job_id,
                             device_id=device_id,
                             attempt=attempt,
-                            error=repr(exc),
+                            error=failure_detail(exc),
                         )
                         if attempt == 2:
                             # CDB keeps the locally-applied reverse diff until some
@@ -1763,7 +1764,7 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
                 job_id=job_id,
                 device_id=device_id,
                 scope=scope,
-                orphans=blocked.orphans,
+                error=failure_detail(blocked),
             )
             await _mark_job_failed(
                 db,
@@ -1795,7 +1796,13 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
         except Exception as exc:  # noqa: BLE001 — record on the job, never crash the worker
             from nso_adapter.core.jobs import _mark_job_failed
 
-            logger.error("removal.failed", job_id=job_id, device_id=device_id, scope=scope, error=repr(exc))
+            logger.error(
+                "removal.failed",
+                job_id=job_id,
+                device_id=device_id,
+                scope=scope,
+                error=failure_detail(exc),
+            )
             await _mark_job_failed(db, job_id, error_envelope(exc, code="removal_failed", detail={"scope": scope}), reg)
 
 
@@ -1814,7 +1821,12 @@ async def _enqueue_followup_sync(db: AsyncSession, job_id: int, device_id: int) 
         # Revocation is not a runner error: recovery already owns the disposition.
         raise
     except Exception as exc:  # noqa: BLE001 — never fail a committed removal on this
-        logger.warning("removal.followup_sync_enqueue_failed", job_id=job_id, device_id=device_id, error=repr(exc))
+        logger.warning(
+            "removal.followup_sync_enqueue_failed",
+            job_id=job_id,
+            device_id=device_id,
+            error=failure_detail(exc),
+        )
 
 
 # store family → the YANG list that carries the object in the route-policy service

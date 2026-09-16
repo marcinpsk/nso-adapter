@@ -636,8 +636,7 @@ def _certify_clears(document: dict, clears: tuple[SrClear, ...]) -> None:
             )
         if clear.key != _row_triple(row):
             raise ValueError(
-                f"recorded static-route clear for row {clear.row_id} names key {list(clear.key)}, "
-                f"which is not the {list(_row_triple(row))} that row renders"
+                f"recorded static-route clear for row {clear.row_id} does not match the row's rendered key"
             )
         authorized = authorized_clear_fields(row.get("pending_clear"))
         unset = {field for field in authorized if not wire_set(field, row.get(field))}
@@ -649,14 +648,14 @@ def _certify_clears(document: dict, clears: tuple[SrClear, ...]) -> None:
 
 
 def _sr_key(value) -> Triple:
-    """Return the execution key *value* names, naming a malformed one.
+    """Return the execution key *value* names.
 
     The length is checked here because ``as_triple`` UNPACKS: a two-element key raised
-    "not enough values to unpack" and said nothing about the document that carried it.
+    "not enough values to unpack" instead of the authored document diagnostic.
     """
     key = as_triple(value) if isinstance(value, (list, tuple)) and len(value) == 3 else None
     if key is None:
-        raise ValueError(f"a static-route execution key must contain three values; got {value!r}")
+        raise ValueError("a static-route execution key must contain three values")
     return key
 
 
