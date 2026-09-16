@@ -85,6 +85,19 @@ def test_flags_new_credential_literals(statement):
 
 
 @pytest.mark.parametrize(
+    ("statement", "expected_hits"),
+    [
+        ('client(*("admin", "placeholder"))', 1),
+        ('client(*["admin"])', 1),
+        ('username, password = *("admin",), "p"', 1),
+        ('client(*("placeholder-user", "placeholder"))', 0),
+    ],
+)
+def test_checks_credential_literals_in_starred_values(statement, expected_hits):
+    assert len(scan_source(statement, "t.py")) == expected_hits
+
+
+@pytest.mark.parametrize(
     "statement",
     [
         'lambda password="admin": None',
