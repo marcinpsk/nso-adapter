@@ -298,12 +298,16 @@ rules:
       include:
         - nso_adapter/main.py
         - nso_adapter/api/capability.py
+        - nso_adapter/core/apply.py
         - nso_adapter/core/capability.py
+        - nso_adapter/core/failover.py
         - nso_adapter/core/importer.py
         - nso_adapter/core/redistribution.py
         - nso_adapter/core/refresh_engine.py
+        - nso_adapter/core/route_policy.py
         - nso_adapter/notifications/sse_subscriber.py
         - nso_adapter/notifications/persistent_subscriber.py
+        - nso_adapter/nso/apply.py
         - nso_adapter/nso/client.py
         - review-patterns.py
     pattern-either:
@@ -322,12 +326,16 @@ rules:
       include:
         - nso_adapter/main.py
         - nso_adapter/api/capability.py
+        - nso_adapter/core/apply.py
         - nso_adapter/core/capability.py
+        - nso_adapter/core/failover.py
         - nso_adapter/core/importer.py
         - nso_adapter/core/redistribution.py
         - nso_adapter/core/refresh_engine.py
+        - nso_adapter/core/route_policy.py
         - nso_adapter/notifications/sse_subscriber.py
         - nso_adapter/notifications/persistent_subscriber.py
+        - nso_adapter/nso/apply.py
         - nso_adapter/nso/client.py
         - review-patterns.py
     pattern-sources:

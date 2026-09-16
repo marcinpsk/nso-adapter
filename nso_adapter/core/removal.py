@@ -688,7 +688,13 @@ async def guarded_device_write(
             orphans = _document_orphans(current, containers, allowed)
             if orphans:
                 raise RemovalBlockedError(orphans)
-    return await apply_device_intent(client, device_name, containers, no_networking=no_networking)
+    return await apply_device_intent(
+        client,
+        device_name,
+        containers,
+        device_id=device.id,
+        no_networking=no_networking,
+    )
 
 
 # Static-route carriers retain their settlement classification across the aggregate send.
