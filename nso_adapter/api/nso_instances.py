@@ -12,6 +12,7 @@ from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404, RESP_502_NSO, ApiError, api_error
 from nso_adapter.config import get_config
 from nso_adapter.core.importer import get_nso_client
+from nso_adapter.domain.diagnostics import device_ref
 from nso_adapter.nso.neds import extract_ned_id_from_device_dict, ned_family
 from nso_adapter.store.models import Device
 
@@ -29,6 +30,7 @@ class InstanceDeviceOut(BaseModel):
     """EMIT-NULL enriched device row — every key present, nullables emitted as null."""
 
     name: str
+    device_ref: str
     address: str | None
     ned_id: str | None
     platform: str | None
@@ -121,6 +123,7 @@ async def list_instance_devices(instance_id: str, db: AsyncSession = Depends(get
         out.append(
             {
                 "name": name,
+                "device_ref": device_ref(instance_id, name),
                 "address": d.get("address") or None,
                 "ned_id": raw_ned_id,
                 "platform": ned_family(raw_ned_id) if raw_ned_id else None,
