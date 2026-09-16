@@ -1118,7 +1118,7 @@ def test_hydration_refuses_a_recorded_clear_the_documents_own_rows_do_not_descri
     with pytest.raises(ValueError) as malformed_key:
         hydrate_static_route_removal_plan(_document({**good, "key": ["", recorded_prefix]}))
     assert_chain_free_of(malformed_key.value, [recorded_prefix])
-    assert str(malformed_key.value) == "a static-route execution key must contain three values"
+    assert str(malformed_key.value) == "a static-route execution key must contain three values; got 2"
     with pytest.raises(ValueError, match="wire-unset"):
         hydrate_static_route_removal_plan(_document({**good, "fields": ["tag"]}))
 
