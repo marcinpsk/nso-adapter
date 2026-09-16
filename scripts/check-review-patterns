@@ -20,7 +20,61 @@ case "$mode" in
       set -- nso_adapter
     fi
     require_opengrep
-    exec "$scan_bin" scan --config .opengrep/nso-rules.yaml --error -- "$@"
+    scan_output="$(mktemp)"
+    trap 'rm -f "$scan_output"' EXIT
+    if "$scan_bin" scan --config .opengrep/nso-rules.yaml --error --quiet --json -- "$@" >"$scan_output"; then
+      scan_status=0
+    else
+      scan_status=$?
+    fi
+    if python3 - "$scan_output" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+expected_partial_paths = {
+    "nso_adapter/core/failover.py",
+    "nso_adapter/core/refresh_engine.py",
+}
+
+report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+for finding in report.get("results", []):
+    print(
+        f"{finding['path']}:{finding['start']['line']}  "
+        f"{finding['check_id']}  {finding['extra']['message']}"
+    )
+
+partial_paths = {
+    error["path"]
+    for error in report.get("errors", [])
+    if error.get("type")
+    and (error["type"] == "PartialParsing" or error["type"][0] == "PartialParsing")
+}
+new_partial_paths = partial_paths - expected_partial_paths
+resolved_partial_paths = expected_partial_paths - partial_paths
+if new_partial_paths or resolved_partial_paths:
+    print("OpenGrep partial parsing changed. Inspect kb #1718 and update the pin by hand.", file=sys.stderr)
+    if new_partial_paths:
+        print("New partially analysed files:", file=sys.stderr)
+        for path in sorted(new_partial_paths):
+            print(f"  {path}", file=sys.stderr)
+    if resolved_partial_paths:
+        print("Expected partially analysed files no longer reported:", file=sys.stderr)
+        for path in sorted(resolved_partial_paths):
+            print(f"  {path}", file=sys.stderr)
+    raise SystemExit(1)
+
+print(f"OpenGrep partial-parse pin matches exactly ({len(partial_paths)} files).")
+PY
+    then
+      report_status=0
+    else
+      report_status=$?
+    fi
+    if (( scan_status )); then
+      exit "$scan_status"
+    fi
+    exit "$report_status"
     ;;
   test)
     if (( $# )); then echo "test does not accept arguments" >&2; exit 2; fi
