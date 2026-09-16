@@ -822,14 +822,18 @@ def test_clears_suppressed_matches_the_two_removal_modes():
     assert clears_suppressed({"retract_deferred": True}) is True
 
 
-def test_malformed_execution_key_error_names_the_internal_key_shape():
+def test_malformed_execution_key_error_names_the_shape_not_the_route():
     from nso_adapter.core.static_route_plan import _sr_key
+    from tests._secret_discipline import assert_chain_free_of
 
-    internal_value = "internal-route-key"
+    # The element is a route identity even inside our own stored document, so the message
+    # names how many values arrived and never which ones.
+    route_identity = "198.18.7.0/24"
     with pytest.raises(ValueError, match="must contain three values") as caught:
-        _sr_key([internal_value])
+        _sr_key([route_identity])
 
-    assert str(caught.value) == "a static-route execution key must contain three values; got ['internal-route-key']"
+    assert str(caught.value) == "a static-route execution key must contain three values; got 1"
+    assert_chain_free_of(caught.value, [route_identity])
 
 
 async def test_a_frozen_removal_plan_round_trips_its_clears(adapter_client):
