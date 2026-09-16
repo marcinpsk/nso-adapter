@@ -85,17 +85,53 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
         if lineno not in self.violations:
             self.violations.append(lineno)
 
-    def _assignment(self, targets: list[ast.expr], value: ast.expr) -> None:
-        aliases_exception = not _is_closed_exception_classification(value) and any(
-            isinstance(part, ast.Name) and part.id in self.aliases for part in ast.walk(value)
+    def _aliases_exception(self, values: ast.expr | list[ast.expr]) -> bool:
+        if not isinstance(values, list):
+            values = [values]
+        return any(
+            not _is_closed_exception_classification(value)
+            and any(isinstance(part, ast.Name) and part.id in self.aliases for part in ast.walk(value))
+            for value in values
         )
-        for target in targets:
-            if not isinstance(target, ast.Name):
-                continue
-            if aliases_exception:
+
+    def _bind_target(self, target: ast.expr, values: ast.expr | list[ast.expr]) -> None:
+        if isinstance(target, ast.Name):
+            if self._aliases_exception(values):
                 self.aliases.add(target.id)
             else:
                 self.aliases.discard(target.id)
+        elif isinstance(target, ast.Starred):
+            self._bind_target(target.value, values)
+        elif isinstance(target, (ast.List, ast.Tuple)):
+            if isinstance(values, (ast.List, ast.Tuple)):
+                self._bind_sequence(target.elts, values.elts)
+            else:
+                for element in target.elts:
+                    self._bind_target(element, values)
+
+    def _bind_sequence(self, targets: list[ast.expr], values: list[ast.expr]) -> None:
+        starred = next((index for index, target in enumerate(targets) if isinstance(target, ast.Starred)), None)
+        if starred is None:
+            if len(targets) == len(values):
+                for target, value in zip(targets, values, strict=True):
+                    self._bind_target(target, value)
+                return
+        elif len(values) >= len(targets) - 1:
+            trailing = len(targets) - starred - 1
+            for target, value in zip(targets[:starred], values[:starred], strict=True):
+                self._bind_target(target, value)
+            starred_end = len(values) - trailing if trailing else len(values)
+            self._bind_target(targets[starred], values[starred:starred_end])
+            if trailing:
+                for target, value in zip(targets[-trailing:], values[-trailing:], strict=True):
+                    self._bind_target(target, value)
+            return
+        for target in targets:
+            self._bind_target(target, values)
+
+    def _assignment(self, targets: list[ast.expr], value: ast.expr) -> None:
+        for target in targets:
+            self._bind_target(target, value)
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         outer_aliases = self.aliases
@@ -277,6 +313,31 @@ except Exception as caught:
     logger.warning("event", detail=alias)
 """
     assert _raw_log_exception_renderers(source) == [5]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """\
+detail, authored = exc, "authored detail"
+logger.warning("event", detail=detail)
+logger.warning("event", detail=authored)
+""",
+        """\
+[detail, authored] = [exc, "authored detail"]
+logger.warning("event", detail=detail)
+logger.warning("event", detail=authored)
+""",
+        """\
+*detail, authored = exc, "authored detail"
+logger.warning("event", detail=detail)
+logger.warning("event", detail=authored)
+""",
+    ],
+    ids=["tuple", "list", "starred"],
+)
+def test_raw_exception_log_guard_tracks_structured_assignment_elements(source: str) -> None:
+    assert _raw_log_exception_renderers(source) == [2]
 
 
 def test_raw_exception_log_guard_rejects_bound_logger_calls() -> None:
