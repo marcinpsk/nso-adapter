@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import logging
 import os
 import subprocess
 import sys
@@ -19,10 +20,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import sqlalchemy as sa
+import structlog
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.orm import Session as SyncSession
+from structlog.testing import capture_logs
 
 from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.main import create_app
@@ -46,6 +49,26 @@ def pytest_xdist_auto_num_workers(config: pytest.Config) -> int:
 
 
 VALID_TOKEN = "test-bearer-token"
+
+
+@pytest.fixture
+def debug_logs():
+    """Capture DEBUG structlog records without leaking temporary global configuration."""
+    was_configured = structlog.is_configured()
+    previous = structlog.get_config().copy()
+    structlog.configure(
+        wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG),
+        cache_logger_on_first_use=False,
+    )
+    try:
+        with capture_logs() as logs:
+            yield logs
+    finally:
+        if was_configured:
+            structlog.configure(**previous)
+        else:
+            structlog.reset_defaults()
+
 
 # Every in-protocol intent PUT REQUIRES X-Push-Seq (a header-less delivery is a 422), so a
 # test that pushes is a claim sender like any other. The counter only ever increases, and

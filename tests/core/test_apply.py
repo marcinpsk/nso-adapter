@@ -4,14 +4,12 @@
 
 from __future__ import annotations
 
-import logging
 from contextlib import ExitStack
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-import structlog
 from sqlalchemy import select
 from structlog.testing import capture_logs
 
@@ -33,16 +31,6 @@ from nso_adapter.store.models import (
 )
 from tests._secret_discipline import assert_records_free_of, assert_text_free_of
 from tests.conftest import attach_apply_generation, note_projection_write, session
-
-
-@pytest.fixture
-def recorded_logs(caplog):
-    previous = structlog.get_config().copy()
-    structlog.configure(logger_factory=structlog.stdlib.LoggerFactory(), cache_logger_on_first_use=False)
-    caplog.set_level(logging.INFO)
-    yield caplog
-    structlog.configure(**previous)
-
 
 # ── nokia_routed_kind (pure: derives SR OS router context from kind/service/vrf) ──
 
@@ -1985,7 +1973,16 @@ async def test_localisation_empties_one_family_at_a_time_and_records_its_capabil
         await db.commit()
     job_id = await _seed_apply_job(device_id)
 
-    async def _sender(client, device_name, containers, *, dry_run=False, no_networking=False, strict=False):
+    async def _sender(
+        client,
+        device_name,
+        containers,
+        *,
+        device_id,
+        dry_run=False,
+        no_networking=False,
+        strict=False,
+    ):
         if not dry_run:
             raise NsoApplyError("nso_put_failed", "static route rejected by NED")
         # the localisation trials: only the document WITHOUT static-route compiles
@@ -2036,7 +2033,16 @@ async def test_a_refusal_that_names_its_family_skips_the_localisation_loop(adapt
     refusal = "device-intent: refused [family=snmp field=community]: no such construct"
     trials: list[set[str]] = []
 
-    async def _sender(client, device_name, containers, *, dry_run=False, no_networking=False, strict=False):
+    async def _sender(
+        client,
+        device_name,
+        containers,
+        *,
+        device_id,
+        dry_run=False,
+        no_networking=False,
+        strict=False,
+    ):
         if dry_run:
             trials.append(set(containers))
             return "delta"
@@ -2095,7 +2101,16 @@ async def test_a_rejected_interface_family_is_attributed_to_the_offending_half(a
         ' "99" is out of range.'
     )
 
-    async def _sender(client, device_name, containers, *, dry_run=False, no_networking=False, strict=False):
+    async def _sender(
+        client,
+        device_name,
+        containers,
+        *,
+        device_id,
+        dry_run=False,
+        no_networking=False,
+        strict=False,
+    ):
         if not dry_run:
             raise NsoApplyError(
                 "nso_put_failed",
@@ -2151,7 +2166,16 @@ async def test_an_unattributable_interface_rejection_records_both_halves(adapter
         await db.commit()
     job_id = await _seed_apply_job(device_id)
 
-    async def _sender(client, device_name, containers, *, dry_run=False, no_networking=False, strict=False):
+    async def _sender(
+        client,
+        device_name,
+        containers,
+        *,
+        device_id,
+        dry_run=False,
+        no_networking=False,
+        strict=False,
+    ):
         if not dry_run:
             raise NsoApplyError("nso_put_failed", "opaque NED failure")
         if "interface" in containers:
@@ -2265,7 +2289,16 @@ async def test_run_apply_misconfig_device_rejection_records_no_capability(adapte
 
     device_err = "RPC error towards sw01: Policy error: PL-X prefix-list referenced (in term 10) but not defined"
 
-    async def _sender(client, device_name, containers, *, dry_run=False, no_networking=False, strict=False):
+    async def _sender(
+        client,
+        device_name,
+        containers,
+        *,
+        device_id,
+        dry_run=False,
+        no_networking=False,
+        strict=False,
+    ):
         if not dry_run:
             raise NsoApplyError(
                 "nso_patch_failed",
@@ -2297,7 +2330,16 @@ async def test_run_apply_transient_failure_records_no_capability(adapter_client)
     await _seed_route_map_intent(device_id, "juniper-junos-nc-4.19:junos")
     job_id = await _seed_apply_job(device_id)
 
-    async def _sender(client, device_name, containers, *, dry_run=False, no_networking=False, strict=False):
+    async def _sender(
+        client,
+        device_name,
+        containers,
+        *,
+        device_id,
+        dry_run=False,
+        no_networking=False,
+        strict=False,
+    ):
         if not dry_run:
             raise NsoApplyError("internal", "connection timed out")  # transport — no nso_error
         return "rendered-delta"
@@ -2314,7 +2356,7 @@ async def test_run_apply_transient_failure_records_no_capability(adapter_client)
 
 
 @pytest.mark.asyncio
-async def test_run_apply_transient_during_localize_records_no_capability(adapter_client):
+async def test_run_apply_transient_during_localize_records_no_capability(adapter_client, debug_logs):
     """A transient transport error DURING per-scope localisation must NOT brand the scope
     'unsupported' — only a conclusive rejection is a capability signal (finding #10)."""
     from nso_adapter.nso.apply import NsoApplyError
@@ -2329,8 +2371,19 @@ async def test_run_apply_transient_during_localize_records_no_capability(adapter
     job_id = await _seed_apply_job(device_id)
 
     device_err = "RPC error: something rejected"
+    seen_device_ids = []
 
-    async def _sender(client, device_name, containers, *, dry_run=False, no_networking=False, strict=False):
+    async def _sender(
+        client,
+        device_name,
+        containers,
+        *,
+        device_id=None,
+        dry_run=False,
+        no_networking=False,
+        strict=False,
+    ):
+        seen_device_ids.append(device_id)
         if not dry_run:
             raise NsoApplyError(
                 "nso_patch_failed",
@@ -2348,6 +2401,75 @@ async def test_run_apply_transient_during_localize_records_no_capability(adapter
     async with session() as db:
         assert (await db.execute(select(DeviceCapability))).scalars().all() == []  # no false 'unsupported'
         assert (await db.get(Job, job_id)).status == JobStatus.failed
+    records = [
+        record
+        for record in debug_logs
+        if record["event"] in {"apply.localize.inconclusive", "apply.localize.not_reproducible"}
+    ]
+    assert {record["event"] for record in records} == {
+        "apply.localize.inconclusive",
+        "apply.localize.not_reproducible",
+    }
+    assert all(record["device_id"] == device_id for record in records)
+    assert set(seen_device_ids) == {device_id}
+    assert_records_free_of(records, ["sw01"])
+
+
+@pytest.mark.asyncio
+async def test_run_apply_trial_localize_diagnostic_uses_device_id(adapter_client, debug_logs):
+    from nso_adapter.nso.apply import NsoApplyError
+    from nso_adapter.store.models import Device
+
+    device_id = await _seed_device(name="placeholder-localize-trial")
+    await _seed_snmp_and_static_route(device_id)
+    async with session() as db:
+        dev = await db.get(Device, device_id)
+        dev.ned_id, dev.sw_version = "cisco-ios-cli:cisco-ios", "15.7"
+        await db.commit()
+    job_id = await _seed_apply_job(device_id)
+    dry_runs = 0
+    seen_device_ids = []
+
+    async def _sender(
+        client,
+        device_name,
+        containers,
+        *,
+        device_id=None,
+        dry_run=False,
+        no_networking=False,
+        strict=False,
+    ):
+        nonlocal dry_runs
+        seen_device_ids.append(device_id)
+        if not dry_run:
+            raise NsoApplyError(
+                "nso_patch_failed",
+                "rejected",
+                detail={
+                    "nso_error": {
+                        "ietf-restconf:errors": {"error": [{"error-message": "RPC error: something rejected"}]}
+                    }
+                },
+            )
+        dry_runs += 1
+        if dry_runs == 1:
+            raise NsoApplyError("dry_run_rejected", "document rejected")
+        raise ConnectionError("transient trial blip")
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, _sender),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    records = [
+        record for record in debug_logs if record["event"] == "apply.localize.inconclusive" and "family" in record
+    ]
+    assert records
+    assert all(record["device_id"] == device_id for record in records)
+    assert set(seen_device_ids) == {device_id}
+    assert_records_free_of(records, ["placeholder-localize-trial"])
 
 
 @pytest.mark.asyncio
@@ -2550,6 +2672,7 @@ async def test_run_apply_reader_compare_flags_silent_drop(adapter_client):
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
+        capture_logs() as logs,
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -2565,6 +2688,10 @@ async def test_run_apply_reader_compare_flags_silent_drop(adapter_client):
         )
         assert row.last_apply_error["code"] == "reader_compare_missing"
         assert "198.18.26.0/24" in row.last_apply_error["message"]
+    record = next(record for record in logs if record["event"] == "apply.reader_compare_missing")
+    assert record["device_id"] == device_id
+    assert record["scope"] == "static_route"
+    assert_records_free_of([record], ["rtr-rc-drop"])
 
 
 async def test_run_apply_reader_compare_ok_when_key_lands(adapter_client):
