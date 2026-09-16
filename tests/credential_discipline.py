@@ -32,6 +32,14 @@ from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
 
+from tests._ast_scanner_support import (
+    argument_names,
+    match_capture_names,
+    pattern_is_irrefutable,
+    scope_bound_names,
+    statement_may_raise,
+)
+
 TESTS_ROOT = Path(__file__).resolve().parent
 _OBSOLETE_BASELINE_PATH = TESTS_ROOT / "credential_discipline_baseline.txt"
 _CREDENTIAL_WORDS = {"username", "user", "password", "passwd", "pwd", "secret", "token", "auth", "credentials"}
@@ -124,79 +132,6 @@ def _constant_strings(node: ast.AST, aliases: dict[str, set[str]] | None = None)
     return None
 
 
-def _match_capture_names(pattern: ast.pattern) -> set[str]:
-    names: set[str] = set()
-    for part in ast.walk(pattern):
-        if isinstance(part, (ast.MatchAs, ast.MatchStar)) and part.name is not None:
-            names.add(part.name)
-        elif isinstance(part, ast.MatchMapping) and part.rest is not None:
-            names.add(part.rest)
-    return names
-
-
-def _pattern_is_irrefutable(pattern: ast.pattern) -> bool:
-    if isinstance(pattern, ast.MatchAs):
-        return pattern.pattern is None or _pattern_is_irrefutable(pattern.pattern)
-    return isinstance(pattern, ast.MatchOr) and any(_pattern_is_irrefutable(part) for part in pattern.patterns)
-
-
-class _ScopeBindingCollector(ast.NodeVisitor):
-    """Collect names bound in one lexical scope without entering child scopes."""
-
-    def __init__(self) -> None:
-        self.names: set[str] = set()
-
-    def visit_Name(self, node: ast.Name) -> None:  # noqa: N802 - ast visitor API
-        if isinstance(node.ctx, (ast.Store, ast.Del)):
-            self.names.add(node.id)
-
-    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:  # noqa: N802 - ast visitor API
-        if node.name is not None:
-            self.names.add(node.name)
-        self.generic_visit(node)
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802 - ast visitor API
-        self.names.add(node.name)
-
-    visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
-
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802 - ast visitor API
-        self.names.add(node.name)
-
-    def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802 - ast visitor API
-        return
-
-    def visit_ListComp(self, node: ast.ListComp) -> None:  # noqa: N802 - ast visitor API
-        return
-
-    visit_SetComp = visit_ListComp  # type: ignore[assignment]
-    visit_GeneratorExp = visit_ListComp  # type: ignore[assignment]
-    visit_DictComp = visit_ListComp  # type: ignore[assignment]
-
-
-def _scope_bound_names(nodes: list[ast.AST]) -> set[str]:
-    collector = _ScopeBindingCollector()
-    for node in nodes:
-        collector.visit(node)
-    return collector.names
-
-
-def _statement_may_raise(statement: ast.stmt) -> bool:
-    if isinstance(statement, (ast.Pass, ast.Break, ast.Continue)):
-        return False
-    if isinstance(statement, (ast.Try, ast.TryStar)):
-        return False
-    if isinstance(statement, ast.Assign):
-        return not isinstance(statement.value, ast.Constant) or not all(
-            isinstance(target, ast.Name) for target in statement.targets
-        )
-    return (
-        not isinstance(statement, ast.AnnAssign)
-        or not isinstance(statement.target, ast.Name)
-        or not isinstance(statement.value, ast.Constant)
-    )
-
-
 class _Scanner(ast.NodeVisitor):
     """Collect credential literals with their lexical scope."""
 
@@ -226,14 +161,6 @@ class _Scanner(ast.NodeVisitor):
             if value is not None and _credential_name(arg.arg):
                 self._check_value(value, value)
 
-    @staticmethod
-    def _argument_names(arguments: ast.arguments) -> set[str]:
-        return (
-            {argument.arg for argument in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)}
-            | ({arguments.vararg.arg} if arguments.vararg is not None else set())
-            | ({arguments.kwarg.arg} if arguments.kwarg is not None else set())
-        )
-
     def _visit_enclosing_expressions(self, expressions) -> None:
         for expression in expressions:
             if expression is None:
@@ -262,7 +189,7 @@ class _Scanner(ast.NodeVisitor):
         enclosing_constants = (
             self._class_enclosing_constants[-1] if self._class_enclosing_constants else outer_constants
         )
-        local_names = _scope_bound_names(list(node.body)) | self._argument_names(node.args)
+        local_names = scope_bound_names(list(node.body)) | argument_names(node.args)
         inherited = {name: values.copy() for name, values in enclosing_constants.items() if name not in local_names}
         self._scope.append(node.name)
         self._constant_scopes.append(inherited)
@@ -289,7 +216,7 @@ class _Scanner(ast.NodeVisitor):
         enclosing_constants = (
             self._class_enclosing_constants[-1] if self._class_enclosing_constants else outer_constants
         )
-        local_names = _scope_bound_names([node.body]) | self._argument_names(node.args)
+        local_names = scope_bound_names([node.body]) | argument_names(node.args)
         inherited = {name: values.copy() for name, values in enclosing_constants.items() if name not in local_names}
         self._constant_scopes.append(inherited)
         self._try_handler_inputs = []
@@ -393,7 +320,7 @@ class _Scanner(ast.NodeVisitor):
 
     def _visit_statements(self, statements: list[ast.stmt]) -> bool:
         for statement in statements:
-            if _statement_may_raise(statement):
+            if statement_may_raise(statement):
                 self._record_handler_input()
                 if self._try_exception_inputs:
                     self._try_exception_inputs[-1] = self._merge_constants(
@@ -584,7 +511,7 @@ class _Scanner(ast.NodeVisitor):
 
         for case in node.cases:
             self._constant_scopes[-1] = {name: values.copy() for name, values in incoming.items()}
-            for name in _match_capture_names(case.pattern):
+            for name in match_capture_names(case.pattern):
                 if subject_values is None:
                     self._constant_scopes[-1].pop(name, None)
                 else:
@@ -595,7 +522,7 @@ class _Scanner(ast.NodeVisitor):
             if case_falls_through:
                 case_states.append(self._copy_constants())
                 falls_through = True
-            exhaustive |= case.guard is None and _pattern_is_irrefutable(case.pattern)
+            exhaustive |= case.guard is None and pattern_is_irrefutable(case.pattern)
 
         if not exhaustive:
             case_states.append(incoming)
