@@ -20,6 +20,7 @@ from nso_adapter.nso.read_outcome import (
     UnavailableReason,
     classify_envelope_section,
 )
+from tests._secret_discipline import assert_text_free_of
 
 _ASKED = {"device": "rg03", "family": "static-route"}
 
@@ -61,7 +62,7 @@ class TestStatusMapping:
         assert outcome.failure.code is ReadFailureCode.section_status_error
         assert outcome.failure.operation is ReadOperation.section_classify
         assert (outcome.failure.device, outcome.failure.family) == ("rg03", "static-route")
-        assert "extract boom" not in repr(outcome)
+        assert_text_free_of(repr(outcome), ["extract boom"])
 
     @pytest.mark.parametrize("status", [None, "bogus", ""])
     def test_unknown_status_is_never_guessed_at(self, status):

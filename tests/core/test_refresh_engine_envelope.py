@@ -26,6 +26,7 @@ from nso_adapter.core.static_route import STATIC_ROUTE_SPEC
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
 from nso_adapter.nso.read_outcome import AbsentAuthoritative, Unavailable, UnavailableReason
 from nso_adapter.store.models import Device, DeviceStaticRoute, RefreshOutcome
+from tests._secret_discipline import assert_records_free_of
 from tests.conftest import seed_device, session
 
 ENV_SPEC = dataclasses.replace(STATIC_ROUTE_SPEC, wire_name="static-route")
@@ -233,7 +234,7 @@ async def test_refresh_events_do_not_log_the_nso_device_name(adapter_client):
     }
     records = [record for record in logs if record["event"] in expected_events]
     assert {record["event"] for record in records} == expected_events
-    assert all(device_name not in str(record) for record in records)
+    assert_records_free_of(records, [device_name])
 
 
 @pytest.mark.anyio

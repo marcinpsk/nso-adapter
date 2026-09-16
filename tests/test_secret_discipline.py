@@ -20,7 +20,9 @@ _NON_DISCLOSURE_TESTS = (
     _TEST_ROOT / "api" / "test_api_secrets.py",
     _TEST_ROOT / "api" / "test_api_snmp_intent.py",
     _TEST_ROOT / "core" / "test_action_apply_promotion.py",
+    _TEST_ROOT / "core" / "test_envelope_classification.py",
     _TEST_ROOT / "core" / "test_redistribution.py",
+    _TEST_ROOT / "core" / "test_refresh_engine_envelope.py",
     _TEST_ROOT / "test_secret_discipline.py",
     _TEST_ROOT / "test_vault_provider.py",
 )
@@ -33,7 +35,7 @@ def _reads_an_inspected_surface(node: ast.AST) -> bool:
         and part.attr in _INSPECTED_ATTRIBUTES
         or isinstance(part, ast.Call)
         and isinstance(part.func, ast.Name)
-        and part.func.id == "str"
+        and part.func.id in {"repr", "str"}
         for part in ast.walk(node)
     )
 
