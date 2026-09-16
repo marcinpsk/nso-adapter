@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import pytest
 
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -51,7 +52,7 @@ async def test_unregistered_instance_refusal_does_not_echo_the_persisted_name(ad
 
     assert resp.status_code == 409
     assert resp.json()["error"] == {"code": "no_nso_client", "message": "No NSO client is registered", "detail": {}}
-    assert instance not in resp.text
+    assert_text_free_of(resp.text, [instance])
 
 
 @pytest.mark.asyncio

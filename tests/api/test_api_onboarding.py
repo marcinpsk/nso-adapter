@@ -7,6 +7,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from tests._secret_discipline import assert_records_free_of, assert_text_free_of
 from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -59,7 +60,7 @@ async def test_onboard_duplicate_netbox_id_returns_409(adapter_client_with_nso):
         "message": "The requested NetBox device is already onboarded",
         "detail": {"reason": "netbox_device_claimed"},
     }
-    assert "100" not in resp.text
+    assert_text_free_of(resp.text, ["100"])
 
 
 async def test_onboard_duplicate_nso_device_returns_409(adapter_client_with_nso):
@@ -102,7 +103,8 @@ async def test_onboard_conflict_log_uses_adapter_ids_not_caller_names(adapter_cl
     assert error["code"] == "conflict"
     assert error["message"] == "The NSO device is already onboarded to a different NetBox device"
     assert error["detail"] == {"reason": "onboarded_elsewhere"}
-    assert "46231" not in resp.text, "the answer names the NetBox device the adapter is linked to"
+    assert_text_free_of(resp.text, ["46231"])
+    assert_records_free_of(logs, ["placeholder-linked-node"])
     refused = [record for record in logs if record["event"] == "device.onboard_refused"]
     assert refused, "the operator was told nothing"
     assert refused[0]["device_id"] == existing_id
@@ -136,7 +138,8 @@ async def test_rekey_conflict_log_uses_adapter_ids_not_caller_names(adapter_clie
     assert error["code"] == "conflict"
     assert error["message"] == "The target NSO identity is already claimed by another device"
     assert error["detail"] == {"reason": "identity_claimed"}
-    assert "placeholder-stored-node" not in resp.text, "the answer repeats the identity the row holds"
+    assert_text_free_of(resp.text, ["placeholder-stored-node"])
+    assert_records_free_of(logs, ["placeholder-stored-node"])
     refused = [record for record in logs if record["event"] == "device.rekey_refused"]
     assert refused, "the operator was told nothing"
     assert refused[0]["device_id"] == device_id
@@ -160,7 +163,7 @@ async def test_onboard_unknown_instance_returns_422(adapter_client):
     error = resp.json()["error"]
     assert error["code"] == "validation_error"
     assert error["message"] == "The requested NSO instance is not configured"
-    assert "nonexistent-nso" not in resp.text
+    assert_text_free_of(resp.text, ["nonexistent-nso"])
 
 
 async def test_onboard_requires_auth(adapter_client):
@@ -236,7 +239,7 @@ async def test_rekey_device_unknown_instance_returns_422(adapter_client):
     error = resp.json()["error"]
     assert error["code"] == "validation_error"
     assert error["message"] == "The requested NSO instance is not configured"
-    assert "nonexistent-nso" not in resp.text
+    assert_text_free_of(resp.text, ["nonexistent-nso"])
 
 
 async def test_rekey_requires_auth(adapter_client):

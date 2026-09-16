@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import text
 
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import VALID_TOKEN, push_seq, seed_device, seed_switchport, seed_vlan_database, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -584,4 +585,4 @@ async def test_apply_switchport_refusal_states_the_reason_and_not_the_root(adapt
     assert error["code"] == "validation_error"
     assert error["message"] == "a deleted root is not authorized on this device"
     assert error["detail"] == {"reason": "root_not_authorized"}
-    assert "placeholder-unauthorized-root" not in response.text, "the answer repeats the root the caller sent"
+    assert_text_free_of(response.text, ["placeholder-unauthorized-root"])

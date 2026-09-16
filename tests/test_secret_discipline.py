@@ -16,9 +16,13 @@ _TEST_ROOT = Path(__file__).resolve().parent
 _NON_DISCLOSURE_TESTS = (
     _TEST_ROOT / "api" / "test_actions_direct.py",
     _TEST_ROOT / "api" / "test_api.py",
+    _TEST_ROOT / "api" / "test_api_capability.py",
     _TEST_ROOT / "api" / "test_api_lag_config.py",
+    _TEST_ROOT / "api" / "test_api_onboarding.py",
+    _TEST_ROOT / "api" / "test_api_provision_async.py",
     _TEST_ROOT / "api" / "test_api_secrets.py",
     _TEST_ROOT / "api" / "test_api_snmp_intent.py",
+    _TEST_ROOT / "api" / "test_api_vlan.py",
     _TEST_ROOT / "core" / "test_action_apply_promotion.py",
     _TEST_ROOT / "core" / "test_envelope_classification.py",
     _TEST_ROOT / "core" / "test_redistribution.py",

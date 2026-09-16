@@ -14,6 +14,7 @@ from sqlalchemy import select
 
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import VALID_TOKEN, session, start_job
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -86,7 +87,7 @@ async def test_provision_unknown_instance_returns_422(adapter_client):
     error = resp.json()["error"]
     assert error["code"] == "validation_error"
     assert error["message"] == "The requested NSO instance is not configured"
-    assert "ghost-nso" not in resp.text
+    assert_text_free_of(resp.text, ["ghost-nso"])
 
 
 async def test_provision_requires_auth(adapter_client):
@@ -206,7 +207,7 @@ async def test_provision_step_detail_carries_no_bytes_from_the_host_key_answer(a
     assert job.result["ok"] is False
     step = next(s for s in job.result["steps"] if s["step"] == "fetch_host_keys")
     assert step["status"] == "failed"
-    assert "placeholder-server-secret" not in repr(job.result), "the job result repeats the server's bytes"
+    assert_text_free_of(job.result, ["placeholder-server-secret"])
     assert step["detail"] == "UnicodeDecodeError", "the step must still name WHAT failed"
 
 
@@ -221,4 +222,4 @@ async def test_provision_step_detail_keeps_the_ADAPTER_AUTHORED_host_key_refusal
     assert job.result["ok"] is False
     step = next(s for s in job.result["steps"] if s["step"] == "fetch_host_keys")
     assert "did not report a stored key" in step["detail"], "the authored refusal is the diagnostic"
-    assert "placeholder-server-secret" not in repr(job.result), "the action's own text must not travel"
+    assert_text_free_of(job.result, ["placeholder-server-secret"])
