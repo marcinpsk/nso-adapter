@@ -397,34 +397,48 @@ async def test_put_ip_intent_unknown_interface_lands(adapter_client):
 async def test_put_ip_intent_greenfield_routed_creates_interface(adapter_client):
     """An unknown interface carrying Nokia routed binding → DbInterface is materialised."""
     from sqlalchemy import select
+    from structlog.testing import capture_logs
 
     from nso_adapter.store.models import DbInterface, InterfaceIpIntent
+    from tests._secret_discipline import assert_records_free_of
 
     device_id = await seed_device(nso_device_name="ip-intent-gf", netbox_device_id=910)
+    interface_name = "LAG99:99"
+    parent_binding = "lag-99"
     payload = {
         "addresses": [
             {
-                "interface": "LAG99:99",
+                "interface": interface_name,
                 "address": "198.18.249.160/31",
                 "family": "ipv4",
                 "routed": True,
-                "parent_binding": "lag-99",
+                "parent_binding": parent_binding,
                 "encap_tag": "99",
             }
         ]
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH | push_seq(), json=payload)
+    with capture_logs() as logs:
+        resp = await adapter_client.put(
+            f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH | push_seq(), json=payload
+        )
     assert resp.status_code == 200
     assert resp.json()["address_count"] == 1
+
+    record = next(record for record in logs if record["event"] == "ip_intent.put.greenfield_interface")
+    assert record["device_id"] == device_id
+    assert record["encap_tag"] == "99"
+    assert "interface" not in record
+    assert "parent_binding" not in record
+    assert_records_free_of([record], [interface_name, parent_binding])
 
     async with session() as db:
         iface = (
             await db.execute(
-                select(DbInterface).where(DbInterface.device_id == device_id, DbInterface.name == "LAG99:99")
+                select(DbInterface).where(DbInterface.device_id == device_id, DbInterface.name == interface_name)
             )
         ).scalar_one()
         assert iface.kind == "logical"
-        assert iface.parent_binding == "lag-99"
+        assert iface.parent_binding == parent_binding
         assert iface.encap_tag == "99"
         rows = (
             (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface.id)))
@@ -433,6 +447,46 @@ async def test_put_ip_intent_greenfield_routed_creates_interface(adapter_client)
         )
         assert len(rows) == 1
         assert rows[0].address == "198.18.249.160/31"
+
+
+async def test_put_ip_intent_unknown_interface_record_uses_device_id(adapter_client):
+    from structlog.testing import capture_logs
+
+    from nso_adapter.api.interface_ip import IpAddressEntry, put_ip_intent
+    from nso_adapter.core.receipt import IntentDelivery, PushIdentity
+    from tests._secret_discipline import assert_records_free_of
+
+    staged = IpAddressEntry(interface="placeholder-staged", address="198.18.249.162/31", family="ipv4")
+    missing = IpAddressEntry(interface="placeholder-missing", address="198.18.249.164/31", family="ipv4")
+
+    class ChangingBody:
+        reads = 0
+
+        @property
+        def addresses(self):
+            self.reads += 1
+            return [staged] if self.reads == 1 else [] if self.reads == 2 else [missing]
+
+    delivery = IntentDelivery(
+        stream="ip",
+        identity=PushIdentity(
+            seq=91,
+            digest="placeholder-digest",
+            store_only=False,
+            delete_origin=False,
+            backfill_only=False,
+        ),
+    )
+    device_id = await seed_device(nso_device_name="ip-intent-defensive", netbox_device_id=911)
+    with capture_logs() as logs:
+        async with session() as db:
+            result = await put_ip_intent(device_id, ChangingBody(), db, delivery)
+
+    assert result["address_count"] == 0
+    record = next(record for record in logs if record["event"] == "ip_intent.put.unknown_interface")
+    assert record["device_id"] == device_id
+    assert "interface" not in record
+    assert_records_free_of([record], [missing.interface])
 
 
 async def test_put_ip_intent_routed_backfills_binding_only_when_missing(adapter_client):

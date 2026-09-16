@@ -483,10 +483,21 @@ async def test_c4_6_a_reclaimed_key_is_not_dropped(adapter_client, shape):
     assert fake.device_keys == expected
     warnings = [log for log in logs if log["event"] == "static_route.removal_key_reclaimed"]
     assert len(warnings) == int(rendered)
+    if rendered:
+        assert warnings[0]["device_id"] == device_id
+        assert warnings[0]["job_id"] == job_id
+        assert "keys" not in warnings[0]
+        from tests._secret_discipline import assert_records_free_of
+
+        assert_records_free_of(warnings, A[1:])
 
 
 async def test_c4_7_a_fully_superseded_removal_issues_no_http_at_all(adapter_client):
     """C4.7 — consumption by supersession, not by failure: no PUT, no read, job succeeds."""
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
     device_id = await seed_device(nso_device_name="sr-c47", netbox_device_id=7407)
     await seed_rows(device_id, [{"triple": A, "route_id": 2}])
     fake = SrFake("sr-c47", service=[wire(A), wire(B)])
@@ -494,13 +505,19 @@ async def test_c4_7_a_fully_superseded_removal_issues_no_http_at_all(adapter_cli
     tomb = await seed_tomb(device_id, A, route_id=1)
     job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
-    job = await run_removal_job(device_id, job_id, client)
+    with capture_logs() as logs:
+        job = await run_removal_job(device_id, job_id, client)
 
     assert job.status == JobStatus.succeeded
     assert job.result["superseded"] is True
     assert fake.calls == [], "a superseded removal must issue no HTTP at all"
     client.service_instance_state.assert_not_awaited()
     assert await tombstone_ids(device_id) == []
+    record = next(record for record in logs if record["event"] == "static_route.removal_superseded")
+    assert record["device_id"] == device_id
+    assert record["job_id"] == job_id
+    assert "reclaimed" not in record
+    assert_records_free_of([record], A[1:])
 
 
 # ── C4.8/C4.9 — an unproven deletion keeps its carrier and fails ─────────────
@@ -523,7 +540,10 @@ async def test_c4_8_service_absent_still_runs_the_proof(adapter_client):
 
 async def test_c4_9_residue_found_fails_the_job_and_the_next_sweep_reissues(adapter_client):
     """C4.9 — a ``succeeded`` job would make the tombstone permanently un-sweepable (G17)."""
+    from structlog.testing import capture_logs
+
     from nso_adapter.core.tombstone_sweep import sweep_tombstones
+    from tests._secret_discipline import assert_records_free_of
 
     device_id = await seed_device(nso_device_name="sr-c49", netbox_device_id=7409)
     await seed_owned(device_id, [B])
@@ -542,12 +562,18 @@ async def test_c4_9_residue_found_fails_the_job_and_the_next_sweep_reissues(adap
 
     fake.section = _sticky_section
 
-    job = await run_removal_job(device_id, job_id, client)
+    with capture_logs() as logs:
+        job = await run_removal_job(device_id, job_id, client)
 
     assert job.status == JobStatus.failed
     assert job.error["code"] == "static_route_removal_residue_found"
     assert await tombstone_ids(device_id) == [tomb]
     assert await sweep_tombstones() == 1, "a failed owner makes the tombstone eligible again"
+    record = next(record for record in logs if record["event"] == "removal.residue_found")
+    assert record["device_id"] == device_id
+    assert record["scope"] == "static_route"
+    assert "residue" not in record
+    assert_records_free_of([record], A[1:])
 
 
 # ── C4.10/C4.11 — the detach proof's other two halves ────────────────────────

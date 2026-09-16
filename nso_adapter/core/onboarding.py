@@ -30,6 +30,7 @@ from nso_adapter.core.claim import (
     resolve_claim_by_token,
 )
 from nso_adapter.core.families import ALL_FAMILY_KEYS
+from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.client import failure_detail
 from nso_adapter.store import outcome_store
 from nso_adapter.store.device_settle import create_counter
@@ -333,7 +334,9 @@ async def onboard_device(
             raise conflict
         await db.refresh(existing)
         logger.info(
-            "device.adopted", device_id=existing.id, nso_device=nso_device_name, netbox_device_id=netbox_device_id
+            "device.adopted",
+            **device_fields(device_id=existing.id),
+            netbox_device_id=netbox_device_id,
         )
         return existing
 
@@ -369,7 +372,7 @@ async def onboard_device(
     if recovered is not None:
         return recovered
     await db.refresh(device)
-    logger.info("device.onboarded", device_id=device.id, nso_device=nso_device_name)
+    logger.info("device.onboarded", **device_fields(device_id=device.id))
     return device
 
 
@@ -454,7 +457,7 @@ async def _onboard_under_claim(
         if time.monotonic() >= deadline:
             logger.warning(
                 "device.mapping_claim_timeout",
-                nso_device=nso_device_name,
+                **device_fields(device_id=existing_id),
                 waited_s=get_config().intent_claim_wait_seconds,
             )
             raise ClaimUnavailableError("NSO device is claimed by another operation")
@@ -534,7 +537,7 @@ async def _insert_device_with_claim(
 
     reg.register(device.id, token)
     await db.refresh(device)
-    logger.info("device.onboarded", device_id=device.id, nso_device=nso_device_name, claimed=True)
+    logger.info("device.onboarded", **device_fields(device_id=device.id), claimed=True)
     return device
 
 
@@ -562,10 +565,7 @@ async def _link_existing_under_claim(
         return None
     # Snapshotted: ending the transaction below expires the instance, and an implicit lazy
     # load on an async session raises MissingGreenlet instead of the intended error.
-    linked_to, nso_device_name = (
-        existing.netbox_device_id,
-        existing.nso_device_name,
-    )
+    linked_to = existing.netbox_device_id
 
     # Already linked to THIS NetBox device → idempotent no-op; nothing to write.
     if linked_to == netbox_device_id:
@@ -599,8 +599,7 @@ async def _link_existing_under_claim(
     await db.refresh(existing)
     logger.info(
         "device.adopted",
-        device_id=device_id,
-        nso_device=nso_device_name,
+        **device_fields(device_id=device_id),
         netbox_device_id=netbox_device_id,
         claimed=True,
     )
@@ -773,11 +772,17 @@ async def provision_nso_device(
     if sync_ok and device_id is not None:
         await _initial_mirror_refresh(db, device_id, client, reg=reg)
 
-    # Both correlators are adapter-owned. `device_id` is absent for a provision with no NetBox
-    # link, so `job_id` carries the record on that path rather than leaving it unaddressable.
+    # `device_fields` answers `device_id` for a device that has a row and a keyed `device_ref`
+    # for one that does not, so the record is addressable either way. `job_id` correlates it to
+    # the job that produced it.
+    identity_fields = (
+        device_fields(device_id=device_id)
+        if device_id is not None
+        else device_fields(nso_instance=nso_instance, nso_device_name=device_name)
+    )
     logger.info(
         "device.provisioned",
-        device_id=device_id,
+        **identity_fields,
         job_id=job_id,
         instance=nso_instance,
         steps=_step_classifications(steps),
@@ -1035,7 +1040,7 @@ async def rekey_device(
         raise DeviceIdentityRefused(_IDENTITY_CLAIMED, reason="identity_claimed")
 
     await db.refresh(device)
-    logger.info("device.rekeyed", device_id=device.id, nso_device=device.nso_device_name)
+    logger.info("device.rekeyed", **device_fields(device_id=device.id))
     return device
 
 

@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import structlog
 from sqlalchemy import select
+from structlog.testing import capture_logs
 
 from nso_adapter.core.apply import enqueue_apply
 from nso_adapter.core.apply import run_apply as _run_apply_worker
@@ -30,6 +31,7 @@ from nso_adapter.store.models import (
     JobType,
     SyncState,
 )
+from tests._secret_discipline import assert_records_free_of
 from tests.conftest import attach_apply_generation, note_projection_write, session
 
 
@@ -430,10 +432,16 @@ async def test_run_apply_syncs_from_device_by_default(adapter_client):
     job_id = await _seed_apply_job(device_id)
 
     mock_client = _nso_client()
-    with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client):
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        capture_logs() as logs,
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     mock_client.sync_from.assert_awaited_once_with("rtr-sync-on")
+    record = next(record for record in logs if record["event"] == "apply.sync_from.done")
+    assert record["device_id"] == device_id
+    assert_records_free_of([record], ["rtr-sync-on"])
 
 
 async def test_run_apply_skips_sync_from_when_disabled(adapter_client):
@@ -457,12 +465,19 @@ async def test_run_apply_survives_sync_from_failure(adapter_client):
 
     mock_client = _nso_client()
     mock_client.sync_from.side_effect = RuntimeError("transport timeout")
-    with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client):
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        capture_logs() as logs,
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded  # nothing eligible, sync error swallowed
+    record = next(record for record in logs if record["event"] == "apply.sync_from.failed")
+    assert record["device_id"] == device_id
+    assert record["error"] == "transport timeout"
+    assert_records_free_of([record], ["rtr-sync-err"])
 
 
 async def _preview_head(device_id: int) -> int:
@@ -639,6 +654,7 @@ async def test_collect_apply_diff_classifies_an_unexpected_dry_run_failure(adapt
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
         patch(_SENDER, AsyncMock(side_effect=RuntimeError(secret))),
+        capture_logs() as logs,
     ):
         async with session() as db:
             diffs = await collect_apply_diff(db, device_id)
@@ -646,9 +662,12 @@ async def test_collect_apply_diff_classifies_an_unexpected_dry_run_failure(adapt
     assert diffs[PREVIEW_KEY].startswith("!! preview unavailable")
     assert "RuntimeError" in diffs[PREVIEW_KEY]
     assert secret not in diffs[PREVIEW_KEY]
+    record = next(record for record in logs if record["event"] == "apply_diff.failed")
+    assert record["device_id"] == device_id
+    assert_records_free_of([record], ["rtr-diff-boom"])
 
 
-async def test_collect_apply_diff_redacts_value_bearing_apply_error(adapter_client, recorded_logs):
+async def test_collect_apply_diff_redacts_value_bearing_apply_error(adapter_client):
     """A typed apply error cannot make an invalid intent value public."""
     from nso_adapter.core.apply import PREVIEW_KEY, collect_apply_diff
 
@@ -663,13 +682,21 @@ async def test_collect_apply_diff_redacts_value_bearing_apply_error(adapter_clie
     )
     await _preview_head(device_id)
 
-    with patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()):
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        capture_logs() as logs,
+    ):
         async with session() as db:
             diffs = await collect_apply_diff(db, device_id)
 
     assert "invalid_enabled_value" in diffs[PREVIEW_KEY]
     assert secret not in diffs[PREVIEW_KEY]
-    assert secret not in repr([record.__dict__ for record in recorded_logs.records])
+    build_record = next(record for record in logs if record["event"] == "apply.section_build_failed")
+    diff_record = next(record for record in logs if record["event"] == "apply_diff.failed")
+    assert build_record["device_id"] == device_id
+    assert build_record["section"] == "interface_config"
+    assert diff_record["device_id"] == device_id
+    assert_records_free_of([build_record, diff_record], [secret, "rtr-diff-invalid"])
 
 
 async def test_run_apply_all_succeed(adapter_client):
@@ -2417,6 +2444,7 @@ async def test_an_apply_is_blocked_when_the_document_would_flush_a_live_orphan(a
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=client),
         patch(_SENDER, sender),
+        capture_logs() as logs,
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -2428,6 +2456,17 @@ async def test_an_apply_is_blocked_when_the_document_would_flush_a_live_orphan(a
         row = (await db.execute(select(VlanIntent).where(VlanIntent.device_id == device_id))).scalar_one()
         assert row.last_apply_error["code"] == "removal_blocked_collateral"
         assert row.last_apply_error["detail"]["orphans"] == {"vlan/vlan": [["999"]]}
+    blocked = next(record for record in logs if record["event"] == "apply.blocked_collateral")
+    failed = next(record for record in logs if record["event"] == "apply.atomic_failed")
+    assert blocked == {
+        "device_id": device_id,
+        "event": "apply.blocked_collateral",
+        "job_id": job_id,
+        "log_level": "error",
+    }
+    assert failed["device_id"] == device_id
+    assert failed["job_id"] == job_id
+    assert_records_free_of([blocked, failed], ["sw01-collateral", "999"])
 
 
 async def test_a_failed_commit_marks_both_the_subif_and_its_address(adapter_client):
@@ -2701,6 +2740,7 @@ async def test_run_apply_reader_compare_absent_reader_surface_is_not_a_drop(adap
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
+        capture_logs() as logs,
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -2715,6 +2755,10 @@ async def test_run_apply_reader_compare_absent_reader_surface_is_not_a_drop(adap
             .one()
         )
         assert row.last_apply_error is None
+    record = next(record for record in logs if record["event"] == "apply.reader_compare_unknown")
+    assert record["device_id"] == device_id
+    assert record["scope"] == "static_route"
+    assert_records_free_of([record], ["rtr-rc-none"])
 
 
 async def test_run_apply_reader_compare_empty_list_payload_is_still_a_drop(adapter_client):
@@ -2884,6 +2928,7 @@ async def test_run_apply_reader_compare_reader_error_is_nonfatal(adapter_client)
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
+        capture_logs() as logs,
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -2892,6 +2937,45 @@ async def test_run_apply_reader_compare_reader_error_is_nonfatal(adapter_client)
         assert job.status == JobStatus.succeeded
         assert job.result["static_route_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
         assert job.result["reader_compare"]["static_route"] == "error"
+    record = next(record for record in logs if record["event"] == "apply.reader_compare_error")
+    assert record["device_id"] == device_id
+    assert_records_free_of([record], ["rtr-rc-err"])
+
+
+async def test_run_apply_reader_compare_prepare_error_uses_device_id(adapter_client):
+    from nso_adapter.store.models import StaticRouteIntent
+
+    device_id = await _seed_device("rtr-rc-prepare", 444)
+    job_id = await _seed_apply_job(device_id)
+    async with session() as db:
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id,
+                vrf="",
+                prefix="198.18.44.0/24",
+                next_hop="10.0.0.1",
+                accepted_at=datetime.now(UTC),
+            )
+        )
+        await db.commit()
+
+    mock_client = _nso_client()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.core.apply._reader_compare_prepare", AsyncMock(side_effect=RuntimeError("bad prep"))),
+        patch(_SENDER, new_callable=AsyncMock),
+        capture_logs() as logs,
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        assert job.result["reader_compare"]["static_route"] == "error"
+    record = next(record for record in logs if record["event"] == "apply.reader_compare_error")
+    assert record["device_id"] == device_id
+    assert record["scope"] == "static_route"
+    assert_records_free_of([record], ["rtr-rc-prepare"])
 
 
 async def test_run_apply_reader_compare_bgp_checks_router_and_peers(adapter_client):
@@ -3319,6 +3403,7 @@ async def test_reader_compare_non_terminal_section_is_error(adapter_client):
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
+        capture_logs() as logs,
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -3326,6 +3411,10 @@ async def test_reader_compare_non_terminal_section_is_error(adapter_client):
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded  # error never fails a good apply
         assert job.result["reader_compare"]["static_route"] == "error"
+    record = next(record for record in logs if record["event"] == "apply.reader_compare_error")
+    assert record["device_id"] == device_id
+    assert record["scope"] == "static_route"
+    assert_records_free_of([record], ["rtr-rc-notready"])
 
 
 # ── codex review (READSEM 1328): verifier robustness ──────────────────────────────────────────
@@ -3397,6 +3486,7 @@ async def test_reader_compare_malformed_batched_section_is_error_not_job_crash(a
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, AsyncMock(return_value=None)),
+        capture_logs() as logs,
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
@@ -3404,6 +3494,10 @@ async def test_reader_compare_malformed_batched_section_is_error_not_job_crash(a
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result["reader_compare"]["static_route"] == "error"
+    record = next(record for record in logs if record["event"] == "apply.reader_compare_error")
+    assert record["device_id"] == device_id
+    assert record["scope"] == "static_route"
+    assert_records_free_of([record], ["sw01-atomic-malformed"])
 
 
 async def test_action_failure_preserves_unverifiable_labels(adapter_client, vault):

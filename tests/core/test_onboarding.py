@@ -23,16 +23,24 @@ from tests.conftest import session
 
 async def test_onboard_creates_device(adapter_client_with_nso):
     """onboard_device inserts a Device row and returns it with mapping_status=mapped."""
+    from structlog.testing import capture_logs
+
     from nso_adapter.core.onboarding import onboard_device
     from nso_adapter.store.models import MappingStatus
+    from tests._secret_discipline import assert_records_free_of
 
     async with session() as db:
-        device = await onboard_device(db, "nso-dev", "core-rtr-01", 42)
+        with capture_logs() as logs:
+            device = await onboard_device(db, "nso-dev", "core-rtr-01", 42)
         assert device.id is not None
         assert device.nso_instance == "nso-dev"
         assert device.nso_device_name == "core-rtr-01"
         assert device.netbox_device_id == 42
         assert device.mapping_status == MappingStatus.mapped
+    record = next(record for record in logs if record["event"] == "device.onboarded")
+    assert record["device_id"] == device.id
+    assert "nso_device" not in record
+    assert_records_free_of([record], ["core-rtr-01"])
 
 
 async def test_onboard_raises_for_unknown_instance(adapter_client):
@@ -49,10 +57,12 @@ async def test_onboard_raises_for_unknown_instance(adapter_client):
 
 
 async def test_claim_timeout_does_not_repeat_the_nso_device_name(adapter_client_with_nso, monkeypatch):
+    from structlog.testing import capture_logs
+
     from nso_adapter.config import get_config
     from nso_adapter.core.claim import ClaimRegistration, ClaimUnavailableError, acquire_claim, release_claim
     from nso_adapter.core.onboarding import onboard_device
-    from tests._secret_discipline import assert_chain_free_of
+    from tests._secret_discipline import assert_chain_free_of, assert_records_free_of
     from tests.conftest import seed_device
 
     device_name = "placeholder-claimed-device"
@@ -63,12 +73,16 @@ async def test_claim_timeout_does_not_repeat_the_nso_device_name(adapter_client_
 
     try:
         async with session() as db:
-            with pytest.raises(ClaimUnavailableError) as caught:
+            with capture_logs() as logs, pytest.raises(ClaimUnavailableError) as caught:
                 await onboard_device(db, "nso-dev", device_name, 99, reg=ClaimRegistration())
     finally:
         await release_claim(rival)
 
     assert_chain_free_of(caught.value, [device_name])
+    record = next(record for record in logs if record["event"] == "device.mapping_claim_timeout")
+    assert record["device_id"] == device_id
+    assert "nso_device" not in record
+    assert_records_free_of([record], [device_name])
 
 
 async def test_onboard_raises_for_duplicate_netbox_id(adapter_client_with_nso):
@@ -134,17 +148,27 @@ async def test_onboard_adopts_unlinked_existing_device(adapter_client_with_nso):
     row silently blocked linking (409 -> plugin swallowed it), so the plugin's adapter_device_id
     stayed None and the device never onboarded (live: netbox device 23 / lab01c-ri6 vs the
     June-provisioned adapter device 343, netbox_device_id NULL)."""
+    from structlog.testing import capture_logs
+
     from nso_adapter.core.onboarding import onboard_device
     from nso_adapter.store.models import MappingStatus
+    from tests._secret_discipline import assert_records_free_of
     from tests.conftest import seed_device
 
     existing_id = await seed_device(nso_instance="nso-dev", nso_device_name="preprovisioned", netbox_device_id=None)
 
     async with session() as db:
-        device = await onboard_device(db, "nso-dev", "preprovisioned", 77)
+        with capture_logs() as logs:
+            device = await onboard_device(db, "nso-dev", "preprovisioned", 77)
         assert device.id == existing_id  # adopted the SAME row — not a second device
         assert device.netbox_device_id == 77
         assert device.mapping_status == MappingStatus.mapped
+
+    record = next(record for record in logs if record["event"] == "device.adopted")
+    assert record["device_id"] == existing_id
+    assert record["netbox_device_id"] == 77
+    assert "nso_device" not in record
+    assert_records_free_of([record], ["preprovisioned"])
 
     # Exactly one row for that NSO node — adoption must not create a duplicate.
     async with session() as db:
@@ -429,7 +453,10 @@ async def test_unlinked_devices_may_coexist(adapter_client_with_nso):
 
 async def test_rekey_changes_device_name(adapter_client_with_nso):
     """rekey_device updates nso_device_name and resets sync metadata."""
+    from structlog.testing import capture_logs
+
     from nso_adapter.core.onboarding import rekey_device
+    from tests._secret_discipline import assert_records_free_of
     from tests.conftest import seed_device
 
     device_id = await seed_device(nso_instance="nso-dev", nso_device_name="old-name", netbox_device_id=300)
@@ -440,13 +467,18 @@ async def test_rekey_changes_device_name(adapter_client_with_nso):
         device.sw_version = "old-version"
         device.degraded_surfaces = ["ospf"]
         await db.commit()
-        updated = await rekey_device(db, device, nso_device_name="new-name")
+        with capture_logs() as logs:
+            updated = await rekey_device(db, device, nso_device_name="new-name")
         assert updated.nso_device_name == "new-name"
         assert updated.ned_id is None
         assert updated.sw_version is None
         assert updated.last_sync_at is None
         assert updated.degraded_surfaces is None
         assert updated.source_epoch == 2
+    record = next(record for record in logs if record["event"] == "device.rekeyed")
+    assert record["device_id"] == device_id
+    assert "nso_device" not in record
+    assert_records_free_of([record], ["new-name"])
 
 
 async def test_rekey_reports_identity_refusal_when_the_target_is_claimed_after_the_precheck(
