@@ -60,7 +60,12 @@ async def write_interfaces(
             else:
                 result.interfaces_written += 1
         except Exception as exc:
-            logger.warning("netbox.write_failed", interface=iface.name, error=str(exc))
+            logger.warning(
+                "netbox.write_failed",
+                netbox_device_id=netbox_device_id,
+                netbox_interface_id=nb_id,
+                error=str(exc),
+            )
             result.interfaces_skipped += 1
 
     return result

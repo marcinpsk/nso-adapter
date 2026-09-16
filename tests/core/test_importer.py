@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.bindings.netbox.client import NetboxClient
-from nso_adapter.core.importer import _attrs_to_interface_list, sync_device
+from nso_adapter.core.importer import _attrs_to_interface_list, _flush_netbox_patches, sync_device
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.models import (
     DbInterface,
@@ -164,6 +164,29 @@ def test_attrs_to_interface_list_skips_malformed_entry():
     assert len(result) == 2
     assert result[0].name == "GigabitEthernet0/1"
     assert result[1].name == "GigabitEthernet0/2"
+
+
+async def test_flush_netbox_patches_forwards_device_id():
+    client = AsyncMock(spec=NetboxClient)
+    client.bulk_patch_interfaces = AsyncMock(return_value=[])
+    patches = {51: {"id": 51, "description": "updated"}}
+
+    assert await _flush_netbox_patches(client, 42, patches, {}) == 0
+
+    client.bulk_patch_interfaces.assert_awaited_once_with(
+        [{"id": 51, "description": "updated"}],
+        netbox_device_id=42,
+    )
+
+
+async def test_flush_netbox_patches_refuses_missing_device_id():
+    client = AsyncMock(spec=NetboxClient)
+    client.bulk_patch_interfaces = AsyncMock(return_value=[])
+
+    with pytest.raises(RuntimeError, match="NetBox patches queued without a NetBox device id"):
+        await _flush_netbox_patches(client, None, {51: {"id": 51}}, {})
+
+    client.bulk_patch_interfaces.assert_not_called()
 
 
 async def test_a_MALFORMED_attrs_entry_puts_no_payload_in_the_record(db_session: AsyncSession, adapter_client):
@@ -547,7 +570,8 @@ async def test_sync_change_detection_skips_unchanged_on_resync(db_session: Async
     nb.bulk_create_interfaces = AsyncMock(return_value=[])
     patched_batches = []
 
-    def _patch(p):
+    def _patch(p, *, netbox_device_id):
+        assert netbox_device_id == 7
         rows = list(p)
         patched_batches.append(rows)
         return [{"id": r["id"]} for r in rows]  # echo = confirmed written
@@ -618,9 +642,13 @@ async def test_sync_failed_patch_not_marked_synced(db_session: AsyncSession):
 
             # Next sync re-enqueues it (still a delta).
             enqueued = []
-            nb.bulk_patch_interfaces = AsyncMock(
-                side_effect=lambda p: enqueued.extend(p) or [{"id": r["id"]} for r in p]
-            )
+
+            def _patch(p, *, netbox_device_id):
+                assert netbox_device_id == 8
+                enqueued.extend(p)
+                return [{"id": r["id"]} for r in p]
+
+            nb.bulk_patch_interfaces = AsyncMock(side_effect=_patch)
             await sync_device(device.id, db_session)
             assert any(r["id"] == 600 for r in enqueued)
     finally:
