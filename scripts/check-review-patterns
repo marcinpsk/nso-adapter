@@ -27,7 +27,7 @@ case "$mode" in
     else
       scan_status=$?
     fi
-    if python3 - "$scan_output" <<'PY'
+    if python3 - "$scan_output" "$@" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -38,6 +38,8 @@ expected_partial_paths = {
 }
 
 report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+repo_root = Path.cwd().resolve()
+scan_targets = [Path(target).resolve() for target in sys.argv[2:]]
 for finding in report.get("results", []):
     print(
         f"{finding['path']}:{finding['start']['line']}  "
@@ -51,7 +53,12 @@ partial_paths = {
     and (error["type"] == "PartialParsing" or error["type"][0] == "PartialParsing")
 }
 new_partial_paths = partial_paths - expected_partial_paths
-resolved_partial_paths = expected_partial_paths - partial_paths
+scoped_partial_paths = {
+    path
+    for path in expected_partial_paths
+    if any((repo_root / path).resolve().is_relative_to(target) for target in scan_targets)
+}
+resolved_partial_paths = scoped_partial_paths - partial_paths
 if new_partial_paths or resolved_partial_paths:
     print("OpenGrep partial parsing changed. Inspect kb #1718 and update the pin by hand.", file=sys.stderr)
     if new_partial_paths:
@@ -64,7 +71,12 @@ if new_partial_paths or resolved_partial_paths:
             print(f"  {path}", file=sys.stderr)
     raise SystemExit(1)
 
-print(f"OpenGrep partial-parse pin matches exactly ({len(partial_paths)} files).")
+if scoped_partial_paths == expected_partial_paths:
+    print(f"OpenGrep partial-parse pin matches exactly ({len(partial_paths)} files).")
+else:
+    partial_count = len(partial_paths)
+    noun = "file" if partial_count == 1 else "files"
+    print(f"OpenGrep partial-parse pin matches scan scope ({partial_count} {noun}).")
 PY
     then
       report_status=0
@@ -81,7 +93,18 @@ PY
     require_opengrep
     staging_dir="$(mktemp -d)"
     trap 'rm -rf "$staging_dir"' EXIT
-    cp .opengrep/nso-rules.yaml "$staging_dir/review-patterns.yaml"
+    python3 - .opengrep/nso-rules.yaml "$staging_dir/review-patterns.yaml" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+import yaml
+
+source = Path(sys.argv[1])
+target = Path(sys.argv[2])
+rules = json.loads(json.dumps(yaml.safe_load(source.read_text(encoding="utf-8"))))
+target.write_text(yaml.safe_dump(rules, sort_keys=False), encoding="utf-8")
+PY
     cp .opengrep/tests/review-patterns.py "$staging_dir/review-patterns.py"
     "$scan_bin" test "$staging_dir"
     ;;

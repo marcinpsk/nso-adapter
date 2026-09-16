@@ -209,6 +209,57 @@ def test_review_pattern_scan_accepts_the_pinned_partial_paths(tmp_path: Path) ->
     assert not result.stderr
 
 
+@pytest.mark.parametrize(
+    ("target", "partial_paths", "expected_count"),
+    [
+        ("nso_adapter/core/vlan.py", set(), 0),
+        ("nso_adapter/core/failover.py", {"nso_adapter/core/failover.py"}, 1),
+    ],
+)
+def test_review_pattern_targeted_scan_checks_only_pins_in_scope(
+    tmp_path: Path,
+    target: str,
+    partial_paths: set[str],
+    expected_count: int,
+) -> None:
+    stub, invocations = _write_opengrep_stub(tmp_path, partial_paths)
+
+    result = subprocess.run(
+        ["/usr/bin/bash", str(REVIEW_PATTERNS), "scan", target],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ | {"OPENGREP_BIN": str(stub)},
+    )
+
+    assert result.returncode == 0
+    noun = "file" if expected_count == 1 else "files"
+    assert result.stdout.strip() == f"OpenGrep partial-parse pin matches scan scope ({expected_count} {noun})."
+    assert not result.stderr
+    assert target in invocations.read_text(encoding="utf-8")
+
+
+def test_review_pattern_targeted_scan_rejects_a_new_partial_parse(tmp_path: Path) -> None:
+    target = "nso_adapter/core/vlan.py"
+    stub, _invocations = _write_opengrep_stub(tmp_path, {target})
+
+    result = subprocess.run(
+        ["/usr/bin/bash", str(REVIEW_PATTERNS), "scan", target],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ | {"OPENGREP_BIN": str(stub)},
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert result.stderr.splitlines() == [
+        "OpenGrep partial parsing changed. Inspect kb #1718 and update the pin by hand.",
+        "New partially analysed files:",
+        f"  {target}",
+    ]
+
+
 def test_review_pattern_scan_renders_findings_from_one_json_scan(tmp_path: Path) -> None:
     message = "Keep this finding text intact: punctuation!"
     stub, invocations = _write_opengrep_stub(
