@@ -46,6 +46,7 @@ from nso_adapter.core.static_route_plan import (
     hydrate_static_route_apply_plan,
     recorded_static_route_apply_mode,
 )
+from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.apply import NsoApplyError
 from nso_adapter.nso.client import failure_detail
 from nso_adapter.store.models import (
@@ -238,8 +239,7 @@ async def _static_route_proof(client, device, plan, *, verify, evidence, consume
             if survivors:
                 logger.error(
                     "static_route.residue_found",
-                    device_id=device.id,
-                    survivors=[list(k) for k in survivors],
+                    **device_fields(device_id=device.id),
                 )
     return SrProof(verify, evidence, residue, survivors, entries)
 
@@ -731,7 +731,7 @@ async def build_device_containers(
         except NsoApplyError as exc:
             logger.error(
                 "apply.section_build_failed",
-                device=device.nso_device_name,
+                **device_fields(device_id=device.id),
                 section=section,
                 error=_apply_error_summary(exc),
             )
@@ -787,11 +787,11 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
         )
     except NsoApplyError as exc:
         reason = _apply_error_summary(exc)
-        logger.warning("apply_diff.failed", device=device.nso_device_name, error=reason)
+        logger.warning("apply_diff.failed", **device_fields(device_id=device_id), error=reason)
         return {PREVIEW_KEY: f"!! preview unavailable: {reason}"}
     except Exception as exc:  # noqa: BLE001 — the preview must never fail hard
         internal = internal_error(exc)
-        logger.warning("apply_diff.failed", device=device.nso_device_name, error=internal["message"])
+        logger.warning("apply_diff.failed", **device_fields(device_id=device_id), error=internal["message"])
         reason = internal["message"]
         return {PREVIEW_KEY: f"!! preview unavailable: {reason}"}
     if delta is None:
@@ -974,9 +974,9 @@ async def _maybe_sync_from(db: AsyncSession, client, device_name: str, device_id
         return
     try:
         await client.sync_from(device_name)
-        logger.info("apply.sync_from.done", device=device_name)
+        logger.info("apply.sync_from.done", **device_fields(device_id=device_id))
     except Exception as exc:
-        logger.warning("apply.sync_from.failed", device=device_name, error=str(exc))
+        logger.warning("apply.sync_from.failed", **device_fields(device_id=device_id), error=str(exc))
 
 
 class _AttributeApply(NamedTuple):
@@ -1331,7 +1331,11 @@ async def _document_reader_compare(
             preps[section] = await _reader_compare_prepare(section, apply_rows.sent, apply_rows.ned_id)
         except Exception as exc:  # noqa: BLE001 — a family's translation must never fail the apply
             logger.warning(
-                "apply.reader_compare_error", job_id=job_id, device=device_name, scope=section, error=repr(exc)
+                "apply.reader_compare_error",
+                job_id=job_id,
+                **device_fields(device_id=device.id),
+                scope=section,
+                error=repr(exc),
             )
             preps[section] = "error"
 
@@ -1343,7 +1347,9 @@ async def _document_reader_compare(
             fetched = await _live_family_sections(client, device.nso_device_name, wires, timeout=_VERIFY_BATCH_TIMEOUT)
         except Exception as exc:  # noqa: BLE001 — a batched read failure fails no family's apply
             action_error = exc
-            logger.warning("apply.reader_compare_error", job_id=job_id, device=device_name, error=repr(exc))
+            logger.warning(
+                "apply.reader_compare_error", job_id=job_id, **device_fields(device_id=device.id), error=repr(exc)
+            )
 
     reader_compare: dict[str, str] = {}
     reader_compare_unverifiable: dict[str, list[str]] = {}
@@ -1380,7 +1386,11 @@ async def _document_reader_compare(
                 )
             except Exception as exc:  # noqa: BLE001 — a read-side glitch never fails a good commit
                 logger.warning(
-                    "apply.reader_compare_error", job_id=job_id, device=device_name, scope=section, error=repr(exc)
+                    "apply.reader_compare_error",
+                    job_id=job_id,
+                    **device_fields(device_id=device.id),
+                    scope=section,
+                    error=repr(exc),
                 )
                 n_ok, n_failed, fails, status, evidence = s_ok, 0, [], "error", {}
         reader_compare[section] = status
@@ -1547,7 +1557,7 @@ async def _commit_document(
     try:
         verify = await guarded_device_write(client, device, containers, allowed=allowed, current=body.snapshot)
     except RemovalBlockedError as exc:
-        logger.error("apply.blocked_collateral", job_id=job_id, device=device_name, orphans=exc.orphans)
+        logger.error("apply.blocked_collateral", job_id=job_id, **device_fields(device_id=device.id))
         commit_error = NsoApplyError(
             "removal_blocked_collateral",
             "PUT-replace would retract rows not in intent",
@@ -1560,7 +1570,12 @@ async def _commit_document(
         # The TYPE only: exception text can carry credentials (a RESTCONF error echoes the
         # request, an httpx error its headers) and this payload is persisted on every row.
         internal = internal_error(exc)
-        logger.error("apply.commit_internal_error", job_id=job_id, device=device_name, error=internal["message"])
+        logger.error(
+            "apply.commit_internal_error",
+            job_id=job_id,
+            **device_fields(device_id=device.id),
+            error=internal["message"],
+        )
         commit_error = NsoApplyError("internal", internal["message"], detail=internal["detail"])
 
     if commit_error is None:
@@ -1574,7 +1589,7 @@ async def _commit_document(
         return None, verify, {}, None, ""
 
     message = _apply_error_summary(commit_error)
-    logger.error("apply.atomic_failed", job_id=job_id, device=device_name, error=message)
+    logger.error("apply.atomic_failed", job_id=job_id, **device_fields(device_id=device.id), error=message)
     device_err = _device_error_message(commit_error)
     # A guard refusal never reached the device, so there is nothing to localise and no
     # capability verdict to draw: the whole unsent document is the failure.
@@ -1972,14 +1987,19 @@ def _classify_fetched_section(
     """
     from nso_adapter.core.removal import _verifier_section_status
 
+    device_id = translated[0][0].device_id
     status = _verifier_section_status(section)
     if status == "error":
         logger.warning(
-            "apply.reader_compare_error", job_id=job_id, device=device_name, scope=scope, error="section status=error"
+            "apply.reader_compare_error",
+            job_id=job_id,
+            **device_fields(device_id=device_id),
+            scope=scope,
+            error="section status=error",
         )
         return ok, 0, [], "error", {}
     if status == "unknown":  # the NED does not export this family
-        logger.info("apply.reader_compare_unknown", job_id=job_id, device=device_name, scope=scope)
+        logger.info("apply.reader_compare_unknown", job_id=job_id, **device_fields(device_id=device_id), scope=scope)
         return ok, 0, [], "unknown", {}
     return _reader_compare_walk(
         scope, translated, unverifiable, section, lists, ok, job_id=job_id, device_name=device_name, stamp_of=stamp_of

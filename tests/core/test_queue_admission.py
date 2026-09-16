@@ -478,8 +478,15 @@ async def test_a_running_provision_still_refuses_a_second_one(adapter_client):
 
 async def test_provision_admission_retries_when_the_winner_finishes(adapter_client, rival_engine):
     """Zero rows plus no active job is a finished winner, not "blocked" — admit a fresh one."""
+    import logging
+
+    import structlog
+    from structlog.testing import capture_logs
+
     from nso_adapter.core import jobs as jobs_mod
+    from nso_adapter.domain.diagnostics import device_ref
     from nso_adapter.store.models import Job, JobStatus
+    from tests._secret_discipline import assert_records_free_of
 
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
     async with session() as db:
@@ -500,16 +507,29 @@ async def test_provision_admission_retries_when_the_winner_finishes(adapter_clie
     jobs_mod.get_active_provision_job = _finish_then_look
     try:
         async with session() as db:
-            second, created = await jobs_mod.enqueue_provision_job({**_PROVISION, "address": "10.0.0.1"}, db)
+            previous = structlog.get_config().copy()
+            structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG))
+            try:
+                with capture_logs() as logs:
+                    second, created = await jobs_mod.enqueue_provision_job({**_PROVISION, "address": "10.0.0.1"}, db)
+            finally:
+                structlog.configure(**previous)
     finally:
         jobs_mod.get_active_provision_job = original
 
     assert created is True and second.id != first.id
+    record = next(record for record in logs if record["event"] == "job.provision_admission.winner_finished")
+    assert record["device_ref"] == device_ref(_PROVISION["nso_instance"], _PROVISION["device_name"])
+    assert "device_name" not in record
+    assert_records_free_of([record], [_PROVISION["device_name"]])
 
 
 async def test_provision_admission_exhaustion_does_not_repeat_the_device_name(adapter_client, monkeypatch):
+    from structlog.testing import capture_logs
+
     from nso_adapter.core import jobs as jobs_mod
-    from tests._secret_discipline import assert_chain_free_of
+    from nso_adapter.domain.diagnostics import device_ref
+    from tests._secret_discipline import assert_chain_free_of, assert_records_free_of
 
     device_name = "placeholder-provision-admission-device"
     params = {**_PROVISION, "device_name": device_name, "address": "198.18.0.1"}
@@ -521,10 +541,14 @@ async def test_provision_admission_exhaustion_does_not_repeat_the_device_name(ad
 
     monkeypatch.setattr(jobs_mod, "get_active_provision_job", _hide_active_job)
     async with session() as db:
-        with pytest.raises(RuntimeError) as caught:
+        with capture_logs() as logs, pytest.raises(RuntimeError) as caught:
             await jobs_mod.enqueue_provision_job(params, db)
 
     assert_chain_free_of(caught.value, [device_name])
+    record = next(record for record in logs if record["event"] == "job.provision_admission.retries_exhausted")
+    assert record["device_ref"] == device_ref(params["nso_instance"], device_name)
+    assert "device_name" not in record
+    assert_records_free_of([record], [device_name])
 
 
 async def test_a_failing_insert_does_not_poison_the_caller(adapter_client):

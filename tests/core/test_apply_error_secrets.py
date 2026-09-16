@@ -11,6 +11,7 @@ import httpx
 import pytest
 import structlog
 from sqlalchemy import select
+from structlog.testing import capture_logs
 
 from nso_adapter.core.apply import run_apply
 from nso_adapter.core.community_dialect import community_dialect_for
@@ -202,9 +203,7 @@ async def test_verification_delta_keeps_no_secret_in_logs_or_errors(adapter_clie
     assert any("nso.apply.verify_mismatch" in record.getMessage() for record in recorded_logs.records)
 
 
-async def test_unexpected_commit_exception_keeps_secret_out_of_logs_and_errors(
-    adapter_client, monkeypatch, recorded_logs
-):
+async def test_unexpected_commit_exception_keeps_secret_out_of_logs_and_errors(adapter_client, monkeypatch):
     device_id, row = await _community()
 
     async def fail_commit(*args, **kwargs):
@@ -212,14 +211,20 @@ async def test_unexpected_commit_exception_keeps_secret_out_of_logs_and_errors(
 
     monkeypatch.setattr("nso_adapter.nso.apply.apply_device_intent", fail_commit)
     client = _client_with(httpx.MockTransport(lambda request: httpx.Response(404)))
-    job = await _run(device_id, client, monkeypatch)
+    with capture_logs() as logs:
+        job = await _run(device_id, client, monkeypatch)
     async with session() as db:
         stored = await db.get(SnmpCommunityIntent, row.id)
 
     assert stored.last_apply_error["code"] == "internal"
     assert stored.last_apply_error["message"] == "apply error (internal); see the server log"
-    for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error), _log_surface(recorded_logs)):
+    for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error)):
         assert _SECRET not in surface
+    internal = next(record for record in logs if record["event"] == "apply.commit_internal_error")
+    failed = next(record for record in logs if record["event"] == "apply.atomic_failed")
+    assert internal["device_id"] == device_id
+    assert failed["device_id"] == device_id
+    assert_records_free_of([internal, failed], [_SECRET, _DEVICE])
 
 
 async def test_typed_commit_failure_keeps_its_message_out_of_logs_and_errors(
