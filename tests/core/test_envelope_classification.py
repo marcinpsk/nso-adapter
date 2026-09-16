@@ -30,6 +30,28 @@ from tests._secret_discipline import assert_text_free_of
 _ASKED = {"device": "rg03", "family": "static-route"}
 
 
+def test_read_failure_representations_redact_the_device_from_every_container():
+    device = "placeholder-distinctive-device"
+    failure = ReadFailure(
+        operation=ReadOperation.device_state_read,
+        device=device,
+        family="static-route",
+        error_type="NsoReadContractError",
+        http_status=503,
+        code=ReadFailureCode.action_output_not_atomic,
+    )
+    unavailable = Unavailable(UnavailableReason.read_error, failure)
+    present = Present.composite({}, Freshness.stale, [unavailable])
+
+    for rendered in (repr(failure), str(failure), repr(unavailable), str(unavailable), repr(present), str(present)):
+        assert_text_free_of(rendered, [device])
+
+    classification = repr(failure)
+    for field in ("device_state_read", "static-route", "NsoReadContractError", "503", "action_output_not_atomic"):
+        if field not in classification:
+            raise AssertionError("the read failure representation omits an authored classification field")
+
+
 class TestStatusMapping:
     def test_ok_is_present_fresh_with_the_section_as_data(self):
         section = {"status": "ok", "last-updated": "2026-07-20T12:00:00+00:00", "route": [{"prefix": "10.0.0.0/8"}]}

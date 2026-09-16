@@ -55,15 +55,31 @@ def test_main_lifespan_is_in_the_non_disclosure_registry() -> None:
     assert _TEST_ROOT / "test_main_lifespan.py" in _NON_DISCLOSURE_TESTS
 
 
-def _reads_an_inspected_surface(node: ast.AST) -> bool:
+def _reads_an_inspected_surface(node: ast.AST, aliases: set[str] | None = None) -> bool:
+    aliases = aliases or set()
     return any(
         isinstance(part, ast.Attribute)
         and part.attr in _INSPECTED_ATTRIBUTES
         or isinstance(part, ast.Call)
         and isinstance(part.func, ast.Name)
         and part.func.id in _INSPECTED_CALLS
+        or isinstance(part, ast.Name)
+        and part.id in aliases
         for part in ast.walk(node)
     )
+
+
+def _inspected_surface_aliases(tree: ast.AST) -> set[str]:
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        if value is None or not _reads_an_inspected_surface(value, aliases):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        aliases.update(target.id for target in targets if isinstance(target, ast.Name))
+    return aliases
 
 
 def _raised_with_context(inner: BaseException, outer: BaseException) -> BaseException:
@@ -147,7 +163,7 @@ def _assertion_comparisons(test: ast.expr) -> list[ast.Compare]:
     return comparisons
 
 
-def _is_rewritten_check(node: ast.Assert) -> bool:
+def _is_rewritten_check(node: ast.Assert, aliases: set[str] | None = None) -> bool:
     """True when pytest would rewrite *node* into a print of an inspected surface.
 
     BOTH operands are read: ``assert resp.text not in allowed`` renders the response on the
@@ -155,7 +171,9 @@ def _is_rewritten_check(node: ast.Assert) -> bool:
     """
     return any(
         any(isinstance(operator, ast.NotIn) for operator in comparison.ops)
-        and any(_reads_an_inspected_surface(value) for value in (comparison.left, *comparison.comparators))
+        and any(
+            _reads_an_inspected_surface(value, aliases) for value in (comparison.left, *comparison.comparators)
+        )
         for comparison in _assertion_comparisons(node.test)
     )
 
@@ -164,8 +182,9 @@ def test_non_disclosure_checks_do_not_use_rewritten_assertions() -> None:
     violations = []
     for path in _NON_DISCLOSURE_TESTS:
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        aliases = _inspected_surface_aliases(tree)
         for node in ast.walk(tree):
-            if isinstance(node, ast.Assert) and _is_rewritten_check(node):
+            if isinstance(node, ast.Assert) and _is_rewritten_check(node, aliases):
                 violations.append(f"{path.relative_to(_TEST_ROOT.parent)}:{node.lineno}")
     assert violations == []
 

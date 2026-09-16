@@ -180,6 +180,15 @@ class ReadFailure:
         if faults:
             raise ValueError(f"{self.code.value} cannot come from this read: {', '.join(faults)}")
 
+    def __repr__(self) -> str:
+        return (
+            f"ReadFailure(operation={self.operation!r}, device='<redacted>', family={self.family!r}, "
+            f"error_type={self.error_type!r}, http_status={self.http_status!r}, code={self.code!r})"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def for_family(self, family: str) -> ReadFailure:
         """Narrow a whole-device read failure to the family it is being reported for."""
         return replace(self, family=family)

@@ -32,6 +32,7 @@ from nso_adapter.nso.apply import (
     encode_l2_sap,
     encode_ospf,
     encode_route_policy,
+    encode_snmp,
     encode_static_route,
     encode_vlan,
 )
@@ -171,13 +172,19 @@ def test_an_attribute_with_no_wire_leaf_is_refused_not_dropped():
     no leaf for. Emitting the entry without it would stamp the row in_sync for a leaf that
     never reached the device (#26), and under a full-document PUT nothing else would say so.
     """
-    rows = [_attr_row(1, "description", "uplink"), _attr_row(1, "mtu", "1500")]
+    from tests._secret_discipline import assert_chain_free_of
+
+    interface = "placeholder-provider-interface"
+    attribute = "placeholder-unsupported-attribute"
+    rows = [_attr_row(1, "description", "uplink"), _attr_row(1, attribute, "1500")]
 
     with pytest.raises(NsoApplyError) as exc_info:
-        _interface_body(rows)
+        _interface_body(rows, interfaces=[_iface(name=interface)])
 
     assert exc_info.value.code == "unsupported_attribute"
-    assert exc_info.value.detail == {"interface": "Gi0/0", "attribute": "mtu"}
+    assert exc_info.value.detail == {"interface": interface, "attribute": attribute}
+    assert attribute in str(exc_info.value)
+    assert_chain_free_of(exc_info.value, [interface])
 
 
 def test_a_corrupt_enabled_value_raises_rather_than_shutting_the_interface():
@@ -784,24 +791,94 @@ def test_bgp_omits_the_router_id_when_unset():
 
 def test_bgp_invalid_asn_raises_a_clean_error():
     """A non-numeric ASN raises a descriptive NsoApplyError, not an opaque ValueError."""
-    with pytest.raises(NsoApplyError, match="ASN"):
-        _bgp_body([BgpRouterIntent(asn="not-an-asn")])
+    from tests._secret_discipline import assert_chain_free_of
+
+    asn = "placeholder-invalid-asn"
+    with pytest.raises(NsoApplyError, match="ASN") as caught:
+        _bgp_body([BgpRouterIntent(asn=asn)])
+    assert_chain_free_of(caught.value, [asn])
 
 
 def test_build_interface_ip_body_rejects_address_without_prefix():
     """An address missing '/prefix' raises a descriptive NsoApplyError (surfaced), not a
     bare ValueError that would abort the whole atomic apply opaquely."""
-    row = SimpleNamespace(address="10.0.0.1", family="ipv4", vrf=None, secondary=False)
-    with pytest.raises(NsoApplyError, match="prefix"):
-        build_interface_ip_body("Gi0/0", [row])
+    from tests._secret_discipline import assert_chain_free_of
+
+    interface = "placeholder-provider-interface"
+    address = "placeholder-address-without-prefix"
+    row = SimpleNamespace(address=address, family="ipv4", vrf=None, secondary=False)
+    with pytest.raises(NsoApplyError, match="prefix") as caught:
+        build_interface_ip_body(interface, [row])
+    assert_chain_free_of(caught.value, [interface, address])
+
+
+def test_build_interface_ip_body_rejects_non_numeric_prefix_without_echoing_input():
+    from tests._secret_discipline import assert_chain_free_of
+
+    interface = "placeholder-prefix-interface"
+    address = "198.18.0.1/placeholder-prefix"
+    row = SimpleNamespace(address=address, family="ipv4", vrf=None, secondary=False)
+    with pytest.raises(NsoApplyError, match="prefix") as caught:
+        build_interface_ip_body(interface, [row])
+    assert_chain_free_of(caught.value, [interface, address, "placeholder-prefix"])
 
 
 def test_build_interface_ip_body_rejects_unknown_family():
     """A row whose family is neither ipv4 nor ipv6 is NOT silently dropped — it raises so
     the address can never be reported in_sync while never emitted."""
-    row = SimpleNamespace(address="10.0.0.1/24", family="inet", vrf=None, secondary=False)
-    with pytest.raises(NsoApplyError, match="family"):
-        build_interface_ip_body("Gi0/0", [row])
+    from tests._secret_discipline import assert_chain_free_of
+
+    interface = "placeholder-family-interface"
+    address = "198.18.0.1/24"
+    family = "placeholder-address-family"
+    row = SimpleNamespace(address=address, family=family, vrf=None, secondary=False)
+    with pytest.raises(NsoApplyError, match="family") as caught:
+        build_interface_ip_body(interface, [row])
+    assert_chain_free_of(caught.value, [interface, address, family])
+
+
+def test_snmp_enum_rejection_does_not_echo_the_owner_or_value():
+    from tests._secret_discipline import assert_chain_free_of
+
+    owner = "placeholder-snmp-owner"
+    value = "placeholder-snmp-value"
+    host = SimpleNamespace(
+        address=owner,
+        version=value,
+        notify_type="trap",
+        community_or_user=None,
+        port=None,
+    )
+    with pytest.raises(NsoApplyError) as caught:
+        encode_snmp(
+            {
+                "snmp_community_intent": [],
+                "snmp_v3_user_intent": [],
+                "snmp_host_intent": [host],
+                "snmp_system_info_intent": [],
+            },
+            _PLAIN,
+        )
+    assert_chain_free_of(caught.value, [owner, value])
+
+
+def test_snmp_vault_ref_rejection_does_not_echo_the_owner():
+    from tests._secret_discipline import assert_chain_free_of
+
+    owner = "placeholder-snmp-community"
+    reference = "network/placeholder path#placeholder-key"
+    community = SimpleNamespace(label=owner, access="RO", acl=None, vault_ref=reference)
+    with pytest.raises(NsoApplyError) as caught:
+        encode_snmp(
+            {
+                "snmp_community_intent": [community],
+                "snmp_v3_user_intent": [],
+                "snmp_host_intent": [],
+                "snmp_system_info_intent": [],
+            },
+            _PLAIN,
+        )
+    assert_chain_free_of(caught.value, [owner, reference, "placeholder path"])
 
 
 def test_build_interface_ip_body_secondary_none_is_boolean_not_null():

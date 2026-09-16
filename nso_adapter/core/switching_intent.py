@@ -279,12 +279,12 @@ async def _prepare_snapshot(
     marked = list(deleted_roots)
     duplicates = sorted(root for root, count in Counter(marked).items() if count > 1)
     if duplicates:
-        raise SwitchingRequestRefused(SwitchingRefusal.repeated_root, f"deleted_roots repeats a root: {duplicates}")
+        raise SwitchingRequestRefused(SwitchingRefusal.repeated_root, "deleted_roots contains a repeated root")
     store_only = STORE_ONLY.get()
     kept = sorted(set(marked) & desired_roots)
     if kept:
         raise SwitchingRequestRefused(
-            SwitchingRefusal.root_still_present, f"a deleted root is still present in this snapshot: {kept}"
+            SwitchingRefusal.root_still_present, "a deleted root is still present in this snapshot"
         )
 
     await lock_projection(db, device_id)
@@ -299,7 +299,7 @@ async def _prepare_snapshot(
     unauthorized = sorted(set(marked) - _root_names(authorized, root_table))
     if unauthorized:
         raise SwitchingRequestRefused(
-            SwitchingRefusal.root_not_authorized, f"a deleted root is not authorized on this device: {unauthorized}"
+            SwitchingRefusal.root_not_authorized, "a deleted root is not authorized on this device"
         )
 
     revision = await note_write(db, device_id, stream, push_seq=None)

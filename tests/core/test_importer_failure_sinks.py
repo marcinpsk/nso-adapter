@@ -80,10 +80,17 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.aliases = {"exc"}
         self.violations: list[int] = []
+        self._try_handler_inputs: list[set[str]] = []
 
     def _record_violation(self, lineno: int) -> None:
         if lineno not in self.violations:
             self.violations.append(lineno)
+
+    def _visit_statements(self, statements: list[ast.stmt]) -> None:
+        for statement in statements:
+            for handler_input in self._try_handler_inputs:
+                handler_input.update(self.aliases)
+            self.visit(statement)
 
     def _aliases_exception(self, values: ast.expr | list[ast.expr]) -> bool:
         if not isinstance(values, list):
@@ -135,9 +142,11 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         outer_aliases = self.aliases
+        outer_handler_inputs = self._try_handler_inputs
         self.aliases = {"exc"}
-        for statement in node.body:
-            self.visit(statement)
+        self._try_handler_inputs = []
+        self._visit_statements(node.body)
+        self._try_handler_inputs = outer_handler_inputs
         self.aliases = outer_aliases
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802 - ast visitor API
@@ -167,56 +176,98 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
         incoming = self.aliases.copy()
 
         self.aliases = incoming.copy()
-        for statement in node.body:
-            self.visit(statement)
+        self._visit_statements(node.body)
         body_aliases = self.aliases
 
         self.aliases = incoming.copy()
-        for statement in node.orelse:
-            self.visit(statement)
+        self._visit_statements(node.orelse)
         self.aliases |= body_aliases
 
-    def _visit_try(self, node: ast.Try | ast.TryStar) -> None:
-        # generic_visit walks body, handlers, orelse and finalbody in source order, so an
-        # alias a handler taints was discarded by an `else` assignment before `finally` ran.
+    def _visit_loop(self, node: ast.For | ast.AsyncFor | ast.While) -> None:
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            self.visit(node.iter)
+        else:
+            self.visit(node.test)
         incoming = self.aliases.copy()
-        raising = incoming.copy()
-        for statement in node.body:
-            self.visit(statement)
-            raising |= self.aliases
-        body_aliases = self.aliases
 
-        reaching: set[str] = set()
-        for handler in node.handlers:
-            self.aliases = raising.copy()
-            self.visit(handler)
-            reaching |= self.aliases
+        self.aliases = incoming.copy()
+        self._visit_statements(node.body)
+        body_aliases = self.aliases.copy()
+
+        self.aliases = incoming | body_aliases
+        self._visit_statements(node.orelse)
+        self.aliases |= incoming | body_aliases
+
+    def visit_For(self, node: ast.For) -> None:  # noqa: N802 - ast visitor API
+        self._visit_loop(node)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:  # noqa: N802 - ast visitor API
+        self._visit_loop(node)
+
+    def visit_While(self, node: ast.While) -> None:  # noqa: N802 - ast visitor API
+        self._visit_loop(node)
+
+    def _visit_with(self, node: ast.With | ast.AsyncWith) -> None:
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self.visit(item.optional_vars)
+        self._visit_statements(node.body)
+
+    def visit_With(self, node: ast.With) -> None:  # noqa: N802 - ast visitor API
+        self._visit_with(node)
+
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> None:  # noqa: N802 - ast visitor API
+        self._visit_with(node)
+
+    def visit_Match(self, node: ast.Match) -> None:  # noqa: N802 - ast visitor API
+        self.visit(node.subject)
+        incoming = self.aliases.copy()
+        surviving = incoming.copy()
+        for case in node.cases:
+            self.aliases = incoming.copy()
+            self.visit(case.pattern)
+            if case.guard is not None:
+                self.visit(case.guard)
+            self._visit_statements(case.body)
+            surviving |= self.aliases
+        self.aliases = surviving
+
+    def visit_TryStar(self, node: ast.TryStar) -> None:  # noqa: N802 - ast visitor API
+        # Same fields, same flow: without this, generic_visit walks `except*` in source order.
+        self.visit_Try(node)
+
+    def visit_Try(self, node: ast.Try | ast.TryStar) -> None:  # noqa: N802 - ast visitor API
+        incoming = self.aliases.copy()
+        handler_input = incoming.copy()
+
+        self.aliases = incoming.copy()
+        self._try_handler_inputs.append(handler_input)
+        self._visit_statements(node.body)
+        self._try_handler_inputs.pop()
+        body_aliases = self.aliases.copy()
 
         self.aliases = body_aliases.copy()
-        for statement in node.orelse:
-            self.visit(statement)
-        reaching |= self.aliases
+        self._visit_statements(node.orelse)
+        surviving = self.aliases.copy()
+
+        for handler in node.handlers:
+            self.aliases = handler_input.copy()
+            self.visit(handler)
+            surviving |= self.aliases
 
         # `finally` also runs when an earlier try-body statement raises, before a later
         # assignment can clear an alias. Only paths that fall out of the try continue after it.
-        entry = reaching | raising
+        entry = surviving | handler_input
         self.aliases = entry.copy()
-        for statement in node.finalbody:
-            self.visit(statement)
-        self.aliases = (reaching | (self.aliases - entry)) - (entry - self.aliases)
-
-    def visit_Try(self, node: ast.Try) -> None:  # noqa: N802 - ast visitor API
-        self._visit_try(node)
-
-    def visit_TryStar(self, node: ast.TryStar) -> None:  # noqa: N802 - ast visitor API
-        self._visit_try(node)
+        self._visit_statements(node.finalbody)
+        self.aliases = (surviving | (self.aliases - entry)) - (entry - self.aliases)
 
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:  # noqa: N802 - ast visitor API
         handler_name = node.name
         if handler_name is not None:
             self.aliases.add(handler_name)
-        for statement in node.body:
-            self.visit(statement)
+        self._visit_statements(node.body)
         if handler_name is not None:
             self.aliases.discard(handler_name)
 
@@ -441,6 +492,86 @@ def test_raw_exception_log_guard_preserves_conditional_flow(source: str, expecte
     assert _raw_log_exception_renderers(source) == expected
 
 
+def test_raw_exception_log_guard_unions_handler_and_else_paths() -> None:
+    source = """\
+try:
+    work()
+except Exception as caught:
+    alias = caught
+else:
+    alias = "authored detail"
+logger.warning("event", detail=alias)
+"""
+    assert _raw_log_exception_renderers(source) == [7]
+
+
+def test_raw_exception_log_guard_preserves_taint_at_each_try_body_exit() -> None:
+    source = """\
+try:
+    alias = exc
+    work()
+    alias = "authored detail"
+except Exception:
+    pass
+else:
+    alias = "authored detail"
+logger.warning("event", detail=alias)
+"""
+    assert _raw_log_exception_renderers(source) == [9]
+
+
+def test_raw_exception_log_guard_preserves_nested_try_body_taint() -> None:
+    source = """\
+try:
+    if condition:
+        alias = exc
+        work()
+        alias = "authored detail"
+except Exception:
+    pass
+logger.warning("event", detail=alias)
+"""
+    assert _raw_log_exception_renderers(source) == [8]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_line"),
+    [
+        (
+            """\
+try:
+    with context():
+        alias = exc
+        work()
+        alias = "authored detail"
+except Exception:
+    pass
+logger.warning("event", detail=alias)
+""",
+            8,
+        ),
+        (
+            """\
+try:
+    match value:
+        case _:
+            alias = exc
+            work()
+            alias = "authored detail"
+except Exception:
+    pass
+logger.warning("event", detail=alias)
+""",
+            9,
+        ),
+    ],
+)
+def test_raw_exception_log_guard_preserves_taint_in_nested_statement_containers(
+    source: str, expected_line: int
+) -> None:
+    assert _raw_log_exception_renderers(source) == [expected_line]
+
+
 def test_raw_exception_log_guard_does_not_leak_aliases_between_functions() -> None:
     source = """\
 def first():
@@ -483,6 +614,45 @@ def test_the_action_section_code_is_derived_in_exactly_one_place() -> None:
     )
 
     assert offenders == [], "derive the code via read_outcome.section_absence_code, never in the caller"
+
+
+@pytest.mark.anyio
+async def test_discovery_error_uses_the_configured_instance_identity(db_session, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from structlog.testing import capture_logs
+
+    from nso_adapter.config import NsoInstanceConfig
+    from nso_adapter.core import importer
+    from nso_adapter.nso.client import NsoClient
+    from tests._secret_discipline import assert_records_free_of
+
+    provider_device = "placeholder-provider-device"
+    configured = NsoInstanceConfig(
+        name="configured-discovery-instance",
+        base_url="http://nso.invalid:8080",
+        username_ref="NSO_USERNAME",
+        password_ref="NSO_PASSWORD",
+    )
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            503,
+            request=request,
+            extensions={"reason_phrase": provider_device.encode()},
+        )
+    )
+    client = NsoClient(configured, "placeholder-user", "placeholder-password")
+    client._client = lambda timeout=None: httpx.AsyncClient(transport=transport, base_url=configured.base_url)
+    monkeypatch.setattr(importer, "get_config", lambda: SimpleNamespace(nso_instances=[configured]))
+    monkeypatch.setitem(importer._nso_clients, configured.name, client)
+
+    with capture_logs() as logs:
+        await importer.discover_devices(db_session)
+
+    record = next(item for item in logs if item["event"] == "discover.error")
+    assert_records_free_of([record], [provider_device])
+    assert record["instance"] == configured.name
+    assert record["error"] == "HTTPStatusError (HTTP 503)"
 
 
 def test_guarded_modules_are_documented() -> None:

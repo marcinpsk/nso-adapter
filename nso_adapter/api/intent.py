@@ -146,7 +146,7 @@ async def put_intent(
             raise api_error(
                 422,
                 "validation_error",
-                f"Attribute {item.attribute!r} is not in the managed scope for device {device_id}",
+                "Attribute is not in the managed scope for this device",
             )
 
     # Build a lookup: interface name → DbInterface.id

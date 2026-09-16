@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from nso_adapter.api.nso_instances import list_instance_devices, list_nso_instances
+from nso_adapter.api.nso_instances import list_instance_devices, list_instance_neds, list_nso_instances
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.models import Device
 from tests.conftest import session
@@ -58,20 +58,57 @@ async def test_list_nso_instances_with_instance_unreachable(adapter_client_with_
 
 async def test_list_instance_devices_unknown_instance(adapter_client_with_nso):
     """list_instance_devices() raises 404 for unknown instance_id."""
+    from tests._secret_discipline import assert_chain_free_of
+
+    submitted = "placeholder-unknown-instance"
     async with session() as db:
         with pytest.raises(HTTPException) as exc_info:
-            await list_instance_devices(instance_id="nonexistent", db=db)
+            await list_instance_devices(instance_id=submitted, db=db)
         assert exc_info.value.status_code == 404
+        assert_chain_free_of(exc_info.value, [submitted])
 
 
 async def test_list_instance_devices_nso_connection_error(adapter_client_with_nso):
     """list_instance_devices() raises 502 when NSO is unreachable."""
-    nso = _nso_client(error=ConnectionError("NSO down"))
+    from tests._secret_discipline import assert_chain_free_of
+
+    provider_text = "placeholder-provider-device-error"
+    nso = _nso_client(error=ConnectionError(provider_text))
     async with session() as db:
         with patch("nso_adapter.api.nso_instances.get_nso_client", return_value=nso):
             with pytest.raises(HTTPException) as exc_info:
                 await list_instance_devices(instance_id="nso-dev", db=db)
         assert exc_info.value.status_code == 502
+        assert exc_info.value.__context__ is None
+        assert exc_info.value.__cause__ is None
+        assert_chain_free_of(exc_info.value, [provider_text])
+
+
+async def test_list_instance_neds_unknown_instance(adapter_client_with_nso):
+    from tests._secret_discipline import assert_chain_free_of
+
+    submitted = "placeholder-unknown-ned-instance"
+    with pytest.raises(HTTPException) as exc_info:
+        await list_instance_neds(instance_id=submitted)
+
+    assert exc_info.value.status_code == 404
+    assert_chain_free_of(exc_info.value, [submitted])
+
+
+async def test_list_instance_neds_connection_error(adapter_client_with_nso):
+    from tests._secret_discipline import assert_chain_free_of
+
+    provider_text = "placeholder-provider-ned-error"
+    nso = _nso_client(error=ConnectionError(provider_text))
+    nso.list_ned_packages = AsyncMock(side_effect=ConnectionError(provider_text))
+    with patch("nso_adapter.api.nso_instances.get_nso_client", return_value=nso):
+        with pytest.raises(HTTPException) as exc_info:
+            await list_instance_neds(instance_id="nso-dev")
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.__context__ is None
+    assert exc_info.value.__cause__ is None
+    assert_chain_free_of(exc_info.value, [provider_text])
 
 
 async def test_list_instance_devices_returns_sorted_list(adapter_client_with_nso):
