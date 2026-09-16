@@ -30,6 +30,7 @@ from nso_adapter.store.models import (
     SwitchportIntent,
     SwitchportTaggedVlanIntent,
 )
+from tests._secret_discipline import assert_chain_free_of
 from tests.conftest import seed_device, session
 
 
@@ -583,6 +584,7 @@ async def test_a_refused_preparation_leaves_the_store_and_every_revision_untouch
     from nso_adapter.core.switching_intent import SwitchingRequestRefused
     from nso_adapter.store.models import DeviceProjectionStream
 
+    submitted_root = "caller-root-credential-shaped"
     device_id = await seed_device(nso_device_name="switching-refusal", netbox_device_id=1623)
     async with session() as db:
         await replace_lag_snapshot(
@@ -591,8 +593,9 @@ async def test_a_refused_preparation_leaves_the_store_and_every_revision_untouch
         await db.commit()
 
     async with session() as db:
-        with pytest.raises(SwitchingRequestRefused, match="not authorized"):
-            await replace_lag_snapshot(db, device_id, (), deleted_roots=["Port-channel1"])
+        with pytest.raises(SwitchingRequestRefused, match="not authorized") as exc_info:
+            await replace_lag_snapshot(db, device_id, (), deleted_roots=[submitted_root])
+        assert_chain_free_of(exc_info.value, [submitted_root])
         await db.rollback()
 
     async with session() as db:
@@ -609,6 +612,39 @@ async def test_a_refused_preparation_leaves_the_store_and_every_revision_untouch
         )
     assert (row.desired_revision, row.prepared_revision) == (1, 1)
     assert names == ["Port-channel1"]
+
+
+@pytest.mark.anyio
+async def test_repeated_deleted_root_refusal_does_not_echo_the_submitted_root(adapter_client):
+    from nso_adapter.core.switching_intent import SwitchingRequestRefused
+
+    submitted_root = "caller-repeated-root-credential-shaped"
+    device_id = await seed_device(nso_device_name="switching-repeated-root", netbox_device_id=16231)
+
+    async with session() as db:
+        with pytest.raises(SwitchingRequestRefused) as exc_info:
+            await replace_lag_snapshot(db, device_id, (), deleted_roots=[submitted_root, submitted_root])
+
+    assert_chain_free_of(exc_info.value, [submitted_root])
+
+
+@pytest.mark.anyio
+async def test_retained_deleted_root_refusal_does_not_echo_the_submitted_root(adapter_client):
+    from nso_adapter.core.switching_intent import SwitchingRequestRefused
+
+    submitted_root = "caller-retained-root-credential-shaped"
+    device_id = await seed_device(nso_device_name="switching-retained-root", netbox_device_id=16232)
+
+    async with session() as db:
+        with pytest.raises(SwitchingRequestRefused) as exc_info:
+            await replace_lag_snapshot(
+                db,
+                device_id,
+                (LagBundleSnapshot(name=submitted_root, lag_id=1),),
+                deleted_roots=[submitted_root],
+            )
+
+    assert_chain_free_of(exc_info.value, [submitted_root])
 
 
 def test_the_writer_stream_names_are_the_route_registry_names():

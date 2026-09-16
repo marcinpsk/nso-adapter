@@ -374,19 +374,17 @@ async def test_vault_permission_denied_returns_structured_502(vault_client):
     error, not an unhandled 500 - live-observed on a path outside the AppRole's
     policy. The response names the failure and nothing the caller sent."""
     client, store, kv = vault_client
-    store["credentials/other-svc"] = {"password": "placeholder-denied-value"}
-    kv.forbid_always.add("credentials/other-svc")
+    path = "credentials/placeholder-denied-service"
+    reference = f"network/{path}"
+    password = "placeholder-denied-password"
+    store[path] = {"password": password}
+    kv.forbid_always.add(path)
 
-    resp = await client.post(
-        "/api/v1/secrets/verify", json={"vault_ref": "network/credentials/other-svc"}, headers=AUTH
-    )
+    resp = await client.post("/api/v1/secrets/verify", json={"vault_ref": reference}, headers=AUTH)
 
     assert resp.status_code == 502
     assert resp.json()["error"]["code"] == "vault_error"
-    assert_text_free_of(
-        resp.text,
-        ["placeholder-denied-value", "credentials/other-svc", "network/credentials/other-svc"],
-    )
+    assert_text_free_of(resp.text, [password, path, reference])
 
 
 @pytest.mark.anyio
@@ -580,7 +578,8 @@ async def test_a_missing_community_404_repeats_no_part_of_the_request(vault_clie
 @pytest.mark.anyio
 async def test_harvest_community_unsupported_ned(vault_client):
     client, _, _ = vault_client
-    device_id = await _seed_harvest_device("timos-nc-9.1")
+    ned_id = "placeholder-unsupported-ned"
+    device_id = await _seed_harvest_device(ned_id)
 
     resp = await client.post(
         f"/api/v1/devices/{device_id}/secrets/harvest-community",
@@ -590,8 +589,7 @@ async def test_harvest_community_unsupported_ned(vault_client):
 
     assert resp.status_code == 409
     assert resp.json()["error"]["code"] == "harvest_unsupported_ned"
-    # The NED id is provider-derived text; the closed code already names the refusal.
-    assert_text_free_of(resp.text, ["timos-nc-9.1"])
+    assert_text_free_of(resp.text, [ned_id])
 
 
 @pytest.mark.anyio

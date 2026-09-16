@@ -115,7 +115,7 @@ class RemovalBlockedError(Exception):
 
     def __init__(self, orphans: dict[str, list]):
         self.orphans = orphans
-        super().__init__(f"PUT-replace would retract rows not in intent: {orphans}")
+        super().__init__("PUT-replace would retract rows not in intent")
 
 
 # ── collateral guard (#90) — every device-keyed PUT-replace scope ─────────────

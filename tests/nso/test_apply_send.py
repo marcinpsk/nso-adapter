@@ -127,6 +127,19 @@ async def test_native_dry_run_none_on_non_2xx():
     assert await native_dry_run(client, "http://nso/x", "{}", "sw03") is None
 
 
+async def test_strict_native_dry_run_rejection_does_not_echo_the_device():
+    from tests._secret_discipline import assert_chain_free_of
+
+    device = "placeholder-dry-run-device"
+    client = _client_with(_RecordingTransport(dryrun_status=409))
+
+    with pytest.raises(NsoApplyError) as caught:
+        await native_dry_run(client, "http://nso/x", "{}", device, strict=True)
+
+    assert caught.value.code == "dry_run_rejected"
+    assert_chain_free_of(caught.value, [device])
+
+
 async def test_native_dry_run_none_on_transport_error():
     client = _client_with(_RecordingTransport(raise_exc=httpx.ConnectError("refused")))
     assert await native_dry_run(client, "http://nso/x", "{}", "sw03") is None
@@ -232,12 +245,17 @@ async def test_no_networking_also_reaches_the_post_commit_verification():
 
 
 async def test_verify_raises_when_delta_remains():
-    body = {"dry-run-result": {"native": {"device": [{"name": "sw03", "data": "leftover\n"}]}}}
+    from tests._secret_discipline import assert_chain_free_of
+
+    device = "placeholder-verify-device"
+    body = {"dry-run-result": {"native": {"device": [{"name": device, "data": "leftover\n"}]}}}
     client = _client_with(_RecordingTransport(dryrun_body=body))
 
     with pytest.raises(NsoApplyError) as exc:
-        await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="snmp")
+        await _verify_native_or_raise(client, "http://nso/x", "{}", device, scope="snmp")
     assert exc.value.code == "verify_mismatch"
+    assert str(exc.value).startswith("snmp:")
+    assert_chain_free_of(exc.value, [device])
 
 
 async def test_verify_passes_when_delta_empty():

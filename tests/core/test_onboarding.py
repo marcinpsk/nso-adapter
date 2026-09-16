@@ -47,10 +47,37 @@ async def test_onboard_creates_device(adapter_client_with_nso):
 async def test_onboard_raises_for_unknown_instance(adapter_client):
     """onboard_device raises ValueError when NSO instance is not in config."""
     from nso_adapter.core.onboarding import onboard_device
+    from tests._secret_discipline import assert_chain_free_of
 
+    unknown_instance = "placeholder-unknown-onboard-instance"
     async with session() as db:
-        with pytest.raises(ValueError, match="not found in config"):
-            await onboard_device(db, "nonexistent-nso", "device-01", 99)
+        with pytest.raises(ValueError, match="not found in config") as caught:
+            await onboard_device(db, unknown_instance, "device-01", 99)
+
+    assert_chain_free_of(caught.value, [unknown_instance])
+
+
+async def test_claim_timeout_does_not_repeat_the_nso_device_name(adapter_client_with_nso, monkeypatch):
+    from nso_adapter.config import get_config
+    from nso_adapter.core.claim import ClaimRegistration, ClaimUnavailableError, acquire_claim, release_claim
+    from nso_adapter.core.onboarding import onboard_device
+    from tests._secret_discipline import assert_chain_free_of
+    from tests.conftest import seed_device
+
+    device_name = "placeholder-claimed-device"
+    device_id = await seed_device(nso_instance="nso-dev", nso_device_name=device_name, netbox_device_id=None)
+    rival = await acquire_claim(device_id, "intent_put")
+    assert rival is not None
+    monkeypatch.setattr(get_config(), "intent_claim_wait_seconds", 0.0)
+
+    try:
+        async with session() as db:
+            with pytest.raises(ClaimUnavailableError) as caught:
+                await onboard_device(db, "nso-dev", device_name, 99, reg=ClaimRegistration())
+    finally:
+        await release_claim(rival)
+
+    assert_chain_free_of(caught.value, [device_name])
 
 
 async def test_onboard_raises_for_duplicate_netbox_id(adapter_client_with_nso):
@@ -729,14 +756,18 @@ async def test_old_source_sync_metadata_cannot_overwrite_rekey_reset(adapter_cli
 async def test_rekey_raises_for_unknown_instance(adapter_client):
     """rekey_device raises ValueError when new NSO instance is not in config."""
     from nso_adapter.core.onboarding import rekey_device
+    from tests._secret_discipline import assert_chain_free_of
     from tests.conftest import seed_device
 
+    unknown_instance = "placeholder-unknown-rekey-instance"
     device_id = await seed_device(nso_instance="nso-dev", nso_device_name="rekey-inst", netbox_device_id=302)
 
     async with session() as db:
         device = await db.get(Device, device_id)
-        with pytest.raises(ValueError, match="not found in config"):
-            await rekey_device(db, device, nso_instance="ghost-nso")
+        with pytest.raises(ValueError, match="not found in config") as caught:
+            await rekey_device(db, device, nso_instance=unknown_instance)
+
+    assert_chain_free_of(caught.value, [unknown_instance])
 
 
 async def test_rekey_changes_nso_instance(adapter_client_with_nso):

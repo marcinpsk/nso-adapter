@@ -361,11 +361,11 @@ async def _upsert_route_policy_object(db: AsyncSession, device_id: int, obj: dic
     invert_match = bool(obj.get("invert_match", False))
 
     if family not in _VALID_FAMILIES:
-        raise api_error(422, "invalid_family", f"Unknown family: {family!r}")
+        raise api_error(422, "invalid_family", "Object has an unknown family")
     if not isinstance(name, str) or not name:
         raise api_error(422, "invalid_name", "Each object must have a non-empty 'name'")
     if not isinstance(entries, list):
-        raise api_error(422, "invalid_entries", f"'entries' for {name!r} must be a list")
+        raise api_error(422, "invalid_entries", "Object entries must be a list")
 
     row = (
         await db.execute(

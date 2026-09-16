@@ -263,17 +263,21 @@ async def test_provision_sync_failure_is_nonfatal(adapter_client_with_nso):
 
 async def test_provision_unknown_instance_raises(adapter_client):
     from nso_adapter.core.onboarding import provision_nso_device
+    from tests._secret_discipline import assert_chain_free_of
 
+    unknown_instance = "placeholder-unknown-provision-instance"
     async with session() as db:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError) as caught:
             await provision_nso_device(
                 db,
-                nso_instance="ghost",
+                nso_instance=unknown_instance,
                 device_name="x",
                 address="1.1.1.1",
                 ned_id="x",
                 authgroup="network",
             )
+
+    assert_chain_free_of(caught.value, [unknown_instance])
 
 
 async def test_provision_retries_fetch_host_keys_once(adapter_client_with_nso):

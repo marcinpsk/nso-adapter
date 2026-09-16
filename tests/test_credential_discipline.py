@@ -112,6 +112,48 @@ def test_flags_constant_credential_string_expressions(statement):
     assert len(scan_source(statement, "t.py")) == 1
 
 
+def test_flags_a_constant_alias_at_a_credential_sink():
+    source = 'placeholder = "admin"\nusername = placeholder\n'
+
+    hits = scan_source(source, "t.py")
+
+    assert len(hits) == 1
+    assert hits[0].lineno == 2
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'placeholder = "admin"\nplaceholder = supplied\nusername = placeholder\n',
+        'placeholder = "admin"\nplaceholder = "placeholder-user"\nusername = placeholder\n',
+        'placeholder = "admin"\nplaceholder += supplied\nusername = placeholder\n',
+        'placeholder = "admin"\nplaceholder += "-suffix"\nusername = placeholder\n',
+    ],
+)
+def test_reassigned_constant_alias_does_not_retain_its_old_value(source):
+    assert scan_source(source, "t.py") == []
+
+
+def test_conditional_reassignment_preserves_the_tainted_path():
+    source = 'placeholder = "admin"\nif condition:\n    placeholder = supplied\nusername = placeholder\n'
+
+    hits = scan_source(source, "t.py")
+
+    assert len(hits) == 1
+    assert hits[0].lineno == 4
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'def first():\n    placeholder = "admin"\ndef second():\n    username = placeholder\n',
+        'class First:\n    placeholder = "admin"\nclass Second:\n    username = placeholder\n',
+    ],
+)
+def test_constant_aliases_do_not_leak_between_lexical_scopes(source):
+    assert scan_source(source, "t.py") == []
+
+
 @pytest.mark.parametrize(
     "source",
     [
