@@ -4,15 +4,24 @@
 
 from __future__ import annotations
 
+import json
+import shutil
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
-from textwrap import dedent
+from pathlib import Path
+from textwrap import dedent, indent
 
 import pytest
 
 from tests.core.test_importer_failure_sinks import _raw_log_exception_renderers
 from tests.credential_discipline import scan_source as scan_credentials
 from tests.test_secret_discipline import _non_disclosure_assertion_lines
+
+ROOT = Path(__file__).parents[1]
+OPENGREP = shutil.which("opengrep")
+OPENGREP_RULES = ROOT / ".opengrep" / "nso-rules.yaml"
+OPENGREP_EXCEPTION_RULE = "nso-outcome-raw-exception-alias-renderer"
 
 
 @dataclass(frozen=True)
@@ -241,6 +250,92 @@ CASES = (
     ),
 )
 
+OPENGREP_FUNCTION_SCOPE_CASES = (
+    ConformanceCase(
+        "control-finally-exceptional-state-at-function-scope",
+        "value = CLEAN\ntry:\n    value = SOURCE\n    work()\n    value = CLEAN\nfinally:\n    SINK",
+        "value = CLEAN\ntry:\n    value = SOURCE\n    work()\n    value = CLEAN\nexcept:\n    value = CLEAN\nfinally:\n    SINK",
+    ),
+    ConformanceCase(
+        "control-handler-exceptional-finally-state-at-function-scope",
+        "value = CLEAN\ntry:\n    work()\nexcept:\n    value = SOURCE\n    work_again()\n    value = CLEAN\nfinally:\n    SINK",
+        "value = CLEAN\ntry:\n    work()\nexcept:\n    value = CLEAN\n    work_again()\nfinally:\n    SINK",
+    ),
+    ConformanceCase(
+        "control-nested-try-exception-propagation-at-function-scope",
+        "value = CLEAN\ntry:\n    try:\n        value = SOURCE\n        work()\n        value = CLEAN\n    except ValueError:\n        value = CLEAN\nfinally:\n    SINK",
+        "value = CLEAN\ntry:\n    try:\n        value = SOURCE\n        work()\n        value = CLEAN\n    except:\n        value = CLEAN\nfinally:\n    SINK",
+    ),
+    ConformanceCase(
+        "control-nested-try-handler-propagation-at-function-scope",
+        "value = CLEAN\ntry:\n    try:\n        value = SOURCE\n        work()\n        value = CLEAN\n    except ValueError:\n        value = CLEAN\nexcept:\n    SINK",
+        "value = CLEAN\ntry:\n    try:\n        value = SOURCE\n        work()\n        value = CLEAN\n    except:\n        value = CLEAN\n    work_outer()\nexcept:\n    SINK",
+    ),
+)
+OPENGREP_CASES = (*CASES, *OPENGREP_FUNCTION_SCOPE_CASES)
+
+_OPENGREP_CLASS_SCOPE_GAPS = {
+    "scope-class-inward",
+    "scope-class-inward-before-shadow",
+    "scope-class-compound-inward-before-shadow",
+    "scope-class-try-finally-before-shadow",
+    "scope-class-except-intermediate-state",
+    "scope-class-loop-before-shadow",
+    "scope-class-loop-fixed-point",
+    "scope-method-skips-class",
+    "control-finally-exceptional-state",
+    "control-handler-exceptional-finally-state",
+    "control-nested-try-exception-propagation",
+    "control-nested-try-handler-propagation",
+}
+OPENGREP_XFAILS = {
+    **{
+        (name, True): "OpenGrep does not propagate the exception taint into a nested class body"
+        for name in _OPENGREP_CLASS_SCOPE_GAPS
+    },
+    (
+        "control-break-in-try",
+        True,
+    ): "OpenGrep does not replay a finally block over a pending break path",
+    (
+        "control-continue-in-try",
+        True,
+    ): "OpenGrep does not replay a finally block over a pending continue path",
+    (
+        "control-finally-replaces-exit",
+        False,
+    ): "OpenGrep reports stale taint after finally replaces a pending loop exit",
+    (
+        "control-finally-exceptional-state-at-function-scope",
+        False,
+    ): "OpenGrep retains taint after a catch-all handler overwrites exceptional state",
+    (
+        "control-nested-try-exception-propagation-at-function-scope",
+        False,
+    ): "OpenGrep retains taint after a nested catch-all handler overwrites exceptional state",
+    (
+        "control-nested-try-handler-propagation-at-function-scope",
+        False,
+    ): "OpenGrep propagates stale taint past a nested catch-all handler",
+}
+
+CREDENTIAL_CONSTANT_CASES = (
+    ("direct-literal", '"admin"', True, None),
+    (
+        "lower",
+        '"ADMIN".lower()',
+        True,
+        "OpenGrep does not constant-fold str.lower() when identifying a taint source",
+    ),
+    (
+        "join",
+        '"".join(("ad", "min"))',
+        True,
+        "OpenGrep does not constant-fold str.join() when identifying a taint source",
+    ),
+    ("clean-literal", '"placeholder-user"', False, None),
+)
+
 
 def _render(case_source: str, scanner: ScannerSpec) -> str:
     return (
@@ -252,6 +347,140 @@ def _render(case_source: str, scanner: ScannerSpec) -> str:
     )
 
 
+def _opengrep_case_parameters() -> list[object]:
+    parameters = []
+    for case in OPENGREP_CASES:
+        for tainted in (True, False):
+            marks = []
+            if reason := OPENGREP_XFAILS.get((case.name, tainted)):
+                marks.append(pytest.mark.xfail(reason=reason, strict=True))
+            parameters.append(
+                pytest.param(
+                    case,
+                    tainted,
+                    marks=marks,
+                    id=f"{case.name}-{'tainted' if tainted else 'clean'}",
+                )
+            )
+    return parameters
+
+
+@pytest.fixture(scope="module")
+def opengrep_verdicts(tmp_path_factory: pytest.TempPathFactory) -> set[tuple[str, bool]]:
+    if OPENGREP is None:
+        pytest.skip("opengrep is not installed")
+
+    target_dir = tmp_path_factory.mktemp("opengrep-conformance")
+    target = target_dir / "review-patterns.py"
+    source_lines: list[str] = []
+    line_owners: dict[int, tuple[str, bool]] = {}
+    exception_scanner = SCANNERS[0]
+    for case in OPENGREP_CASES:
+        for tainted in (True, False):
+            case_source = _render(case.tainted if tainted else case.clean, exception_scanner)
+            function_name = f"case_{case.name.replace('-', '_')}_{'tainted' if tainted else 'clean'}"
+            # The live source pattern does not match a try body that contains only pass.
+            block = (
+                f"def {function_name}():\n"
+                "    try:\n"
+                "        work()\n"
+                "    except Exception as exc:\n"
+                f"{indent(case_source, '        ')}\n"
+            )
+            start_line = len(source_lines) + 1
+            block_lines = block.splitlines()
+            source_lines.extend(block_lines)
+            source_lines.append("")
+            for line in range(start_line, start_line + len(block_lines)):
+                line_owners[line] = (case.name, tainted)
+    target.write_text("\n".join(source_lines), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            OPENGREP,
+            "scan",
+            "--config",
+            str(OPENGREP_RULES),
+            "--quiet",
+            "--json",
+            "--",
+            str(target),
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert not report["errors"], report["errors"]
+    return {
+        line_owners[finding["start"]["line"]]
+        for finding in report["results"]
+        if finding["check_id"].endswith(OPENGREP_EXCEPTION_RULE)
+    }
+
+
+@pytest.fixture(scope="module")
+def opengrep_credential_verdicts(tmp_path_factory: pytest.TempPathFactory) -> set[str]:
+    if OPENGREP is None:
+        pytest.skip("opengrep is not installed")
+
+    target_dir = tmp_path_factory.mktemp("opengrep-credential-conformance")
+    config = target_dir / "credential-rule.yaml"
+    config.write_text(
+        dedent(
+            """
+            rules:
+              - id: credential-literal-conformance
+                languages: [python]
+                severity: ERROR
+                message: Credential literal reached a credential sink.
+                mode: taint
+                pattern-sources:
+                  - pattern: '"admin"'
+                pattern-sinks:
+                  - patterns:
+                      - pattern: username = $VALUE
+                      - focus-metavariable: $VALUE
+            """
+        ),
+        encoding="utf-8",
+    )
+    target = target_dir / "credential-conformance.py"
+    source_lines: list[str] = []
+    line_owners: dict[int, str] = {}
+    for name, expression, _expected, _reason in CREDENTIAL_CONSTANT_CASES:
+        block = (
+            f"def case_{name.replace('-', '_')}():\n"
+            "    try:\n"
+            "        work()\n"
+            "    except Exception:\n"
+            f"        username = {expression}\n"
+        )
+        start_line = len(source_lines) + 1
+        block_lines = block.splitlines()
+        source_lines.extend(block_lines)
+        source_lines.append("")
+        for line in range(start_line, start_line + len(block_lines)):
+            line_owners[line] = name
+    target.write_text("\n".join(source_lines), encoding="utf-8")
+
+    result = subprocess.run(
+        [OPENGREP, "scan", "--config", str(config), "--quiet", "--json", "--", str(target)],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert not report["errors"], report["errors"]
+    return {line_owners[finding["start"]["line"]] for finding in report["results"]}
+
+
 @pytest.mark.parametrize("scanner", SCANNERS, ids=lambda scanner: scanner.name)
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
 @pytest.mark.parametrize("tainted", [True, False], ids=["tainted", "clean"])
@@ -261,3 +490,38 @@ def test_scanner_conformance(scanner: ScannerSpec, case: ConformanceCase, tainte
     source = _render(case.tainted if tainted else case.clean, scanner)
 
     assert scanner.scan(source) is tainted
+
+
+@pytest.mark.skipif(OPENGREP is None, reason="opengrep is not installed")
+@pytest.mark.parametrize(("case", "tainted"), _opengrep_case_parameters())
+def test_opengrep_taint_conformance(
+    opengrep_verdicts: set[tuple[str, bool]],
+    case: ConformanceCase,
+    tainted: bool,
+) -> None:
+    assert ((case.name, tainted) in opengrep_verdicts) is tainted
+
+
+@pytest.mark.skipif(OPENGREP is None, reason="opengrep is not installed")
+@pytest.mark.parametrize(
+    ("name", "_expression", "expected", "_reason"),
+    [
+        pytest.param(
+            name,
+            expression,
+            expected,
+            reason,
+            marks=pytest.mark.xfail(reason=reason, strict=True) if reason else (),
+            id=name,
+        )
+        for name, expression, expected, reason in CREDENTIAL_CONSTANT_CASES
+    ],
+)
+def test_opengrep_credential_constant_conformance(
+    opengrep_credential_verdicts: set[str],
+    name: str,
+    _expression: str,
+    expected: bool,
+    _reason: str | None,
+) -> None:
+    assert (name in opengrep_credential_verdicts) is expected
