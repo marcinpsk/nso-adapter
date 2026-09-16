@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -19,7 +20,7 @@ from tests.credential_discipline import scan_source as scan_credentials
 from tests.test_secret_discipline import _non_disclosure_assertion_lines
 
 ROOT = Path(__file__).parents[1]
-OPENGREP = shutil.which("opengrep")
+OPENGREP = shutil.which(os.environ.get("OPENGREP_BIN") or "opengrep")
 OPENGREP_RULES = ROOT / ".opengrep" / "nso-rules.yaml"
 OPENGREP_EXCEPTION_RULES = {
     "nso-outcome-raw-exception-alias-renderer",
@@ -42,7 +43,7 @@ class ConformanceCase:
     name: str
     tainted: str
     clean: str
-    skips: dict[str, str] | None = None
+    gaps: dict[str, str] | None = None
 
 
 def _credential_verdict(source: str) -> bool:
@@ -373,10 +374,20 @@ def _opengrep_case_parameters() -> list[object]:
     return parameters
 
 
+def _scanner_case_parameters() -> list[object]:
+    parameters = []
+    for scanner in SCANNERS:
+        for case in CASES:
+            gap_reason = (case.gaps or {}).get(scanner.name)
+            if gap_reason:
+                continue
+            parameters.append(pytest.param(scanner, case, id=f"{case.name}-{scanner.name}"))
+    return parameters
+
+
 @pytest.fixture(scope="module")
 def opengrep_verdicts(tmp_path_factory: pytest.TempPathFactory) -> set[tuple[str, bool]]:
-    if OPENGREP is None:
-        pytest.skip("opengrep is not installed")
+    assert OPENGREP is not None
 
     target_dir = tmp_path_factory.mktemp("opengrep-conformance")
     target = target_dir / "review-patterns.py"
@@ -432,8 +443,7 @@ def opengrep_verdicts(tmp_path_factory: pytest.TempPathFactory) -> set[tuple[str
 
 @pytest.fixture(scope="module")
 def opengrep_credential_verdicts(tmp_path_factory: pytest.TempPathFactory) -> set[str]:
-    if OPENGREP is None:
-        pytest.skip("opengrep is not installed")
+    assert OPENGREP is not None
 
     target_dir = tmp_path_factory.mktemp("opengrep-credential-conformance")
     config = target_dir / "credential-rule.yaml"
@@ -489,47 +499,43 @@ def opengrep_credential_verdicts(tmp_path_factory: pytest.TempPathFactory) -> se
     return {line_owners[finding["start"]["line"]] for finding in report["results"]}
 
 
-@pytest.mark.parametrize("scanner", SCANNERS, ids=lambda scanner: scanner.name)
-@pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
+@pytest.mark.parametrize(("scanner", "case"), _scanner_case_parameters())
 @pytest.mark.parametrize("tainted", [True, False], ids=["tainted", "clean"])
 def test_scanner_conformance(scanner: ScannerSpec, case: ConformanceCase, tainted: bool) -> None:
-    if case.skips and scanner.name in case.skips:
-        pytest.skip(case.skips[scanner.name])
     source = _render(case.tainted if tainted else case.clean, scanner)
 
     assert scanner.scan(source) is tainted
 
 
-@pytest.mark.skipif(OPENGREP is None, reason="opengrep is not installed")
-@pytest.mark.parametrize(("case", "tainted"), _opengrep_case_parameters())
-def test_opengrep_taint_conformance(
-    opengrep_verdicts: set[tuple[str, bool]],
-    case: ConformanceCase,
-    tainted: bool,
-) -> None:
-    assert ((case.name, tainted) in opengrep_verdicts) is tainted
+if OPENGREP is not None:
 
+    @pytest.mark.parametrize(("case", "tainted"), _opengrep_case_parameters())
+    def test_opengrep_taint_conformance(
+        opengrep_verdicts: set[tuple[str, bool]],
+        case: ConformanceCase,
+        tainted: bool,
+    ) -> None:
+        assert ((case.name, tainted) in opengrep_verdicts) is tainted
 
-@pytest.mark.skipif(OPENGREP is None, reason="opengrep is not installed")
-@pytest.mark.parametrize(
-    ("name", "_expression", "expected", "_reason"),
-    [
-        pytest.param(
-            name,
-            expression,
-            expected,
-            reason,
-            marks=pytest.mark.xfail(reason=reason, strict=True) if reason else (),
-            id=name,
-        )
-        for name, expression, expected, reason in CREDENTIAL_CONSTANT_CASES
-    ],
-)
-def test_opengrep_credential_constant_conformance(
-    opengrep_credential_verdicts: set[str],
-    name: str,
-    _expression: str,
-    expected: bool,
-    _reason: str | None,
-) -> None:
-    assert (name in opengrep_credential_verdicts) is expected
+    @pytest.mark.parametrize(
+        ("name", "_expression", "expected", "_reason"),
+        [
+            pytest.param(
+                name,
+                expression,
+                expected,
+                reason,
+                marks=pytest.mark.xfail(reason=reason, strict=True) if reason else (),
+                id=name,
+            )
+            for name, expression, expected, reason in CREDENTIAL_CONSTANT_CASES
+        ],
+    )
+    def test_opengrep_credential_constant_conformance(
+        opengrep_credential_verdicts: set[str],
+        name: str,
+        _expression: str,
+        expected: bool,
+        _reason: str | None,
+    ) -> None:
+        assert (name in opengrep_credential_verdicts) is expected
