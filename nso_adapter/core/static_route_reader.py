@@ -25,6 +25,8 @@ from typing import NamedTuple
 
 import structlog
 
+from nso_adapter.domain.diagnostics import device_fields
+
 logger = structlog.get_logger(__name__)
 
 
@@ -68,7 +70,7 @@ async def certified_static_route_section(client, device) -> CertifiedSection:
     try:
         routes = _project(state.entry)
     except _Uncertifiable as exc:
-        logger.warning("static_route.section_uncertifiable", device=device.nso_device_name, reason=str(exc))
+        logger.warning("static_route.section_uncertifiable", **device_fields(device_id=device.id), reason=str(exc))
         return CertifiedSection("inconclusive", None)
     if not routes:
         # An instance with no entry and no instance at all say the same thing, and the

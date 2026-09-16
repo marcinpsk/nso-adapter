@@ -18,6 +18,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list, wire_int
 from nso_adapter.store.models import Device, LagInterface, LagMember
@@ -66,8 +67,7 @@ async def _upsert_lags(
             # instead of KeyError'ing the whole refresh and losing every lag.
             logger.warning(
                 "lag_topology.entry_skipped",
-                device_id=device.id,
-                lag_name=lag.get("name"),
+                **device_fields(device_id=device.id),
                 reason="no lag-id",
             )
             continue

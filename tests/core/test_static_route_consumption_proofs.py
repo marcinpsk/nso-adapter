@@ -631,9 +631,11 @@ async def test_a_malformed_route_leaf_reaches_no_sink_and_still_names_the_field(
     assert (section.status, section.entry, section.instance) == ("inconclusive", None, None)
     reported = [record for record in logs if record["event"] == "static_route.section_uncertifiable"]
     assert reported, "the malformed answer was not reported at all"
+    assert reported[0]["device_id"] == _MALFORMED_DEVICE.id
+    assert "device" not in reported[0]
     assert leaf in reported[0]["reason"], "the operator cannot tell WHICH leaf was malformed"
     assert arrived in reported[0]["reason"], "the operator cannot tell WHAT type arrived"
-    assert_records_free_of(logs, [_MALFORMED_SECRET])
+    assert_records_free_of(logs, [_MALFORMED_SECRET, _MALFORMED_DEVICE.nso_device_name])
 
     # The raise itself, on the real projector: no node of the chain repeats the value either.
     with pytest.raises(_Uncertifiable) as caught:

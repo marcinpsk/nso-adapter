@@ -40,6 +40,7 @@ from nso_adapter.core.request_flags import (
     STORE_ONLY_PROVENANCE,
     request_marking,
 )
+from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.client import failure_detail
 
 logger = structlog.get_logger(__name__)
@@ -575,7 +576,12 @@ async def _record_residue(
     elif residue:
         result["residue_check"] = "found"
         result["residue"] = residue
-        logger.warning("removal.residue_found", job_id=job_id, device_id=device_id, scope=scope, residue=residue)
+        logger.warning(
+            "removal.residue_found",
+            job_id=job_id,
+            **device_fields(device_id=device_id),
+            scope=scope,
+        )
     elif unverifiable:
         result["residue_check"] = "partial"
     else:
@@ -747,19 +753,17 @@ def _classify_static_route_removal(generation, context: dict) -> SrRemoval:
     if plan.reclaimed:
         logger.warning(
             "static_route.removal_key_reclaimed",
-            device_id=generation.device_id,
+            **device_fields(device_id=generation.device_id),
             job_id=generation.job_id,
-            keys=[list(key) for key in plan.reclaimed],
         )
     branch = "detach" if context.get("detach") else "networked"
     if not plan.authorized and not plan.clears:
         branch = "superseded"
         logger.info(
             SR_SUPERSEDED_EVENT,
-            device_id=generation.device_id,
+            **device_fields(device_id=generation.device_id),
             job_id=generation.job_id,
             tombstones=list(plan.tombstone_ids),
-            reclaimed=[list(key) for key in plan.reclaimed],
         )
     return SrRemoval(
         branch,
@@ -905,7 +909,11 @@ async def _sr_networked_proof(client, device, out: SrRemoval, result: dict):
         result["residue_check"] = residue
         if survivors:
             result["residue"] = {"route": [list(key) for key in survivors]}
-            logger.error("removal.residue_found", device_id=device.id, scope="static_route", residue=result["residue"])
+            logger.error(
+                "removal.residue_found",
+                **device_fields(device_id=device.id),
+                scope="static_route",
+            )
     else:
         # A pure-clear removal authorizes no key at all: nothing to look for, so say so
         # rather than reporting a clean bill nothing was checked against.
@@ -1762,7 +1770,7 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
             logger.error(
                 "removal.blocked_collateral",
                 job_id=job_id,
-                device_id=device_id,
+                **device_fields(device_id=device_id),
                 scope=scope,
                 error=failure_detail(blocked),
             )

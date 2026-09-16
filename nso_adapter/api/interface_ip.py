@@ -20,6 +20,7 @@ from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ,
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant, iso_z, latest_refreshed
+from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import DbInterface, Device, InterfaceIpAddress, InterfaceIpIntent
 
@@ -250,9 +251,7 @@ async def put_ip_intent(
             ifaces[item.interface] = iface
             logger.info(
                 "ip_intent.put.greenfield_interface",
-                device_id=device_id,
-                interface=item.interface,
-                parent_binding=item.parent_binding,
+                **device_fields(device_id=device_id),
                 encap_tag=item.encap_tag,
             )
         else:
@@ -292,7 +291,7 @@ async def put_ip_intent(
     for item in body.addresses:
         iface = ifaces.get(item.interface)
         if iface is None:
-            logger.warning("ip_intent.put.unknown_interface", device_id=device_id, interface=item.interface)
+            logger.warning("ip_intent.put.unknown_interface", **device_fields(device_id=device_id))
             continue
         key = (iface.id, item.address, item.vrf)
         accepted = item.accepted_at if item.accepted_at else now

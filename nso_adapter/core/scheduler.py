@@ -11,6 +11,7 @@ import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from nso_adapter.config import get_config
+from nso_adapter.domain.diagnostics import device_fields
 
 logger = structlog.get_logger(__name__)
 _scheduler: AsyncIOScheduler | None = None
@@ -236,8 +237,7 @@ async def _scheduled_intent_reconcile() -> None:
                     if iface is None:
                         logger.debug(
                             "scheduler.intent_reconcile.unknown_interface",
-                            device_id=device.id,
-                            interface=rec.interface_name,
+                            **device_fields(device_id=device.id),
                         )
                         continue
                     value = str(rec.intent_value) if rec.intent_value is not None else None

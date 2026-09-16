@@ -120,8 +120,13 @@ async def _seed_topology(device_id: int) -> None:
         return
 
 
-async def _run_ensure(device_id: int, nb_client) -> set[str]:
+async def _run_ensure(device_id: int, nb_client) -> tuple[set[str], list[dict]]:
     """Call ensure_topology_interfaces with bulk_ensure stubbed; return the names set."""
+    import logging
+
+    import structlog
+    from structlog.testing import capture_logs
+
     import nso_adapter.core.topology_interfaces as mod
     from nso_adapter.store.models import Device
 
@@ -140,20 +145,26 @@ async def _run_ensure(device_id: int, nb_client) -> set[str]:
         async with session() as db:
             device = await db.get(Device, device_id)
             expected_nb_id = device.netbox_device_id
-            await mod.ensure_topology_interfaces(db, device, nb_client)
+            previous = structlog.get_config().copy()
+            structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG))
+            try:
+                with capture_logs() as logs:
+                    await mod.ensure_topology_interfaces(db, device, nb_client)
+            finally:
+                structlog.configure(**previous)
     finally:
         mod.bulk_ensure_interfaces = orig
     # The resolved NetBox client + the device's netbox id must actually reach bulk_ensure.
     assert captured["client"] is nb_client
     assert captured["nb_device_id"] == expected_nb_id
-    return set(captured.get("names", []))
+    return set(captured.get("names", [])), logs
 
 
 async def test_unions_and_filters_sources(adapter_client):
     device_id = await seed_device(nso_device_name="topo-nokia", netbox_device_id=900)
     await _seed_topology(device_id)
 
-    names = await _run_ensure(device_id, _nb_client())
+    names, logs = await _run_ensure(device_id, _nb_client())
 
     assert names == {
         "1/1/c22/1",  # cfg.port base
@@ -167,6 +178,17 @@ async def test_unions_and_filters_sources(adapter_client):
     }
     assert "lag67:0" not in names  # decision 3: colon-form unbound shell skipped
     assert "lag-4" not in names  # decision 2: empty + unreferenced LAG skipped
+
+    from tests._secret_discipline import assert_records_free_of
+
+    ensured = next(record for record in logs if record["event"] == "topology_interfaces.ensured")
+    skipped = next(record for record in logs if record["event"] == "topology_interfaces.skipped_unbound")
+    assert ensured["device_id"] == device_id
+    assert ensured["total"] == len(names)
+    assert "nso_device_name" not in ensured
+    assert skipped["device_id"] == device_id
+    assert "names" not in skipped
+    assert_records_free_of([ensured, skipped], ["topo-nokia", "lag67:0"])
 
 
 async def test_no_netbox_binding_returns_empty(adapter_client):
