@@ -421,6 +421,44 @@ def test_constant_aliases_do_not_leak_between_lexical_scopes(source):
 
 
 @pytest.mark.parametrize(
+    "nested_scope",
+    [
+        'def nested():\n        value = "admin"\n        if condition:\n            pass',
+        'async def nested():\n        value = "admin"\n        if condition:\n            pass',
+        'class Nested:\n        value = "admin"\n        if condition:\n            pass',
+    ],
+    ids=["function", "async-function", "class"],
+)
+def test_nested_scopes_do_not_pollute_enclosing_try_handler_state(nested_scope):
+    source = f"""\
+value = supplied
+try:
+    {nested_scope}
+    work()
+except Exception:
+    pass
+username = value
+"""
+
+    assert scan_source(source, "t.py") == []
+
+
+def test_function_decorators_and_defaults_use_the_enclosing_constant_scope():
+    source = """\
+value = "admin"
+@connect(username=value)
+def decorated():
+    value = supplied
+def defaulted(password=value):
+    value = supplied
+"""
+
+    hits = scan_source(source, "t.py")
+
+    assert [hit.lineno for hit in hits] == [2, 5]
+
+
+@pytest.mark.parametrize(
     "source",
     [
         'role = "admin"',
