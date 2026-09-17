@@ -8,6 +8,7 @@ vectors below in sync with its test suite so both repos agree on the grammar.
 import pytest
 
 from nso_adapter.secrets.refs import VaultRef, VaultRefError, parse_vault_ref
+from tests._secret_discipline import assert_text_free_of
 
 GOOD_VECTORS = [
     (
@@ -68,7 +69,7 @@ def test_rejected_reference_is_not_repeated_in_the_exception():
         parse_vault_ref(rejected)
 
     assert str(caught.value) == "vault_ref must be '<mount>/<path...>'"
-    assert rejected not in str(caught.value)
+    assert_text_free_of(caught.value, [rejected])
 
 
 def test_require_secret_fingerprint_owns_its_pattern_and_diagnostic():

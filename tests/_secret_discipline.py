@@ -50,6 +50,20 @@ def assert_text_free_of(value, secrets) -> None:
             raise AssertionError(f"text repeats secret material (secrets[{index}])")
 
 
+def assert_text_omits(value, fragments) -> None:
+    """Fail without copying the inspected value into diagnostics.
+
+    The sibling of :func:`assert_text_free_of` for an absence check over text that carries no
+    protected material — a URL query parameter, a tool's own stderr. The property is the same:
+    pytest must not rewrite the assertion and print the whole surface. The fragment IS named,
+    because naming it discloses nothing and the test is unreadable without it.
+    """
+    rendered = str(value)
+    for fragment in fragments:
+        if fragment in rendered:
+            raise AssertionError(f"text contains {fragment!r}")
+
+
 class EchoingVault:
     """A Vault provider whose failure repeats the reference and the plaintext.
 

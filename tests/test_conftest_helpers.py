@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from nso_adapter.store import db as store_db
 from nso_adapter.store.models import Job, JobStatus, JobType
 from tests import conftest as root_conftest
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import _drop_database, _url_for, seed_device, session, start_job
 
 _TESTS_ROOT = Path(__file__).resolve().parent
@@ -78,8 +79,7 @@ def test_drop_database_reports_surviving_backend_diagnostics(pg_database, pg_pro
     assert "backend_start=" in message
     assert "state='idle'" in message
     assert "xact_start=" in message
-    assert "instrumentation_probe" not in message
-    assert "query=" not in message
+    assert_text_free_of(message, ["instrumentation_probe", "query="])
 
 
 def test_seed_device_type_contract_allows_no_netbox_identity():

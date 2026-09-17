@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from nso_adapter.notifications.sse_subscriber import SSESubscriber
-from tests._secret_discipline import assert_records_free_of
+from tests._secret_discipline import assert_records_free_of, assert_text_free_of
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -232,8 +232,7 @@ async def test_pre_header_read_timeout_stays_a_transport_error():
 
     record = next(record for record in logs if record["event"] == "sse_subscribe_error")
     assert record["error"] == "ReadTimeout"
-    assert "placeholder-secret" not in str(record)
-    assert "placeholder-stream-secret" not in str(record)
+    assert_text_free_of(record, ["placeholder-secret", "placeholder-stream-secret"])
 
 
 async def test_subscribe_calls_on_event_for_each_sse_block():

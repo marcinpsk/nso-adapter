@@ -19,28 +19,18 @@ from tests._secret_discipline import assert_chain_free_of, exception_chain
 
 _SECRET = "placeholder-vault-secret"
 _TEST_ROOT = Path(__file__).resolve().parent
-_NON_DISCLOSURE_TESTS = (
-    _TEST_ROOT / "api" / "test_actions_direct.py",
-    _TEST_ROOT / "api" / "test_api.py",
-    _TEST_ROOT / "api" / "test_api_capability.py",
-    _TEST_ROOT / "api" / "test_api_lag_config.py",
-    _TEST_ROOT / "api" / "test_api_onboarding.py",
-    _TEST_ROOT / "api" / "test_api_provision_async.py",
-    _TEST_ROOT / "api" / "test_api_secrets.py",
-    _TEST_ROOT / "api" / "test_api_snmp_intent.py",
-    _TEST_ROOT / "api" / "test_api_vlan.py",
-    _TEST_ROOT / "core" / "test_action_apply_promotion.py",
-    _TEST_ROOT / "core" / "test_apply_error_secrets.py",
-    _TEST_ROOT / "core" / "test_envelope_classification.py",
-    _TEST_ROOT / "core" / "test_onboarding.py",
-    _TEST_ROOT / "core" / "test_redistribution.py",
-    _TEST_ROOT / "core" / "test_refresh_engine_envelope.py",
-    _TEST_ROOT / "core" / "test_vlan.py",
-    _TEST_ROOT / "nso" / "test_device_state_client.py",
-    _TEST_ROOT / "test_secret_discipline.py",
-    _TEST_ROOT / "test_vault_provider.py",
-)
-_INSPECTED_ATTRIBUTES = {"json", "read_failures", "text", "value"}
+#: Every test module. A fixed allowlist lets a new module's assertion escape the guard, and
+#: three review rounds found exactly that escape before this list was retired.
+_NON_DISCLOSURE_TESTS = tuple(sorted(_TEST_ROOT.rglob("test_*.py")))
+#: Surfaces whose value is rendered TEXT, so `protected not in surface` is a substring test — a
+#: non-disclosure check, and pytest prints both operands when it fails.
+#:
+#: A parsed container is deliberately NOT here. `"local_as" not in peer` asks whether a KEY is
+#: absent, which `assert_text_free_of` cannot express: it would substring-match the rendered
+#: mapping and pass or fail for an unrelated reason. Those assertions are a different kind, and
+#: flagging them would force a wrong rewrite rather than prevent a disclosure.
+_INSPECTED_ATTRIBUTES = {"text"}
+_INSPECTED_CALLS = {"repr", "str"}
 
 
 class _InspectedSurfaceReader(ast.NodeVisitor):
@@ -62,7 +52,7 @@ class _InspectedSurfaceReader(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 - ast visitor API
-        if isinstance(node.func, ast.Name) and node.func.id in {"repr", "str"}:
+        if isinstance(node.func, ast.Name) and node.func.id in _INSPECTED_CALLS:
             self.found = True
             return
         self.generic_visit(node)
@@ -274,9 +264,30 @@ def _resolve_bindings(bindings: list[tuple[str, list[ast.AST]]], aliases: set[st
     return aliases | _binding_aliases(bindings, aliases)
 
 
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
+
+
+def _assertion_comparisons(test: ast.expr) -> list[ast.Compare]:
+    """Return the assertion's own comparisons, skipping any inside a comprehension.
+
+    A `not in` used as a comprehension filter is a per-element test. The assertion renders the
+    comprehension's RESULT — a count, a list — never the element, so it discloses nothing.
+    """
+    comparisons: list[ast.Compare] = []
+    stack: list[ast.AST] = [test]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, _COMPREHENSIONS):
+            continue
+        if isinstance(node, ast.Compare):
+            comparisons.append(node)
+        stack.extend(ast.iter_child_nodes(node))
+    return comparisons
+
+
 def _record_non_disclosure_assertions(assertions: list[ast.Assert], aliases: set[str], violations: list[int]) -> None:
     for node in assertions:
-        comparisons = [part for part in ast.walk(node.test) if isinstance(part, ast.Compare)]
+        comparisons = _assertion_comparisons(node.test)
         if any(
             any(isinstance(operator, ast.NotIn) for operator in comparison.ops)
             and any(_reads_an_inspected_surface(value, aliases) for value in comparison.comparators)
@@ -560,6 +571,45 @@ def test_non_disclosure_checks_do_not_use_rewritten_assertions() -> None:
             for line in _non_disclosure_assertion_lines(path.read_text(encoding="utf-8"))
         )
     assert violations == []
+
+
+def test_a_KEY_MEMBERSHIP_test_over_a_parsed_container_is_not_a_disclosure_check() -> None:
+    """`"local_as" not in peer` asks whether a KEY is absent. `assert_text_free_of` cannot express
+    that — it substring-matches the rendered mapping and would pass or fail for an unrelated
+    reason — so flagging it would force a wrong rewrite instead of preventing a disclosure.
+    """
+    container = """\
+body = response.json()
+peer = body["peers"][0]
+assert "local_as" not in peer
+"""
+    text = """\
+body = response.text
+assert protected not in body
+"""
+
+    assert _non_disclosure_assertion_lines(container) == []
+    assert _non_disclosure_assertion_lines(text) == [2]
+
+
+def test_a_NOT_IN_used_as_a_comprehension_filter_is_not_a_disclosure_check() -> None:
+    """The assertion renders the comprehension's RESULT — a count — never the element."""
+    filtered = """\
+assert len([item for item in requests if "dry-run" not in str(item.url)]) == 1
+"""
+    rendered = """\
+assert protected not in str(request.url)
+"""
+
+    assert _non_disclosure_assertion_lines(filtered) == []
+    assert _non_disclosure_assertion_lines(rendered) == [1]
+
+
+def test_the_guard_reads_EVERY_test_module() -> None:
+    """The allowlist is gone and must stay gone: three review rounds found assertions escaping
+    through modules nobody had added to it."""
+    assert set(_NON_DISCLOSURE_TESTS) == set(_TEST_ROOT.rglob("test_*.py"))
+    assert len(_NON_DISCLOSURE_TESTS) > 200, "the sweep should see the whole suite"
 
 
 def test_non_disclosure_aliases_converge_without_cross_scope_contamination() -> None:

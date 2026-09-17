@@ -14,6 +14,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests._secret_discipline import assert_text_omits
+
 ROOT = Path(__file__).parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 PRE_COMMIT = ROOT / ".pre-commit-config.yaml"
@@ -170,7 +172,7 @@ def test_review_pattern_scan_rejects_partial_parse_drift(
     assert heading in result.stderr
     assert changed_path in result.stderr
     for unchanged_path in _EXPECTED_PARTIAL_PATHS & partial_paths:
-        assert unchanged_path not in result.stderr
+        assert_text_omits(result.stderr, [unchanged_path])
 
 
 def test_review_pattern_scan_accepts_the_pinned_partial_paths(tmp_path: Path) -> None:

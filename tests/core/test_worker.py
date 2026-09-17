@@ -12,6 +12,7 @@ from unittest.mock import patch
 from nso_adapter.core import worker
 from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
+from tests._secret_discipline import assert_records_free_of
 from tests.conftest import session
 
 
@@ -76,7 +77,7 @@ async def test_generation_advancement_retries_transient_failures(monkeypatch):
     assert [entry["attempt"] for entry in retries] == [1, 2]
     assert all(entry["exception_type"] == "RuntimeError" for entry in retries)
     assert all("error" not in entry for entry in retries)
-    assert secret_marker not in repr(logs)
+    assert_records_free_of(logs, [secret_marker])
 
 
 async def test_generation_advancement_logs_once_after_retries_are_exhausted(monkeypatch):
@@ -111,7 +112,7 @@ async def test_generation_advancement_logs_once_after_retries_are_exhausted(monk
     assert failure["device_id"] == 18
     assert failure["exception_type"] == "RuntimeError"
     assert "error" not in failure
-    assert secret_marker not in repr(logs)
+    assert_records_free_of(logs, [secret_marker])
 
 
 # ── _claim_next_job ─────────────────────────────────────────────────────────────

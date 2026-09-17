@@ -42,7 +42,7 @@ from nso_adapter.nso.apply import (
 from nso_adapter.nso.client import DEVICE_INTENT_ROOT, NsoClient
 from nso_adapter.nso.nso_json import NSO_LEX_CHUNK, straddling_bare_tokens
 from nso_adapter.store.models import OspfInstanceIntent, OspfInterfaceIntent, RedistributionIntent
-from tests._secret_discipline import assert_records_free_of
+from tests._secret_discipline import assert_records_free_of, assert_text_free_of, assert_text_omits
 
 _EMPTY_DRYRUN = {"dry-run-result": {"native": {}}}
 _DEVICE_ID = 501
@@ -644,7 +644,7 @@ def test_snmp_rejects_a_malformed_vault_ref(bad_ref):
     from tests._secret_discipline import assert_chain_free_of
 
     if bad_ref:
-        assert bad_ref not in str(caught.value)
+        assert_text_free_of(caught.value, [bad_ref])
         assert bad_ref not in "".join(traceback.format_exception(caught.value))
         assert_chain_free_of(caught.value, [bad_ref])
 
@@ -852,7 +852,7 @@ async def test_a_real_ospf_commit_puts_then_verifies():
     assert result == VERIFY_CONCLUSIVE  # the verdict rides out of the committing send
     put_req = transport.requests[0]
     assert put_req.method == "PUT"
-    assert "dry-run=native" not in str(put_req.url)
+    assert_text_omits(put_req.url, ["dry-run=native"])  # the URL carries the device name
     assert "reconcile=" in str(put_req.url)
     assert _sent(transport, "ospf")["process-config"][0]["enabled"] is False
     # a verify dry-run followed the commit
