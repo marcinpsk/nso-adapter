@@ -479,7 +479,7 @@ async def test_a_taken_netbox_id_is_refused_and_leaks_no_claim(adapter_client_wi
         result = await _provision(db, name="pg-taken", netbox_device_id=7240, reg=reg, job_id=job_id, refresh=refresh)
 
     mapping = next(step for step in result["steps"] if step["step"] == "adapter_mapping")
-    assert mapping == {"step": "adapter_mapping", "status": "exists", "detail": "LookupError"}
+    assert mapping == {"step": "adapter_mapping", "status": "exists", "failure": "LookupError"}
     assert result["device_id"] is None
     assert not reg.registered
     assert await _device_by_name("pg-taken") is None
@@ -522,7 +522,7 @@ async def test_a_late_taken_netbox_id_in_claim_held_adoption_is_sanitized(adapte
         )
 
     mapping = next(step for step in result["steps"] if step["step"] == "adapter_mapping")
-    assert mapping == {"step": "adapter_mapping", "status": "exists", "detail": "LookupError"}
+    assert mapping == {"step": "adapter_mapping", "status": "exists", "failure": "LookupError"}
     assert result["device_id"] is None
     assert not reg.registered
     assert await _claim_row(existing_id) is None
@@ -564,7 +564,7 @@ async def test_a_pair_mapped_elsewhere_is_reported_and_leaks_no_claim(adapter_cl
     assert mapping == {
         "step": "adapter_mapping",
         "status": "exists",
-        "detail": "DeviceIdentityRefused",
+        "failure": "DeviceIdentityRefused",
         "reason": "onboarded_elsewhere",
     }
     record = next(record for record in logs if record["event"] == "device.onboard_refused")

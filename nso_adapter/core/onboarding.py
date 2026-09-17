@@ -136,7 +136,7 @@ async def _bootstrap_address(client, device_name: str, primary: str, oob_ip: str
         return ActiveAddress.primary.value, {
             "step": "failover_bootstrap",
             "status": "failed",
-            "detail": failure_detail(exc),
+            "failure": failure_detail(exc),
         }
     return ActiveAddress.oob.value, {
         "step": "failover_bootstrap",
@@ -607,14 +607,14 @@ async def _link_existing_under_claim(
     return existing
 
 
-def _step_classifications(steps: list[dict]) -> list[dict[str, str]]:
-    """Return each step's fixed name and status.
+#: The step keys a diagnostic sink may carry. `detail` is deliberately absent: it holds the
+#: requested admin-state, the derived device-type, or a failover bootstrap's address pair.
+_SAFE_STEP_KEYS = ("step", "status", "failure", "reason")
 
-    A step detail carries the requested admin-state, the derived device-type, or the primary
-    and OOB addresses of a failover bootstrap. The caller reads the full list off the job
-    result; a diagnostic sink gets the classifications.
-    """
-    return [{"step": step["step"], "status": step["status"]} for step in steps]
+
+def _step_classifications(steps: list[dict]) -> list[dict[str, str]]:
+    """Return each step's authored classifications, dropping its descriptive detail."""
+    return [{key: step[key] for key in _SAFE_STEP_KEYS if key in step} for step in steps]
 
 
 async def provision_nso_device(
@@ -669,10 +669,19 @@ async def provision_nso_device(
     client = get_nso_client(nso_instance)
     steps: list[dict] = []
 
-    def _step(name: str, status: str, detail: str | None = None) -> None:
+    def _step(name: str, status: str, detail: str | None = None, *, failure: str | None = None) -> None:
+        """Record one step.
+
+        ``detail`` is descriptive text — a derived device-type, the requested admin-state, an
+        address pair — and never reaches a diagnostic sink. ``failure`` is a classification from
+        :func:`failure_detail`, which is authored, so the terminal record still tells a 401 from
+        a 503.
+        """
         entry = {"step": name, "status": status}
         if detail:
             entry["detail"] = detail
+        if failure:
+            entry["failure"] = failure
         steps.append(entry)
 
     def _result(ok: bool, device_id: int | None = None) -> dict:
@@ -686,7 +695,7 @@ async def provision_nso_device(
             await client.create_device(device_name, address, ned_id, authgroup, ned_type=device_type, port=port)
             _step("create", "ok", f"device-type={device_type}")
     except Exception as exc:
-        _step("create", "failed", failure_detail(exc))
+        _step("create", "failed", failure=failure_detail(exc))
         return _result(False)
 
     # 2. admin-state unlocked — blocking. MUST precede fetch-host-keys: a newly
@@ -696,7 +705,7 @@ async def provision_nso_device(
         await client.set_admin_state(device_name, admin_state)
         _step("admin_state", "ok", admin_state)
     except Exception as exc:
-        _step("admin_state", "failed", failure_detail(exc))
+        _step("admin_state", "failed", failure=failure_detail(exc))
         return _result(False)
 
     # 2b. reachability-aware address: bootstrap a fresh device over OOB if primary is
@@ -712,7 +721,7 @@ async def provision_nso_device(
         await _once_with_retry(lambda: client.fetch_host_keys(device_name))
         _step("fetch_host_keys", "ok")
     except Exception as exc:
-        _step("fetch_host_keys", "failed", failure_detail(exc))
+        _step("fetch_host_keys", "failed", failure=failure_detail(exc))
         # If the bootstrap pinned NSO to the OOB address, don't strand the device: map it and
         # seed the failover row so the loop can fail it back to primary once in-band recovers.
         if active_address == ActiveAddress.oob.value:
@@ -739,7 +748,7 @@ async def provision_nso_device(
             sync_ok = bool(await _once_with_retry(lambda: client.sync_from(device_name), ok=bool))
             _step("sync_from", "ok" if sync_ok else "failed")
         except Exception as exc:
-            _step("sync_from", "failed", failure_detail(exc))
+            _step("sync_from", "failed", failure=failure_detail(exc))
 
     # 5-6. adapter mapping row (so the read pipeline manages it henceforth) + failover row
     #      (IPs + bootstrapped address) so the failover loop can manage it.
@@ -854,12 +863,12 @@ async def _map_and_seed_failover(
                 {
                     "step": "adapter_mapping",
                     "status": "exists",
-                    "detail": failure_detail(exc),
+                    "failure": failure_detail(exc),
                     "reason": exc.reason,
                 }
             )
         except LookupError as exc:
-            steps.append({"step": "adapter_mapping", "status": "exists", "detail": failure_detail(exc)})
+            steps.append({"step": "adapter_mapping", "status": "exists", "failure": failure_detail(exc)})
     fo_seed = await _seed_onboarding_failover(db, device_id, address, oob_ip, active_address, reg=reg)
     if fo_seed:
         steps.append(fo_seed)
@@ -893,7 +902,7 @@ async def _seed_onboarding_failover(
         # transaction has to go, or the mirror refresh and the runner's terminal write both
         # die of PendingRollbackError on a device that mapped perfectly well.
         await db.rollback()
-        return {"step": "failover_seed", "status": "failed", "detail": failure_detail(exc)}
+        return {"step": "failover_seed", "status": "failed", "failure": failure_detail(exc)}
 
 
 async def rekey_device(

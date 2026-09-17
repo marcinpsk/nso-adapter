@@ -445,11 +445,12 @@ def test_read_path_refuses_a_NON_MAPPING_payload(fake_hvac):
         provider.read_path("network", "netbox/snmp/community/prod-ro")
 
 
-def test_a_NON_MAPPING_METADATA_envelope_reads_as_an_UNVERSIONED_path(fake_hvac):
-    """``metadata`` is payload too: ``.get("version")`` on a non-mapping is an AttributeError.
+def test_a_NON_MAPPING_METADATA_envelope_is_REFUSED_not_read_as_unversioned(fake_hvac):
+    """``metadata`` is payload too, and a malformed one is not the same state as an absent one.
 
-    Absent-or-unusable metadata already has a meaning here — an unversioned path — so this
-    lands there rather than failing a read whose data half is well formed.
+    Absent metadata means an unversioned path, which `/secrets/verify` reports and a merge-write
+    acts on. Reading a malformed block as "unversioned" would let both proceed on a payload
+    nothing understood, so it refuses instead.
     """
     _, store, kv = fake_hvac
     store["netbox/snmp/community/prod-ro"] = {"community": "placeholder-community"}
@@ -460,6 +461,17 @@ def test_a_NON_MAPPING_METADATA_envelope_reads_as_an_UNVERSIONED_path(fake_hvac)
         return {"data": {**secret["data"], "metadata": "not-a-mapping"}}
 
     kv.read_secret_version = _with_bad_metadata
+
+    with pytest.raises(ValueError, match="not a mapping"):
+        _provider().read_path_meta("network", "netbox/snmp/community/prod-ro")
+
+
+def test_an_ABSENT_metadata_block_still_reads_as_an_UNVERSIONED_path(fake_hvac):
+    """The other half: absence keeps its own meaning, so the refusal above is not over-broad."""
+    _, store, kv = fake_hvac
+    store["netbox/snmp/community/prod-ro"] = {"community": "placeholder-community"}
+    kv.omit_metadata.add("netbox/snmp/community/prod-ro")
+
     data, version = _provider().read_path_meta("network", "netbox/snmp/community/prod-ro")
 
     assert data == {"community": "placeholder-community"}

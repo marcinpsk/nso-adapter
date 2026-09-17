@@ -208,7 +208,7 @@ async def test_provision_step_detail_carries_no_bytes_from_the_host_key_answer(a
     step = next(s for s in job.result["steps"] if s["step"] == "fetch_host_keys")
     assert step["status"] == "failed"
     assert_text_free_of(job.result, ["placeholder-server-secret"])
-    assert step["detail"] == "UnicodeDecodeError", "the step must still name WHAT failed"
+    assert step["failure"] == "UnicodeDecodeError", "the step must still name WHAT failed"
 
 
 async def test_provision_step_detail_keeps_the_ADAPTER_AUTHORED_host_key_refusal(adapter_client_with_nso):
@@ -222,4 +222,4 @@ async def test_provision_step_detail_keeps_the_ADAPTER_AUTHORED_host_key_refusal
     assert_text_free_of(job.result, ["placeholder-server-secret"])
     assert job.result["ok"] is False
     step = next(s for s in job.result["steps"] if s["step"] == "fetch_host_keys")
-    assert "did not report a stored key" in step["detail"], "the authored refusal is the diagnostic"
+    assert "did not report a stored key" in step["failure"], "the authored refusal is the diagnostic"

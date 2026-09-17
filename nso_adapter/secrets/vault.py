@@ -39,9 +39,19 @@ def _secret_data(secret: object) -> dict[str, object]:
 
 
 def _secret_version(secret: object) -> int | None:
-    """Return the KV v2 version, or None for a path that carries no usable metadata."""
-    metadata = _secret_envelope(secret).get("metadata")
-    version = metadata.get("version") if isinstance(metadata, Mapping) else None
+    """Return the KV v2 version, or None for an unversioned path.
+
+    An ABSENT metadata block is a real state with a meaning of its own. A metadata block that is
+    present but not a mapping is a malformed payload, and reading it as "unversioned" would let
+    a verification report success and a merge-write proceed on a payload nothing understood.
+    """
+    envelope = _secret_envelope(secret)
+    if "metadata" not in envelope:
+        return None
+    metadata = envelope["metadata"]
+    if not isinstance(metadata, Mapping):
+        raise ValueError("the Vault payload is not a mapping")
+    version = metadata.get("version")
     return int(version) if version is not None else None
 
 

@@ -779,7 +779,7 @@ async def test_a_failed_host_key_fetch_keeps_the_action_info_out_of_the_provisio
     assert result["ok"] is False
     step = next(entry for entry in result["steps"] if entry["step"] == "fetch_host_keys")
     assert step["status"] == "failed"
-    assert "fetch-host-keys" in step["detail"], "the step must still say what failed"
+    assert "fetch-host-keys" in step["failure"], "the step must still say what failed"
 
     with pytest.raises(RuntimeError) as caught:
         await client.fetch_host_keys(name)
@@ -958,4 +958,4 @@ async def test_a_REDIRECTED_host_key_fetch_records_the_STATUS_and_not_the_locati
     assert result["ok"] is False
     step = next(entry for entry in result["steps"] if entry["step"] == "fetch_host_keys")
     assert step["status"] == "failed"
-    assert step["detail"] == "HTTPStatusError (HTTP 302)", "the status is what tells the failures apart"
+    assert step["failure"] == "HTTPStatusError (HTTP 302)", "the status is what tells the failures apart"

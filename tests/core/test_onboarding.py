@@ -936,7 +936,7 @@ async def test_failover_seed_failure_step_classifies_the_store_error(adapter_cli
     async with session() as db:
         step = await _seed_onboarding_failover(db, absent_device_id, "198.51.100.10", "203.0.113.10", "primary")
 
-    assert step == {"step": "failover_seed", "status": "failed", "detail": "IntegrityError"}
+    assert step == {"step": "failover_seed", "status": "failed", "failure": "IntegrityError"}
 
 
 async def test_failover_seed_success_step_is_unchanged(adapter_client_with_nso, monkeypatch):
@@ -1007,3 +1007,49 @@ async def test_the_PROVISIONED_record_carries_step_names_and_statuses_but_no_ste
     assert_records_free_of(logs, [submitted_admin_state, "device-type=", "198.51.100.20"])
     # The response keeps what the sink drops.
     assert {"step": "admin_state", "status": "ok", "detail": submitted_admin_state} in result["steps"]
+
+
+async def test_a_NONFATAL_step_failure_keeps_its_CLASSIFICATION_in_the_record(adapter_client_with_nso):
+    """sync-from is non-fatal, so its failure only ever surfaces through the terminal record.
+
+    Dropping the whole step payload would make an auth failure and an outage read identically
+    there. `failure` is authored by `failure_detail`, so it stays; `detail` is descriptive and
+    does not.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    import httpx
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.onboarding import provision_nso_device
+    from nso_adapter.nso.client import NsoClient
+    from tests._secret_discipline import assert_records_free_of
+
+    submitted_name = "placeholder-caller-unsynced-device"
+    request = httpx.Request("POST", "https://nso.invalid/restconf/placeholder-sync-url")
+    client = AsyncMock(spec=NsoClient)
+    client.device_exists.return_value = False
+    client.sync_from.side_effect = httpx.HTTPStatusError(
+        "placeholder-server-text", request=request, response=httpx.Response(401, request=request)
+    )
+
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
+        async with session() as db:
+            with capture_logs() as logs:
+                result = await provision_nso_device(
+                    db,
+                    nso_instance="nso-dev",
+                    device_name=submitted_name,
+                    address="198.51.100.21",
+                    ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+                    authgroup="network",
+                    netbox_device_id=int(uuid4().int % 10**8),
+                )
+
+    assert result["ok"] is True  # sync-from is non-fatal
+    record = next(r for r in logs if r["event"] == "device.provisioned")
+    sync_step = next(s for s in record["steps"] if s["step"] == "sync_from")
+    assert sync_step == {"step": "sync_from", "status": "failed", "failure": "HTTPStatusError (HTTP 401)"}
+    assert not any("detail" in step for step in record["steps"]), "descriptive detail is not a sink field"
+    # The device name itself is the diagnostic-identity migration's contract, not this one's.
+    assert_records_free_of(logs, ["placeholder-server-text", "placeholder-sync-url", "device-type="])
