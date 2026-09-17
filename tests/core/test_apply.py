@@ -652,7 +652,7 @@ async def test_collect_apply_diff_classifies_an_unexpected_dry_run_failure(adapt
     assert secret not in diffs[PREVIEW_KEY]
     record = next(record for record in logs if record["event"] == "apply_diff.failed")
     assert record["device_id"] == device_id
-    assert_records_free_of([record], ["rtr-diff-boom"])
+    assert_records_free_of([record], [secret, "rtr-diff-boom"])
 
 
 async def test_collect_apply_diff_redacts_value_bearing_apply_error(adapter_client):

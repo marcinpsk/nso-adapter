@@ -13,6 +13,7 @@ import structlog
 from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.bindings.netbox.mapper import resolve_or_create_interface
 from nso_adapter.domain.models import Interface as DomainInterface
+from nso_adapter.nso.client import failure_detail
 
 logger = structlog.get_logger(__name__)
 
@@ -64,7 +65,7 @@ async def write_interfaces(
                 "netbox.write_failed",
                 netbox_device_id=netbox_device_id,
                 netbox_interface_id=nb_id,
-                error=str(exc),
+                error=failure_detail(exc),
             )
             result.interfaces_skipped += 1
 

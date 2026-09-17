@@ -43,6 +43,11 @@ def classified_outcome_errors(logger, exc, failure_detail):
     logger.warning("family.outcome.read_record_failed", detail=failure_detail(exc))
 
 
+def classified_rejection_bodies(logger, body, rejection_detail):
+    # ok: nso-outcome-raw-exception-renderer
+    logger.warning("netbox.bulk_patch.row_rejected", error=rejection_detail(body))
+
+
 def aliased_outcome_error(logger, failure_detail, http_status_of):
     try:
         work()
@@ -69,6 +74,14 @@ def aliased_outcome_error(logger, failure_detail, http_status_of):
         logger.warning("family.outcome.read_record_failed", detail=alias)
         # ok: nso-outcome-raw-exception-alias-renderer
         logger.warning("family.outcome.read_record_failed", detail=failure_detail(caught))
+
+
+def aliased_rejection_body(logger, rejection_detail):
+    try:
+        work()
+    except Exception as caught:
+        # ok: nso-outcome-raw-exception-alias-renderer
+        logger.warning("netbox.bulk_patch.row_rejected", error=rejection_detail(caught))
 
 
 def authored_outcome_details(logger, reason):

@@ -853,7 +853,9 @@ class _SecondAddressWriteFailsNso(FakeNso):
     async def set_address(self, name: str, address: str, port: int | None = None) -> None:
         self.calls.append(("set_address", address))
         if len(_set_address_calls(self)) == 2:
-            raise RuntimeError("address restore failed")
+            # A real NSO failure quotes what it was asked to write, so the assertion below
+            # only means something when the injected exception carries it too.
+            raise RuntimeError(f"address restore failed for {name} at {address}")
         self.address = address
 
 
@@ -889,7 +891,7 @@ async def test_revert_failure_diagnostic_uses_the_caller_role(
 async def test_revert_failure_diagnostic_omits_an_unknown_role():
     class AddressWriteFails:
         async def set_address(self, name, address):
-            raise RuntimeError("address restore failed")
+            raise RuntimeError(f"address restore failed for {name} at {address}")
 
     with capture_logs() as logs:
         await failover._revert_address(
