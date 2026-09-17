@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import shlex
@@ -27,10 +28,16 @@ _MISSING_OPENGREP = "opengrep-that-this-test-never-installs"
 _REMOTE_ZIZMOR_HOOK = "https://github.com/zizmorcore/zizmor-pre-commit"
 _ZIZMOR_UV_PREFIX = ["uv", "run", "--locked", "--native-tls", "--", "zizmor"]
 _ZIZMOR_COLLECTIONS = {"workflows", "actions", "dependabot"}
-_EXPECTED_PARTIAL_PATHS = {
-    "nso_adapter/core/failover.py",
-    "nso_adapter/core/refresh_engine.py",
-}
+
+
+def _pinned_partial_paths() -> set[str]:
+    """Read the pin from the script itself: a second copy here would drift silently."""
+    block = re.search(r"^expected_partial_paths = (\{.*?^\})", REVIEW_PATTERNS.read_text(encoding="utf-8"), re.M | re.S)
+    assert block is not None, "check-review-patterns no longer declares expected_partial_paths"
+    return ast.literal_eval(block.group(1))
+
+
+_EXPECTED_PARTIAL_PATHS = _pinned_partial_paths()
 
 
 def _write_opengrep_stub(
@@ -205,7 +212,8 @@ def test_review_pattern_scan_accepts_the_pinned_partial_paths(tmp_path: Path) ->
     )
 
     assert result.returncode == 0
-    assert result.stdout.strip() == "OpenGrep partial-parse pin matches exactly (2 files)."
+    expected = f"OpenGrep partial-parse pin matches exactly ({len(_EXPECTED_PARTIAL_PATHS)} files)."
+    assert result.stdout.strip() == expected
     assert not result.stderr
 
 

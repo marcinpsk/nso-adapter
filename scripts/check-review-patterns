@@ -32,7 +32,11 @@ import json
 import sys
 from pathlib import Path
 
+# PEP 695 syntax OpenGrep cannot parse (kb #1718). Which of these it actually reports depends
+# on the RULESET, not only on the tree: adding nso-vault-payload-unvalidated made it parse
+# timestamps.py, where `def latest_refreshed[RowT: RefreshStamped]` has always been unparsable.
 expected_partial_paths = {
+    "nso_adapter/api/timestamps.py",
     "nso_adapter/core/failover.py",
     "nso_adapter/core/refresh_engine.py",
 }
