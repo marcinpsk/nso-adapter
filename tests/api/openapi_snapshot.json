@@ -2020,6 +2020,7 @@
             "title": "Degraded Surfaces"
           },
           "device_ref": {
+            "pattern": "^[0-9a-f]{16}$",
             "title": "Device Ref",
             "type": "string"
           },
@@ -2874,6 +2875,7 @@
             "title": "Auth Group"
           },
           "device_ref": {
+            "pattern": "^[0-9a-f]{16}$",
             "title": "Device Ref",
             "type": "string"
           },
