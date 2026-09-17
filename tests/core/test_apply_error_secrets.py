@@ -959,3 +959,47 @@ async def test_a_REDIRECTED_host_key_fetch_records_the_STATUS_and_not_the_locati
     step = next(entry for entry in result["steps"] if entry["step"] == "fetch_host_keys")
     assert step["status"] == "failed"
     assert step["failure"] == "HTTPStatusError (HTTP 302)", "the status is what tells the failures apart"
+
+
+# ── a failed pre-apply sync-from: the device-keyed URL reaches no sink ──
+
+_SYNC_FROM_DEVICE = "sync-from-http"
+#: What `str(exc)` on the httpx failure carries: the whole request path and the server's phrase.
+_SYNC_FROM_LEAKS = [f"device={_SYNC_FROM_DEVICE}/sync-from", "Denied by proxy"]
+
+
+def _sync_from_client(status: int):
+    """A real NsoClient whose sync-from answers *status* with a server-chosen reason phrase."""
+
+    def respond(request):
+        if "sync-from" in str(request.url):
+            return httpx.Response(
+                status,
+                json={"error": f"Denied by proxy for {_SECRET}"},
+                extensions={"reason_phrase": b"Denied by proxy"},
+            )
+        return httpx.Response(200, json={})
+
+    return _client_with(httpx.MockTransport(respond))
+
+
+async def test_a_FAILED_pre_apply_sync_from_records_the_STATUS_and_not_the_device_url(adapter_client):
+    """`sync_from` POSTs a device-keyed RESTCONF path, so `str(exc)` repeats the whole URL.
+
+    The sync-from is best-effort, so this warning is the only report of the failure and the
+    raw text stayed in it. The numeric status stays: an operator has to tell 502 from 401.
+    """
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.apply import _maybe_sync_from
+
+    device_id = await seed_device(nso_device_name=_SYNC_FROM_DEVICE, netbox_device_id=9483)
+    client = _sync_from_client(502)
+    async with session() as db:
+        with capture_logs() as logs:
+            await _maybe_sync_from(db, client, _SYNC_FROM_DEVICE, device_id)
+
+    reported = [record for record in logs if record["event"] == "apply.sync_from.failed"]
+    assert reported, "the failed sync-from was not reported at all"
+    assert reported[0]["error"] == "HTTPStatusError (HTTP 502)", "the status is what tells the failures apart"
+    assert_records_free_of(logs, _SYNC_FROM_LEAKS)
