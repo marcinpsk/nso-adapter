@@ -69,7 +69,7 @@ def test_the_log_surface_sees_what_logrecord_repr_hides(caplog):
     weak = repr(caplog.records)
     surface = _log_surface(caplog)
     for secret in ("ARGS-ONLY-SECRET", "EXC-ONLY-SECRET"):
-        assert secret not in weak, "LogRecord.__repr__ renders only msg"
+        assert_text_free_of(weak, [secret])  # LogRecord.__repr__ renders only msg
         assert secret in surface, "the surface must expose args and exc_text"
 
 

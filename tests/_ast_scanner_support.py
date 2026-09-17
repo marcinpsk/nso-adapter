@@ -49,6 +49,17 @@ class _ScopeBindingCollector(ast.NodeVisitor):
             self.names.add(node.name)
         self.generic_visit(node)
 
+    def visit_alias(self, node: ast.alias) -> None:  # noqa: N802 - ast visitor API
+        # An import binds a name with no ast.Name store: `import a.b` binds `a`.
+        self.names.add(node.asname or node.name.split(".", maxsplit=1)[0])
+
+    def visit_MatchAs(self, node: ast.MatchAs) -> None:  # noqa: N802 - ast visitor API
+        self.names.update(match_capture_names(node))
+        self.generic_visit(node)
+
+    visit_MatchStar = visit_MatchAs  # type: ignore[assignment]
+    visit_MatchMapping = visit_MatchAs  # type: ignore[assignment]
+
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802 - ast visitor API
         self.names.add(node.name)
 
