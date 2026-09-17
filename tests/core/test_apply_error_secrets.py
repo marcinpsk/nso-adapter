@@ -17,7 +17,7 @@ from nso_adapter.core.community_dialect import community_dialect_for
 from nso_adapter.nso.apply import NsoApplyError, SectionExecution, apply_device_intent, encode_snmp
 from nso_adapter.nso.client import DEVICE_INTENT_ROOT
 from nso_adapter.store.models import BgpRouterIntent, Job, JobStatus, OspfInterfaceIntent, SnmpCommunityIntent
-from tests._secret_discipline import assert_chain_free_of, assert_records_free_of
+from tests._secret_discipline import assert_chain_free_of, assert_records_free_of, assert_text_free_of
 from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 from tests.core.test_static_route_put import seed_apply_job
 from tests.nso.test_apply_send import _client_with
@@ -774,13 +774,12 @@ async def test_a_failed_host_key_fetch_keeps_the_action_info_out_of_the_provisio
                 authgroup="network",
             )
 
+    assert_text_free_of(result, _SECRETS)  # first: the assertions below render the step detail
+    assert_records_free_of(logs, _SECRETS)
     assert result["ok"] is False
     step = next(entry for entry in result["steps"] if entry["step"] == "fetch_host_keys")
     assert step["status"] == "failed"
     assert "fetch-host-keys" in step["detail"], "the step must still say what failed"
-    for secret in _SECRETS:
-        assert secret not in json.dumps(result), "the persisted step detail repeats server text"
-    assert_records_free_of(logs, _SECRETS)
 
     with pytest.raises(RuntimeError) as caught:
         await client.fetch_host_keys(name)
@@ -954,10 +953,9 @@ async def test_a_REDIRECTED_host_key_fetch_records_the_STATUS_and_not_the_locati
                 authgroup="network",
             )
 
+    assert_text_free_of(result, _STEP_SECRETS)  # first: the assertions below render the step detail
+    assert_records_free_of(logs, _STEP_SECRETS)
     assert result["ok"] is False
     step = next(entry for entry in result["steps"] if entry["step"] == "fetch_host_keys")
     assert step["status"] == "failed"
     assert step["detail"] == "HTTPStatusError (HTTP 302)", "the status is what tells the failures apart"
-    for secret in _STEP_SECRETS:
-        assert secret not in json.dumps(result), "the persisted step detail repeats the transport's own words"
-    assert_records_free_of(logs, _STEP_SECRETS)

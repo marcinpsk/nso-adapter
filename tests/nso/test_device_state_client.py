@@ -18,6 +18,7 @@ import pytest
 
 from nso_adapter.config import NsoInstanceConfig
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError, NsoReadContractError
+from tests._secret_discipline import assert_text_free_of
 
 
 def _make_client() -> NsoClient:
@@ -131,7 +132,7 @@ async def test_section_404_with_dead_container_raises_export_unavailable(patch_c
         with pytest.raises(NsoExportUnavailableError) as caught:
             await client.get_device_state_section("placeholder-secret-device", "ospf-config")
 
-    assert "placeholder-secret" not in str(caught.value)
+    assert_text_free_of(caught.value, ["placeholder-secret"])
 
 
 async def test_section_5xx_raises(patch_client):
@@ -173,7 +174,7 @@ async def test_doc_404_with_dead_container_raises_export_unavailable(patch_clien
         with pytest.raises(NsoExportUnavailableError) as caught:
             await client.get_device_state_doc("placeholder-secret-device")
 
-    assert "placeholder-secret" not in str(caught.value)
+    assert_text_free_of(caught.value, ["placeholder-secret"])
     assert caught.value.__context__ is None, "the malformed response must not stay attached"
 
 
@@ -253,7 +254,7 @@ async def test_doc_malformed_200_raises_never_absence(patch_client, body):
         with pytest.raises(NsoReadContractError) as caught:
             await client.get_device_state_doc("placeholder-secret-device")
 
-    assert "placeholder-secret" not in str(caught.value)
+    assert_text_free_of(caught.value, ["placeholder-secret"])
 
 
 # ── READSEM 1328: run_device_state_read certifies the snapshot before any consumer walks it ──

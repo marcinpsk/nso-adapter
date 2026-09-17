@@ -83,11 +83,11 @@ async def test_provision_unknown_instance_returns_422(adapter_client):
         json={**_PROVISION_BODY, "nso_instance": "ghost-nso"},
         headers=AUTH,
     )
+    assert_text_free_of(resp.text, ["ghost-nso"])
     assert resp.status_code == 422
     error = resp.json()["error"]
     assert error["code"] == "validation_error"
     assert error["message"] == "The requested NSO instance is not configured"
-    assert_text_free_of(resp.text, ["ghost-nso"])
 
 
 async def test_provision_requires_auth(adapter_client):
@@ -219,7 +219,7 @@ async def test_provision_step_detail_keeps_the_ADAPTER_AUTHORED_host_key_refusal
     answer = httpx.Response(200, json={"tailf-ncs:output": {"result": "failed", "info": "placeholder-server-secret"}})
     job = await _drain_provision(adapter_client_with_nso, "nokey-rtr", _provision_transport(answer))
 
+    assert_text_free_of(job.result, ["placeholder-server-secret"])
     assert job.result["ok"] is False
     step = next(s for s in job.result["steps"] if s["step"] == "fetch_host_keys")
     assert "did not report a stored key" in step["detail"], "the authored refusal is the diagnostic"
-    assert_text_free_of(job.result, ["placeholder-server-secret"])

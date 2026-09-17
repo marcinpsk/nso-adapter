@@ -24,9 +24,12 @@ _NON_DISCLOSURE_TESTS = (
     _TEST_ROOT / "api" / "test_api_snmp_intent.py",
     _TEST_ROOT / "api" / "test_api_vlan.py",
     _TEST_ROOT / "core" / "test_action_apply_promotion.py",
+    _TEST_ROOT / "core" / "test_apply_error_secrets.py",
     _TEST_ROOT / "core" / "test_envelope_classification.py",
+    _TEST_ROOT / "core" / "test_onboarding.py",
     _TEST_ROOT / "core" / "test_redistribution.py",
     _TEST_ROOT / "core" / "test_refresh_engine_envelope.py",
+    _TEST_ROOT / "nso" / "test_device_state_client.py",
     _TEST_ROOT / "test_secret_discipline.py",
     _TEST_ROOT / "test_vault_provider.py",
 )

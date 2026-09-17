@@ -15,6 +15,7 @@ import pytest
 from sqlalchemy import select
 
 from nso_adapter.store.models import DbInterface, Device, InterfaceAttrState, ManagedScope
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import session
 
 # ── onboard_device ───────────────────────────────────────────────────────────
@@ -92,9 +93,9 @@ async def test_claimed_onboard_refusal_names_no_netbox_link(adapter_client_with_
                 reg=ClaimRegistration(run_attempt=1),
             )
 
+    assert_text_free_of(caught.value, ["46431"])  # first: the assertions below render the message
     assert str(caught.value) == "The NSO device is already onboarded to a different NetBox device"
     assert caught.value.reason == "onboarded_elsewhere"
-    assert "46431" not in str(caught.value), "the refusal names the link the adapter holds"
     refused = [record for record in logs if record["event"] == "device.onboard_refused"]
     assert refused and refused[0]["linked_netbox_device_id"] == 46431
 
