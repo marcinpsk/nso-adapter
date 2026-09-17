@@ -285,6 +285,52 @@ async def test_refresh_switchport_rejects_an_empty_tagged_vlan_list_without_clea
         assert sorted(tagged) == [10, 20], "the rejected refresh must preserve the last valid links"
 
 
+@pytest.mark.parametrize("wire", [{}, {"tagged-vlans": ""}], ids=["absent", "empty-string"])
+@pytest.mark.anyio
+async def test_refresh_switchport_treats_an_empty_tagged_vlans_leaf_as_none(adapter_client, wire):
+    """Empty is a VALUE, not malformed data, so the mirror clears rather than refusing the read.
+
+    `network-state-export.yang` types the leaf `string` and documents it as
+    "(empty = none / trunk-all)", and the producer omits it entirely when the list is empty
+    (`switchport.py`: `if tagged: entry["tagged-vlans"] = ...`). Refusing an empty value would
+    raise on every access port and roll the whole switchport materializer back.
+    """
+    device_id = await seed_device(nso_device_name=f"vsw-none-tagged-{len(wire)}", netbox_device_id=1316 + len(wire))
+    async with _device_session(device_id) as (db, device):
+        nso = AsyncMock()
+        sections = _serve_sections(nso)
+        sections["vlan-database"] = {
+            "status": "ok",
+            "vlan": [{"vlan-id": 10, "name": "A"}, {"vlan-id": 20, "name": "B"}],
+        }
+        await refresh_vlan_database_for_device(db, device, nso)
+        sections["switchport"] = {
+            "status": "ok",
+            "interface": [{"interface-name": "Gi0/1", "mode": "trunk", "tagged-vlans": "10,20"}],
+        }
+        await refresh_switchport_for_device(db, device, nso)
+
+        sections["switchport"] = {
+            "status": "ok",
+            "interface": [{"interface-name": "Gi0/1", "mode": "access", **wire}],
+        }
+        await refresh_switchport_for_device(db, device, nso)
+
+        tagged = (
+            (
+                await db.execute(
+                    select(DeviceVlan.vlan_id)
+                    .join(DeviceSwitchportTaggedVlan, DeviceSwitchportTaggedVlan.vlan_id == DeviceVlan.id)
+                    .join(DeviceSwitchport, DeviceSwitchport.id == DeviceSwitchportTaggedVlan.switchport_id)
+                    .where(DeviceSwitchport.device_id == device.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert tagged == [], "an empty tagged-vlans is 'none', so the mirror must follow the device"
+
+
 @pytest.mark.parametrize("tagged_vlans", ["not-a-vlan", "10,not-a-vlan"])
 @pytest.mark.anyio
 async def test_refresh_switchport_rejects_invalid_tagged_vlan_chunks_without_clearing_rows(

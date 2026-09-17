@@ -1098,3 +1098,30 @@ async def test_a_NONFATAL_step_failure_keeps_its_CLASSIFICATION_in_the_record(ad
     assert_records_free_of(
         [record], [submitted_name, "placeholder-server-text", "placeholder-sync-url", "device-type="]
     )
+
+
+def test_every_production_provision_call_carries_the_job_correlator() -> None:
+    """`device.provisioned` is addressable only through `device_id` or `job_id`.
+
+    `device_id` is absent for a provision with no NetBox link, so `job_id` is the only
+    correlator left on that path. Both default to `None` on the signature, which makes an
+    unaddressable success record representable. The one production caller passes `job_id`;
+    this pins that rather than rejecting a combination no caller can reach.
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "nso_adapter"
+    missing = []
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", None)
+            if name != "provision_nso_device":
+                continue
+            if not any(keyword.arg == "job_id" for keyword in node.keywords):
+                missing.append(f"{path.relative_to(root)}:{node.lineno}")
+
+    assert missing == [], "a provision that reaches NSO must carry job_id, or its record is unaddressable"
