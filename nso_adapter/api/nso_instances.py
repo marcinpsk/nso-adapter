@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,7 +12,7 @@ from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404, RESP_502_NSO, ApiError, api_error
 from nso_adapter.config import get_config
 from nso_adapter.core.importer import get_nso_client
-from nso_adapter.domain.diagnostics import device_ref
+from nso_adapter.domain.diagnostics import DEVICE_REF_PATTERN, device_ref
 from nso_adapter.nso.neds import extract_ned_id_from_device_dict, ned_family
 from nso_adapter.store.models import Device
 
@@ -30,7 +30,7 @@ class InstanceDeviceOut(BaseModel):
     """EMIT-NULL enriched device row — every key present, nullables emitted as null."""
 
     name: str
-    device_ref: str
+    device_ref: str = Field(pattern=DEVICE_REF_PATTERN)
     address: str | None
     ned_id: str | None
     platform: str | None

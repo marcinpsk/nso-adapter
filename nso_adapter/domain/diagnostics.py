@@ -8,6 +8,11 @@ import sys
 
 _DEVICE_REF_DOMAIN = b"nso-adapter:device-ref:v1\0"
 _DEVICE_REF_HEX_WIDTH = 16
+
+#: Exactly what :func:`device_ref` produces, for declaring the response contract on the models
+#: that publish one. Derived from the width so the two cannot drift.
+DEVICE_REF_PATTERN = rf"^[0-9a-f]{{{_DEVICE_REF_HEX_WIDTH}}}$"
+
 _device_ref_key: bytes | None = None
 
 
