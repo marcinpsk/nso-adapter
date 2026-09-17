@@ -160,6 +160,7 @@ def safe_generic_conflicts(api_error):
     try:
         onboard()
     except DeviceIdentityRefused as exc:
+        # ok: nso-api-conflict-handler-contract
         refused = api_error(409, "conflict", str(exc), {"reason": exc.reason})
     except LookupError:
         # ok: nso-api-conflict-handler-contract
