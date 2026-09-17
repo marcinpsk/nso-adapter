@@ -13,7 +13,10 @@ _device_ref_key: bytes | None = None
 
 def register_device_ref_key(key: str) -> None:
     global _device_ref_key
-    if not key:
+    # Blank is unset wearing a space: the provider accepts it and every pseudonym in the fleet
+    # is then keyed with a value an attacker guesses first. Rejected, never trimmed - the key is
+    # used verbatim, so trimming would merge two different configured keys.
+    if not key.strip():
         raise ValueError("diagnostic reference key must not be empty")
     _device_ref_key = key.encode("utf-8")
 
