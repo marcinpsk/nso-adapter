@@ -1137,13 +1137,16 @@ async def test_an_UNLINKED_provision_is_still_correlatable_without_a_device_id(a
     """A provision with no NetBox link creates no adapter row, so `device_id` is None.
 
     Dropping the submitted name would leave that record unaddressable, which is the failure mode
-    the identity design warns about. `job_id` is adapter-owned and carries it instead.
+    the identity design warns about. The keyed `device_ref` names the pair without repeating it,
+    and `job_id` correlates the record to the job that produced it.
     """
+    import re
     from unittest.mock import AsyncMock, patch
 
     from structlog.testing import capture_logs
 
     from nso_adapter.core.onboarding import provision_nso_device
+    from nso_adapter.domain.diagnostics import DEVICE_REF_PATTERN
     from nso_adapter.nso.client import NsoClient
     from tests._secret_discipline import assert_records_free_of
 
@@ -1169,8 +1172,9 @@ async def test_an_UNLINKED_provision_is_still_correlatable_without_a_device_id(a
     assert result["ok"] is True
     assert result["device_id"] is None  # no NetBox link, so no adapter row
     record = next(r for r in logs if r["event"] == "device.provisioned")
-    assert record["device_id"] is None
-    assert record["job_id"] == 4242, "the record must stay correlatable without a device row"
+    assert "device_id" not in record
+    assert re.fullmatch(DEVICE_REF_PATTERN, record["device_ref"]), "the keyed reference carries it"
+    assert record["job_id"] == 4242, "and the job correlates the record to what produced it"
     assert_records_free_of([record], [submitted_name])
 
 
