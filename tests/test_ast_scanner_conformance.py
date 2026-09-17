@@ -154,6 +154,18 @@ CASES = (
         "value = SOURCE\ndef nested():\n    SINK",
         "value = SOURCE\ndef nested():\n    match subject:\n        case [value]:\n            SINK",
     ),
+    # The other direction of the same visitor: a capture shadows the outer alias, but it must
+    # carry the SUBJECT's value with it, or `case [name]` launders the taint.
+    ConformanceCase(
+        "binding-match-capture-from-subject",
+        "match SOURCE:\n    case value:\n        SINK",
+        "match CLEAN:\n    case value:\n        SINK",
+    ),
+    ConformanceCase(
+        "binding-match-capture-from-subject-in-nested-scope",
+        "value = CLEAN\ndef nested():\n    match SOURCE:\n        case value:\n            SINK",
+        "value = SOURCE\ndef nested():\n    match CLEAN:\n        case value:\n            SINK",
+    ),
     ConformanceCase(
         "scope-function-shadow-by-match-star",
         "value = SOURCE\ndef nested():\n    SINK",
@@ -325,12 +337,18 @@ OPENGREP_FUNCTION_SCOPE_CASES = (
 #: changes OpenGrep's verdict for NINE unrelated cases elsewhere in the same file (both directions:
 #: strict xfails start XPASSing and clean variants start reporting). Appending the same case at the
 #: end of the file changes nothing, so the effect is positional, not a parse failure — the scan
-#: reports no errors and skips no file. Keeping it would mean nine xfail entries that document
-#: OpenGrep's reaction to an unrelated neighbour rather than any real gap, so the case is measured
-#: against the hand-written scanners only.
+#: reports no errors and skips no file. Keeping it in the shared file would mean nine xfail entries
+#: documenting OpenGrep's reaction to an unrelated neighbour rather than any real gap, so it moves
+#: to OPENGREP_ISOLATED_CASES and is scanned in a file of its own instead.
 OPENGREP_CONTEXT_SENSITIVE_CASES = frozenset({"scope-function-shadow-by-import-alias"})
 OPENGREP_CASES = tuple(
     case for case in (*CASES, *OPENGREP_FUNCTION_SCOPE_CASES) if case.name not in OPENGREP_CONTEXT_SENSITIVE_CASES
+)
+#: Measured on a file of its own, so it cannot move another case's verdict. Excluding it from the
+#: shared file is not a reason to stop measuring it: its clean variant is a real OpenGrep false
+#: positive, recorded in OPENGREP_XFAILS below.
+OPENGREP_ISOLATED_CASES = tuple(
+    case for case in (*CASES, *OPENGREP_FUNCTION_SCOPE_CASES) if case.name in OPENGREP_CONTEXT_SENSITIVE_CASES
 )
 
 _OPENGREP_CLASS_SCOPE_GAPS = {
@@ -360,6 +378,10 @@ OPENGREP_XFAILS = {
         "scope-function-shadow-by-import",
         False,
     ): "OpenGrep does not treat an import as a local binding that shadows an inherited alias",
+    (
+        "scope-function-shadow-by-import-alias",
+        False,
+    ): "OpenGrep does not treat an import alias as a local binding that shadows an inherited alias",
     (
         "control-break-in-try",
         True,
@@ -416,7 +438,7 @@ def _render(case_source: str, scanner: ScannerSpec) -> str:
 
 def _opengrep_case_parameters() -> list[object]:
     parameters = []
-    for case in OPENGREP_CASES:
+    for case in (*OPENGREP_CASES, *OPENGREP_ISOLATED_CASES):
         for tainted in (True, False):
             marks = []
             if reason := OPENGREP_XFAILS.get((case.name, tainted)):
@@ -492,11 +514,47 @@ def opengrep_verdicts(tmp_path_factory: pytest.TempPathFactory) -> set[tuple[str
     assert result.returncode == 0, result.stderr
     report = json.loads(result.stdout)
     assert not report["errors"], report["errors"]
-    return {
+    verdicts = {
         line_owners[finding["start"]["line"]]
         for finding in report["results"]
         if any(finding["check_id"].endswith(rule) for rule in OPENGREP_EXCEPTION_RULES)
     }
+
+    for case in OPENGREP_ISOLATED_CASES:
+        for tainted in (True, False):
+            if _opengrep_isolated_verdict(target_dir, case, tainted):
+                verdicts.add((case.name, tainted))
+    return verdicts
+
+
+def _opengrep_isolated_verdict(target_dir, case: ConformanceCase, tainted: bool) -> bool:
+    """Scan one case in a file of its own and return whether OpenGrep reports it."""
+    name = f"{case.name.replace('-', '_')}_{'tainted' if tainted else 'clean'}"
+    isolated_dir = target_dir / name
+    isolated_dir.mkdir()
+    target = isolated_dir / "review-patterns.py"
+    case_source = _render(case.tainted if tainted else case.clean, SCANNERS[0])
+    target.write_text(
+        f"def case_{name}():\n"
+        "    try:\n"
+        "        work()\n"
+        "    except Exception as exc:\n"
+        f"{indent(case_source, '        ')}\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [OPENGREP, "scan", "--config", str(OPENGREP_RULES), "--quiet", "--json", "--", str(target)],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert not report["errors"], report["errors"]
+    return any(
+        any(finding["check_id"].endswith(rule) for rule in OPENGREP_EXCEPTION_RULES) for finding in report["results"]
+    )
 
 
 @pytest.fixture(scope="module")

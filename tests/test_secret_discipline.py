@@ -186,12 +186,17 @@ class _ScopeFacts(ast.NodeVisitor):
         # An import binds a name with no ast.Name store: `import a.b` binds `a`.
         self.local_names.add(node.asname or node.name.split(".", maxsplit=1)[0])
 
-    def visit_MatchAs(self, node: ast.MatchAs) -> None:  # noqa: N802 - ast visitor API
-        self.local_names.update(match_capture_names(node))
-        self.generic_visit(node)
-
-    visit_MatchStar = visit_MatchAs  # type: ignore[assignment]
-    visit_MatchMapping = visit_MatchAs  # type: ignore[assignment]
+    def visit_Match(self, node: ast.Match) -> None:  # noqa: N802 - ast visitor API
+        # A capture shadows an inherited alias, but it carries the SUBJECT's value with it.
+        # Binding the name without its value would make `case [name]` launder the taint.
+        self.visit(node.subject)
+        for case in node.cases:
+            for name in match_capture_names(case.pattern):
+                self._bind(ast.Name(id=name, ctx=ast.Store()), node.subject)
+            if case.guard is not None:
+                self.visit(case.guard)
+            for statement in case.body:
+                self.visit(statement)
 
     def visit_Assert(self, node: ast.Assert) -> None:  # noqa: N802 - ast visitor API
         self.assertions.append(node)
