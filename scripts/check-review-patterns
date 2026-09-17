@@ -50,12 +50,21 @@ for finding in report.get("results", []):
         f"{finding['check_id']}  {finding['extra']['message']}"
     )
 
-partial_paths = {
-    error["path"]
-    for error in report.get("errors", [])
-    if error.get("type")
-    and (error["type"] == "PartialParsing" or error["type"][0] == "PartialParsing")
-}
+def _is_partial_parsing(error):
+    kind = error.get("type")
+    return bool(kind) and (kind == "PartialParsing" or kind[0] == "PartialParsing")
+
+
+# A malformed rule is reported here and NOWHERE else: OpenGrep drops the rule, scans with the
+# rest and still exits 0, so the gate goes green with the guard silently disabled.
+rule_errors = [error for error in report.get("errors", []) if not _is_partial_parsing(error)]
+if rule_errors:
+    print("OpenGrep reported errors that are not partial parsing:", file=sys.stderr)
+    for error in rule_errors:
+        print(f"  {error.get('type')}: {error.get('message', '')}".rstrip(), file=sys.stderr)
+    sys.exit(1)
+
+partial_paths = {error["path"] for error in report.get("errors", []) if _is_partial_parsing(error)}
 new_partial_paths = partial_paths - expected_partial_paths
 scoped_partial_paths = {
     path
