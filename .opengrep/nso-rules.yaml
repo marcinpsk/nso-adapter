@@ -8,11 +8,14 @@ rules:
     paths: &outcome_log_paths
       include:
         - nso_adapter/main.py
+        - nso_adapter/core/failover.py
         - nso_adapter/core/generation.py
         - nso_adapter/core/importer.py
         - nso_adapter/core/removal.py
         - nso_adapter/core/refresh_engine.py
         - nso_adapter/core/redistribution.py
+        - nso_adapter/bindings/netbox/client.py
+        - nso_adapter/bindings/netbox/writer.py
         - nso_adapter/notifications/sse_subscriber.py
         - nso_adapter/notifications/persistent_subscriber.py
         - review-patterns.py
@@ -20,6 +23,7 @@ rules:
       - patterns:
           - pattern: logger.$LEVEL(..., error=$ERROR, ...)
           - pattern-not: logger.$LEVEL(..., error=failure_detail($EXCEPTION), ...)
+          - pattern-not: logger.$LEVEL(..., error=rejection_detail($BODY), ...)
       - patterns:
           - pattern-either:
               - pattern: logger.$LEVEL(..., detail=$EXCEPTION, ...)
@@ -58,6 +62,7 @@ rules:
       - pattern: failure_detail(...)
       - pattern: type(...).__name__
       - pattern: http_status_of(...)
+      - pattern: rejection_detail(...)
     pattern-sinks:
       - patterns:
           - pattern: logger.$LEVEL(..., $FIELD=$DETAIL, ...)

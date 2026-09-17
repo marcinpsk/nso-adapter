@@ -38,12 +38,21 @@ for its configuration names and workflow skip conditions.
 
 `nso-outcome-raw-exception-renderer` rejects traceback logging and raw exception
 values in every positional or structured log field. It covers `nso_adapter/main.py`,
-`core/importer.py`, `core/generation.py`, `core/removal.py`, `notifications/sse_subscriber.py`,
-`notifications/persistent_subscriber.py`, and the outcome bookkeeping logs in
-`refresh_engine.py` and `redistribution.py`. These logs must use `failure_detail`
-so an HTTP exception cannot repeat a request URL or server text. The behavioral
-and AST regressions in `tests/core/test_importer_failure_sinks.py` remain
-authoritative for the classification contract and complete Python syntax.
+`core/importer.py`, `core/generation.py`, `core/removal.py`, `core/failover.py`,
+`bindings/netbox/client.py`, `bindings/netbox/writer.py`,
+`notifications/sse_subscriber.py`, `notifications/persistent_subscriber.py`, and the
+outcome bookkeeping logs in `refresh_engine.py` and `redistribution.py`. These logs
+must use `failure_detail` so an HTTP exception cannot repeat a request URL or server
+text. The behavioral and AST regressions in `tests/core/test_importer_failure_sinks.py`
+remain authoritative for the classification contract and complete Python syntax.
+
+`failover.py`, `client.py` and `writer.py` joined the list in the C1c round: each
+NSO or NetBox call takes the device or interface identity as an argument, so the
+raised transport error repeats it and the handler logged it raw. `rejection_detail`
+is the second approved classifier, for a NetBox rejection body: NetBox repeats the
+submitted value in its validation messages, so only the field names travel. The
+remaining modules named in `test_guarded_modules_never_log_raw_exception_text` are
+tracked by the universal-guard card; this list is still an allowlist, not the tree.
 
 `nso-diagnostic-raw-identifier` rejects `device_name` and `device` fields in the
 guarded importer, redistribution, client, refresh, capability, startup, and

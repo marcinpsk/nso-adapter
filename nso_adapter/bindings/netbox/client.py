@@ -6,6 +6,8 @@ from __future__ import annotations
 import httpx
 import structlog
 
+from nso_adapter.nso.client import failure_detail
+
 logger = structlog.get_logger(__name__)
 
 # Max rows per bulk request. A single multi-thousand-row body makes NetBox drop
@@ -17,6 +19,21 @@ _BULK_PATCH_CHUNK = 50
 # Bulk writes can be slow on a busy / DEBUG NetBox; give them headroom beyond the
 # default per-call timeout.
 _BULK_TIMEOUT = 120.0
+
+
+def rejection_detail(body: object) -> str:
+    """Classify a NetBox rejection body for a log record.
+
+    NetBox repeats the submitted value in its validation messages, and a bulk row carries
+    an interface name, so no message text may travel. Only the field NAMES stay: they are
+    our own schema, and they are what tells an operator which column to fix.
+    """
+    if isinstance(body, dict):
+        names = sorted(str(key) for key in body)
+        return f"fields: {', '.join(names)}" if names else "fields: none"
+    if isinstance(body, list):
+        return f"errors: {len(body)}"
+    return "unparsed"
 
 
 def _row_fields(position: int, payload: dict) -> dict[str, int]:
@@ -210,7 +227,7 @@ class NetboxClient:
                     netbox_device_id=netbox_device_id,
                     batch_start=start,
                     batch_size=len(rows),
-                    error=str(exc) or type(exc).__name__,
+                    error=failure_detail(exc),
                 )
         return out
 
@@ -262,7 +279,7 @@ class NetboxClient:
                         f"netbox.{label}.row_rejected",
                         netbox_device_id=netbox_device_id,
                         **_row_fields(position, payload),
-                        error=errors[i],
+                        error=rejection_detail(errors[i]),
                     )
                 good = [row for i, row in enumerate(rows) if i not in bad]
                 return (
@@ -278,7 +295,7 @@ class NetboxClient:
                 f"netbox.{label}.row_rejected",
                 netbox_device_id=netbox_device_id,
                 **_row_fields(position, payload),
-                error=errors if errors is not None else resp.text[:200],
+                error=rejection_detail(errors),
             )
             return []
         # Bisect to isolate the culprit; each half is retried independently.
