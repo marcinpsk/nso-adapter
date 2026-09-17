@@ -122,8 +122,8 @@ async def test_section_404_with_healthy_container_is_device_absent(patch_client)
     # BOUNDED: without ?depth=1 the bare container GET serializes the whole fleet x 18 sections.
     assert len(transport.requests) == 2
     probe_url = str(transport.requests[1].url)
-    assert "/device=" not in probe_url
-    assert "depth=1" in probe_url
+    # One positive assertion says both halves: the bare container (no /device=) and bounded.
+    assert probe_url.endswith("/restconf/data/network-state-export:device-state?depth=1")
 
 
 async def test_section_404_with_dead_container_raises_export_unavailable(patch_client):
