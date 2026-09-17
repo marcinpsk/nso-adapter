@@ -85,6 +85,26 @@ async def _put_svis(client, device_id: int, vlan_ids: list[int], *, seq: int, qu
     )
 
 
+async def test_freeze_returns_the_fragment_on_the_success_path(adapter_client):
+    """A `return` inside the try exits `_freeze`; the trailing `raise` is unreachable on success.
+
+    A review read `raise unexecutable` (generation.py) as reachable after a successful return and
+    called it an UnboundLocalError on every call. It is reachable only when the except handler ran
+    and bound the name. This pins the real control flow so the claim cannot be re-argued.
+    """
+    from nso_adapter.core.generation import _freeze
+    from nso_adapter.core.projection import snapshot_stream
+    from nso_adapter.store.models import Device
+
+    device_id = await seed_device(nso_device_name="placeholder-freeze-success")
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        tables = await snapshot_stream(db, device_id, "static_route")
+        fragment = await _freeze(db, device, "static_route", tables)
+
+    assert isinstance(fragment, dict)
+
+
 async def _apply(client, device_id: int, selected: dict[str, int], *, attempt_id=None):
     return await client.post(
         f"/api/v1/devices/{device_id}/actions/apply",

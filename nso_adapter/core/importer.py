@@ -101,7 +101,8 @@ def _attrs_to_interface_list(data: dict | None, *, device_id: int) -> list[Inter
         return []
     result = []
     for entry in as_list(data.get("interface")):
-        name = entry.get("interface-name")
+        # as_list keeps whatever the NED emitted, including a bare scalar singleton.
+        name = entry.get("interface-name") if isinstance(entry, dict) else None
         if not name:
             # The entry is the device's own data and can carry any leaf the NED emits, so
             # the record names the field that is missing and the read it came from.
@@ -340,13 +341,14 @@ def _split_sections(
     """
     sections: dict[str, dict | None] = {}
     for wire in wire_names:
+        section_missing = wire not in served
         section = served.get(wire)
         if isinstance(section, dict):
             sections[wire] = section
             failures.pop(wire, None)
             continue
         sections[wire] = None
-        absent_from_action = section is None and operation is ReadOperation.device_state_read
+        absent_from_action = section_missing and operation is ReadOperation.device_state_read
         failures[wire] = ReadFailure(
             operation=operation,
             device=device_name,

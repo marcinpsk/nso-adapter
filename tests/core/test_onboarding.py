@@ -421,6 +421,47 @@ async def test_rekey_changes_device_name(adapter_client_with_nso):
         assert updated.source_epoch == 2
 
 
+async def test_rekey_reports_identity_refusal_when_the_target_is_claimed_after_the_precheck(
+    adapter_client_with_nso,
+):
+    """The family fences lock (device_id, family); they do not serialize two devices on one identity.
+
+    The pre-check and the commit are select-then-write, so a rival can claim the target pair in
+    between and `uq_device_nso_identity` is what actually decides. Simulated by committing the
+    competing row right after this caller's pre-check, which is exactly what losing looks like.
+    """
+    from nso_adapter.core.onboarding import DeviceIdentityRefused, rekey_device
+    from tests._secret_discipline import assert_chain_free_of
+    from tests.conftest import seed_device
+
+    device_id = await seed_device(nso_instance="nso-dev", nso_device_name="rekey-loser", netbox_device_id=301)
+
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        original_execute = db.execute
+        state = {"saw_precheck": False, "seeded": False}
+
+        async def execute_racing_the_precheck(statement, *args, **kwargs):
+            # Seed on the first statement AFTER the dup pre-check, so the pre-check misses the
+            # rival and our own identity UPDATE is the one the constraint refuses.
+            if state["saw_precheck"] and not state["seeded"]:
+                state["seeded"] = True
+                await seed_device(nso_instance="nso-dev", nso_device_name="rekey-winner", netbox_device_id=302)
+            if "devices.id !=" in str(statement):
+                state["saw_precheck"] = True
+            return await original_execute(statement, *args, **kwargs)
+
+        db.execute = execute_racing_the_precheck
+        with pytest.raises(DeviceIdentityRefused) as caught:
+            await rekey_device(db, device, nso_device_name="rekey-winner")
+
+    assert state["seeded"], "the race was never injected; the test proves nothing"
+    assert caught.value.reason == "identity_claimed"
+    # The IntegrityError names the colliding key, so the refusal is raised OUTSIDE the handler:
+    # chaining it would republish the device name through every sink that renders the chain.
+    assert_chain_free_of(caught.value, ["rekey-winner", "uq_device_nso_identity"])
+
+
 async def test_rekey_same_source_is_true_noop(adapter_client_with_nso):
     """An idempotent source PATCH preserves the generation and read publications."""
     from nso_adapter.core.onboarding import rekey_device

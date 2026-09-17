@@ -914,65 +914,82 @@ async def rekey_device(
         )
         raise DeviceIdentityRefused(_IDENTITY_CLAIMED, reason="identity_claimed")
 
-    device.nso_instance = target_instance
-    device.nso_device_name = target_name
-    device.source_epoch += 1
+    # The fences lock (device_id, family) and cannot serialize two devices onto one identity,
+    # so uq_device_nso_identity is what actually decides a lost race. The violation can surface
+    # at any autoflush in the teardown below, not only at the commit.
+    identity_claimed = False
+    try:
+        device.nso_instance = target_instance
+        device.nso_device_name = target_name
+        device.source_epoch += 1
 
-    # Child rows use ON DELETE CASCADE where applicable. Interfaces retain the
-    # established explicit cleanup because their oldest FKs predate DB cascades.
-    iface_ids_result = await db.execute(select(DbInterface.id).where(DbInterface.device_id == device.id))
-    iface_ids = list(iface_ids_result.scalars().all())
-    if iface_ids:
-        from nso_adapter.store.models import InterfaceAttrState, InterfaceIntent, InterfaceIpIntent
+        # Child rows use ON DELETE CASCADE where applicable. Interfaces retain the
+        # established explicit cleanup because their oldest FKs predate DB cascades.
+        iface_ids_result = await db.execute(select(DbInterface.id).where(DbInterface.device_id == device.id))
+        iface_ids = list(iface_ids_result.scalars().all())
+        if iface_ids:
+            from nso_adapter.store.models import InterfaceAttrState, InterfaceIntent, InterfaceIpIntent
 
-        await db.execute(delete(InterfaceAttrState).where(InterfaceAttrState.interface_id.in_(iface_ids)))
-        intent_iface_ids = set(
-            (await db.execute(select(InterfaceIntent.interface_id).where(InterfaceIntent.interface_id.in_(iface_ids))))
-            .scalars()
-            .all()
-        )
-        intent_iface_ids.update(
-            (
+            await db.execute(delete(InterfaceAttrState).where(InterfaceAttrState.interface_id.in_(iface_ids)))
+            intent_iface_ids = set(
+                (
+                    await db.execute(
+                        select(InterfaceIntent.interface_id).where(InterfaceIntent.interface_id.in_(iface_ids))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            intent_iface_ids.update(
+                (
+                    await db.execute(
+                        select(InterfaceIpIntent.interface_id).where(InterfaceIpIntent.interface_id.in_(iface_ids))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            # Interface intents are operator-owned state, not a read mirror. Keep their
+            # minimal interface identity anchor so the next source read reuses the
+            # same row by name and the intent/history survives the rekey.
+            if intent_iface_ids:
                 await db.execute(
-                    select(InterfaceIpIntent.interface_id).where(InterfaceIpIntent.interface_id.in_(iface_ids))
+                    delete(DbInterface).where(
+                        DbInterface.device_id == device.id,
+                        DbInterface.id.not_in(intent_iface_ids),
+                    )
                 )
-            )
-            .scalars()
-            .all()
-        )
-        # Interface intents are operator-owned state, not a read mirror. Keep their
-        # minimal interface identity anchor so the next source read reuses the
-        # same row by name and the intent/history survives the rekey.
-        if intent_iface_ids:
-            await db.execute(
-                delete(DbInterface).where(
-                    DbInterface.device_id == device.id,
-                    DbInterface.id.not_in(intent_iface_ids),
+                await db.execute(
+                    update(DbInterface)
+                    .where(DbInterface.id.in_(intent_iface_ids))
+                    .values(parent_binding=None, kind=None, encap_tag=None, vrf=None, service=None)
                 )
-            )
-            await db.execute(
-                update(DbInterface)
-                .where(DbInterface.id.in_(intent_iface_ids))
-                .values(parent_binding=None, kind=None, encap_tag=None, vrf=None, service=None)
-            )
-        else:
-            await db.execute(delete(DbInterface).where(DbInterface.device_id == device.id))
-    for table_name in _READ_MIRROR_ROOTS:
-        if table_name == "interfaces":
-            continue  # handled above so operator-owned interface-intent anchors survive
-        table = Base.metadata.tables[table_name]
-        await db.execute(delete(table).where(table.c.device_id == device.id))
-    await db.execute(delete(RefreshOutcomePointer).where(RefreshOutcomePointer.device_id == device.id))
-    await db.execute(delete(ManagedScope).where(ManagedScope.device_id == device.id))
+            else:
+                await db.execute(delete(DbInterface).where(DbInterface.device_id == device.id))
+        for table_name in _READ_MIRROR_ROOTS:
+            if table_name == "interfaces":
+                continue  # handled above so operator-owned interface-intent anchors survive
+            table = Base.metadata.tables[table_name]
+            await db.execute(delete(table).where(table.c.device_id == device.id))
+        await db.execute(delete(RefreshOutcomePointer).where(RefreshOutcomePointer.device_id == device.id))
+        await db.execute(delete(ManagedScope).where(ManagedScope.device_id == device.id))
 
-    device.ned_id = None
-    device.sw_version = None
-    device.mapping_status = MappingStatus.mapped
-    device.last_sync_at = None
-    device.last_sync_status = None
-    device.degraded_surfaces = None
+        device.ned_id = None
+        device.sw_version = None
+        device.mapping_status = MappingStatus.mapped
+        device.last_sync_at = None
+        device.last_sync_status = None
+        device.degraded_surfaces = None
 
-    await db.commit()
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        identity_claimed = True
+
+    if identity_claimed:
+        logger.warning("device.rekey_refused", reason="identity_claimed", device_id=device_id)
+        raise DeviceIdentityRefused(_IDENTITY_CLAIMED, reason="identity_claimed")
+
     await db.refresh(device)
     logger.info("device.rekeyed", device_id=device.id, nso_device=device.nso_device_name)
     return device

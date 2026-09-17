@@ -125,6 +125,32 @@ def test_attrs_to_interface_list_returns_empty_when_no_interface_key():
     assert _attrs_to_interface_list({"device-name": "sw01"}, device_id=1) == []
 
 
+def test_attrs_to_interface_list_skips_a_non_mapping_entry():
+    """as_list keeps whatever the NED emitted; a bare scalar must be skipped, not crash the sync."""
+    from structlog.testing import capture_logs
+
+    data = {"interface": ["GigabitEthernet0/0", {"interface-name": "GigabitEthernet0/1"}]}
+
+    with capture_logs() as logs:
+        result = _attrs_to_interface_list(data, device_id=7)
+
+    assert [iface.name for iface in result] == ["GigabitEthernet0/1"]
+    skipped = [log for log in logs if log["event"] == "interface_attributes.entry_skipped"]
+    assert len(skipped) == 1
+    assert skipped[0]["device_id"] == 7
+    assert skipped[0]["missing_field"] == "interface-name"
+
+
+def test_attrs_to_interface_list_skips_a_bare_scalar_singleton():
+    """A singleton the NED rendered as a bare scalar reaches as_list as a one-element list."""
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        assert _attrs_to_interface_list({"interface": "GigabitEthernet0/0"}, device_id=8) == []
+
+    assert [log["event"] for log in logs] == ["interface_attributes.entry_skipped"]
+
+
 def test_attrs_to_interface_list_skips_malformed_entry():
     """Entries without interface-name are skipped; valid entries are returned."""
     entry = {

@@ -690,6 +690,38 @@ async def test_a_missing_action_section_is_named_missing_not_malformed(adapter_c
     assert failure.family == "interface-ip"
 
 
+async def test_an_explicitly_null_action_section_is_named_malformed_not_missing(adapter_client):
+    """An action that ANSWERED the family with null sent something unusable, not nothing.
+
+    Certification lets a null section through (`client.py:137`), so the split decides. `.get()`
+    cannot tell an absent key from a present null, and only the absent key is the action's
+    omission contract failure.
+    """
+    from nso_adapter.core.importer import _fetch_projection
+    from nso_adapter.nso.read_outcome import ReadFailureCode, ReadOperation
+    from tests.nso.test_nso_client_methods import MockTransport, _make_client
+
+    device_id = await seed_device(nso_device_name="split-null-section")
+    client = _make_client()
+    served = _atomic_output(
+        "split-null-section",
+        {"static-route": {"status": "ok", "route": []}, "interface-ip": None},
+    )
+    transport = MockTransport(200, served)
+    client._client = lambda timeout=None: httpx.AsyncClient(transport=transport, base_url="http://nso:8080")
+
+    async with _device_session(device_id) as (_db, device):
+        sections, outcome, failures = await _fetch_projection(
+            client, device, ["static-route", "interface-ip"], atomic=True
+        )
+
+    assert outcome is None
+    assert sections["interface-ip"] is None
+    failure = failures["interface-ip"]
+    assert failure.code is ReadFailureCode.section_malformed, "a present null is not an omission"
+    assert failure.operation is ReadOperation.device_state_read
+
+
 async def test_a_non_terminal_action_section_never_reaches_the_split(adapter_client):
     """The client refuses a non-terminal status, so the split cannot see a not-ready one.
 
