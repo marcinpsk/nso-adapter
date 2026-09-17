@@ -1262,7 +1262,10 @@ class SnmpCommunity(Base):
     """Read mirror of SNMP community entries from NSO oper-data.
 
     Full-replace on every refresh: all rows for a device are deleted then re-inserted.
-    The community string is NEVER stored; community_hash is a SHA-256 opaque identifier.
+    The community string is NEVER stored. ``community_hash`` holds the cross-repo secret
+    fingerprint validated by :func:`nso_adapter.secrets.refs.require_secret_fingerprint`:
+    the first 16 lowercase hexadecimal characters of the SHA-256 digest, not the full
+    64-character digest.
     """
 
     __tablename__ = "snmp_community"
