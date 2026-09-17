@@ -39,6 +39,7 @@ def _write_opengrep_stub(
     partial_paths: set[str],
     *,
     results: list[dict[str, object]] | None = None,
+    errors: list[dict[str, object]] | None = None,
     exit_code: int = 0,
 ) -> tuple[Path, Path]:
     payload = {
@@ -48,7 +49,8 @@ def _write_opengrep_stub(
                 "type": ["PartialParsing", []],
             }
             for path in sorted(partial_paths)
-        ],
+        ]
+        + (errors or []),
         "results": results or [],
     }
     stub = tmp_path / "opengrep-stub"
@@ -268,3 +270,29 @@ def test_review_pattern_scan_renders_findings_from_one_json_scan(tmp_path: Path)
     calls = invocations.read_text(encoding="utf-8").splitlines()
     assert len(calls) == 1
     assert "--json" in calls[0]
+
+
+def test_the_scan_fails_when_opengrep_drops_a_malformed_rule(tmp_path: Path):
+    """A rule OpenGrep cannot parse is reported here and nowhere else.
+
+    OpenGrep drops the rule, scans with the rest and still exits 0, so before this the gate
+    went green with the guard silently disabled. Measured for real: a `pattern-not-inside`
+    holding a bare `except` clause took `nso-api-error-raw-exception-renderer` out of a scan
+    that reported success.
+    """
+    stub, _invocations = _write_opengrep_stub(
+        tmp_path,
+        _EXPECTED_PARTIAL_PATHS,
+        errors=[{"type": "Rule parse error", "message": "Invalid pattern for Python"}],
+    )
+
+    result = subprocess.run(
+        ["/usr/bin/bash", str(REVIEW_PATTERNS), "scan"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ | {"OPENGREP_BIN": str(stub)},
+    )
+
+    assert result.returncode == 1, "a dropped rule must fail the scan, not pass it"
+    assert "Rule parse error" in result.stderr
