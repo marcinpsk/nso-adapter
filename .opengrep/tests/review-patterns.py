@@ -177,6 +177,55 @@ def handled_with_exit_outcome_detail(logger, context):
             logger.warning("family.outcome.read_record_failed", detail=detail)
 
 
+def non_pass_handler_with_exit_outcome_detail(logger, context):
+    # The nested handler runs a statement instead of `pass`, so the earlier shape missed it:
+    # the alias survives the context-manager exit and the else's authored text never runs.
+    try:
+        work()
+    except Exception as caught:
+        try:
+            with context():
+                detail = caught
+        except Exception:
+            logger.debug("handled")
+        else:
+            detail = "authored detail"
+        # ruleid: nso-outcome-with-exit-raw-exception-alias-renderer
+        logger.warning("family.outcome.read_record_failed", detail=detail)
+
+
+async def async_non_pass_handler_with_exit_outcome_detail(logger, context):
+    try:
+        work()
+    except Exception as caught:
+        try:
+            async with context():
+                detail = caught
+        except Exception:
+            logger.debug("handled")
+        else:
+            detail = "authored detail"
+        # ruleid: nso-outcome-with-exit-raw-exception-alias-renderer
+        logger.warning("family.outcome.read_record_failed", detail=detail)
+
+
+def handler_overwrite_with_exit_outcome_detail(logger, context):
+    # The counterpart exclusion: an arbitrary handler body is now matched, so a handler that
+    # reassigns the alias to authored text has to be excluded like a with-body overwrite.
+    try:
+        work()
+    except Exception as caught:
+        try:
+            with context():
+                detail = caught
+        except Exception:
+            detail = "authored detail"
+        else:
+            detail = "authored detail"
+        # ok: nso-outcome-with-exit-raw-exception-alias-renderer
+        logger.warning("family.outcome.read_record_failed", detail=detail)
+
+
 def authored_outcome_details(logger, reason):
     # ok: nso-outcome-raw-exception-renderer
     logger.warning("family.outcome.read_record_failed", detail=f"Reason: {reason}")
