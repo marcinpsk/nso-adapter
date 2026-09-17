@@ -9,7 +9,7 @@ import pytest
 import respx
 from structlog.testing import capture_logs
 
-from nso_adapter.bindings.netbox.client import NetboxClient
+from nso_adapter.bindings.netbox.client import NetboxClient, rejection_detail
 from tests._secret_discipline import assert_records_free_of
 
 BASE = "http://netbox.local"
@@ -258,6 +258,91 @@ async def test_bulk_create_rejection_keeps_absolute_position_after_chunking(clie
     assert "device_id" not in record
     assert "netbox_interface_id" not in record
     assert_records_free_of([record], names)
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ({"mtu": ["too big"], "name": ["'placeholder-x' is taken"]}, "fields: mtu, name"),
+        ({}, "fields: none"),
+        # A 400 whose positional list flags nothing reaches the single-row path as a list.
+        ([{}], "errors: 1"),
+        (None, "unparsed"),
+        ("<html>no such interface placeholder-x</html>", "unparsed"),
+    ],
+)
+def test_rejection_detail_keeps_only_the_shape_of_a_rejection_body(body, expected):
+    """The classifier is total: an unrecognized body degrades to a fixed string, never a value."""
+    assert rejection_detail(body) == expected
+
+
+@respx.mock
+async def test_bulk_create_rejection_keeps_a_reflected_name_out_of_the_record(client):
+    """NetBox echoes the submitted value in its validation message; the record may not carry it."""
+    name = "placeholder-reflected-create"
+    respx.post(f"{BASE}/api/dcim/interfaces/").mock(
+        return_value=httpx.Response(400, json=[{"name": [f"Interface with this name '{name}' already exists."]}])
+    )
+
+    with capture_logs() as logs:
+        result = await client.bulk_create_interfaces([{"name": name}], netbox_device_id=45)
+
+    assert result == []
+    record = next(record for record in logs if record["event"] == "netbox.bulk_create.row_rejected")
+    assert record["payload_index"] == 0
+    assert record["error"] == "fields: name"
+    assert_records_free_of([record], [name])
+
+
+@respx.mock
+async def test_bulk_patch_non_positional_rejection_keeps_a_reflected_name_out_of_the_record(client):
+    """The single-row non-positional path parses a dict body; only its field names may travel."""
+    name = "placeholder-reflected-patch"
+    respx.patch(f"{BASE}/api/dcim/interfaces/").mock(
+        return_value=httpx.Response(400, json={"name": [f"'{name}' is already taken."], "mtu": ["too big"]})
+    )
+
+    with capture_logs() as logs:
+        result = await client.bulk_patch_interfaces([{"id": 7, "name": name}], netbox_device_id=46)
+
+    assert result == []
+    record = next(record for record in logs if record["event"] == "netbox.bulk_patch.row_rejected")
+    assert record["netbox_interface_id"] == 7
+    assert record["error"] == "fields: mtu, name"
+    assert_records_free_of([record], [name])
+
+
+@respx.mock
+async def test_bulk_patch_unparsed_rejection_body_never_reaches_the_record(client):
+    """An unparseable 400 body is a server document, not ours to print."""
+    name = "placeholder-unparsed-patch"
+    respx.patch(f"{BASE}/api/dcim/interfaces/").mock(
+        return_value=httpx.Response(400, text=f"<html><body>no such interface {name}</body></html>")
+    )
+
+    with capture_logs() as logs:
+        result = await client.bulk_patch_interfaces([{"id": 8, "name": name}], netbox_device_id=47)
+
+    assert result == []
+    record = next(record for record in logs if record["event"] == "netbox.bulk_patch.row_rejected")
+    assert record["netbox_interface_id"] == 8
+    assert record["error"] == "unparsed"
+    assert_records_free_of([record], [name])
+
+
+@respx.mock
+async def test_batch_failure_reports_only_the_classified_exception(client):
+    """A raised batch failure travels as its classification, never as the httpx message."""
+    name = "placeholder-batch-failure"
+    respx.post(f"{BASE}/api/dcim/interfaces/").mock(return_value=httpx.Response(500, text=f"boom {name}"))
+
+    with capture_logs() as logs:
+        result = await client.bulk_create_interfaces([{"name": name}], netbox_device_id=48)
+
+    assert result == []
+    record = next(record for record in logs if record["event"] == "netbox.bulk_create.batch_failed")
+    assert record["error"] == "HTTPStatusError (HTTP 500)"
+    assert_records_free_of([record], [name, f"{BASE}/api/dcim/interfaces/"])
 
 
 @respx.mock

@@ -24,6 +24,7 @@ from sqlalchemy import select
 
 from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.actions import ProbeStatus, ReachabilityProbe, probe_reachable
+from nso_adapter.nso.client import failure_detail
 from nso_adapter.store.models import ActiveAddress, DeviceFailover, FailoverConfig
 
 if TYPE_CHECKING:
@@ -229,7 +230,7 @@ async def _safe_disconnect(client: NsoClient, name: str, device_id: int) -> bool
         await client.disconnect(name)
         return True
     except Exception as exc:  # no live session / already disconnected — usually benign
-        logger.debug("failover.disconnect_ignored", **device_fields(device_id=device_id), error=repr(exc))
+        logger.debug("failover.disconnect_ignored", **device_fields(device_id=device_id), error=failure_detail(exc))
         return False
 
 
@@ -238,7 +239,7 @@ async def _safe_sync_from(client: NsoClient, name: str, device_id: int) -> None:
     try:
         await client.sync_from(name)
     except Exception as exc:
-        logger.warning("failover.sync_from_failed", **device_fields(device_id=device_id), error=repr(exc))
+        logger.warning("failover.sync_from_failed", **device_fields(device_id=device_id), error=failure_detail(exc))
 
 
 async def _set_address(client: NsoClient, name: str, address: str, device_id: int) -> bool:
@@ -268,7 +269,7 @@ async def _revert_address(
             "failover.revert_failed",
             **device_fields(device_id=device_id),
             **({"role": role} if role is not None else {}),
-            error=repr(exc),
+            error=failure_detail(exc),
         )
 
 
@@ -478,7 +479,7 @@ async def _failback_flip_probe(
             "failover.failback_blocked",
             **device_fields(device_id=fo.device_id),
             reason=_BLOCKED_ADDRESS_UNREADABLE,
-            error=repr(exc),
+            error=failure_detail(exc),
         )
     if address_before is None:
         if fo.failback_blocked_reason != _BLOCKED_ACTIVE_OOB_CONFLICT:
