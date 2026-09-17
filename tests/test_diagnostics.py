@@ -75,6 +75,45 @@ def test_startup_rejects_an_empty_diagnostic_key(monkeypatch) -> None:
     assert_chain_free_of(caught.value, ["DIAGNOSTIC_KEY", "placeholder-adapter-token"])
 
 
+@pytest.mark.parametrize("blank", [" ", "   ", "\t", "\n", " \t\n "])
+def test_startup_rejects_a_WHITESPACE_ONLY_diagnostic_key(monkeypatch, blank) -> None:
+    """A blank key is an unset key wearing a space: it keys every pseudonym in the fleet with a
+    value an attacker guesses first, which is what the keyed digest exists to prevent."""
+    monkeypatch.setenv("ADAPTER_TOKEN", "placeholder-adapter-token")
+    monkeypatch.setenv("DIAGNOSTIC_KEY", blank)
+
+    with pytest.raises(ValueError) as caught:
+        _init_secrets(SimpleNamespace(state=SimpleNamespace()), _config(), SimpleNamespace())
+
+    assert str(caught.value) == "diagnostic reference key must not be empty"
+    assert_chain_free_of(caught.value, ["DIAGNOSTIC_KEY", "placeholder-adapter-token"])
+
+
+@pytest.mark.parametrize("blank", ["", " ", "\t"])
+def test_startup_rejects_a_BLANK_ADAPTER_TOKEN(monkeypatch, blank) -> None:
+    """Same class as the diagnostic key: the provider serves a blank as a SET value, so nothing
+    below rejects it. A blank bearer token is guessed on the first try, and it gates every
+    write, apply and push endpoint."""
+    monkeypatch.setenv("ADAPTER_TOKEN", blank)
+    monkeypatch.setenv("DIAGNOSTIC_KEY", "placeholder-diagnostic-key")
+
+    with pytest.raises(SecretResolutionError) as caught:
+        _init_secrets(SimpleNamespace(state=SimpleNamespace()), _config(), SimpleNamespace())
+
+    assert str(caught.value) == "api.adapter_token_ref: the configured secret is blank"
+    assert_chain_free_of(caught.value, ["ADAPTER_TOKEN", "placeholder-diagnostic-key"])
+
+
+def test_a_NONBLANK_key_keeps_its_own_whitespace() -> None:
+    """Rejecting blanks must not silently strip: the key is secret material, used verbatim, and
+    trimming it would make two different configured keys produce the same references."""
+    register_device_ref_key(" placeholder-diagnostic-key ")
+    padded = device_ref("nso-a", "edge-1")
+    register_device_ref_key("placeholder-diagnostic-key")
+
+    assert padded != device_ref("nso-a", "edge-1")
+
+
 def test_startup_registers_the_resolved_diagnostic_key(monkeypatch) -> None:
     register_device_ref_key("stale-placeholder-key")
     monkeypatch.setenv("ADAPTER_TOKEN", "placeholder-adapter-token")
