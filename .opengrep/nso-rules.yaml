@@ -252,7 +252,6 @@ rules:
     pattern-either:
       - pattern: logger.$LEVEL(..., device_name=$VALUE, ...)
       - pattern: logger.$LEVEL(..., device=$VALUE, ...)
-      - pattern: logger.$LEVEL(..., nso_instance=$VALUE, ...)
       - pattern: logger.$LEVEL(..., stream=stream_url, ...)
       - pattern: logger.$LEVEL(..., stream_url=stream_url, ...)
       - pattern: logger.$LEVEL(..., url=stream_url, ...)

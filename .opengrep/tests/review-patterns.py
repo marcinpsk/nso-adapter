@@ -378,8 +378,12 @@ def raw_diagnostic_identifiers(logger, device, device_name, nso_instance, stream
     logger.info("family.refresh.done", device_name=device_name)
     # ruleid: nso-diagnostic-raw-identifier
     logger.warning("family.refresh.failed", device=device_name)
-    # ruleid: nso-diagnostic-raw-identifier
+    # The NSO instance name is operator-authored configuration, not caller text: every
+    # endpoint that takes one refuses a name absent from the configured set. Both spellings.
+    # ok: nso-diagnostic-raw-identifier
     logger.warning("family.refresh.failed", nso_instance=nso_instance)
+    # ok: nso-diagnostic-raw-identifier
+    logger.info("nso.client.registered", instance=nso_instance)
     # ruleid: nso-diagnostic-raw-identifier, nso-diagnostic-raw-identifier-alias
     logger.info("sse_event", stream=stream_url)
     # ruleid: nso-diagnostic-raw-identifier, nso-diagnostic-raw-identifier-alias

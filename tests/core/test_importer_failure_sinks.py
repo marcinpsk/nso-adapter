@@ -481,6 +481,21 @@ def test_review_guards_cover_each_authored_error_boundary() -> None:
     } <= identifier_paths
 
 
+def test_the_identifier_guard_leaves_the_operator_authored_instance_name_alone() -> None:
+    """The NSO instance name is out of the identifier class, so neither rule may carry it.
+
+    The keyword rule banned `nso_instance=` while the tree spells the field `instance=`, so
+    the guard passed on the spelling rather than on the verdict and a reviewer re-raised the
+    same site three times. Both rules are pinned here, together, so they cannot drift apart.
+    """
+    rules = {rule["id"]: rule for rule in yaml.safe_load(_RULES.read_text(encoding="utf-8"))["rules"]}
+    keyword = repr(rules["nso-diagnostic-raw-identifier"]["pattern-either"])
+    alias = repr(rules["nso-diagnostic-raw-identifier-alias"]["pattern-sources"])
+
+    assert "instance" not in keyword, "the instance name is operator-authored configuration"
+    assert "instance" not in alias, "the alias rule must not carry an instance source either"
+
+
 def _binds_formatter_name(node: ast.AST) -> bool:
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         return node.name == "failure_detail"
