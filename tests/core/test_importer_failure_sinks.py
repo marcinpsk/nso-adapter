@@ -336,6 +336,14 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
             self._loop_continue_aliases[-1].append(self.aliases.copy())
         return False
 
+    def visit_Return(self, node: ast.Return) -> bool:  # noqa: N802 - ast visitor API
+        self.generic_visit(node)
+        return False
+
+    def visit_Raise(self, node: ast.Raise) -> bool:  # noqa: N802 - ast visitor API
+        self.generic_visit(node)
+        return False
+
     def _visit_comprehension(self, node: ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp) -> None:
         outer_aliases = self.aliases
         first_generator, *remaining_generators = node.generators
@@ -674,6 +682,36 @@ logger.warning("event", detail=authored)
 )
 def test_raw_exception_log_guard_tracks_structured_assignment_elements(source: str) -> None:
     assert _raw_log_exception_renderers(source) == [2]
+
+
+@pytest.mark.parametrize("exit_statement", ["return", "raise RuntimeError"], ids=["return", "raise"])
+def test_raw_exception_log_guard_drops_a_returned_or_raised_branch(exit_statement: str) -> None:
+    """A branch that leaves through `return` or `raise` cannot reach the statement after it.
+
+    Only break and continue answered the fall-through protocol, so the scanner merged the
+    exceptional state of an unreachable path and reported a renderer that cannot run.
+    """
+    unreachable = (
+        "def handler():\n"
+        "    try:\n"
+        "        work()\n"
+        "    except Exception as exc:\n"
+        '        detail = "authored detail"\n'
+        "        if condition:\n"
+        "            detail = exc\n"
+        f"            {exit_statement}\n"
+        '        logger.warning("event", detail=detail)\n'
+    )
+    reachable = unreachable.replace(f"            {exit_statement}\n", "")
+
+    assert _raw_log_exception_renderers(unreachable) == []
+    assert _raw_log_exception_renderers(reachable) == [8]
+
+
+def test_raw_exception_log_guard_still_reads_a_returned_expression() -> None:
+    """Cutting the path must not stop the scanner reading what the statement itself renders."""
+    source = 'def handler():\n    try:\n        work()\n    except Exception as exc:\n        return logger.warning("event", detail=exc)\n'
+    assert _raw_log_exception_renderers(source) == [5]
 
 
 def test_raw_exception_log_guard_rejects_bound_logger_calls() -> None:

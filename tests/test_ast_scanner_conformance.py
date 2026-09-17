@@ -299,6 +299,28 @@ CASES = (
         "value = SOURCE\nfor item in items:\n    try:\n        break\n    finally:\n        value = CLEAN\n        continue\nelse:\n    value = CLEAN\nSINK",
         {"non-disclosure": "the scanner is lexical and does not model control-flow overwrites"},
     ),
+    # A `for` target binds the iterable's values, exactly as a comprehension target does. The
+    # two loop forms disagreed, so one spelling of the same value was reported and the other
+    # was not.
+    ConformanceCase(
+        "binding-loop-target",
+        "for value in [SOURCE]:\n    SINK",
+        "for value in [CLEAN]:\n    SINK",
+    ),
+    # `return` and `raise` end the path, so the state of the branch they leave behind must not
+    # merge into the code that follows.
+    ConformanceCase(
+        "control-return-exits-branch",
+        "def nested():\n    value = CLEAN\n    if condition:\n        value = SOURCE\n    SINK",
+        "def nested():\n    value = CLEAN\n    if condition:\n        value = SOURCE\n        return\n    SINK",
+        {"non-disclosure": "the scanner unions a scope's bindings and does not model control flow"},
+    ),
+    ConformanceCase(
+        "control-raise-exits-branch",
+        "value = CLEAN\nif condition:\n    value = SOURCE\nSINK",
+        "value = CLEAN\nif condition:\n    value = SOURCE\n    raise RuntimeError\nSINK",
+        {"non-disclosure": "the scanner unions a scope's bindings and does not model control flow"},
+    ),
     ConformanceCase(
         "control-if-body",
         "value = CLEAN\nif condition:\n    value = SOURCE\nSINK",

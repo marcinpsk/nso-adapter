@@ -403,7 +403,10 @@ class _Scanner(ast.NodeVisitor):
         for _ in range(max_passes):
             self._constant_scopes[-1] = {name: values.copy() for name, values in loop_inputs.items()}
             if isinstance(node, (ast.For, ast.AsyncFor)):
+                # Clear first so a tuple or starred target drops every stale name, then bind
+                # the iterable's constants the way _visit_comprehension already does.
                 self._clear_target(node.target)
+                self._track_constant_values(node.target, self._iteration_constants(node.iter))
 
             self._loop_break_states.append([])
             self._loop_continue_states.append([])
@@ -445,6 +448,14 @@ class _Scanner(ast.NodeVisitor):
     def visit_Continue(self, node: ast.Continue) -> bool:
         if self._loop_continue_states:
             self._loop_continue_states[-1].append(self._copy_constants())
+        return False
+
+    def visit_Return(self, node: ast.Return) -> bool:
+        self.generic_visit(node)
+        return False
+
+    def visit_Raise(self, node: ast.Raise) -> bool:
+        self.generic_visit(node)
         return False
 
     def _iteration_constants(self, expression: ast.AST) -> set[str] | None:

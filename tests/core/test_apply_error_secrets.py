@@ -97,8 +97,7 @@ def _assert_safe(exc, job, row_error, logs, secrets):
         _log_surface(logs),
     ]
     for surface in surfaces:
-        for secret in secrets:
-            assert secret not in surface
+        assert_text_free_of(surface, secrets)
     assert_chain_free_of(exc, secrets)
 
 
