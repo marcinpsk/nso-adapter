@@ -46,9 +46,11 @@ must use `failure_detail` so an HTTP exception cannot repeat a request URL or se
 text. The behavioral and AST regressions in `tests/core/test_importer_failure_sinks.py`
 remain authoritative for the classification contract and complete Python syntax.
 
-`failover.py`, `client.py` and `writer.py` joined the list in the C1c round: each
-NSO or NetBox call takes the device or interface identity as an argument, so the
-raised transport error repeats it and the handler logged it raw. `rejection_detail`
+`failover.py`, `client.py`, `mapper.py` and `writer.py` joined the list in the C1c
+round: each NSO or NetBox call takes the device or interface identity as an
+argument, so the raised transport error repeats it and the handler logged it raw.
+`mapper.py` is the narrowest case: its PATCH URL carries the NetBox interface id
+and its POST payload carries the interface name. `rejection_detail`
 is the second approved classifier, for a NetBox rejection body: NetBox repeats the
 submitted value in its validation messages, so only the field names travel. The
 remaining modules named in `test_guarded_modules_never_log_raw_exception_text` are

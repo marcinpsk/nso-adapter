@@ -857,3 +857,66 @@ async def test_bulk_ensure_real_client_reparents_existing_flat_unit():
     assert state["posts"] == []
     assert state["patches"] == [[{"id": 11, "parent": 10}]]
     await client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# The single-interface create/reparent failures: a transport error names the
+# request, so only its classification may reach the log record.
+# ---------------------------------------------------------------------------
+
+#: What `str(exc)` on the httpx failure carries: the PATCH URL names the NetBox interface id,
+#: and the server's reason phrase is its own text.
+_REFUSED_REASON = "Denied by proxy"
+_REFUSED_INTERFACE = "GigabitEthernet0/0/0/7"
+
+
+def _refusing_netbox(status: int):
+    """A real NetboxClient whose interface GET succeeds and whose writes answer *status*."""
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            name = request.url.params.get("name")
+            existing = [{"id": 4711, "name": name, "parent": None}] if name == _REFUSED_INTERFACE else []
+            return httpx.Response(200, json={"results": existing, "next": None})
+        return httpx.Response(
+            status,
+            json={"name": [f"Interface {_REFUSED_INTERFACE} is not permitted"]},
+            extensions={"reason_phrase": _REFUSED_REASON.encode()},
+        )
+
+    return _real_client(handler)
+
+
+@pytest.mark.anyio
+async def test_a_REFUSED_reparent_records_the_STATUS_and_not_the_patch_url():
+    """The PATCH URL ends in the NetBox interface id, so `str(exc)` republished it."""
+    from nso_adapter.bindings.netbox.mapper import _resolve_or_create_simple
+
+    client = _refusing_netbox(403)
+    with capture_logs() as logs:
+        nb_id = await _resolve_or_create_simple(client, 42, _REFUSED_INTERFACE, parent_id=99)
+    await client.aclose()
+
+    assert nb_id == 4711, "a refused reparent still resolves the interface it found"
+    reported = [record for record in logs if record["event"] == "netbox.interface.reparent_failed"]
+    assert reported, "the refused reparent was not reported at all"
+    assert reported[0]["error"] == "HTTPStatusError (HTTP 403)", "the status tells the failures apart"
+    assert_records_free_of(logs, ["/api/dcim/interfaces/4711/", _REFUSED_REASON])
+
+
+@pytest.mark.anyio
+async def test_a_REFUSED_interface_create_records_the_STATUS_and_not_the_server_text():
+    """The create payload carries the interface name, and NetBox repeats it in its refusal."""
+    from nso_adapter.bindings.netbox.mapper import _resolve_or_create_simple
+
+    client = _refusing_netbox(400)
+    with capture_logs() as logs:
+        nb_id = await _resolve_or_create_simple(client, 42, "TenGigE0/0/0/3")
+    await client.aclose()
+
+    assert nb_id is None, "a refused create resolves to no interface"
+    reported = [record for record in logs if record["event"] == "netbox.interface.create_failed"]
+    assert reported, "the refused create was not reported at all"
+    assert reported[0]["error"] == "HTTPStatusError (HTTP 400)"
+    assert_records_free_of(logs, ["/api/dcim/interfaces/", _REFUSED_REASON])

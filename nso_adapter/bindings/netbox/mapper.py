@@ -13,6 +13,7 @@ import structlog
 
 from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.domain.models import Interface as DomainInterface
+from nso_adapter.nso.client import failure_detail
 
 logger = structlog.get_logger(__name__)
 
@@ -303,7 +304,7 @@ async def _resolve_or_create_simple(
                     "netbox.interface.reparent_failed",
                     netbox_device_id=netbox_device_id,
                     netbox_interface_id=nb_id,
-                    error=str(exc),
+                    error=failure_detail(exc),
                 )
         return nb_id
 
@@ -329,7 +330,7 @@ async def _resolve_or_create_simple(
         logger.warning(
             "netbox.interface.create_failed",
             netbox_device_id=netbox_device_id,
-            error=str(exc),
+            error=failure_detail(exc),
         )
         return None
 
