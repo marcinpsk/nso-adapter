@@ -136,6 +136,34 @@ CASES = (
         "value = SOURCE\ndef nested():\n    SINK",
         "value = SOURCE\ndef nested():\n    value = CLEAN\n    SINK",
     ),
+    # A nested scope can bind a name without an ast.Name store: an import alias and a match
+    # capture both shadow the inherited alias, so a scanner that misses them reports the
+    # rebound local as the outer taint.
+    ConformanceCase(
+        "scope-function-shadow-by-import",
+        "value = SOURCE\ndef nested():\n    SINK",
+        "value = SOURCE\ndef nested():\n    import value\n    SINK",
+    ),
+    ConformanceCase(
+        "scope-function-shadow-by-import-alias",
+        "value = SOURCE\ndef nested():\n    SINK",
+        "value = SOURCE\ndef nested():\n    from package import thing as value\n    SINK",
+    ),
+    ConformanceCase(
+        "scope-function-shadow-by-match-capture",
+        "value = SOURCE\ndef nested():\n    SINK",
+        "value = SOURCE\ndef nested():\n    match subject:\n        case [value]:\n            SINK",
+    ),
+    ConformanceCase(
+        "scope-function-shadow-by-match-star",
+        "value = SOURCE\ndef nested():\n    SINK",
+        "value = SOURCE\ndef nested():\n    match subject:\n        case [_, *value]:\n            SINK",
+    ),
+    ConformanceCase(
+        "scope-function-shadow-by-match-mapping-rest",
+        "value = SOURCE\ndef nested():\n    SINK",
+        "value = SOURCE\ndef nested():\n    match subject:\n        case {'k': _, **value}:\n            SINK",
+    ),
     ConformanceCase(
         "scope-async-function-inward",
         "value = SOURCE\nasync def nested():\n    SINK",
@@ -293,7 +321,17 @@ OPENGREP_FUNCTION_SCOPE_CASES = (
         "value = CLEAN\ntry:\n    try:\n        value = SOURCE\n        work()\n        value = CLEAN\n    except:\n        value = CLEAN\n    work_outer()\nexcept:\n    SINK",
     ),
 )
-OPENGREP_CASES = (*CASES, *OPENGREP_FUNCTION_SCOPE_CASES)
+#: Measured at this commit: putting `from package import thing as value` inside a function body
+#: changes OpenGrep's verdict for NINE unrelated cases elsewhere in the same file (both directions:
+#: strict xfails start XPASSing and clean variants start reporting). Appending the same case at the
+#: end of the file changes nothing, so the effect is positional, not a parse failure — the scan
+#: reports no errors and skips no file. Keeping it would mean nine xfail entries that document
+#: OpenGrep's reaction to an unrelated neighbour rather than any real gap, so the case is measured
+#: against the hand-written scanners only.
+OPENGREP_CONTEXT_SENSITIVE_CASES = frozenset({"scope-function-shadow-by-import-alias"})
+OPENGREP_CASES = tuple(
+    case for case in (*CASES, *OPENGREP_FUNCTION_SCOPE_CASES) if case.name not in OPENGREP_CONTEXT_SENSITIVE_CASES
+)
 
 _OPENGREP_CLASS_SCOPE_GAPS = {
     "scope-class-inward",
@@ -318,6 +356,10 @@ OPENGREP_XFAILS = {
         (name, True): "OpenGrep does not bind a comprehension walrus in the containing scope (PEP 572)"
         for name in ("binding-walrus-in-comprehension-body", "binding-walrus-in-comprehension-condition")
     },
+    (
+        "scope-function-shadow-by-import",
+        False,
+    ): "OpenGrep does not treat an import as a local binding that shadows an inherited alias",
     (
         "control-break-in-try",
         True,
