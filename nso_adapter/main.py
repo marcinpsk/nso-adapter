@@ -72,7 +72,7 @@ from nso_adapter.core.worker import start_workers, stop_workers
 from nso_adapter.notifications.persistent_subscriber import persistent_subscriber
 from nso_adapter.notifications.sse_subscriber import SSESubscriber
 from nso_adapter.nso.client import NsoClient, failure_detail
-from nso_adapter.secrets import make_provider, require_nonblank_secret, resolve_secret
+from nso_adapter.secrets import make_provider, resolve_secret
 from nso_adapter.store.db import get_engine, init_db, session
 
 logger = structlog.get_logger(__name__)
@@ -159,10 +159,7 @@ def _init_secrets(app: FastAPI, cfg, env):
     # vault_ref into the sha256 the device export keys it by (CR-A17) — same module-level
     # registry pattern as the NSO / NetBox clients in core.importer.
     register_secrets_provider(provider)
-    app.state.adapter_token = require_nonblank_secret(
-        resolve_secret(provider, cfg.api.adapter_token_ref, slot="api.adapter_token_ref"),
-        slot="api.adapter_token_ref",
-    )
+    app.state.adapter_token = resolve_secret(provider, cfg.api.adapter_token_ref, slot="api.adapter_token_ref")
     diagnostic_key = resolve_secret(provider, cfg.diagnostic_key_ref, slot="diagnostic_key_ref")
     register_device_ref_key(diagnostic_key)
     return provider
