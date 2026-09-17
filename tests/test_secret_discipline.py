@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from tests._ast_scanner_support import argument_names, statement_may_raise
+from tests._ast_scanner_support import argument_names, statement_may_raise, walrus_expressions
 from tests._secret_discipline import assert_chain_free_of, exception_chain
 
 _SECRET = "placeholder-vault-secret"
@@ -208,7 +208,13 @@ class _ScopeFacts(ast.NodeVisitor):
         self.children.append(node)
 
     def _visit_comprehension(self, node: ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp) -> None:
+        visited = {id(binding) for binding in walrus_expressions(node.generators[0].iter)}
         self.visit(node.generators[0].iter)
+        # The comprehension is its own scope, but a walrus in it binds HERE (PEP 572), so its
+        # VALUE belongs to these facts too, not only its name.
+        for binding in walrus_expressions(node):
+            if id(binding) not in visited:
+                self._bind(binding.target, binding.value)
         self.children.append(node)
 
     def visit_ListComp(self, node: ast.ListComp) -> None:  # noqa: N802 - ast visitor API
