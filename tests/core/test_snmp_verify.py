@@ -14,8 +14,6 @@ digest, or hashing something that is not the secret.
 
 from __future__ import annotations
 
-from typing import cast
-
 import pytest
 
 from nso_adapter.core import snmp_verify
@@ -79,13 +77,10 @@ def test_ONE_bad_ref_does_not_sink_the_GOOD_ones():
 def test_ONE_non_string_secret_does_not_sink_the_GOOD_ones():
     malformed_path = ("network", "netbox/snmp/community/malformed")
     provider = FakeVault(
-        cast(
-            dict[tuple[str, str], dict[str, str]],
-            {
-                _PATH: {"community": SNMP_COMMUNITY},
-                malformed_path: {"community": 42},
-            },
-        )
+        {
+            _PATH: {"community": SNMP_COMMUNITY},
+            malformed_path: {"community": 42},
+        }
     )
 
     out = _fingerprints_blocking(

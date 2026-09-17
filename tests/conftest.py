@@ -515,13 +515,13 @@ class FakeVault:
     real bytes.
     """
 
-    def __init__(self, secrets: dict[tuple[str, str], dict[str, str]], *, fail: bool = False):
+    def __init__(self, secrets: dict[tuple[str, str], dict[str, object]], *, fail: bool = False):
         self._secrets = secrets
         self._fail = fail
         self.reads = 0
         self.read_threads: list[int] = []
 
-    def read_path(self, mount: str, path: str) -> dict[str, str]:
+    def read_path(self, mount: str, path: str) -> dict[str, object]:
         self.reads += 1
         # CR-A13: hvac is blocking `requests`. A read that happens on the event-loop thread freezes
         # the whole adapter for the round-trip — /health stops answering (a liveness probe can then
