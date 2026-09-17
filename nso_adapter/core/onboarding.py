@@ -773,9 +773,12 @@ async def provision_nso_device(
     if sync_ok and device_id is not None:
         await _initial_mirror_refresh(db, device_id, client, reg=reg)
 
+    # Both correlators are adapter-owned. `device_id` is absent for a provision with no NetBox
+    # link, so `job_id` carries the record on that path rather than leaving it unaddressable.
     logger.info(
         "device.provisioned",
-        nso_device=device_name,
+        device_id=device_id,
+        job_id=job_id,
         instance=nso_instance,
         steps=_step_classifications(steps),
     )

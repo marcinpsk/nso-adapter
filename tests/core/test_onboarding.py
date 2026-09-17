@@ -1003,10 +1003,54 @@ async def test_the_PROVISIONED_record_carries_step_names_and_statuses_but_no_ste
         {"step": "sync_from", "status": "ok"},
         {"step": "adapter_mapping", "status": "ok"},
     ]
-    # The device name itself is the diagnostic-identity migration's contract, not this one's.
-    assert_records_free_of(logs, [submitted_admin_state, "device-type=", "198.51.100.20"])
+    # The TERMINAL record is this finding's scope. The six other `nso_device=` sites in this
+    # module pre-date the stack on main and belong to the diagnostic-identity migration, which
+    # needs the keyed reference to name a device that has no adapter row yet.
+    assert_records_free_of(provisioned, [submitted_name, submitted_admin_state, "device-type=", "198.51.100.20"])
+    assert provisioned[0]["device_id"] is not None, "the record must stay correlatable"
     # The response keeps what the sink drops.
     assert {"step": "admin_state", "status": "ok", "detail": submitted_admin_state} in result["steps"]
+
+
+async def test_an_UNLINKED_provision_is_still_correlatable_without_a_device_id(adapter_client_with_nso):
+    """A provision with no NetBox link creates no adapter row, so `device_id` is None.
+
+    Dropping the submitted name would leave that record unaddressable, which is the failure mode
+    the identity design warns about. `job_id` is adapter-owned and carries it instead.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.onboarding import provision_nso_device
+    from nso_adapter.nso.client import NsoClient
+    from tests._secret_discipline import assert_records_free_of
+
+    submitted_name = "placeholder-caller-unlinked-provision"
+    client = AsyncMock(spec=NsoClient)
+    client.device_exists.return_value = False
+    client.sync_from.return_value = True
+
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
+        async with session() as db:
+            with capture_logs() as logs:
+                result = await provision_nso_device(
+                    db,
+                    nso_instance="nso-dev",
+                    device_name=submitted_name,
+                    address="198.51.100.22",
+                    ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+                    authgroup="network",
+                    netbox_device_id=None,
+                    job_id=4242,
+                )
+
+    assert result["ok"] is True
+    assert result["device_id"] is None  # no NetBox link, so no adapter row
+    record = next(r for r in logs if r["event"] == "device.provisioned")
+    assert record["device_id"] is None
+    assert record["job_id"] == 4242, "the record must stay correlatable without a device row"
+    assert_records_free_of([record], [submitted_name])
 
 
 async def test_a_NONFATAL_step_failure_keeps_its_CLASSIFICATION_in_the_record(adapter_client_with_nso):
@@ -1051,5 +1095,6 @@ async def test_a_NONFATAL_step_failure_keeps_its_CLASSIFICATION_in_the_record(ad
     sync_step = next(s for s in record["steps"] if s["step"] == "sync_from")
     assert sync_step == {"step": "sync_from", "status": "failed", "failure": "HTTPStatusError (HTTP 401)"}
     assert not any("detail" in step for step in record["steps"]), "descriptive detail is not a sink field"
-    # The device name itself is the diagnostic-identity migration's contract, not this one's.
-    assert_records_free_of(logs, ["placeholder-server-text", "placeholder-sync-url", "device-type="])
+    assert_records_free_of(
+        [record], [submitted_name, "placeholder-server-text", "placeholder-sync-url", "device-type="]
+    )
