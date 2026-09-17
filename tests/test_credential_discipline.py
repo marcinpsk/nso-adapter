@@ -552,3 +552,25 @@ def test_the_scanner_visits_every_ast_node_that_binds_a_value_to_a_target():
     )
     missing = sorted(name for name in binding if not hasattr(credential_discipline._Scanner, f"visit_{name}"))
     assert missing == [], f"a binding form the scanner never inspects: {missing}"
+
+
+def test_a_for_target_carries_the_iterables_constants_like_a_comprehension_target():
+    """The two loop forms disagreed: the comprehension bound the target, the `for` cleared it.
+
+    So the same forbidden value was reported in one spelling and passed unchecked in the other.
+    """
+    assert len(scan_source('for password in ["admin"]:\n    connect(password=password)\n')) == 1
+    assert scan_source('[connect(password=password) for password in ["admin"]]\n')
+    assert scan_source('for password in ["placeholder-user"]:\n    connect(password=password)\n') == []
+
+
+@pytest.mark.parametrize("exit_statement", ["return", "raise RuntimeError"], ids=["return", "raise"])
+def test_a_returned_or_raised_branch_does_not_merge_into_the_following_code(exit_statement):
+    """`_visit_statements` stops merging only on a `False` verdict, which only break and
+    continue answered. A branch that leaves through `return` or `raise` kept merging, so the
+    scanner reported a credential on a path that cannot reach the statement it flagged."""
+    unreachable = f'def handler(supplied):\n    value = supplied\n    if condition:\n        value = "admin"\n        {exit_statement}\n    username = value\n'
+    reachable = 'def handler(supplied):\n    value = supplied\n    if condition:\n        value = "admin"\n    username = value\n'
+
+    assert scan_source(unreachable) == []
+    assert len(scan_source(reachable)) == 1
