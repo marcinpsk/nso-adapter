@@ -11,7 +11,12 @@ from types import SimpleNamespace
 import pytest
 
 from nso_adapter.config import ApiConfig, AppConfig, NetboxConfig, SecretsConfig
-from nso_adapter.domain.diagnostics import device_fields, device_ref, register_device_ref_key
+from nso_adapter.domain.diagnostics import (
+    DEVICE_REF_PATTERN,
+    device_fields,
+    device_ref,
+    register_device_ref_key,
+)
 from nso_adapter.main import _init_secrets
 from nso_adapter.secrets.base import SecretResolutionError
 from tests._secret_discipline import assert_chain_free_of
@@ -224,3 +229,39 @@ def test_device_ref_refuses_a_non_string_component(bad):
         device_ref("nso-dev", bad)
     with pytest.raises(TypeError, match="must be a str"):
         device_ref(bad, "rtr01")
+
+
+def test_the_PUBLISHED_pattern_is_what_device_ref_actually_produces() -> None:
+    """The response models declare this pattern, so a width change must break here rather than
+    500 on a live response when pydantic validates the outgoing field."""
+    import re
+
+    register_device_ref_key("placeholder-diagnostic-key")
+
+    for instance, name in (("nso-a", "edge-1"), ("nso-b", "edge-1"), ("nso-a", "a" * 200)):
+        assert re.fullmatch(DEVICE_REF_PATTERN, device_ref(instance, name))
+
+
+def test_a_response_model_REFUSES_a_reference_that_is_not_one() -> None:
+    """The declaration has to be enforced, not decorative."""
+    import pytest as _pytest
+    from pydantic import ValidationError
+
+    from nso_adapter.api.nso_instances import InstanceDeviceOut
+
+    fields = {
+        "name": "placeholder-device",
+        "address": None,
+        "ned_id": None,
+        "platform": None,
+        "auth_group": None,
+        "admin_state": None,
+        "onboarded": False,
+        "onboarded_device_id": None,
+        "onboarded_netbox_device_id": None,
+    }
+
+    assert InstanceDeviceOut(device_ref="0123456789abcdef", **fields).device_ref == "0123456789abcdef"
+    for rejected in ("placeholder-device", "0123456789ABCDEF", "0123456789abcde", "0123456789abcdef0"):
+        with _pytest.raises(ValidationError):
+            InstanceDeviceOut(device_ref=rejected, **fields)

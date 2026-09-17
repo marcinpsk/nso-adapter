@@ -25,7 +25,7 @@ from nso_adapter.api.errors import (
 )
 from nso_adapter.api.pagination import DEFAULT_PAGE, LIMIT_MAX, LIMIT_MIN, validate_page_limit
 from nso_adapter.api.timestamps import iso_z
-from nso_adapter.domain.diagnostics import device_ref
+from nso_adapter.domain.diagnostics import DEVICE_REF_PATTERN, device_ref
 from nso_adapter.store.models import (
     DbInterface,
     DeploymentApplyAttempt,
@@ -163,7 +163,7 @@ class DeviceOut(BaseModel):
     id: int
     nso_instance: str
     nso_device_name: str
-    device_ref: str
+    device_ref: str = Field(pattern=DEVICE_REF_PATTERN)
     netbox_device_id: int | None
     source_epoch: int
     mapping_status: str
