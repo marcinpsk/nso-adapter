@@ -69,29 +69,30 @@ def test_startup_rejects_a_missing_diagnostic_key(monkeypatch) -> None:
     assert_chain_free_of(caught.value, ["DIAGNOSTIC_KEY"])
 
 
-def test_startup_rejects_an_empty_diagnostic_key(monkeypatch) -> None:
-    monkeypatch.setenv("ADAPTER_TOKEN", "placeholder-adapter-token")
-    monkeypatch.setenv("DIAGNOSTIC_KEY", "")
-
-    with pytest.raises(ValueError) as caught:
-        _init_secrets(SimpleNamespace(state=SimpleNamespace()), _config(), SimpleNamespace())
-
-    assert str(caught.value) == "diagnostic reference key must not be empty"
-    assert_chain_free_of(caught.value, ["DIAGNOSTIC_KEY", "placeholder-adapter-token"])
-
-
-@pytest.mark.parametrize("blank", [" ", "   ", "\t", "\n", " \t\n "])
-def test_startup_rejects_a_WHITESPACE_ONLY_diagnostic_key(monkeypatch, blank) -> None:
+@pytest.mark.parametrize("blank", ["", " ", "   ", "\t", "\n", " \t\n "])
+def test_startup_rejects_a_BLANK_diagnostic_key(monkeypatch, blank) -> None:
     """A blank key is an unset key wearing a space: it keys every pseudonym in the fleet with a
-    value an attacker guesses first, which is what the keyed digest exists to prevent."""
+    value an attacker guesses first, which is what the keyed digest exists to prevent.
+
+    The refusal comes from `resolve_secret`, so it names the configuration slot the operator has
+    to fix. `register_device_ref_key` keeps its own check for callers that do not come through
+    the resolver.
+    """
     monkeypatch.setenv("ADAPTER_TOKEN", "placeholder-adapter-token")
     monkeypatch.setenv("DIAGNOSTIC_KEY", blank)
 
-    with pytest.raises(ValueError) as caught:
+    with pytest.raises(SecretResolutionError) as caught:
         _init_secrets(SimpleNamespace(state=SimpleNamespace()), _config(), SimpleNamespace())
 
-    assert str(caught.value) == "diagnostic reference key must not be empty"
+    assert str(caught.value) == "diagnostic_key_ref: the configured secret is blank"
     assert_chain_free_of(caught.value, ["DIAGNOSTIC_KEY", "placeholder-adapter-token"])
+
+
+@pytest.mark.parametrize("blank", ["", " ", "\t\n"])
+def test_register_device_ref_key_refuses_a_blank_on_its_own(blank) -> None:
+    """The module's own contract, independent of where the key came from."""
+    with pytest.raises(ValueError, match="must not be empty"):
+        register_device_ref_key(blank)
 
 
 @pytest.mark.parametrize("blank", ["", " ", "\t"])
@@ -107,6 +108,30 @@ def test_startup_rejects_a_BLANK_ADAPTER_TOKEN(monkeypatch, blank) -> None:
 
     assert str(caught.value) == "api.adapter_token_ref: the configured secret is blank"
     assert_chain_free_of(caught.value, ["ADAPTER_TOKEN", "placeholder-diagnostic-key"])
+
+
+@pytest.mark.parametrize(
+    ("variable", "slot"),
+    [
+        ("NETBOX_TOKEN", "netbox.api_token_ref"),
+        ("NSO_USERNAME", "nso_instances[nso-a].username_ref"),
+        ("NSO_PASSWORD", "nso_instances[nso-a].password_ref"),
+    ],
+)
+def test_EVERY_configured_secret_slot_refuses_a_blank(monkeypatch, variable, slot) -> None:
+    """The rule sits on `resolve_secret`, the one boundary every configured reference crosses, so
+    a slot added later cannot forget it. Without that, a blank NetBox token reaches the wire as
+    `Authorization: Token ` and only fails per-request, long after startup said the config was
+    fine."""
+    from nso_adapter.secrets import LocalSecretsProvider, resolve_secret
+
+    monkeypatch.setenv(variable, "   ")
+
+    with pytest.raises(SecretResolutionError) as caught:
+        resolve_secret(LocalSecretsProvider(), variable, slot=slot)
+
+    assert str(caught.value) == f"{slot}: the configured secret is blank"
+    assert_chain_free_of(caught.value, [variable])
 
 
 def test_a_NONBLANK_key_keeps_its_own_whitespace() -> None:
