@@ -115,7 +115,7 @@ async def list_instance_devices(instance_id: str, db: AsyncSession = Depends(get
 
     out = []
     for d in device_list:
-        if not isinstance(d, dict) or not d.get("name"):
+        if not isinstance(d, dict) or not isinstance(d.get("name"), str) or not d["name"]:
             continue
         name = d["name"]
         raw_ned_id = extract_ned_id_from_device_dict(d)

@@ -27,6 +27,11 @@ def device_ref(nso_instance: str, nso_device_name: str) -> str:
     """Return a stable keyed reference for one adapter device identity."""
     if _device_ref_key is None:
         raise RuntimeError("diagnostic reference key is not configured")
+    # Callers pass NSO oper-data and job-payload values straight in. Without this the failure is
+    # an AttributeError from .encode() inside the digest, raised from whatever log call built it.
+    for label, value in (("nso_instance", nso_instance), ("nso_device_name", nso_device_name)):
+        if not isinstance(value, str):
+            raise TypeError(f"{label} must be a str")
     identity = _DEVICE_REF_DOMAIN + _encode_component(nso_instance) + _encode_component(nso_device_name)
     return hmac.digest(_device_ref_key, identity, "sha256").hex()[:_DEVICE_REF_HEX_WIDTH]
 
