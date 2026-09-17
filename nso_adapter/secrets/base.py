@@ -49,6 +49,18 @@ def selected_secret_value(fields: Mapping[str, object], key: str) -> str | None:
     return value
 
 
+def require_nonblank_secret(value: str, *, slot: str) -> str:
+    """Reject a blank secret at the configuration boundary.
+
+    Both providers serve a blank as a SET value on purpose, so nothing below this rejects one.
+    A blank shared secret is guessed on the first attempt, so a slot that keys or authenticates
+    fails fast here instead of running with it. The value is never trimmed.
+    """
+    if not value.strip():
+        raise SecretResolutionError("the configured secret is blank", slot=slot)
+    return value
+
+
 def resolve_secret(provider: SecretsProvider, reference: str, *, slot: str) -> str:
     """Resolve one CONFIGURED reference, naming the config slot when it fails.
 
