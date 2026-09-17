@@ -6,10 +6,12 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from structlog.testing import capture_logs
 
 from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.bindings.netbox.writer import WriteResult, write_interfaces
 from nso_adapter.domain.models import Interface, InterfaceAttr
+from tests._secret_discipline import assert_records_free_of
 
 
 def _make_nb_client():
@@ -95,15 +97,25 @@ async def test_write_skips_empty_payload():
 @pytest.mark.asyncio
 async def test_write_counts_skipped_on_patch_error():
     """Counts as skipped when patch_interface raises an exception."""
+    interface_name = "placeholder-write-failed-interface"
     client = _make_nb_client()
     client.get_interface.return_value = {"id": 5}
     client.patch_interface.side_effect = Exception("NetBox 502")
-    iface = _domain_iface()
+    iface = _domain_iface(name=interface_name)
 
-    with patch("nso_adapter.bindings.netbox.writer.resolve_or_create_interface", AsyncMock(return_value=5)):
+    with (
+        capture_logs() as logs,
+        patch("nso_adapter.bindings.netbox.writer.resolve_or_create_interface", AsyncMock(return_value=5)),
+    ):
         result = await write_interfaces(client, 42, [iface], ["description"])
 
     assert result.interfaces_skipped == 1
+    record = next(record for record in logs if record["event"] == "netbox.write_failed")
+    assert record["netbox_device_id"] == 42
+    assert record["netbox_interface_id"] == 5
+    assert "device_id" not in record
+    assert "interface" not in record
+    assert_records_free_of([record], [interface_name])
 
 
 @pytest.mark.asyncio

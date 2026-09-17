@@ -120,13 +120,8 @@ async def _seed_topology(device_id: int) -> None:
         return
 
 
-async def _run_ensure(device_id: int, nb_client) -> tuple[set[str], list[dict]]:
+async def _run_ensure(device_id: int, nb_client) -> set[str]:
     """Call ensure_topology_interfaces with bulk_ensure stubbed; return the names set."""
-    import logging
-
-    import structlog
-    from structlog.testing import capture_logs
-
     import nso_adapter.core.topology_interfaces as mod
     from nso_adapter.store.models import Device
 
@@ -145,26 +140,20 @@ async def _run_ensure(device_id: int, nb_client) -> tuple[set[str], list[dict]]:
         async with session() as db:
             device = await db.get(Device, device_id)
             expected_nb_id = device.netbox_device_id
-            previous = structlog.get_config().copy()
-            structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG))
-            try:
-                with capture_logs() as logs:
-                    await mod.ensure_topology_interfaces(db, device, nb_client)
-            finally:
-                structlog.configure(**previous)
+            await mod.ensure_topology_interfaces(db, device, nb_client)
     finally:
         mod.bulk_ensure_interfaces = orig
     # The resolved NetBox client + the device's netbox id must actually reach bulk_ensure.
     assert captured["client"] is nb_client
     assert captured["nb_device_id"] == expected_nb_id
-    return set(captured.get("names", [])), logs
+    return set(captured.get("names", []))
 
 
-async def test_unions_and_filters_sources(adapter_client):
+async def test_unions_and_filters_sources(adapter_client, debug_logs):
     device_id = await seed_device(nso_device_name="topo-nokia", netbox_device_id=900)
     await _seed_topology(device_id)
 
-    names, logs = await _run_ensure(device_id, _nb_client())
+    names = await _run_ensure(device_id, _nb_client())
 
     assert names == {
         "1/1/c22/1",  # cfg.port base
@@ -181,8 +170,8 @@ async def test_unions_and_filters_sources(adapter_client):
 
     from tests._secret_discipline import assert_records_free_of
 
-    ensured = next(record for record in logs if record["event"] == "topology_interfaces.ensured")
-    skipped = next(record for record in logs if record["event"] == "topology_interfaces.skipped_unbound")
+    ensured = next(record for record in debug_logs if record["event"] == "topology_interfaces.ensured")
+    skipped = next(record for record in debug_logs if record["event"] == "topology_interfaces.skipped_unbound")
     assert ensured["device_id"] == device_id
     assert ensured["total"] == len(names)
     assert "nso_device_name" not in ensured

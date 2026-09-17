@@ -318,14 +318,9 @@ def test_a_community_list_row_indexes_under_the_kind_its_list_carries():
 
 
 @pytest.mark.asyncio
-async def test_refresh_ned_id_literal_none_not_persisted(adapter_client, monkeypatch):  # noqa: F811
+async def test_refresh_ned_id_literal_none_not_persisted(adapter_client, monkeypatch, debug_logs):  # noqa: F811
     """A probe reporting the literal string 'None' for ned-id (an unselected device_type.cli)
     must NOT become a capability key or be persisted onto the device (#13)."""
-    import logging
-
-    import structlog
-    from structlog.testing import capture_logs
-
     from nso_adapter.core import capability
     from nso_adapter.store.models import Device
     from tests._secret_discipline import assert_records_free_of
@@ -339,16 +334,10 @@ async def test_refresh_ned_id_literal_none_not_persisted(adapter_client, monkeyp
     monkeypatch.setattr(capability.actions, "capability_probe", fake_probe)
     async with session() as db:
         device = await db.get(Device, device_id)
-        prior_config = structlog.get_config().copy()
-        structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG))
-        try:
-            with capture_logs() as logs:
-                res = await capability.refresh_device_capability(db, object(), "rgX", device)
-        finally:
-            structlog.configure(**prior_config)
+        res = await capability.refresh_device_capability(db, object(), "rgX", device)
         assert res == {}  # 'None' ned-id → treated as no NED, nothing recorded
         assert device.ned_id != "None"  # never persisted as a bogus key
-        record = next(record for record in logs if record["event"] == "capability.refresh.no_ned")
+        record = next(record for record in debug_logs if record["event"] == "capability.refresh.no_ned")
         assert_records_free_of([record], ["rgX", "None"])
         assert record == {
             "event": "capability.refresh.no_ned",

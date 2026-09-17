@@ -982,7 +982,16 @@ def _guard_client(instance=None):
 def _sender():
     """Record every ``apply_device_intent`` call and answer a dry-run with a native delta."""
 
-    async def _impl(_client, _device_name, _containers, *, dry_run=False, no_networking=False, strict=False):
+    async def _impl(
+        _client,
+        _device_name,
+        _containers,
+        *,
+        device_id,
+        dry_run=False,
+        no_networking=False,
+        strict=False,
+    ):
         return "native delta" if dry_run else "conclusive"
 
     return AsyncMock(side_effect=_impl)
@@ -2201,7 +2210,13 @@ async def test_detach_commits_with_no_networking(adapter_client):
         def _client(self, timeout=None):
             return httpx.AsyncClient(transport=_Transport())
 
-    await nso_apply.apply_device_intent(_Client(), "sw-detach", {"vlan": {"vlan": []}}, no_networking=True)
+    await nso_apply.apply_device_intent(
+        _Client(),
+        "sw-detach",
+        {"vlan": {"vlan": []}},
+        device_id=1,
+        no_networking=True,
+    )
 
     assert "no-networking" in recorded[0]
     assert "device-intent:device-intent=sw-detach" in recorded[0]

@@ -49,6 +49,7 @@ from nso_adapter.store.models import (
 
 #: What an encoder that reads no NED-conditioned fact is handed.
 _PLAIN = SectionExecution(None, community_dialect_for(None))
+_DEVICE_ID = 501
 
 
 def _dialect_for(ned_id: str | None) -> SectionExecution:
@@ -266,7 +267,7 @@ async def test_a_rejected_commit_raises_with_the_put_code():
     _stub_pool(client, mock_http)
 
     with pytest.raises(NsoApplyError) as exc_info:
-        await apply_device_intent(client, "ra1", {"l2-sap": {"sap": []}})
+        await apply_device_intent(client, "ra1", {"l2-sap": {"sap": []}}, device_id=_DEVICE_ID)
     assert exc_info.value.code == "nso_put_failed"
 
 
@@ -279,7 +280,7 @@ async def test_a_rejected_commit_with_a_non_json_body_still_raises():
     _stub_pool(client, mock_http)
 
     with pytest.raises(NsoApplyError) as exc_info:
-        await apply_device_intent(client, "ra1", {"l2-sap": {"sap": []}})
+        await apply_device_intent(client, "ra1", {"l2-sap": {"sap": []}}, device_id=_DEVICE_ID)
     assert exc_info.value.code == "nso_put_failed"
     assert exc_info.value.detail["nso_error"] == {"raw": "[redacted]"}
 
@@ -356,29 +357,57 @@ def test_interface_ip_body_without_a_kind_omits_the_routed_fields():
 
 class TestDeviceDeltaFromDryRun:
     def test_empty_native_means_no_delta(self):
-        assert _device_delta_from_dry_run({"dry-run-result": {"native": {}}}, "sw03") == ""
+        assert (
+            _device_delta_from_dry_run(
+                {"dry-run-result": {"native": {}}},
+                "sw03",
+                device_id=_DEVICE_ID,
+            )
+            == ""
+        )
 
     def test_absent_native_means_no_delta(self):
-        assert _device_delta_from_dry_run({"dry-run-result": {"native": None}}, "sw03") == ""
+        assert (
+            _device_delta_from_dry_run(
+                {"dry-run-result": {"native": None}},
+                "sw03",
+                device_id=_DEVICE_ID,
+            )
+            == ""
+        )
 
     def test_matching_device_returns_delta(self):
         body = {"dry-run-result": {"native": {"device": [{"name": "sw03", "data": "ip route 1.0.0.0 ...\n"}]}}}
-        assert _device_delta_from_dry_run(body, "sw03") == "ip route 1.0.0.0 ...\n"
+        assert _device_delta_from_dry_run(body, "sw03", device_id=_DEVICE_ID) == "ip route 1.0.0.0 ...\n"
 
     def test_other_device_only_means_no_delta(self):
         body = {"dry-run-result": {"native": {"device": [{"name": "other", "data": "x"}]}}}
-        assert _device_delta_from_dry_run(body, "sw03") == ""
+        assert _device_delta_from_dry_run(body, "sw03", device_id=_DEVICE_ID) == ""
 
     def test_unexpected_shape_returns_none(self):
-        assert _device_delta_from_dry_run({"something-else": 1}, "sw03") is None
-        assert _device_delta_from_dry_run("not-a-dict", "sw03") is None
+        assert _device_delta_from_dry_run({"something-else": 1}, "sw03", device_id=_DEVICE_ID) is None
+        assert _device_delta_from_dry_run("not-a-dict", "sw03", device_id=_DEVICE_ID) is None
 
     def test_native_not_a_dict_is_inconclusive(self):
         # a non-empty, non-dict `native` is a shape we can't parse → inconclusive (None)
-        assert _device_delta_from_dry_run({"dry-run-result": {"native": "weird"}}, "sw03") is None
+        assert (
+            _device_delta_from_dry_run(
+                {"dry-run-result": {"native": "weird"}},
+                "sw03",
+                device_id=_DEVICE_ID,
+            )
+            is None
+        )
 
     def test_native_device_not_a_list_is_inconclusive(self):
-        assert _device_delta_from_dry_run({"dry-run-result": {"native": {"device": "nope"}}}, "sw03") is None
+        assert (
+            _device_delta_from_dry_run(
+                {"dry-run-result": {"native": {"device": "nope"}}},
+                "sw03",
+                device_id=_DEVICE_ID,
+            )
+            is None
+        )
 
 
 @pytest.mark.asyncio
@@ -391,7 +420,14 @@ async def test_verify_raises_on_nonempty_delta():
     _mock_http_ctx(client, _httpx_response(200, json_data=body))
 
     with pytest.raises(NsoApplyError) as exc_info:
-        await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="static_route")
+        await _verify_native_or_raise(
+            client,
+            "http://nso/x",
+            "{}",
+            "sw03",
+            device_id=_DEVICE_ID,
+            scope="static_route",
+        )
     assert exc_info.value.code == "verify_mismatch"
     assert exc_info.value.detail["device_delta"] == "[redacted]"
 
@@ -400,7 +436,14 @@ async def test_verify_raises_on_nonempty_delta():
 async def test_verify_passes_on_empty_delta():
     client = _make_nso_client()
     _mock_http_ctx(client, _httpx_response(200, json_data={"dry-run-result": {"native": {}}}))
-    await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="vlan")  # no raise
+    await _verify_native_or_raise(
+        client,
+        "http://nso/x",
+        "{}",
+        "sw03",
+        device_id=_DEVICE_ID,
+        scope="vlan",
+    )
 
 
 @pytest.mark.asyncio
@@ -408,7 +451,14 @@ async def test_verify_inconclusive_does_not_raise():
     """Unexpected/garbage dry-run body is fail-safe (no raise, apply stands)."""
     client = _make_nso_client()
     _mock_http_ctx(client, _httpx_response(200, json_data={"weird": 1}))
-    await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="vlan")  # no raise
+    await _verify_native_or_raise(
+        client,
+        "http://nso/x",
+        "{}",
+        "sw03",
+        device_id=_DEVICE_ID,
+        scope="vlan",
+    )
 
 
 @pytest.mark.asyncio
@@ -420,7 +470,14 @@ async def test_verify_raises_on_conclusive_4xx_rejection():
     err_body = {"ietf-restconf:errors": {"error": [{"error-message": "unknown command"}]}}
     _mock_http_ctx(client, _httpx_response(400, json_data=err_body))
     with pytest.raises(NsoApplyError) as exc_info:
-        await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="route_policy")
+        await _verify_native_or_raise(
+            client,
+            "http://nso/x",
+            "{}",
+            "sw03",
+            device_id=_DEVICE_ID,
+            scope="route_policy",
+        )
     assert exc_info.value.detail["nso_error"] == {"ietf-restconf:errors": {"error": [{"error-message": "[redacted]"}]}}
 
 
@@ -430,7 +487,14 @@ async def test_verify_inconclusive_on_5xx_does_not_raise():
     raise) — only a conclusive 4xx fails the apply."""
     client = _make_nso_client()
     _mock_http_ctx(client, _httpx_response(503))
-    await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="vlan")  # no raise
+    await _verify_native_or_raise(
+        client,
+        "http://nso/x",
+        "{}",
+        "sw03",
+        device_id=_DEVICE_ID,
+        scope="vlan",
+    )
 
 
 @pytest.mark.asyncio
@@ -441,7 +505,7 @@ async def test_native_dry_run_non_strict_returns_none_on_4xx():
 
     client = _make_nso_client()
     _mock_http_ctx(client, _httpx_response(400, json_data={"ietf-restconf:errors": {}}))
-    assert await native_dry_run(client, "http://nso/x", "{}", "sw03") is None
+    assert await native_dry_run(client, "http://nso/x", "{}", "sw03", device_id=_DEVICE_ID) is None
 
 
 @pytest.mark.asyncio
@@ -450,7 +514,14 @@ async def test_verify_disabled_by_toggle(monkeypatch):
     monkeypatch.setattr(apply_mod, "VERIFY_AFTER_APPLY", False)
     client = _make_nso_client()
     _mock_http_ctx(client, _httpx_response(200))
-    await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="vlan")
+    await _verify_native_or_raise(
+        client,
+        "http://nso/x",
+        "{}",
+        "sw03",
+        device_id=_DEVICE_ID,
+        scope="vlan",
+    )
     client._client.assert_not_called()
 
 
@@ -470,7 +541,7 @@ async def test_a_committed_document_that_did_not_land_raises_verify_mismatch():
     row = SimpleNamespace(vrf="", prefix="100.64.0.0/10", next_hop="172.16.0.1", metric=1, permanent=False, tag=None)
     body = encode_static_route({"static_route_intent": [row]}, _PLAIN)
     with pytest.raises(NsoApplyError) as exc_info:
-        await apply_device_intent(client, "sw03", {"static-route": body})
+        await apply_device_intent(client, "sw03", {"static-route": body}, device_id=_DEVICE_ID)
     assert exc_info.value.code == "verify_mismatch"
     # First call is the real PUT (no dry-run), second is the verify dry-run, same method.
     assert "dry-run" not in mock_http.put.call_args_list[0][0][0]
@@ -1086,7 +1157,12 @@ async def test_the_document_put_targets_the_keyed_instance_with_reconcile():
     mock_http.put.return_value = _httpx_response(204)
     _stub_pool(client, mock_http)
 
-    await apply_device_intent(client, "sw3", {"vlan": encode_vlan({"vlan_intent": []}, _PLAIN)})
+    await apply_device_intent(
+        client,
+        "sw3",
+        {"vlan": encode_vlan({"vlan_intent": []}, _PLAIN)},
+        device_id=_DEVICE_ID,
+    )
 
     (url,) = mock_http.put.call_args_list[0][0]
     assert url.split("?")[0].endswith("device-intent:device-intent=sw3")
@@ -1103,7 +1179,12 @@ async def test_a_dropped_row_is_simply_absent_from_the_document():
     _stub_pool(client, mock_http)
 
     rows = [SimpleNamespace(vlan_id=10, name="keep")]  # 3366 dropped → absent from the body
-    await apply_device_intent(client, "sw3", {"vlan": encode_vlan({"vlan_intent": rows}, _PLAIN)})
+    await apply_device_intent(
+        client,
+        "sw3",
+        {"vlan": encode_vlan({"vlan_intent": rows}, _PLAIN)},
+        device_id=_DEVICE_ID,
+    )
 
     vids = [v["vlan-id"] for v in _sent_document(client)["vlan"]["vlan"]]
     assert vids == [10]
@@ -1281,7 +1362,7 @@ async def test_the_real_commit_carries_reconcile_and_the_verify_dry_run_does_too
     mock_http.put.return_value = _httpx_response(204)
     _stub_pool(client, mock_http)
 
-    await apply_device_intent(client, "core-rtr-01", {"vlan": {"vlan": []}})
+    await apply_device_intent(client, "core-rtr-01", {"vlan": {"vlan": []}}, device_id=_DEVICE_ID)
 
     real_url = mock_http.put.call_args_list[0][0][0]
     verify_url = mock_http.put.call_args_list[1][0][0]
@@ -1311,7 +1392,7 @@ async def test_the_sender_puts_every_family_in_one_request():
         "subinterface": {"interface": [{"interface-name": "ae99.999"}]},
         "interface": {"interface": [{"interface-name": "ae99.999"}]},
     }
-    await apply_device_intent(client, "sw01", containers)
+    await apply_device_intent(client, "sw01", containers, device_id=_DEVICE_ID)
 
     url = mock_http.put.call_args_list[0][0][0]
     assert url.split("?")[0].endswith("device-intent:device-intent=sw01")
@@ -1327,7 +1408,7 @@ async def test_the_sender_requests_the_cli_outformat_for_a_preview():
     mock_http.put.return_value = _httpx_response(200, json_data={"dry-run-result": {"cli": ""}})
     _stub_pool(client, mock_http)
 
-    await apply_device_intent(client, "sw01", {"interface": {}}, dry_run="cli")
+    await apply_device_intent(client, "sw01", {"interface": {}}, device_id=_DEVICE_ID, dry_run="cli")
 
     url = mock_http.put.call_args_list[0][0][0]
     assert url == apply_mod._commit_url(
@@ -1350,7 +1431,12 @@ async def test_an_empty_family_body_reaches_the_wire_unchanged():
     mock_http.put.return_value = _httpx_response(204)
     _stub_pool(client, mock_http)
 
-    await apply_device_intent(client, "sw01", {"interface": {"interface": []}, "subinterface": {}})
+    await apply_device_intent(
+        client,
+        "sw01",
+        {"interface": {"interface": []}, "subinterface": {}},
+        device_id=_DEVICE_ID,
+    )
 
     body = json.loads(mock_http.put.call_args_list[0].kwargs["content"])
     assert body[DEVICE_INTENT_ROOT][0] == {
@@ -1369,7 +1455,13 @@ async def test_the_sender_dry_run_returns_the_delta_and_commits_nothing():
     )
     _stub_pool(client, mock_http)
 
-    delta = await apply_device_intent(client, "sw01", {"interface": {}}, dry_run=True)
+    delta = await apply_device_intent(
+        client,
+        "sw01",
+        {"interface": {}},
+        device_id=_DEVICE_ID,
+        dry_run=True,
+    )
 
     assert delta == "X"
     assert all("dry-run=native" in call[0][0] for call in mock_http.put.call_args_list)
@@ -1384,7 +1476,7 @@ async def test_the_sender_raises_on_a_rejected_document():
     _stub_pool(client, mock_http)
 
     with pytest.raises(NsoApplyError):
-        await apply_device_intent(client, "sw01", {"interface": {}})
+        await apply_device_intent(client, "sw01", {"interface": {}}, device_id=_DEVICE_ID)
 
 
 def test_build_subif_interfaces_shapes_rows():
@@ -1440,7 +1532,14 @@ async def test_native_dry_run_outformat_cli_requests_and_parses():
     http = AsyncMock()
     http.patch.return_value = _httpx_response(200, json_data=body)
     _stub_pool(client, http)
-    delta = await native_dry_run(client, "http://nso/x", "{}", "sw03", outformat="cli")
+    delta = await native_dry_run(
+        client,
+        "http://nso/x",
+        "{}",
+        "sw03",
+        device_id=_DEVICE_ID,
+        outformat="cli",
+    )
     assert delta == "+ isis bfd"
     url = http.patch.await_args.args[0]
     assert "dry-run=cli" in url
@@ -1456,7 +1555,13 @@ async def test_the_document_preview_honours_the_cli_outformat():
     http.put.return_value = _httpx_response(200, json_data=body)
     _stub_pool(client, http)
 
-    delta = await apply_device_intent(client, "sw03", {"interface": {}}, dry_run="cli")
+    delta = await apply_device_intent(
+        client,
+        "sw03",
+        {"interface": {}},
+        device_id=_DEVICE_ID,
+        dry_run="cli",
+    )
 
     url = http.put.await_args.args[0]
     assert "dry-run=cli" in url, "the preview must ask NSO for the NED-uniform tree diff"

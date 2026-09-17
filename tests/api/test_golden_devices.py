@@ -2,7 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Golden-body tests — the devices router (list / get / by-nso / onboard / provision / rekey).
 
-S2 orchestration. Every device response is built from ``_device_out`` (8 always-present
+S2 orchestration. Every device response is built from ``_device_out`` (always-present
 keys, nullables emitted as null) plus additive keys the caller layers on:
   * ``list``    adds ``sync_state_summary`` (a ``dict[str,int]`` — managed_interfaces + one
                 key per SyncState value);
@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from nso_adapter.domain.diagnostics import device_ref
 from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -104,6 +105,7 @@ async def test_list_devices_golden(adapter_client):
             "id": device_id,
             "nso_instance": "nso-dev",
             "nso_device_name": "dev-list",
+            "device_ref": device_ref("nso-dev", "dev-list"),
             "netbox_device_id": 101,
             "source_epoch": 1,
             "mapping_status": "mapped",
@@ -127,6 +129,7 @@ async def test_get_device_maximal_golden(adapter_client):
         "id": device_id,
         "nso_instance": "nso-dev",
         "nso_device_name": "dev-max",
+        "device_ref": device_ref("nso-dev", "dev-max"),
         "netbox_device_id": 102,
         "source_epoch": 1,
         "mapping_status": "mapped",
@@ -165,6 +168,7 @@ async def test_get_device_minimal_golden(adapter_client):
         "id": device_id,
         "nso_instance": "nso-dev",
         "nso_device_name": "dev-min",
+        "device_ref": device_ref("nso-dev", "dev-min"),
         "netbox_device_id": 103,
         "source_epoch": 1,
         "mapping_status": "mapped",
@@ -192,6 +196,7 @@ async def test_get_device_by_nso_golden(adapter_client):
         "id": device_id,
         "nso_instance": "nso-dev",
         "nso_device_name": "dev-bynso",
+        "device_ref": device_ref("nso-dev", "dev-bynso"),
         "netbox_device_id": 104,
         "source_epoch": 1,
         "mapping_status": "mapped",
@@ -217,6 +222,7 @@ async def test_onboard_device_golden(adapter_client_with_nso):
         "id": body["id"],
         "nso_instance": "nso-dev",
         "nso_device_name": "dev-onboard",
+        "device_ref": device_ref("nso-dev", "dev-onboard"),
         "netbox_device_id": 105,
         "source_epoch": 1,
         "mapping_status": "mapped",

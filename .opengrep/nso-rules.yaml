@@ -298,12 +298,28 @@ rules:
       include:
         - nso_adapter/main.py
         - nso_adapter/api/capability.py
+        - nso_adapter/api/intent.py
+        - nso_adapter/api/interface_ip.py
+        - nso_adapter/bindings/netbox/client.py
+        - nso_adapter/bindings/netbox/mapper.py
+        - nso_adapter/bindings/netbox/writer.py
+        - nso_adapter/core/apply.py
         - nso_adapter/core/capability.py
+        - nso_adapter/core/failover.py
         - nso_adapter/core/importer.py
+        - nso_adapter/core/jobs.py
+        - nso_adapter/core/lag_topology.py
+        - nso_adapter/core/onboarding.py
         - nso_adapter/core/redistribution.py
         - nso_adapter/core/refresh_engine.py
+        - nso_adapter/core/removal.py
+        - nso_adapter/core/route_policy.py
+        - nso_adapter/core/scheduler.py
+        - nso_adapter/core/static_route_reader.py
+        - nso_adapter/core/topology_interfaces.py
         - nso_adapter/notifications/sse_subscriber.py
         - nso_adapter/notifications/persistent_subscriber.py
+        - nso_adapter/nso/apply.py
         - nso_adapter/nso/client.py
         - review-patterns.py
     pattern-either:
@@ -322,22 +338,41 @@ rules:
       include:
         - nso_adapter/main.py
         - nso_adapter/api/capability.py
+        - nso_adapter/api/intent.py
+        - nso_adapter/api/interface_ip.py
+        - nso_adapter/bindings/netbox/client.py
+        - nso_adapter/bindings/netbox/mapper.py
+        - nso_adapter/bindings/netbox/writer.py
+        - nso_adapter/core/apply.py
         - nso_adapter/core/capability.py
+        - nso_adapter/core/failover.py
         - nso_adapter/core/importer.py
+        - nso_adapter/core/jobs.py
+        - nso_adapter/core/lag_topology.py
+        - nso_adapter/core/onboarding.py
         - nso_adapter/core/redistribution.py
         - nso_adapter/core/refresh_engine.py
+        - nso_adapter/core/removal.py
+        - nso_adapter/core/route_policy.py
+        - nso_adapter/core/scheduler.py
+        - nso_adapter/core/static_route_reader.py
+        - nso_adapter/core/topology_interfaces.py
         - nso_adapter/notifications/sse_subscriber.py
         - nso_adapter/notifications/persistent_subscriber.py
+        - nso_adapter/nso/apply.py
         - nso_adapter/nso/client.py
         - review-patterns.py
     pattern-sources:
-      - pattern: $D.nso_device_name
-        exact: true
-      - pattern: $D.ned_id
-        exact: true
-      - pattern: $D.sw_version
-        exact: true
-      - pattern: $B.nso_device_name
+      # A model class attribute in a query predicate is a column expression, not provider text.
+      # Tainting it taints every row that the query returns.
+      - patterns:
+          - pattern-either:
+              - pattern: $D.nso_device_name
+              - pattern: $D.ned_id
+              - pattern: $D.sw_version
+          - metavariable-regex:
+              metavariable: $D
+              regex: ^(?:.*\.)?[a-z_][A-Za-z0-9_]*$
         exact: true
       - pattern: stream_url
         exact: true

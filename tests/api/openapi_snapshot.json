@@ -2019,6 +2019,10 @@
             ],
             "title": "Degraded Surfaces"
           },
+          "device_ref": {
+            "title": "Device Ref",
+            "type": "string"
+          },
           "failover": {
             "anyOf": [
               {
@@ -2122,6 +2126,7 @@
           "id",
           "nso_instance",
           "nso_device_name",
+          "device_ref",
           "netbox_device_id",
           "source_epoch",
           "mapping_status",
@@ -2868,6 +2873,10 @@
             ],
             "title": "Auth Group"
           },
+          "device_ref": {
+            "title": "Device Ref",
+            "type": "string"
+          },
           "name": {
             "title": "Name",
             "type": "string"
@@ -2923,6 +2932,7 @@
         },
         "required": [
           "name",
+          "device_ref",
           "address",
           "ned_id",
           "platform",

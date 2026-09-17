@@ -845,11 +845,16 @@ async def _reconcile_interface(db, device_id, iface, scope_attrs, existing_iface
     return created, changes
 
 
-async def _flush_netbox_patches(nb_client, attr_patches, pending_by_id) -> int:
+async def _flush_netbox_patches(nb_client, netbox_device_id, attr_patches, pending_by_id) -> int:
     """Phase 2: push the batched PATCHes; mark netbox_value only for confirmed ids. Returns count."""
     if not (nb_client and attr_patches):
         return 0
-    written = await nb_client.bulk_patch_interfaces(list(attr_patches.values()))
+    if netbox_device_id is None:
+        raise RuntimeError("NetBox patches queued without a NetBox device id")
+    written = await nb_client.bulk_patch_interfaces(
+        list(attr_patches.values()),
+        netbox_device_id=netbox_device_id,
+    )
     count = 0
     for obj in written:
         for attr_state, nso_str in pending_by_id.get(obj["id"], []):
@@ -1078,6 +1083,7 @@ async def _consume_interface_attributes(
 
             interfaces_written = await _flush_netbox_patches(
                 nb_client,
+                device.netbox_device_id,
                 ctx.attr_patches,
                 ctx.pending_by_id,
             )
