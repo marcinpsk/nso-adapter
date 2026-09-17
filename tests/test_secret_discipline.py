@@ -185,6 +185,17 @@ class _ScopeFacts(ast.NodeVisitor):
         # An import binds a name with no ast.Name store: `import a.b` binds `a`.
         self.local_names.add(node.asname or node.name.split(".", maxsplit=1)[0])
 
+    def visit_For(self, node: ast.For) -> None:  # noqa: N802 - ast visitor API
+        # The loop target binds the iterable's elements: `for value in [response.text]` makes
+        # `value` the response text, exactly as an assignment would.
+        iterated = node.iter.elts if isinstance(node.iter, (ast.List, ast.Tuple)) else node.iter
+        self._bind(node.target, iterated)
+        self.visit(node.iter)
+        for statement in (*node.body, *node.orelse):
+            self.visit(statement)
+
+    visit_AsyncFor = visit_For  # type: ignore[assignment]
+
     def visit_Match(self, node: ast.Match) -> None:  # noqa: N802 - ast visitor API
         # A capture shadows an inherited alias, but it carries the SUBJECT's value with it.
         # Binding the name without its value would make `case [name]` launder the taint.
@@ -1056,6 +1067,21 @@ assert protected not in captured
 
     assert _non_disclosure_assertion_lines(reversed_order) == [3]
     assert _non_disclosure_assertion_lines(cross_scope) == []
+
+
+def test_a_for_target_carries_the_iterables_values() -> None:
+    """A loop target is a binding like any other: without it the scanner saw a bare name.
+
+    The scanner already binds assignment, walrus and match-capture targets, so a surface
+    iterated over in a `for` was the one spelling that reached an assertion unrecognized.
+    """
+    iterated = "for value in [response.text]:\n    assert protected not in value\n"
+    authored = 'for value in ["authored detail"]:\n    assert protected not in value\n'
+    unpacked = "for value, _ in [(response.text, 0)]:\n    assert protected not in value\n"
+
+    assert _non_disclosure_assertion_lines(iterated) == [2]
+    assert _non_disclosure_assertion_lines(authored) == []
+    assert _non_disclosure_assertion_lines(unpacked) == [2]
 
 
 def test_text_non_disclosure_failure_does_not_echo_the_material() -> None:
