@@ -481,19 +481,35 @@ def test_review_guards_cover_each_authored_error_boundary() -> None:
     } <= identifier_paths
 
 
+def _rule_patterns(node: object) -> list[str]:
+    """Every `pattern:` string anywhere under one rule clause, however it is nested."""
+    if isinstance(node, dict):
+        return [
+            *(value for key, value in node.items() if key == "pattern" and isinstance(value, str)),
+            *(item for key, value in node.items() if key != "pattern" for item in _rule_patterns(value)),
+        ]
+    if isinstance(node, list):
+        return [item for element in node for item in _rule_patterns(element)]
+    return []
+
+
 def test_the_identifier_guard_leaves_the_operator_authored_instance_name_alone() -> None:
     """The NSO instance name is out of the identifier class, so neither rule may carry it.
 
     The keyword rule banned `nso_instance=` while the tree spells the field `instance=`, so
     the guard passed on the spelling rather than on the verdict and a reviewer re-raised the
-    same site three times. Both rules are pinned here, together, so they cannot drift apart.
+    same site three times. Both policies are pinned whole, together, so they cannot drift.
     """
     rules = {rule["id"]: rule for rule in yaml.safe_load(_RULES.read_text(encoding="utf-8"))["rules"]}
-    keyword = repr(rules["nso-diagnostic-raw-identifier"]["pattern-either"])
-    alias = repr(rules["nso-diagnostic-raw-identifier-alias"]["pattern-sources"])
+    fields = {
+        pattern.split("=", maxsplit=1)[0].rsplit(" ", maxsplit=1)[-1]
+        for pattern in _rule_patterns(rules["nso-diagnostic-raw-identifier"]["pattern-either"])
+    }
+    sources = _rule_patterns(rules["nso-diagnostic-raw-identifier-alias"]["pattern-sources"])
+    instance_sources = {pattern for pattern in sources if pattern.rsplit(".", maxsplit=1)[-1] == "nso_instance"}
 
-    assert "instance" not in keyword, "the instance name is operator-authored configuration"
-    assert "instance" not in alias, "the alias rule must not carry an instance source either"
+    assert fields == {"device_name", "device", "stream", "stream_url", "url"}
+    assert instance_sources == set(), "the alias rule must not carry an instance source either"
 
 
 def _binds_formatter_name(node: ast.AST) -> bool:
