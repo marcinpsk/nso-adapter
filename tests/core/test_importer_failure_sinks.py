@@ -49,7 +49,7 @@ _GUARDED_LOG_SINKS = (
     ),
     *(
         Path(__file__).resolve().parents[2] / "nso_adapter" / "bindings" / "netbox" / name
-        for name in ("client.py", "writer.py")
+        for name in ("client.py", "mapper.py", "writer.py")
     ),
     *(
         Path(__file__).resolve().parents[2] / "nso_adapter" / "notifications" / name

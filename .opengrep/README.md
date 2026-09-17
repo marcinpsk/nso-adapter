@@ -39,7 +39,7 @@ for its configuration names and workflow skip conditions.
 `nso-outcome-raw-exception-renderer` rejects traceback logging and raw exception
 values in every positional or structured log field. It covers `nso_adapter/main.py`,
 `core/importer.py`, `core/generation.py`, `core/removal.py`, `core/failover.py`,
-`bindings/netbox/client.py`, `bindings/netbox/writer.py`,
+`bindings/netbox/client.py`, `bindings/netbox/mapper.py`, `bindings/netbox/writer.py`,
 `notifications/sse_subscriber.py`, `notifications/persistent_subscriber.py`, and the
 outcome bookkeeping logs in `refresh_engine.py` and `redistribution.py`. These logs
 must use `failure_detail` so an HTTP exception cannot repeat a request URL or server
@@ -49,9 +49,11 @@ The pre-commit AST guard scans guarded modules for exception aliases after
 context-manager exits. Its control-flow model tracks conditional and later
 assignments that OpenGrep cannot classify reliably.
 
-`failover.py`, `client.py` and `writer.py` joined the list because each NSO or
+`failover.py`, `client.py`, `mapper.py` and `writer.py` joined the list because each NSO or
 NetBox call takes the device or interface identity as an argument, so the raised
-transport error repeats it and the handler logged it raw. `rejection_detail` is
+transport error repeats it and the handler logged it raw. `mapper.py` is the narrowest
+case: its PATCH URL carries the NetBox interface id and its POST payload carries the
+interface name. `rejection_detail` is
 the second approved classifier, for a NetBox rejection body: NetBox repeats the
 submitted value in its validation messages, so only the field names travel. The
 remaining modules named in `test_guarded_modules_never_log_raw_exception_text` are

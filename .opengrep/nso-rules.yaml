@@ -15,6 +15,7 @@ rules:
         - nso_adapter/core/refresh_engine.py
         - nso_adapter/core/redistribution.py
         - nso_adapter/bindings/netbox/client.py
+        - nso_adapter/bindings/netbox/mapper.py
         - nso_adapter/bindings/netbox/writer.py
         - nso_adapter/notifications/sse_subscriber.py
         - nso_adapter/notifications/persistent_subscriber.py
