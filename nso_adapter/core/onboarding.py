@@ -64,6 +64,19 @@ class DeviceIdentityRefused(LookupError):
 #: The authored answers. Each states the refusal and interpolates nothing.
 _ONBOARDED_ELSEWHERE = "The NSO device is already onboarded to a different NetBox device"
 _IDENTITY_CLAIMED = "The target NSO identity is already claimed by another device"
+#: The DB constraint that decides an identity race, taken from the model so the two cannot drift.
+_IDENTITY_CONSTRAINT = "uq_device_nso_identity"
+
+
+def _violated_constraint(exc: BaseException) -> str | None:
+    """Return the constraint an integrity error names, or None when the driver reports none."""
+    current: BaseException | None = exc
+    while current is not None:
+        name = getattr(current, "constraint_name", None)
+        if isinstance(name, str) and name:
+            return name
+        current = current.__cause__
+    return None
 
 
 _READ_MIRROR_ROOTS = (
@@ -152,8 +165,8 @@ async def _once_with_retry(action, *, backoff: float = _ONBOARD_RETRY_BACKOFF_SE
         retry = True
     if not retry and ok is not None and not ok(result):
         retry = True
-    # The second attempt runs AFTER the handler: inside it, a second failure keeps the FIRST
-    # exception on __context__, and an HTTP reason phrase there carries the server's text.
+    # Deliberately AFTER the handler: a second failure raised here carries no __context__, so
+    # the first attempt's exception (and any server text in it) never joins the second's chain.
     if retry:
         await asyncio.sleep(backoff)
         return await action()
@@ -982,8 +995,12 @@ async def rekey_device(
         device.degraded_surfaces = None
 
         await db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         await db.rollback()
+        # The try covers the whole mutation, teardown deletes included, so only the identity
+        # constraint may be reported as a lost identity race. Anything else is a real fault.
+        if _violated_constraint(exc) != _IDENTITY_CONSTRAINT:
+            raise
         identity_claimed = True
 
     if identity_claimed:

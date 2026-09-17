@@ -1079,8 +1079,15 @@ async def test_sync_device_unresolved_ned_marks_unmatched(db_session: AsyncSessi
     imp._nso_clients["nso-dev"] = client
     imp._netbox_client = None
 
-    with pytest.raises(ValueError, match="no NED ID"):
+    with pytest.raises(ValueError, match="no NED ID") as caught:
         await sync_device(device.id, db_session)
+
+    # The worker renders repr(exc) for this failure, so the NSO name may not be in the message.
+    from tests._secret_discipline import assert_chain_free_of, assert_text_free_of
+
+    assert_text_free_of(str(caught.value), ["sw-noned"])
+    assert_chain_free_of(caught.value, ["sw-noned"])
+    assert str(device.id) in str(caught.value)
 
     await db_session.refresh(device)
     assert device.mapping_status == MappingStatus.unmatched_device

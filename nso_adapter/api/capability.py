@@ -192,11 +192,9 @@ async def report_read_capability(body: ReadCapabilityReport, db: AsyncSession = 
         stmt = stmt.where(Device.nso_instance == body.nso_instance)
     devices = (await db.execute(stmt)).scalars().all()
     if not devices:
-        raise api_error(404, "not_found", f"No device named {body.nso_device_name!r}")
+        raise api_error(404, "not_found", "Device not found")
     if len(devices) > 1:
-        raise api_error(
-            409, "ambiguous_device", f"{body.nso_device_name!r} exists in several instances — pass nso_instance"
-        )
+        raise api_error(409, "ambiguous_device", "Several devices match; pass nso_instance")
     device = devices[0]
     ned_id = capability._clean_capability_key(device.ned_id)
     sw_version = capability._clean_capability_key(device.sw_version)

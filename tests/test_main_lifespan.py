@@ -464,7 +464,7 @@ async def test_start_sse_streams_enabled_spawns_one_task_per_instance(monkeypatc
                 await asyncio.wait_for(t, timeout=1.0)
 
     record = next(record for record in logs if record["event"] == "sse.stream.started")
-    assert "placeholder-stream-secret" not in str(record)
+    assert_records_free_of([record], ["placeholder-stream-secret"])
 
 
 # --------------------------------------------------------------------------- #

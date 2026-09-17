@@ -462,6 +462,35 @@ async def test_rekey_reports_identity_refusal_when_the_target_is_claimed_after_t
     assert_chain_free_of(caught.value, ["rekey-winner", "uq_device_nso_identity"])
 
 
+async def test_rekey_reraises_an_integrity_error_from_another_constraint(adapter_client_with_nso):
+    """The try covers the teardown deletes too, so only the identity constraint means a lost race.
+
+    A non-identity violation reported as `identity_claimed` would answer 409 and hide a real
+    fault. The identity path itself is proven against the live constraint by the race test above.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from nso_adapter.core.onboarding import rekey_device
+    from tests.conftest import seed_device
+
+    class _OtherConstraint(Exception):
+        constraint_name = "uq_some_other_constraint"
+
+    device_id = await seed_device(nso_instance="nso-dev", nso_device_name="rekey-other", netbox_device_id=303)
+
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        original_commit = db.commit
+
+        async def commit_violating_another_constraint():
+            db.commit = original_commit
+            raise IntegrityError("UPDATE devices", {}, _OtherConstraint()) from _OtherConstraint()
+
+        db.commit = commit_violating_another_constraint
+        with pytest.raises(IntegrityError):
+            await rekey_device(db, device, nso_device_name="rekey-other-target")
+
+
 async def test_rekey_same_source_is_true_noop(adapter_client_with_nso):
     """An idempotent source PATCH preserves the generation and read publications."""
     from nso_adapter.core.onboarding import rekey_device

@@ -516,5 +516,6 @@ async def _rebuild_partitions(
                 device_id=device_id,
                 protocol=proto,
                 reason=outcome.reason.value,
+                **(outcome.failure.log_fields() if outcome.failure is not None else {}),
             )
     return rebuilt

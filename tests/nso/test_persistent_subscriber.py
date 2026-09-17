@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from nso_adapter.notifications.sse_subscriber import SSESubscriber
+from tests._secret_discipline import assert_records_free_of
 
 pytestmark = pytest.mark.asyncio
 
@@ -124,7 +125,7 @@ async def test_idle_timeout_reconnects_fast_and_resets_backoff(monkeypatch: pyte
     assert wait_for_calls[0] <= 1.5, f"idle reconnect must be fast, got {wait_for_calls[0]}"
     assert wait_for_calls[1] == 5.0, f"backoff must reset after a healthy idle cycle, got {wait_for_calls[1]}"
     record = next(record for record in logs if record["event"] == "sse.idle_reconnect")
-    assert "placeholder-stream-secret" not in str(record)
+    assert_records_free_of([record], ["placeholder-stream-secret"])
 
 
 async def test_persistent_subscriber_retries_after_transport_error(monkeypatch: pytest.MonkeyPatch):
@@ -172,8 +173,7 @@ async def test_persistent_subscriber_retries_after_transport_error(monkeypatch: 
     assert wait_for_calls == [5.0]
     record = next(record for record in logs if record["event"] == "sse.reconnect_after_error")
     assert record["error"] == "HTTPStatusError (HTTP 503)"
-    assert "placeholder-secret" not in str(record)
-    assert "placeholder-stream-secret" not in str(record)
+    assert_records_free_of([record], ["placeholder-secret", "placeholder-stream-secret"])
 
 
 async def test_persistent_subscriber_caps_exponential_backoff(monkeypatch: pytest.MonkeyPatch):

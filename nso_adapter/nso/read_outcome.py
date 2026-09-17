@@ -162,6 +162,16 @@ def http_status_of(exc: BaseException) -> int | None:
     return exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
 
 
+def section_absence_code(served: dict, wire: str, *, operation: ReadOperation) -> ReadFailureCode:
+    """Name what a non-dict section is: the action's omission, or an unusable body.
+
+    ``.get()`` returns None for an omitted key AND for a present null, and only the omission is
+    the action's own contract failure. Every caller derives the code here so the two cannot drift.
+    """
+    absent_from_action = wire not in served and operation is ReadOperation.device_state_read
+    return ReadFailureCode.action_section_missing if absent_from_action else ReadFailureCode.section_malformed
+
+
 def read_failure_from_exception(
     exc: BaseException,
     *,

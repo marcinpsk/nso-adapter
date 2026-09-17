@@ -284,6 +284,41 @@ async def test_escalation_action_error_keeps_rows(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_escalation_output_with_an_explicit_null_section_is_malformed(adapter_client):
+    """An action that ANSWERED the family with null sent something unusable, not nothing.
+
+    `output.get(wire)` returns None for an absent key and for a present null, and only the
+    absent key is the action's own omission contract failure.
+    """
+    device_id = await seed_device(nso_device_name="eng-env-nullsect", netbox_device_id=9711)
+    await _seed_one_route(device_id)
+    async with _device_session(device_id) as (db, device):
+        client = _client(section={"status": "not-ready"}, action_output={"atomic": True, "static-route": None})
+
+        ok = await run_family_refresh(db, device, client, ENV_SPEC)
+
+        assert ok is False
+        assert await _routes(db, device_id) == ["10.0.0.0/8"]
+        outcome_row = await _latest_outcome(db, device_id)
+        assert [f["failure_code"] for f in outcome_row.read_failures] == ["section_malformed"]
+
+
+@pytest.mark.anyio
+async def test_escalation_output_omitting_the_section_is_the_action_omission(adapter_client):
+    """The companion case: an omitted key stays `action_section_missing`, so the two pin each other."""
+    device_id = await seed_device(nso_device_name="eng-env-nokey", netbox_device_id=9712)
+    await _seed_one_route(device_id)
+    async with _device_session(device_id) as (db, device):
+        client = _client(section={"status": "not-ready"}, action_output={"atomic": True})
+
+        ok = await run_family_refresh(db, device, client, ENV_SPEC)
+
+        assert ok is False
+        outcome_row = await _latest_outcome(db, device_id)
+        assert [f["failure_code"] for f in outcome_row.read_failures] == ["action_section_missing"]
+
+
+@pytest.mark.anyio
 async def test_escalation_output_missing_the_section_keeps_rows(adapter_client):
     device_id = await seed_device(nso_device_name="eng-env-missect", netbox_device_id=9709)
     await _seed_one_route(device_id)

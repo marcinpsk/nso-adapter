@@ -131,6 +131,45 @@ async def test_redistribution_diagnostics_omit_the_nso_device_name(adapter_clien
 
 
 @pytest.mark.anyio
+async def test_component_kept_carries_the_failure_classification(adapter_client):
+    """`reason` alone cannot tell an auth refusal from a malformed body; the classification can."""
+    from structlog.testing import capture_logs
+
+    from nso_adapter.nso.read_outcome import ReadFailure, ReadFailureCode, ReadOperation
+
+    device_name = "rd-kept-classified"
+    device_id = await seed_device(nso_device_name=device_name, netbox_device_id=7799)
+    failure = ReadFailure(
+        operation=ReadOperation.device_state_read,
+        device=device_name,
+        family="bgp",
+        error_type="HTTPStatusError",
+        http_status=503,
+        code=ReadFailureCode.heal_action_failed,
+    )
+    async with _device_session(device_id) as (db, device):
+        with capture_logs() as logs:
+            await refresh_redistribution_from_outcomes(
+                db,
+                device,
+                {
+                    "ospf": Unavailable(UnavailableReason.unsupported),
+                    "isis": Unavailable(UnavailableReason.unsupported),
+                    "bgp": Unavailable(UnavailableReason.read_error, failure=failure),
+                },
+                refresh_source="test",
+                own_lock=False,
+            )
+
+    record = next(record for record in logs if record["event"] == "redistribution.refresh.component_kept")
+    assert record["read_operation"] == "device_state_read"
+    assert record["error_type"] == "HTTPStatusError"
+    assert record["http_status"] == 503
+    assert record["failure_code"] == "heal_action_failed"
+    assert_records_free_of([record], [device_name])
+
+
+@pytest.mark.anyio
 async def test_refresh_inserts_ospf_rows(adapter_client):
     """OSPF redistribute → DeviceRedistribution rows with dest_protocol='ospf'."""
     device_id = await seed_device(nso_device_name="rd-ospf-sw01", netbox_device_id=7700)

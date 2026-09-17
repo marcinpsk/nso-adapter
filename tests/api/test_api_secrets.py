@@ -587,6 +587,8 @@ async def test_harvest_community_unsupported_ned(vault_client):
 
     assert resp.status_code == 409
     assert resp.json()["error"]["code"] == "harvest_unsupported_ned"
+    # The NED id is provider-derived text; the closed code already names the refusal.
+    assert_text_free_of(resp.text, ["timos-nc-9.1"])
 
 
 @pytest.mark.anyio

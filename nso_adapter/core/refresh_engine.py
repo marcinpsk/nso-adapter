@@ -43,6 +43,7 @@ from nso_adapter.nso.read_outcome import (
     UnavailableReason,
     classify_envelope_section,
     read_failure_from_exception,
+    section_absence_code,
 )
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device
@@ -215,7 +216,7 @@ async def _escalate_not_ready(device: Device, nso_client: NsoClient, wire_name: 
                 operation=ReadOperation.device_state_read,
                 device=name,
                 family=wire_name,
-                code=ReadFailureCode.action_section_missing,
+                code=section_absence_code(output, wire_name, operation=ReadOperation.device_state_read),
             ),
         )
     outcome = classify_envelope_section(section, device=name, family=wire_name)

@@ -433,6 +433,23 @@ def test_guarded_modules_never_log_raw_exception_text() -> None:
     assert violations == {}
 
 
+def test_the_action_section_code_is_derived_in_exactly_one_place() -> None:
+    """`.get()` cannot tell an omitted key from a present null, so only the shared helper decides.
+
+    This class already came back once: `_split_sections` was fixed while the escalation path in
+    `refresh_engine` kept deriving the code itself. Naming the member anywhere but the helper is
+    how that happens, so the guard is the reference, not the comparison.
+    """
+    root = Path(__file__).resolve().parents[2] / "nso_adapter"
+    offenders = sorted(
+        str(path.relative_to(root))
+        for path in root.rglob("*.py")
+        if path.name != "read_outcome.py" and "action_section_missing" in path.read_text(encoding="utf-8")
+    )
+
+    assert offenders == [], "derive the code via read_outcome.section_absence_code, never in the caller"
+
+
 def test_guarded_modules_are_documented() -> None:
     coverage = _COVERAGE_DOC.read_text(encoding="utf-8").split("## Coverage", maxsplit=1)[1]
     for path in (_IMPORTER, *_GUARDED_LOG_SINKS):

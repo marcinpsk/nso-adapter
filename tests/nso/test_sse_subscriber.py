@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from nso_adapter.notifications.sse_subscriber import SSESubscriber
+from tests._secret_discipline import assert_records_free_of
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -205,8 +206,7 @@ async def test_post_header_idle_raises_sse_idle_timeout():
 
     record = next(record for record in logs if record["event"] == "sse_idle_timeout")
     assert record["error"] == "ReadTimeout"
-    assert "placeholder-secret" not in str(record)
-    assert "placeholder-stream-secret" not in str(record)
+    assert_records_free_of([record], ["placeholder-secret", "placeholder-stream-secret"])
     assert_chain_free_of(caught.value, ["placeholder-secret", SECRET_STREAM_URL])
 
 
@@ -310,8 +310,7 @@ async def test_subscribe_raises_on_http_error():
 
     record = next(record for record in logs if record["event"] == "sse_subscribe_error")
     assert record["error"] == "HTTPStatusError (HTTP 503)"
-    assert "placeholder-secret" not in str(record)
-    assert "placeholder-stream-secret" not in str(record)
+    assert_records_free_of([record], ["placeholder-secret", "placeholder-stream-secret"])
 
 
 async def test_subscribe_empty_stream_calls_no_events():
@@ -366,8 +365,7 @@ async def test_subscribe_does_not_log_raw_body():
     assert event_logs
     for event in event_logs:
         assert "raw" not in event
-        assert "hunter2" not in str(list(event.values()))
-        assert "placeholder-stream-secret" not in str(event)
+    assert_records_free_of(event_logs, ["hunter2", "placeholder-stream-secret"])
 
 
 async def test_subscribe_idle_read_timeout_unwedges_half_open_connection():
@@ -446,4 +444,4 @@ async def test_subscribe_completes_on_timeout():
         sub._client = original
 
     record = next(record for record in logs if record["event"] == "sse_subscribe_complete")
-    assert "placeholder-stream-secret" not in str(record)
+    assert_records_free_of([record], ["placeholder-stream-secret"])
