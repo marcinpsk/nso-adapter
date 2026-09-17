@@ -28,6 +28,7 @@ from tests._ast_scanner_support import (
     pattern_is_irrefutable,
     scope_bound_names,
     statement_may_raise,
+    walrus_target_names,
 )
 from tests.conftest import seed_device, session
 
@@ -356,8 +357,15 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
         else:
             self.visit(node.elt)
 
+        body_aliases = self.aliases
         outer_aliases.clear()
         outer_aliases.update(outer_after_iter)
+        # A walrus in the body binds in THIS scope (PEP 572); the generator targets do not.
+        for name in walrus_target_names(node):
+            if name in body_aliases:
+                outer_aliases.add(name)
+            else:
+                outer_aliases.discard(name)
         self.aliases = outer_aliases
 
     def visit_ListComp(self, node: ast.ListComp) -> None:  # noqa: N802 - ast visitor API

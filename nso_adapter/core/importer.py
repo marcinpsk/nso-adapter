@@ -46,6 +46,7 @@ from nso_adapter.nso.read_outcome import (  # noqa: F401 — Present used below
     classify_envelope_section,
     http_status_of,
     read_failure_from_exception,
+    section_absence_code,
 )
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.db import execute_dml
@@ -341,19 +342,17 @@ def _split_sections(
     """
     sections: dict[str, dict | None] = {}
     for wire in wire_names:
-        section_missing = wire not in served
         section = served.get(wire)
         if isinstance(section, dict):
             sections[wire] = section
             failures.pop(wire, None)
             continue
         sections[wire] = None
-        absent_from_action = section_missing and operation is ReadOperation.device_state_read
         failures[wire] = ReadFailure(
             operation=operation,
             device=device_name,
             family=wire,
-            code=ReadFailureCode.action_section_missing if absent_from_action else ReadFailureCode.section_malformed,
+            code=section_absence_code(served, wire, operation=operation),
         )
     return sections
 

@@ -61,11 +61,27 @@ class _ScopeBindingCollector(ast.NodeVisitor):
         return
 
     def visit_ListComp(self, node: ast.ListComp) -> None:  # noqa: N802 - ast visitor API
-        return
+        # The comprehension is its own scope, but a walrus in it binds HERE (PEP 572).
+        self.names.update(walrus_target_names(node))
 
     visit_SetComp = visit_ListComp  # type: ignore[assignment]
     visit_GeneratorExp = visit_ListComp  # type: ignore[assignment]
     visit_DictComp = visit_ListComp  # type: ignore[assignment]
+
+
+def walrus_expressions(node: ast.AST) -> list[ast.NamedExpr]:
+    """Return the assignment expressions inside *node*.
+
+    PEP 572: a walrus inside a comprehension binds its target in the CONTAINING scope, unlike the
+    generator targets, which stay isolated. Every comprehension-scoped scanner owes this, and a
+    scanner that tracks values (not just names) needs the expression, not the name alone.
+    """
+    return [binding for binding in ast.walk(node) if isinstance(binding, ast.NamedExpr)]
+
+
+def walrus_target_names(node: ast.AST) -> set[str]:
+    """Return the names an assignment expression binds inside *node*."""
+    return {binding.target.id for binding in walrus_expressions(node) if isinstance(binding.target, ast.Name)}
 
 
 def scope_bound_names(nodes: list[ast.AST]) -> set[str]:
