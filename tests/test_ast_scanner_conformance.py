@@ -109,6 +109,18 @@ CASES = (
         "if value := SOURCE:\n    SINK",
         "if value := CLEAN:\n    SINK",
     ),
+    # PEP 572: a walrus inside a comprehension binds its target in the CONTAINING scope, unlike
+    # the generator targets, which stay isolated to the comprehension.
+    ConformanceCase(
+        "binding-walrus-in-comprehension-body",
+        "[value := SOURCE for _ in (0,)]\nSINK",
+        "[value := CLEAN for _ in (0,)]\nSINK",
+    ),
+    ConformanceCase(
+        "binding-walrus-in-comprehension-condition",
+        "[_ for _ in (0,) if (value := SOURCE)]\nSINK",
+        "[_ for _ in (0,) if (value := CLEAN)]\nSINK",
+    ),
     ConformanceCase(
         "scope-function-inward",
         "value = SOURCE\ndef nested():\n    SINK",
@@ -301,6 +313,10 @@ OPENGREP_XFAILS = {
     **{
         (name, True): "OpenGrep does not propagate the exception taint into a nested class body"
         for name in _OPENGREP_CLASS_SCOPE_GAPS
+    },
+    **{
+        (name, True): "OpenGrep does not bind a comprehension walrus in the containing scope (PEP 572)"
+        for name in ("binding-walrus-in-comprehension-body", "binding-walrus-in-comprehension-condition")
     },
     (
         "control-break-in-try",

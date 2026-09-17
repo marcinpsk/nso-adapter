@@ -38,6 +38,7 @@ from tests._ast_scanner_support import (
     pattern_is_irrefutable,
     scope_bound_names,
     statement_may_raise,
+    walrus_target_names,
 )
 
 TESTS_ROOT = Path(__file__).resolve().parent
@@ -485,9 +486,15 @@ class _Scanner(ast.NodeVisitor):
         else:
             self.visit(node.elt)
         self._try_handler_inputs = outer_handler_inputs
-        self._constant_scopes.pop()
+        body_constants = self._constant_scopes.pop()
         outer_constants.clear()
         outer_constants.update(outer_after_iter)
+        # A walrus in the body binds in THIS scope (PEP 572); the generator targets do not.
+        for name in walrus_target_names(node):
+            if name in body_constants:
+                outer_constants[name] = body_constants[name]
+            else:
+                outer_constants.pop(name, None)
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
         self._visit_comprehension(node)
