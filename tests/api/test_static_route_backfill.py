@@ -22,6 +22,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import select
 
+from tests._secret_discipline import assert_text_free_of
 from tests.api.test_static_route_deleted_routes import deleted, partition_of, put, receipt, wire_triple
 from tests.api.test_static_route_identity import (
     AUTH,
@@ -273,7 +274,7 @@ async def test_o2b_10_a_malformed_backfill_flag_has_no_effect(adapter_client):
 
     assert response.status_code == 422
     assert response.json()["error"]["detail"] == {"parameter": "backfill_only"}
-    assert raw not in response.text
+    assert_text_free_of(response.text, [raw])
     assert await read_intent_all_columns(device_id) == before
     assert await read_jobs(device_id) == []
     assert await receipt(device_id) is None

@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import seed_device, session
 from tests.core.projection_helpers import freeze_snapshot
 
@@ -641,7 +642,7 @@ async def test_snmp_snapshot_refuses_secret_material_in_a_vault_reference_column
         with pytest.raises(ValueError, match="refusing to serialize non-reference secret material") as exc:
             await snapshot_stream(db, device_id, "snmp")
 
-    assert "resolved-secret-placeholder" not in str(exc.value)
+    assert_text_free_of(exc.value, ["resolved-secret-placeholder"])
 
 
 async def test_snmp_snapshot_refuses_a_keyless_path_reference(adapter_client):
