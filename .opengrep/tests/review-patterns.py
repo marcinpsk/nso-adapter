@@ -435,3 +435,16 @@ async def raw_string_statement(conn, op, query, table, value, text):
     await conn.exec_driver_sql("SELECT * FROM " + table)
     # ok: nso-store-execute-raw-string
     op.execute("ALTER TYPE jobtype ADD VALUE IF NOT EXISTS 'sync_now'")
+
+
+def vault_payload(client, mount, path, _secret_data, _secret_version):
+    secret = client.secrets.kv.v2.read_secret_version(mount_point=mount, path=path)
+    # ruleid: nso-vault-payload-unvalidated
+    fields = secret["data"]["data"]
+    # ruleid: nso-vault-payload-unvalidated
+    version = secret["data"].get("metadata", {}).get("version")
+    # ok: nso-vault-payload-unvalidated
+    fields = _secret_data(secret)
+    # ok: nso-vault-payload-unvalidated
+    version = _secret_version(secret)
+    return fields, version

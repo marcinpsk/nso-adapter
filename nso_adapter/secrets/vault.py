@@ -7,6 +7,7 @@ the configured mount (e.g. ``credentials/svc-netbox-nso#netbox_token``).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import hvac
@@ -15,6 +16,33 @@ import structlog
 from nso_adapter.secrets.base import SecretResolutionError, selected_secret_value
 
 logger = structlog.get_logger(__name__)
+
+
+def _secret_envelope(secret: object) -> Mapping[str, object]:
+    """Return the KV v2 ``data`` envelope, refusing any other payload shape."""
+    envelope = secret.get("data") if isinstance(secret, Mapping) else None
+    if not isinstance(envelope, Mapping):
+        raise ValueError("the Vault payload is not a mapping")
+    return envelope
+
+
+def _secret_data(secret: object) -> dict[str, object]:
+    """Return the KV v2 secret fields.
+
+    hvac types its response ``Any``, so nothing before this proves the shape. Unvalidated, a
+    non-mapping payload reaches a typed mapping operation far from the read that produced it.
+    """
+    data = _secret_envelope(secret).get("data")
+    if not isinstance(data, Mapping):
+        raise ValueError("the Vault payload is not a mapping")
+    return dict(data)
+
+
+def _secret_version(secret: object) -> int | None:
+    """Return the KV v2 version, or None for a path that carries no usable metadata."""
+    metadata = _secret_envelope(secret).get("metadata")
+    version = metadata.get("version") if isinstance(metadata, Mapping) else None
+    return int(version) if version is not None else None
 
 
 class VaultSecretsProvider:
@@ -72,7 +100,7 @@ class VaultSecretsProvider:
             path=path,
             raise_on_deleted_version=True,
         )
-        data: dict[str, object] = secret["data"]["data"]
+        data = _secret_data(secret)
         self._cache[path] = data
         return data
 
@@ -149,8 +177,7 @@ class VaultSecretsProvider:
             )
         except hvac.exceptions.InvalidPath:
             return None
-        version = secret["data"].get("metadata", {}).get("version")
-        return dict(secret["data"]["data"]), int(version) if version is not None else None
+        return _secret_data(secret), _secret_version(secret)
 
     def _read_raw(self, mount: str, path: str) -> dict[str, object]:
         result = self._read_raw_meta(mount, path)

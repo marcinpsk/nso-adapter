@@ -37,6 +37,7 @@ class _FakeKvV2:
         self.write_calls: list[tuple[str, str, dict]] = []
         self.versions: dict[str, int] = {}
         self.omit_metadata: set[str] = set()
+        self.malformed: dict[str, object] = {}
 
     def read_secret_version(self, *, mount_point, path, raise_on_deleted_version):
         self.read_paths.append(path)
@@ -46,6 +47,8 @@ class _FakeKvV2:
         if path in self.forbid_once:
             self.forbid_once.discard(path)  # token "expired" exactly once
             raise _FakeForbidden()
+        if path in self.malformed:
+            return {"data": {"data": self.malformed[path]}}
         if path not in self._store:
             raise _FakeInvalidPath(path)
         data = {"data": dict(self._store[path])}
@@ -395,3 +398,69 @@ def test_a_FAILED_STARTUP_resolution_names_the_CONFIG_SLOT(fake_hvac):
     assert "nso_instances[nso-a].username_ref" in str(caught.value), "the operator must learn WHICH slot"
     assert_text_free_of(caught.value, _STARTUP_PARTS)
     assert_chain_free_of(caught.value, _STARTUP_PARTS)
+
+
+@pytest.mark.parametrize("payload", ["plaintext", ["ab", "cd"], 42, None])
+def test_a_NON_MAPPING_payload_is_one_classified_refusal_not_a_TypeError(fake_hvac, payload):
+    """hvac types the response ``Any``, so nothing between Vault and here proves the shape.
+
+    Unvalidated, the payload reaches ``selected_secret_value`` OUTSIDE ``get``'s classifier and
+    raises TypeError, and ``dict(["ab", "cd"])`` quietly builds ``{"a": "b", "c": "d"}`` — a
+    mapping that was never a secret.
+    """
+    _, _, kv = fake_hvac
+    kv.malformed["credentials/svc"] = payload
+    provider = _provider()
+
+    with pytest.raises(SecretResolutionError) as caught:
+        provider.get("credentials/svc#netbox_token")
+
+    assert caught.value.reason == "the Vault read failed (ValueError)"
+    assert_text_free_of(caught.value, ["credentials/svc", "netbox_token"])
+
+
+def test_a_NON_MAPPING_payload_is_never_CACHED(fake_hvac):
+    """The cached branch reads OUTSIDE the classifier, so caching a bad payload makes every
+    later call raise TypeError from a line that never read Vault."""
+    _, store, kv = fake_hvac
+    kv.malformed["credentials/svc"] = ["ab", "cd"]
+    provider = _provider()
+
+    with pytest.raises(SecretResolutionError):
+        provider.get("credentials/svc#netbox_token")
+
+    del kv.malformed["credentials/svc"]
+    store["credentials/svc"] = {"netbox_token": "placeholder-token"}
+    assert provider.get("credentials/svc#netbox_token") == "placeholder-token"
+
+
+def test_read_path_refuses_a_NON_MAPPING_payload(fake_hvac):
+    """The mount-explicit sibling of _fetch_path: ``dict()`` accepts a pair sequence, so an
+    unguarded read answers the SNMP verification path with a fabricated mapping."""
+    _, _, kv = fake_hvac
+    kv.malformed["netbox/snmp/community/prod-ro"] = ["ab", "cd"]
+    provider = _provider()
+
+    with pytest.raises(ValueError, match="not a mapping"):
+        provider.read_path("network", "netbox/snmp/community/prod-ro")
+
+
+def test_a_NON_MAPPING_METADATA_envelope_reads_as_an_UNVERSIONED_path(fake_hvac):
+    """``metadata`` is payload too: ``.get("version")`` on a non-mapping is an AttributeError.
+
+    Absent-or-unusable metadata already has a meaning here — an unversioned path — so this
+    lands there rather than failing a read whose data half is well formed.
+    """
+    _, store, kv = fake_hvac
+    store["netbox/snmp/community/prod-ro"] = {"community": "placeholder-community"}
+    original = kv.read_secret_version
+
+    def _with_bad_metadata(**kwargs):
+        secret = original(**kwargs)
+        return {"data": {**secret["data"], "metadata": "not-a-mapping"}}
+
+    kv.read_secret_version = _with_bad_metadata
+    data, version = _provider().read_path_meta("network", "netbox/snmp/community/prod-ro")
+
+    assert data == {"community": "placeholder-community"}
+    assert version is None

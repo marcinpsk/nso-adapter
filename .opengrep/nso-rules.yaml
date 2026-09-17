@@ -312,3 +312,13 @@ rules:
           - pattern: $CONN.execute($FORMAT.format(...), ...)
       # Alembic's op.execute takes raw DDL by design.
       - pattern-not: op.execute(...)
+  - id: nso-vault-payload-unvalidated
+    languages: [python]
+    severity: ERROR
+    message: Read a Vault KV v2 payload through _secret_data/_secret_version; hvac types the response Any, so an unguarded subscript sends an unvalidated shape to a typed mapping operation.
+    patterns:
+      - pattern-either:
+          - pattern: $SECRET["data"]["data"]
+          - pattern: $SECRET["data"].get("data", ...)
+          - pattern: $SECRET["data"]["metadata"]
+          - pattern: $SECRET["data"].get("metadata", ...)
