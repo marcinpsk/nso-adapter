@@ -951,3 +951,58 @@ async def test_failover_seed_success_step_is_unchanged(adapter_client_with_nso, 
         step = await _seed_onboarding_failover(db, device.id, "198.51.100.10", "203.0.113.10", "oob")
 
     assert step == {"step": "failover_seed", "status": "ok", "detail": "oob"}
+
+
+async def test_the_PROVISIONED_record_carries_step_names_and_statuses_but_no_step_DETAIL(
+    adapter_client_with_nso,
+):
+    """`steps` is a collection, so the identifier policy has to reach inside it.
+
+    Step details carry caller-supplied text — the requested admin-state, the derived
+    device-type — and the failover-bootstrap branch renders both the primary and the OOB
+    address. The terminal record is a diagnostic sink, so it gets the fixed step names and
+    status classifications and nothing else; the caller still reads the full steps list off
+    the job result, which is a response, not a sink.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.onboarding import provision_nso_device
+    from nso_adapter.nso.client import NsoClient
+    from tests._secret_discipline import assert_records_free_of
+
+    submitted_name = "placeholder-caller-provisioned-device"
+    submitted_admin_state = "placeholder-caller-admin-state"
+    client = AsyncMock(spec=NsoClient)
+    client.device_exists.return_value = False
+    client.sync_from.return_value = True
+
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
+        async with session() as db:
+            with capture_logs() as logs:
+                result = await provision_nso_device(
+                    db,
+                    nso_instance="nso-dev",
+                    device_name=submitted_name,
+                    address="198.51.100.20",
+                    ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+                    authgroup="network",
+                    netbox_device_id=int(uuid4().int % 10**8),
+                    admin_state=submitted_admin_state,
+                )
+
+    assert result["ok"] is True
+    provisioned = [record for record in logs if record["event"] == "device.provisioned"]
+    assert len(provisioned) == 1
+    assert provisioned[0]["steps"] == [
+        {"step": "create", "status": "ok"},
+        {"step": "admin_state", "status": "ok"},
+        {"step": "fetch_host_keys", "status": "ok"},
+        {"step": "sync_from", "status": "ok"},
+        {"step": "adapter_mapping", "status": "ok"},
+    ]
+    # The device name itself is the diagnostic-identity migration's contract, not this one's.
+    assert_records_free_of(logs, [submitted_admin_state, "device-type=", "198.51.100.20"])
+    # The response keeps what the sink drops.
+    assert {"step": "admin_state", "status": "ok", "detail": submitted_admin_state} in result["steps"]

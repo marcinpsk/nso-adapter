@@ -607,6 +607,16 @@ async def _link_existing_under_claim(
     return existing
 
 
+def _step_classifications(steps: list[dict]) -> list[dict[str, str]]:
+    """Return each step's fixed name and status.
+
+    A step detail carries the requested admin-state, the derived device-type, or the primary
+    and OOB addresses of a failover bootstrap. The caller reads the full list off the job
+    result; a diagnostic sink gets the classifications.
+    """
+    return [{"step": step["step"], "status": step["status"]} for step in steps]
+
+
 async def provision_nso_device(
     db: AsyncSession,
     *,
@@ -754,7 +764,12 @@ async def provision_nso_device(
     if sync_ok and device_id is not None:
         await _initial_mirror_refresh(db, device_id, client, reg=reg)
 
-    logger.info("device.provisioned", nso_device=device_name, instance=nso_instance, steps=steps)
+    logger.info(
+        "device.provisioned",
+        nso_device=device_name,
+        instance=nso_instance,
+        steps=_step_classifications(steps),
+    )
     return _result(True, device_id)
 
 
