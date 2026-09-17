@@ -464,8 +464,8 @@ async def test_run_apply_survives_sync_from_failure(adapter_client):
         assert job.status == JobStatus.succeeded  # nothing eligible, sync error swallowed
     record = next(record for record in logs if record["event"] == "apply.sync_from.failed")
     assert record["device_id"] == device_id
-    assert record["error"] == "transport timeout"
-    assert_records_free_of([record], ["rtr-sync-err"])
+    assert record["error"] == "RuntimeError", "the classification, never the transport's own message"
+    assert_records_free_of([record], ["rtr-sync-err", "transport timeout"])
 
 
 async def _preview_head(device_id: int) -> int:
