@@ -974,9 +974,9 @@ async def _maybe_sync_from(db: AsyncSession, client, device_name: str, device_id
         return
     try:
         await client.sync_from(device_name)
-        logger.info("apply.sync_from.done", device=device_name)
+        logger.info("apply.sync_from.done", device_id=device_id)
     except Exception as exc:
-        logger.warning("apply.sync_from.failed", device=device_name, error=failure_detail(exc))
+        logger.warning("apply.sync_from.failed", device_id=device_id, error=failure_detail(exc))
 
 
 class _AttributeApply(NamedTuple):
@@ -1333,7 +1333,7 @@ async def _document_reader_compare(
             logger.warning(
                 "apply.reader_compare_error",
                 job_id=job_id,
-                device=device_name,
+                device_id=device.id,
                 scope=section,
                 error=failure_detail(exc),
             )
@@ -1347,7 +1347,7 @@ async def _document_reader_compare(
             fetched = await _live_family_sections(client, device.nso_device_name, wires, timeout=_VERIFY_BATCH_TIMEOUT)
         except Exception as exc:  # noqa: BLE001 — a batched read failure fails no family's apply
             action_error = exc
-            logger.warning("apply.reader_compare_error", job_id=job_id, device=device_name, error=failure_detail(exc))
+            logger.warning("apply.reader_compare_error", job_id=job_id, device_id=device.id, error=failure_detail(exc))
 
     reader_compare: dict[str, str] = {}
     reader_compare_unverifiable: dict[str, list[str]] = {}
@@ -1386,7 +1386,7 @@ async def _document_reader_compare(
                 logger.warning(
                     "apply.reader_compare_error",
                     job_id=job_id,
-                    device=device_name,
+                    device_id=device.id,
                     scope=section,
                     error=failure_detail(exc),
                 )

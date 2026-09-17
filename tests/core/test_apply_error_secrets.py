@@ -964,8 +964,9 @@ async def test_a_REDIRECTED_host_key_fetch_records_the_STATUS_and_not_the_locati
 # ── a failed pre-apply sync-from: the device-keyed URL reaches no sink ──
 
 _SYNC_FROM_DEVICE = "sync-from-http"
-#: What `str(exc)` on the httpx failure carries: the whole request path and the server's phrase.
-_SYNC_FROM_LEAKS = [f"device={_SYNC_FROM_DEVICE}/sync-from", "Denied by proxy"]
+#: The device name itself, plus what `str(exc)` on the httpx failure carries: the whole request
+#: path and the server's own reason phrase.
+_SYNC_FROM_LEAKS = [_SYNC_FROM_DEVICE, "Denied by proxy"]
 
 
 def _sync_from_client(status: int):
@@ -1002,4 +1003,5 @@ async def test_a_FAILED_pre_apply_sync_from_records_the_STATUS_and_not_the_devic
     reported = [record for record in logs if record["event"] == "apply.sync_from.failed"]
     assert reported, "the failed sync-from was not reported at all"
     assert reported[0]["error"] == "HTTPStatusError (HTTP 502)", "the status is what tells the failures apart"
+    assert reported[0]["device_id"] == device_id, "the record stays addressable by the adapter id"
     assert_records_free_of(logs, _SYNC_FROM_LEAKS)
