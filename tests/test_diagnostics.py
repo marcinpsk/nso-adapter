@@ -169,3 +169,19 @@ def test_device_references_are_stable_across_processes(tmp_path) -> None:
     assert first.returncode == 0, first.stderr
     assert second.returncode == 0, second.stderr
     assert first.stdout == second.stdout == "5682a11cb050d759\n"
+
+
+@pytest.mark.parametrize("bad", [12345, ["a"], {"n": 1}, b"bytes", 3.5])
+def test_device_ref_refuses_a_non_string_component(bad):
+    """The reference is a keyed identity, not a renderer: a non-string component is a contract error.
+
+    Without this the failure is an AttributeError from `.encode()` deep inside the digest, raised
+    from whatever log call happened to build the fields. `device_fields` already refuses a non-int
+    `device_id` the same way.
+    """
+    register_device_ref_key("placeholder-diagnostic-key")
+
+    with pytest.raises(TypeError, match="must be a str"):
+        device_ref("nso-dev", bad)
+    with pytest.raises(TypeError, match="must be a str"):
+        device_ref(bad, "rtr01")

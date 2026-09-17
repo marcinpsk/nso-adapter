@@ -71,6 +71,36 @@ async def test_list_devices_exposes_correlatable_ref_for_unonboarded_device(
     assert resp.json()[0]["device_ref"] == device_ref("nso-dev", name)
 
 
+async def test_list_devices_skips_a_non_string_device_name(adapter_client_with_nso, monkeypatch):
+    """NSO oper-data is untrusted: a truthy non-string name must never reach device_ref().
+
+    The listing already skips a malformed entry rather than failing the whole page, and a name
+    the reference cannot encode is malformed in exactly that sense.
+    """
+
+    def handle(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"tailf-ncs:devices": {"device": [{"name": 12345}, {"name": ["a"]}, {"name": "good-rtr"}]}},
+        )
+
+    nso_client = get_nso_client("nso-dev")
+    monkeypatch.setattr(
+        nso_client,
+        "_client",
+        lambda timeout=None: httpx.AsyncClient(
+            transport=httpx.MockTransport(handle),
+            base_url="http://nso-dev:8080",
+        ),
+    )
+
+    resp = await adapter_client_with_nso.get("/api/v1/nso-instances/nso-dev/devices", headers=AUTH)
+
+    assert resp.status_code == 200
+    assert [d["name"] for d in resp.json()] == ["good-rtr"]
+    assert resp.json()[0]["device_ref"] == device_ref("nso-dev", "good-rtr")
+
+
 async def test_list_devices_unknown_instance_returns_404(adapter_client_with_nso):
     """Instance ID not in the (real) config → 404."""
     resp = await adapter_client_with_nso.get("/api/v1/nso-instances/ghost-instance/devices", headers=AUTH)
