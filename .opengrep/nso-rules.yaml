@@ -375,6 +375,25 @@ rules:
       - patterns:
           - pattern: logger.$LEVEL(..., $KEY=$SINK, ...)
           - focus-metavariable: $SINK
+  - id: nso-api-error-raw-exception-renderer
+    languages: [python]
+    severity: ERROR
+    message: Answer with authored text or failure_detail; str()/repr() on an exception repeats the server's own message and the request URL into the response body.
+    patterns:
+      - pattern-either:
+          - pattern: api_error(..., str($EXC), ...)
+          - pattern: api_error(..., repr($EXC), ...)
+      # Only a BROADLY caught exception. A named application error carries authored text by
+      # construction, so rendering it is the intended answer; a bare Exception is whatever
+      # the transport, the server or a decoder raised.
+      - pattern-inside: |
+          try:
+            ...
+          except $BROAD as $EXC:
+            ...
+      - metavariable-regex:
+          metavariable: $BROAD
+          regex: ^(Exception|BaseException)$
   - id: nso-store-legacy-query-api
     languages: [python]
     severity: ERROR

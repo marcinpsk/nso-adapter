@@ -239,6 +239,42 @@ def authored_outcome_details(logger, reason):
     logger.warning("family.outcome.read_record_failed", detail=format(reason))
 
 
+async def api_error_exception_renderers(api_error, work):
+    # The response body is a sink like any other: a broadly caught exception is whatever the
+    # transport, the server or a decoder raised, and its text repeats the request URL.
+    try:
+        work()
+    except Exception as exc:
+        # ruleid: nso-api-error-raw-exception-renderer
+        raise api_error(502, "nso_unreachable", str(exc)) from exc
+    try:
+        work()
+    except Exception as exc:
+        # ruleid: nso-api-error-raw-exception-renderer
+        raise api_error(502, "nso_unreachable", repr(exc)) from exc
+    try:
+        work()
+    except Exception:
+        # ok: nso-api-error-raw-exception-renderer
+        raise api_error(502, "nso_unreachable", "NSO instance is unreachable")
+
+
+async def api_error_authored_exception_renderers(api_error, work):
+    # A named application error carries authored text by construction, so rendering it IS the
+    # answer. Only the broad catch is a defect.
+    try:
+        work()
+    except DeviceIdentityRefused as exc:
+        # ok: nso-api-error-raw-exception-renderer
+        return api_error(409, "conflict", str(exc), {"reason": exc.reason})
+
+
+async def api_error_handler_argument(api_error, exc):
+    # An exception-handler parameter is not a catch at all; the caller chose the class.
+    # ok: nso-api-error-raw-exception-renderer
+    return api_error(409, "apply_unexecutable", str(exc), {"streams": {exc.stream: "outstanding"}})
+
+
 async def validation_error_messages(api_error, exc, body):
     # ruleid: nso-api-validation-error-raw-exception-renderer
     api_error(422, "validation_error", str(exc))
