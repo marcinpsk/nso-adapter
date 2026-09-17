@@ -1490,9 +1490,11 @@ def encode_interface_config(rows: SectionRows, execution: SectionExecution) -> d
             # The managed scope is data, so the store CAN hold an attribute this writer has
             # no leaf for. Refusing is the only honest answer: emitting the entry without it
             # would stamp the row in_sync for a leaf that never reached the device (#26).
+            # The attribute is caller-controlled (PUT /scope and PUT /intent both store the
+            # submitted name), so it travels in `detail`, never in the message str()/repr() render.
             raise NsoApplyError(
                 "unsupported_attribute",
-                f"interface_config: attribute {row.attribute!r} has no wire leaf",
+                "interface_config: an attribute in the managed scope has no wire leaf",
                 detail={"interface": iface.name, "attribute": row.attribute},
             )
         entry = _entry(iface.name)

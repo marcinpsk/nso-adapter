@@ -182,9 +182,10 @@ def test_an_attribute_with_no_wire_leaf_is_refused_not_dropped():
         _interface_body(rows, interfaces=[_iface(name=interface)])
 
     assert exc_info.value.code == "unsupported_attribute"
+    # The attribute is caller-controlled too: PUT /scope and PUT /intent both accept arbitrary
+    # names and store them unchanged, so it travels in `detail` and never in the message.
     assert exc_info.value.detail == {"interface": interface, "attribute": attribute}
-    assert attribute in str(exc_info.value)
-    assert_chain_free_of(exc_info.value, [interface])
+    assert_chain_free_of(exc_info.value, [interface, attribute])
 
 
 def test_a_corrupt_enabled_value_raises_rather_than_shutting_the_interface():
