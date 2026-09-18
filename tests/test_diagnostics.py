@@ -65,8 +65,8 @@ def test_startup_rejects_a_missing_diagnostic_key(monkeypatch) -> None:
     with pytest.raises(SecretResolutionError) as caught:
         _init_secrets(SimpleNamespace(state=SimpleNamespace()), _config(), SimpleNamespace())
 
-    assert str(caught.value) == "diagnostic_key_ref: the referenced environment variable is not set"
     assert_chain_free_of(caught.value, ["DIAGNOSTIC_KEY"])
+    assert str(caught.value) == "diagnostic_key_ref: the referenced environment variable is not set"
 
 
 @pytest.mark.parametrize("blank", ["", " ", "   ", "\t", "\n", " \t\n "])
@@ -84,8 +84,8 @@ def test_startup_rejects_a_BLANK_diagnostic_key(monkeypatch, blank) -> None:
     with pytest.raises(SecretResolutionError) as caught:
         _init_secrets(SimpleNamespace(state=SimpleNamespace()), _config(), SimpleNamespace())
 
-    assert str(caught.value) == "diagnostic_key_ref: the configured secret is blank"
     assert_chain_free_of(caught.value, ["DIAGNOSTIC_KEY", "placeholder-adapter-token"])
+    assert str(caught.value) == "diagnostic_key_ref: the configured secret is blank"
 
 
 @pytest.mark.parametrize("blank", ["", " ", "\t\n"])
@@ -106,8 +106,8 @@ def test_startup_rejects_a_BLANK_ADAPTER_TOKEN(monkeypatch, blank) -> None:
     with pytest.raises(SecretResolutionError) as caught:
         _init_secrets(SimpleNamespace(state=SimpleNamespace()), _config(), SimpleNamespace())
 
-    assert str(caught.value) == "api.adapter_token_ref: the configured secret is blank"
     assert_chain_free_of(caught.value, ["ADAPTER_TOKEN", "placeholder-diagnostic-key"])
+    assert str(caught.value) == "api.adapter_token_ref: the configured secret is blank"
 
 
 @pytest.mark.parametrize(
@@ -130,8 +130,8 @@ def test_EVERY_configured_secret_slot_refuses_a_blank(monkeypatch, variable, slo
     with pytest.raises(SecretResolutionError) as caught:
         resolve_secret(LocalSecretsProvider(), variable, slot=slot)
 
-    assert str(caught.value) == f"{slot}: the configured secret is blank"
     assert_chain_free_of(caught.value, [variable])
+    assert str(caught.value) == f"{slot}: the configured secret is blank"
 
 
 def test_a_NONBLANK_key_keeps_its_own_whitespace() -> None:
