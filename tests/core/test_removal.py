@@ -39,7 +39,7 @@ from nso_adapter.store.models import (
     RoutePolicyObjectIntent,
     VlanIntent,
 )
-from tests._secret_discipline import assert_text_omits
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import SNMP_COMMUNITY as _COMMUNITY
 from tests.conftest import SNMP_VAULT_REF as _REF
 from tests.conftest import note_projection_write, session
@@ -927,8 +927,9 @@ async def test_isis_removal_force_skips_guard(adapter_client):
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
     assert len(_commits(sender)) == 1
-    # the sent document is the surface; "lo0" is only the marker the flush must omit
-    assert_text_omits(_sent(sender), ["lo0"])
+    # The flush omits the orphan instead of re-asserting it. The sent document carries every
+    # interface name, so a regression must not print it.
+    assert_text_free_of(_sent(sender), ["lo0"])
 
 
 async def test_isis_removal_without_service_instance_proceeds(adapter_client):
