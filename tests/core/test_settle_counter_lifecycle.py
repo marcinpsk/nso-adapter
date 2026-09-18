@@ -474,3 +474,24 @@ async def test_the_sweep_survives_an_offboard_of_a_counter_missing_device(adapte
     assert await _counter(survivor) == 1, "one vanished device cost every other device its repair"
     async with session() as db:
         assert (await db.get(Job, stranded)).status is JobStatus.failed, "the reap tick was aborted"
+
+
+async def test_the_counter_sweep_reraises_an_unrelated_integrity_failure(adapter_client):
+    """Only the device foreign key can mean that a missing counter no longer needs repair."""
+    from sqlalchemy.exc import IntegrityError
+
+    from nso_adapter.store.device_settle import ensure_settle_counters
+
+    device_id = await seed_device(nso_device_name="lc-other-constraint", netbox_device_id=8643)
+    await _drop_counter(device_id)
+    async with session() as db:
+        await db.execute(
+            sa.text(
+                "ALTER TABLE device_settle_counter "
+                "ADD CONSTRAINT ck_device_settle_counter_test_nonzero CHECK (last_seq <> 0)"
+            )
+        )
+        await db.commit()
+
+    with pytest.raises(IntegrityError, match="ck_device_settle_counter_test_nonzero"):
+        await ensure_settle_counters()

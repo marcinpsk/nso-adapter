@@ -17,12 +17,14 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from nso_adapter.store.db import session
+from nso_adapter.store.db import _violated_constraint, session
 from nso_adapter.store.models import StoreMeta
 
 logger = structlog.get_logger(__name__)
 
 _cached: tuple[str, datetime] | None = None
+# PostgreSQL name for the StoreMeta primary key declared by migration b6c8d0e2f4a1.
+_STORE_META_PRIMARY_KEY = "store_meta_pkey"
 
 
 async def ensure_store_meta() -> tuple[str, datetime]:
@@ -44,8 +46,10 @@ async def ensure_store_meta() -> tuple[str, datetime]:
                 await db.commit()
                 await db.refresh(row)
                 logger.info("store_meta.minted", incarnation=row.incarnation)
-            except IntegrityError:
+            except IntegrityError as exc:
                 await db.rollback()
+                if _violated_constraint(exc) != _STORE_META_PRIMARY_KEY:
+                    raise
                 row = (await db.execute(select(StoreMeta))).scalar_one()
         _cached = (row.incarnation, row.born)
         return _cached
