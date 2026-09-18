@@ -130,8 +130,11 @@ async def test_post_map_refresh_runs_under_the_claim(adapter_client_with_nso, mo
     Against an unguarded post-map phase each of these succeeds: the Device is committed and
     visible, and nothing holds it until the run ends.
     """
+    from structlog.testing import capture_logs
+
     from nso_adapter.core.onboarding import offboard_device
     from nso_adapter.store.models import Device, MappingStatus
+    from tests._secret_discipline import assert_records_free_of
 
     monkeypatch.setattr(get_config(), "intent_claim_wait_seconds", 0.3)
     name = f"pg-{branch}"
@@ -145,25 +148,26 @@ async def test_post_map_refresh_runs_under_the_claim(adapter_client_with_nso, mo
     job_id = await _seed_provision_job()
     refresh = _BarrierRefresh()
 
-    async with session() as db:
-        task = asyncio.create_task(
-            _provision(db, name=name, netbox_device_id=netbox_device_id, reg=reg, job_id=job_id, refresh=refresh)
-        )
-        try:
-            await asyncio.wait_for(refresh.entered.wait(), timeout=20)
+    with capture_logs() as logs:
+        async with session() as db:
+            task = asyncio.create_task(
+                _provision(db, name=name, netbox_device_id=netbox_device_id, reg=reg, job_id=job_id, refresh=refresh)
+            )
+            try:
+                await asyncio.wait_for(refresh.entered.wait(), timeout=20)
 
-            assert reg.registered, "the run reached its post-map phase without a claim"
-            device_id = reg.device_id
-            # A rival claimed sync and a failover tick both lose at the database.
-            assert await acquire_claim(device_id, "job") is None
-            assert await acquire_claim(device_id, "failover") is None
-            # And a teardown waits its budget out rather than dismantling a live onboarding.
-            with pytest.raises(ClaimUnavailableError):
-                async with session() as other:
-                    await offboard_device(other, await other.get(Device, device_id))
-        finally:
-            refresh.release.set()
-        result = await asyncio.wait_for(task, timeout=20)
+                assert reg.registered, "the run reached its post-map phase without a claim"
+                device_id = reg.device_id
+                # A rival claimed sync and a failover tick both lose at the database.
+                assert await acquire_claim(device_id, "job") is None
+                assert await acquire_claim(device_id, "failover") is None
+                # And a teardown waits its budget out rather than dismantling a live onboarding.
+                with pytest.raises(ClaimUnavailableError):
+                    async with session() as other:
+                        await offboard_device(other, await other.get(Device, device_id))
+            finally:
+                refresh.release.set()
+            result = await asyncio.wait_for(task, timeout=20)
 
     assert result["ok"] is True
     assert result["device_id"] == reg.device_id
@@ -177,6 +181,22 @@ async def test_post_map_refresh_runs_under_the_claim(adapter_client_with_nso, mo
     claim = await _claim_row(reg.device_id)
     assert claim is not None and claim.claim_token == reg.token
     assert claim.job_id == job_id, "a revoked claim with no job recorded cannot re-disposition it"
+    provisioned = next(record for record in logs if record["event"] == "device.provisioned")
+    assert provisioned["device_id"] == reg.device_id
+    assert "device_ref" not in provisioned
+    assert "nso_device" not in provisioned
+    if branch == "fresh":
+        mapped = next(record for record in logs if record["event"] == "device.onboarded")
+        assert mapped["claimed"] is True
+    elif branch == "adoption":
+        mapped = next(record for record in logs if record["event"] == "device.adopted")
+        assert mapped["claimed"] is True
+    else:
+        mapped = None
+    if mapped is not None:
+        assert mapped["device_id"] == reg.device_id
+        assert "nso_device" not in mapped
+    assert_records_free_of([provisioned, *([mapped] if mapped is not None else [])], [name])
 
 
 async def test_the_sync_ok_gate_on_the_refresh_is_unchanged(adapter_client_with_nso):
@@ -466,7 +486,11 @@ async def test_a_device_that_vanishes_before_the_claim_is_retried_as_fresh(adapt
 
 async def test_a_taken_netbox_id_is_refused_and_leaks_no_claim(adapter_client_with_nso):
     """The mapping conflict is reported, not retried — and no claim survives the refusal."""
+    from structlog.testing import capture_logs
+
+    from nso_adapter.domain.diagnostics import device_ref
     from nso_adapter.store.models import DeviceClaim
+    from tests._secret_discipline import assert_records_free_of
 
     await seed_device(nso_device_name="pg-holder", netbox_device_id=7240, attributes=[])
 
@@ -475,8 +499,11 @@ async def test_a_taken_netbox_id_is_refused_and_leaks_no_claim(adapter_client_wi
     refresh = _BarrierRefresh()
     refresh.release.set()
 
-    async with session() as db:
-        result = await _provision(db, name="pg-taken", netbox_device_id=7240, reg=reg, job_id=job_id, refresh=refresh)
+    with capture_logs() as logs:
+        async with session() as db:
+            result = await _provision(
+                db, name="pg-taken", netbox_device_id=7240, reg=reg, job_id=job_id, refresh=refresh
+            )
 
     mapping = next(step for step in result["steps"] if step["step"] == "adapter_mapping")
     assert mapping == {"step": "adapter_mapping", "status": "exists", "failure": "LookupError"}
@@ -485,6 +512,11 @@ async def test_a_taken_netbox_id_is_refused_and_leaks_no_claim(adapter_client_wi
     assert await _device_by_name("pg-taken") is None
     async with session() as db:
         assert (await db.execute(sa.select(DeviceClaim))).first() is None
+    record = next(record for record in logs if record["event"] == "device.provisioned")
+    assert record["device_ref"] == device_ref(_INSTANCE, "pg-taken")
+    assert "device_id" not in record
+    assert "nso_device" not in record
+    assert_records_free_of([record], ["pg-taken"])
 
 
 async def test_a_late_taken_netbox_id_in_claim_held_adoption_is_sanitized(adapter_client_with_nso):
@@ -545,7 +577,9 @@ async def test_a_pair_mapped_elsewhere_is_reported_and_leaks_no_claim(adapter_cl
     """
     from structlog.testing import capture_logs
 
+    from nso_adapter.domain.diagnostics import device_ref
     from nso_adapter.store.models import DeviceClaim
+    from tests._secret_discipline import assert_records_free_of
 
     await seed_device(nso_device_name="pg-elsewhere", netbox_device_id=7250, attributes=[])
 
@@ -571,6 +605,11 @@ async def test_a_pair_mapped_elsewhere_is_reported_and_leaks_no_claim(adapter_cl
     assert record["linked_netbox_device_id"] == 7250
     assert record["requested_netbox_device_id"] == 7251
     assert record["reason"] == "onboarded_elsewhere"
+    provisioned = next(record for record in logs if record["event"] == "device.provisioned")
+    assert provisioned["device_ref"] == device_ref(_INSTANCE, "pg-elsewhere")
+    assert "device_id" not in provisioned
+    assert "nso_device" not in provisioned
+    assert_records_free_of([provisioned], ["pg-elsewhere"])
     assert not reg.registered
     async with session() as db:
         assert (await db.execute(sa.select(DeviceClaim))).first() is None
@@ -782,19 +821,31 @@ async def test_the_mapping_endpoint_takes_no_claim(adapter_client_with_nso):
     A preservation pin — the mapping creates the Device, enqueues nothing, runs no inline
     refresh (there is none on that path) and takes no claim.
     """
+    from structlog.testing import capture_logs
+
+    from nso_adapter.domain.diagnostics import device_ref
     from nso_adapter.store.models import DeviceClaim, Job
+    from tests._secret_discipline import assert_records_free_of
 
     reg = ClaimRegistration()
     job_id = await _seed_provision_job()
     refresh = _BarrierRefresh()
     refresh.release.set()
 
-    async with session() as db:
-        result = await _provision(db, name="pg-patha", netbox_device_id=None, reg=reg, job_id=job_id, refresh=refresh)
+    with capture_logs() as logs:
+        async with session() as db:
+            result = await _provision(
+                db, name="pg-patha", netbox_device_id=None, reg=reg, job_id=job_id, refresh=refresh
+            )
 
     assert result["ok"] is True and result["device_id"] is None
     assert not reg.registered, "a provision with no mapping must stay on the claimless lane"
     assert refresh.calls == 0
+    provisioned = next(record for record in logs if record["event"] == "device.provisioned")
+    assert provisioned["device_ref"] == device_ref(_INSTANCE, "pg-patha")
+    assert "device_id" not in provisioned
+    assert "nso_device" not in provisioned
+    assert_records_free_of([provisioned], ["pg-patha"])
 
     async with session() as db:
         device = await onboarding_mod.onboard_device(db, _INSTANCE, "pg-patha", 7230)

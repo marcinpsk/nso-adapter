@@ -43,6 +43,11 @@ def classified_outcome_errors(logger, exc, failure_detail):
     logger.warning("family.outcome.read_record_failed", detail=failure_detail(exc))
 
 
+def classified_rejection_bodies(logger, body, rejection_detail):
+    # ok: nso-outcome-raw-exception-renderer
+    logger.warning("netbox.bulk_patch.row_rejected", error=rejection_detail(body))
+
+
 def aliased_outcome_error(logger, failure_detail, http_status_of):
     try:
         work()
@@ -69,6 +74,14 @@ def aliased_outcome_error(logger, failure_detail, http_status_of):
         logger.warning("family.outcome.read_record_failed", detail=alias)
         # ok: nso-outcome-raw-exception-alias-renderer
         logger.warning("family.outcome.read_record_failed", detail=failure_detail(caught))
+
+
+def aliased_rejection_body(logger, rejection_detail):
+    try:
+        work()
+    except Exception as caught:
+        # ok: nso-outcome-raw-exception-alias-renderer
+        logger.warning("netbox.bulk_patch.row_rejected", error=rejection_detail(caught))
 
 
 def with_exit_aliased_outcome_error(logger, context):
@@ -569,6 +582,8 @@ def raw_diagnostic_identifiers(logger, device, device_name, nso_instance, stream
     logger.info("family.refresh.done", device_name=device_name)
     # ruleid: nso-diagnostic-raw-identifier
     logger.warning("family.refresh.failed", device=device_name)
+    # ruleid: nso-diagnostic-raw-identifier
+    logger.warning("family.refresh.failed", nso_device=device_name)
     # The NSO instance name is operator-authored configuration, not caller text: every
     # endpoint that takes one refuses a name absent from the configured set. Both spellings.
     # ok: nso-diagnostic-raw-identifier
@@ -678,6 +693,17 @@ def an_authored_message_names_nothing(code):
 def an_authored_family_name_is_ours(wire):
     # ok: nso-raised-message-raw-identifier
     raise NsoReadContractError(f"device-state-read section {wire!r} is not a dict")
+
+
+def query_predicate_is_not_a_device_name(logger, db, select, Device):
+    rows = db.execute(select(Device).where(Device.nso_device_name == "placeholder"))
+    for row in rows:
+        # ok: nso-diagnostic-raw-identifier-alias
+        logger.info("device.refreshed", device_id=row.id, netbox_device_id=row.netbox_device_id)
+        # ok: nso-diagnostic-raw-identifier-alias
+        logger.info("device.refreshed", instance=row.nso_instance)
+        # ruleid: nso-diagnostic-raw-identifier-alias
+        logger.info("device.refreshed", context=row.nso_device_name)
 
 
 async def legacy_query_api(session, model, select):

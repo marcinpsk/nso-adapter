@@ -398,7 +398,7 @@ async def test_intent_reconcile_handles_device_load_failure(adapter_client, monk
 
 
 @pytest.mark.anyio
-async def test_intent_reconcile_replaces_intent_and_skips_unknown_interface(adapter_client, monkeypatch):
+async def test_intent_reconcile_replaces_intent_and_skips_unknown_interface(adapter_client, monkeypatch, debug_logs):
     ids = await _seed_devices(("sw01", 8001))
     async with session() as db:
         db.add(DbInterface(device_id=ids["sw01"], name="GigabitEthernet0/1"))
@@ -428,6 +428,12 @@ async def test_intent_reconcile_replaces_intent_and_skips_unknown_interface(adap
     async with session() as db:
         rows = (await db.execute(select(InterfaceIntent))).scalars().all()
     assert [(r.attribute, r.intent_value) for r in rows] == [("description", "uplink")]
+    from tests._secret_discipline import assert_records_free_of
+
+    skipped = next(log for log in debug_logs if log["event"] == "scheduler.intent_reconcile.unknown_interface")
+    assert skipped["device_id"] == ids["sw01"]
+    assert "interface" not in skipped
+    assert_records_free_of([skipped], ["GigabitEthernet9/9"])
 
 
 @pytest.mark.anyio

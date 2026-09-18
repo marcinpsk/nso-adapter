@@ -6,6 +6,8 @@ from __future__ import annotations
 import httpx
 import structlog
 
+from nso_adapter.nso.client import failure_detail
+
 logger = structlog.get_logger(__name__)
 
 # Max rows per bulk request. A single multi-thousand-row body makes NetBox drop
@@ -17,6 +19,30 @@ _BULK_PATCH_CHUNK = 50
 # Bulk writes can be slow on a busy / DEBUG NetBox; give them headroom beyond the
 # default per-call timeout.
 _BULK_TIMEOUT = 120.0
+
+
+def rejection_detail(body: object) -> str:
+    """Classify a NetBox rejection body for a log record.
+
+    NetBox repeats the submitted value in its validation messages, and a bulk row carries
+    an interface name, so no message text may travel. Only the field NAMES stay: they are
+    our own schema, and they are what tells an operator which column to fix.
+    """
+    if isinstance(body, dict):
+        names = sorted(str(key) for key in body)
+        return f"fields: {', '.join(names)}" if names else "fields: none"
+    if isinstance(body, list):
+        return f"errors: {len(body)}"
+    return "unparsed"
+
+
+def _row_fields(position: int, payload: dict) -> dict[str, int]:
+    """Row context for a rejected bulk row: its position, plus its interface id on a PATCH."""
+    fields = {"payload_index": position}
+    interface_id = payload.get("id")
+    if isinstance(interface_id, int):
+        fields["netbox_interface_id"] = interface_id
+    return fields
 
 
 class NetboxClient:
@@ -144,7 +170,7 @@ class NetboxClient:
         resp.raise_for_status()
         return resp.json()
 
-    async def bulk_create_interfaces(self, payloads: list[dict]) -> list[dict]:
+    async def bulk_create_interfaces(self, payloads: list[dict], *, netbox_device_id: int) -> list[dict]:
         """Bulk-create interfaces, chunked into batches of ``_BULK_CREATE_CHUNK``.
 
         A single huge list body overwhelms NetBox (the server drops the
@@ -154,16 +180,36 @@ class NetboxClient:
         remainder once, so one rejected name can't strand its batch. Returns the
         concatenated list of created objects (each has ``id`` and ``name``).
         """
-        return await self._bulk_chunked("POST", payloads, chunk=_BULK_CREATE_CHUNK, label="bulk_create")
+        return await self._bulk_chunked(
+            "POST",
+            payloads,
+            netbox_device_id=netbox_device_id,
+            chunk=_BULK_CREATE_CHUNK,
+            label="bulk_create",
+        )
 
-    async def bulk_patch_interfaces(self, payloads: list[dict]) -> list[dict]:
+    async def bulk_patch_interfaces(self, payloads: list[dict], *, netbox_device_id: int) -> list[dict]:
         """Bulk-update interfaces (each item needs ``id``), chunked + serial.
 
         Same batching and all-or-nothing/row-drop semantics as bulk create.
         """
-        return await self._bulk_chunked("PATCH", payloads, chunk=_BULK_PATCH_CHUNK, label="bulk_patch")
+        return await self._bulk_chunked(
+            "PATCH",
+            payloads,
+            netbox_device_id=netbox_device_id,
+            chunk=_BULK_PATCH_CHUNK,
+            label="bulk_patch",
+        )
 
-    async def _bulk_chunked(self, method: str, payloads: list[dict], *, chunk: int, label: str) -> list[dict]:
+    async def _bulk_chunked(
+        self,
+        method: str,
+        payloads: list[dict],
+        *,
+        netbox_device_id: int,
+        chunk: int,
+        label: str,
+    ) -> list[dict]:
         """Send *payloads* in serial batches, isolating failures per batch.
 
         A batch that errors (timeout, 5xx, unexpected 400 body) is logged and
@@ -172,19 +218,27 @@ class NetboxClient:
         """
         out: list[dict] = []
         for start in range(0, len(payloads), chunk):
-            batch = payloads[start : start + chunk]
+            rows = list(enumerate(payloads[start : start + chunk], start))
             try:
-                out.extend(await self._bulk_one(method, batch, label=label))
+                out.extend(await self._bulk_one(method, rows, netbox_device_id=netbox_device_id, label=label))
             except Exception as exc:
                 logger.warning(
                     f"netbox.{label}.batch_failed",
+                    netbox_device_id=netbox_device_id,
                     batch_start=start,
-                    batch_size=len(batch),
-                    error=str(exc) or type(exc).__name__,
+                    batch_size=len(rows),
+                    error=failure_detail(exc),
                 )
         return out
 
-    async def _bulk_one(self, method: str, batch: list[dict], *, label: str) -> list[dict]:
+    async def _bulk_one(
+        self,
+        method: str,
+        rows: list[tuple[int, dict]],
+        *,
+        netbox_device_id: int,
+        label: str,
+    ) -> list[dict]:
         """Send one batch; on a 400, isolate the offending row(s) and write the rest.
 
         NetBox returns a *positional* error list for bulk writes ({} == row ok), so
@@ -197,10 +251,15 @@ class NetboxClient:
         is logged and dropped. This keeps one poison row from stranding its innocent
         batch-mates (the device-27 'stuck 23' bug).
         """
-        if not batch:
+        if not rows:
             return []
         url = f"{self._base}/api/dcim/interfaces/"
-        resp = await self._client().request(method, url, json=batch, timeout=_BULK_TIMEOUT)
+        resp = await self._client().request(
+            method,
+            url,
+            json=[payload for _, payload in rows],
+            timeout=_BULK_TIMEOUT,
+        )
         if resp.status_code != 400:
             resp.raise_for_status()
             return resp.json()
@@ -211,32 +270,36 @@ class NetboxClient:
         except Exception:
             errors = None
 
-        if isinstance(errors, list) and len(errors) == len(batch):
+        if isinstance(errors, list) and len(errors) == len(rows):
             bad = {i for i, e in enumerate(errors) if e}
             if bad:
                 for i in sorted(bad):
+                    position, payload = rows[i]
                     logger.warning(
                         f"netbox.{label}.row_rejected",
-                        name=batch[i].get("name"),
-                        id=batch[i].get("id"),
-                        error=errors[i],
+                        netbox_device_id=netbox_device_id,
+                        **_row_fields(position, payload),
+                        error=rejection_detail(errors[i]),
                     )
-                good = [p for i, p in enumerate(batch) if i not in bad]
-                return await self._bulk_one(method, good, label=label) if good else []
+                good = [row for i, row in enumerate(rows) if i not in bad]
+                return (
+                    await self._bulk_one(method, good, netbox_device_id=netbox_device_id, label=label) if good else []
+                )
             # Positional list but nothing flagged though status==400 — fall through
             # to bisection rather than re-sending the identical batch (infinite loop).
 
         # Non-positional 400 (or unflagged): can't tell which row is bad from the body.
-        if len(batch) == 1:
+        if len(rows) == 1:
+            position, payload = rows[0]
             logger.warning(
                 f"netbox.{label}.row_rejected",
-                name=batch[0].get("name"),
-                id=batch[0].get("id"),
-                error=errors if errors is not None else resp.text[:200],
+                netbox_device_id=netbox_device_id,
+                **_row_fields(position, payload),
+                error=rejection_detail(errors),
             )
             return []
         # Bisect to isolate the culprit; each half is retried independently.
-        mid = len(batch) // 2
-        left = await self._bulk_one(method, batch[:mid], label=label)
-        right = await self._bulk_one(method, batch[mid:], label=label)
+        mid = len(rows) // 2
+        left = await self._bulk_one(method, rows[:mid], netbox_device_id=netbox_device_id, label=label)
+        right = await self._bulk_one(method, rows[mid:], netbox_device_id=netbox_device_id, label=label)
         return left + right

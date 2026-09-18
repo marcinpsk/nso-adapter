@@ -13,6 +13,7 @@ import structlog
 
 from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.domain.models import Interface as DomainInterface
+from nso_adapter.nso.client import failure_detail
 
 logger = structlog.get_logger(__name__)
 
@@ -164,7 +165,12 @@ def _child_create_payloads(
         if parent_id is not None:
             payload["parent"] = parent_id
         else:
-            logger.warning("netbox.bulk_ensure.parent_unresolved", child=name, parent=parent)
+            # This position is the payload_index that the bulk client reports for this row.
+            logger.warning(
+                "netbox.bulk_ensure.parent_unresolved",
+                netbox_device_id=netbox_device_id,
+                payload_index=len(payloads),
+            )
         payloads.append(payload)
     return payloads
 
@@ -251,19 +257,19 @@ async def bulk_ensure_interfaces(
     # ── Pass 1: create missing bases ──
     base_payloads = _base_create_payloads(netbox_device_id, base_names, name_to_id, kind_by_name)
     if base_payloads:
-        for obj in await client.bulk_create_interfaces(base_payloads):
+        for obj in await client.bulk_create_interfaces(base_payloads, netbox_device_id=netbox_device_id):
             name_to_id[obj["name"]] = obj["id"]
 
     # ── Pass 2: create missing children (virtual) with resolved parent ──
     child_payloads = _child_create_payloads(netbox_device_id, children, name_to_id)
     if child_payloads:
-        for obj in await client.bulk_create_interfaces(child_payloads):
+        for obj in await client.bulk_create_interfaces(child_payloads, netbox_device_id=netbox_device_id):
             name_to_id[obj["name"]] = obj["id"]
 
     # ── Pass 3: fix pre-existing children/bases ──
     reparent = _reparent_patches(children, base_names, existing, name_to_id, kind_by_name)
     if reparent:
-        await client.bulk_patch_interfaces(reparent)
+        await client.bulk_patch_interfaces(reparent, netbox_device_id=netbox_device_id)
 
     return name_to_id
 
@@ -287,9 +293,19 @@ async def _resolve_or_create_simple(
         if parent_id is not None and not nb_iface.get("parent"):
             try:
                 await client.patch_interface(nb_id, {"parent": parent_id})
-                logger.info("netbox.interface.reparented", name=name, netbox_id=nb_id, parent=parent_id)
+                logger.info(
+                    "netbox.interface.reparented",
+                    netbox_device_id=netbox_device_id,
+                    netbox_interface_id=nb_id,
+                    netbox_parent_id=parent_id,
+                )
             except Exception as exc:
-                logger.warning("netbox.interface.reparent_failed", name=name, error=str(exc))
+                logger.warning(
+                    "netbox.interface.reparent_failed",
+                    netbox_device_id=netbox_device_id,
+                    netbox_interface_id=nb_id,
+                    error=failure_detail(exc),
+                )
         return nb_id
 
     payload: dict = {
@@ -302,10 +318,20 @@ async def _resolve_or_create_simple(
     try:
         created = await client.create_interface(payload)
         nb_id = created["id"]
-        logger.info("netbox.interface.created", name=name, netbox_id=nb_id, type=payload["type"], parent=parent_id)
+        logger.info(
+            "netbox.interface.created",
+            netbox_device_id=netbox_device_id,
+            netbox_interface_id=nb_id,
+            type=payload["type"],
+            netbox_parent_id=parent_id,
+        )
         return nb_id
     except Exception as exc:
-        logger.warning("netbox.interface.create_failed", name=name, error=str(exc))
+        logger.warning(
+            "netbox.interface.create_failed",
+            netbox_device_id=netbox_device_id,
+            error=failure_detail(exc),
+        )
         return None
 
 
@@ -329,7 +355,7 @@ async def resolve_or_create_interface(
     base_name, _unit = split
     base_id = await _resolve_or_create_simple(client, netbox_device_id, base_name)
     if base_id is None:
-        logger.warning("netbox.interface.base_unresolved", unit=iface.name, base=base_name)
+        logger.warning("netbox.interface.base_unresolved", netbox_device_id=netbox_device_id)
         # Don't drop the unit — create it parentless rather than lose it.
         return await _resolve_or_create_simple(client, netbox_device_id, iface.name, nb_type="virtual")
     return await _resolve_or_create_simple(client, netbox_device_id, iface.name, nb_type="virtual", parent_id=base_id)

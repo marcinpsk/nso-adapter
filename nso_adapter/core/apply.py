@@ -46,6 +46,7 @@ from nso_adapter.core.static_route_plan import (
     hydrate_static_route_apply_plan,
     recorded_static_route_apply_mode,
 )
+from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.apply import NsoApplyError
 from nso_adapter.nso.client import failure_detail
 from nso_adapter.store.models import (
@@ -238,8 +239,7 @@ async def _static_route_proof(client, device, plan, *, verify, evidence, consume
             if survivors:
                 logger.error(
                     "static_route.residue_found",
-                    device_id=device.id,
-                    survivors=[list(k) for k in survivors],
+                    **device_fields(device_id=device.id),
                 )
     return SrProof(verify, evidence, residue, survivors, entries)
 
@@ -731,7 +731,7 @@ async def build_device_containers(
         except NsoApplyError as exc:
             logger.error(
                 "apply.section_build_failed",
-                device=device.nso_device_name,
+                **device_fields(device_id=device.id),
                 section=section,
                 error=_apply_error_summary(exc),
             )
@@ -783,15 +783,20 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
         if body.errors:
             raise next(iter(body.errors.values()))
         delta = await apply_device_intent(
-            client, device.nso_device_name, body.containers, dry_run=fmt, no_networking=policy.no_networking
+            client,
+            device.nso_device_name,
+            body.containers,
+            device_id=device.id,
+            dry_run=fmt,
+            no_networking=policy.no_networking,
         )
     except NsoApplyError as exc:
         reason = _apply_error_summary(exc)
-        logger.warning("apply_diff.failed", device=device.nso_device_name, error=reason)
+        logger.warning("apply_diff.failed", **device_fields(device_id=device_id), error=reason)
         return {PREVIEW_KEY: f"!! preview unavailable: {reason}"}
     except Exception as exc:  # noqa: BLE001 — the preview must never fail hard
         internal = internal_error(exc)
-        logger.warning("apply_diff.failed", device=device.nso_device_name, error=internal["message"])
+        logger.warning("apply_diff.failed", **device_fields(device_id=device_id), error=internal["message"])
         reason = internal["message"]
         return {PREVIEW_KEY: f"!! preview unavailable: {reason}"}
     if delta is None:
@@ -974,9 +979,9 @@ async def _maybe_sync_from(db: AsyncSession, client, device_name: str, device_id
         return
     try:
         await client.sync_from(device_name)
-        logger.info("apply.sync_from.done", device_id=device_id)
+        logger.info("apply.sync_from.done", **device_fields(device_id=device_id))
     except Exception as exc:
-        logger.warning("apply.sync_from.failed", device_id=device_id, error=failure_detail(exc))
+        logger.warning("apply.sync_from.failed", **device_fields(device_id=device_id), error=failure_detail(exc))
 
 
 class _AttributeApply(NamedTuple):
@@ -1116,7 +1121,14 @@ def _refused_family(message: str | None, containers) -> str | None:
     return family if family in containers else None
 
 
-async def _localize_document_failure(client, device_name, containers, device_err) -> tuple[dict[str, str], tuple]:
+async def _localize_document_failure(
+    client,
+    device_name,
+    containers,
+    device_err,
+    *,
+    device_id: int,
+) -> tuple[dict[str, str], tuple]:
     """Localise a failed document commit → ({offender container: its rejection message}, rp).
 
     ``rp`` is the route-policy ``(scope, name)`` construct parse. Three signals, cheapest
@@ -1145,15 +1157,15 @@ async def _localize_document_failure(client, device_name, containers, device_err
         return {named: device_err or ""}, rp
 
     def _unattributable():
-        logger.info("apply.localize.not_reproducible", device=device_name)
+        logger.info("apply.localize.not_reproducible", **device_fields(device_id=device_id))
         return ({_RP_CONTAINER: device_err or ""} if rp[1] and _RP_CONTAINER in containers else {}), rp
 
     try:
-        await apply_device_intent(client, device_name, containers, dry_run=True, strict=True)
+        await apply_device_intent(client, device_name, containers, device_id=device_id, dry_run=True, strict=True)
     except NsoApplyError:
         pass  # the document is conclusively rejected as it stands: the loop can attribute it
     except Exception:  # noqa: BLE001 — a transport blip reproduces nothing, and must not escape
-        logger.debug("apply.localize.inconclusive", device=device_name)
+        logger.debug("apply.localize.inconclusive", **device_fields(device_id=device_id))
         return _unattributable()
     else:
         return _unattributable()
@@ -1162,11 +1174,22 @@ async def _localize_document_failure(client, device_name, containers, device_err
     for container in containers:
         trial = {name: body for name, body in containers.items() if name != container}
         try:
-            delta = await apply_device_intent(client, device_name, trial, dry_run=True, strict=True)
+            delta = await apply_device_intent(
+                client,
+                device_name,
+                trial,
+                device_id=device_id,
+                dry_run=True,
+                strict=True,
+            )
         except NsoApplyError:
             continue  # still rejected without this family — not the offender
         except Exception:  # noqa: BLE001 — transient/transport during localisation → inconclusive
-            logger.debug("apply.localize.inconclusive", device=device_name, family=container)
+            logger.debug(
+                "apply.localize.inconclusive",
+                **device_fields(device_id=device_id),
+                family=container,
+            )
             continue
         if delta is None:  # inconclusive, not a clean pass
             continue
@@ -1333,7 +1356,7 @@ async def _document_reader_compare(
             logger.warning(
                 "apply.reader_compare_error",
                 job_id=job_id,
-                device_id=device.id,
+                **device_fields(device_id=device.id),
                 scope=section,
                 error=failure_detail(exc),
             )
@@ -1344,10 +1367,15 @@ async def _document_reader_compare(
     action_error: Exception | None = None
     if wires:
         try:
-            fetched = await _live_family_sections(client, device.nso_device_name, wires, timeout=_VERIFY_BATCH_TIMEOUT)
+            fetched = await _live_family_sections(client, device_name, wires, timeout=_VERIFY_BATCH_TIMEOUT)
         except Exception as exc:  # noqa: BLE001 — a batched read failure fails no family's apply
             action_error = exc
-            logger.warning("apply.reader_compare_error", job_id=job_id, device_id=device.id, error=failure_detail(exc))
+            logger.warning(
+                "apply.reader_compare_error",
+                job_id=job_id,
+                **device_fields(device_id=device.id),
+                error=failure_detail(exc),
+            )
 
     reader_compare: dict[str, str] = {}
     reader_compare_unverifiable: dict[str, list[str]] = {}
@@ -1379,15 +1407,15 @@ async def _document_reader_compare(
                     fetched[wire],
                     s_ok,
                     job_id=job_id,
-                    device_name=device_name,
+                    device_id=device.id,
                     stamp_of=sections[section].stamp_of,
                 )
             except Exception as exc:  # noqa: BLE001 — a read-side glitch never fails a good commit
                 logger.warning(
                     "apply.reader_compare_error",
                     job_id=job_id,
-                    device_id=device.id,
-                    scope=section,
+                    **device_fields(device_id=device.id),
+                    scope=next(authored for authored in registry if authored == section),
                     error=failure_detail(exc),
                 )
                 n_ok, n_failed, fails, status, evidence = s_ok, 0, [], "error", {}
@@ -1555,7 +1583,7 @@ async def _commit_document(
     try:
         verify = await guarded_device_write(client, device, containers, allowed=allowed, current=body.snapshot)
     except RemovalBlockedError as exc:
-        logger.error("apply.blocked_collateral", job_id=job_id, device=device_name, orphans=exc.orphans)
+        logger.error("apply.blocked_collateral", job_id=job_id, **device_fields(device_id=device.id))
         commit_error = NsoApplyError(
             "removal_blocked_collateral",
             "PUT-replace would retract rows not in intent",
@@ -1568,7 +1596,12 @@ async def _commit_document(
         # The TYPE only: exception text can carry credentials (a RESTCONF error echoes the
         # request, an httpx error its headers) and this payload is persisted on every row.
         internal = internal_error(exc)
-        logger.error("apply.commit_internal_error", job_id=job_id, device=device_name, error=internal["message"])
+        logger.error(
+            "apply.commit_internal_error",
+            job_id=job_id,
+            **device_fields(device_id=device.id),
+            error=internal["message"],
+        )
         commit_error = NsoApplyError("internal", internal["message"], detail=internal["detail"])
 
     if commit_error is None:
@@ -1582,12 +1615,20 @@ async def _commit_document(
         return None, verify, {}, None, ""
 
     message = _apply_error_summary(commit_error)
-    logger.error("apply.atomic_failed", job_id=job_id, device=device_name, error=message)
+    logger.error("apply.atomic_failed", job_id=job_id, **device_fields(device_id=device.id), error=message)
     device_err = _device_error_message(commit_error)
     # A guard refusal never reached the device, so there is nothing to localise and no
     # capability verdict to draw: the whole unsent document is the failure.
     offenders, rp = (
-        ({}, (None, None)) if blocked else await _localize_document_failure(client, device_name, containers, device_err)
+        ({}, (None, None))
+        if blocked
+        else await _localize_document_failure(
+            client,
+            device_name,
+            containers,
+            device_err,
+            device_id=device.id,
+        )
     )
     # Capability (I2): record ONLY reliably-localised offenders — a family whose removal lets
     # the document compile, a refusal that names its own family, or a parse_rejected_construct
@@ -1898,7 +1939,7 @@ def _reader_compare_walk(
     ok: Any,
     *,
     job_id: Any,
-    device_name: Any,
+    device_id: int,
     stamp_of: Any = None,
 ) -> tuple[Any, Any, Any, Any, Any]:
     """Walk an ``ok`` device-state *section* for the presence of every translated key.
@@ -1960,7 +2001,13 @@ def _reader_compare_walk(
         if target is not None:
             target.last_apply_error = current_error
         fails.append({"error": msg})
-    logger.error("apply.reader_compare_missing", job_id=job_id, device=device_name, scope=scope, missing=len(missing))
+    logger.error(
+        "apply.reader_compare_missing",
+        job_id=job_id,
+        **device_fields(device_id=device_id),
+        scope=scope,
+        missing=len(missing),
+    )
     # Clamped: ``ok`` counts rows this pass STAMPED, and a successor-rewritten scope stamps
     # none while still sending — and failing — several. The failure is carried by the count
     # beside it, never by a negative in_sync.
@@ -1968,7 +2015,16 @@ def _reader_compare_walk(
 
 
 def _classify_fetched_section(
-    scope, translated, unverifiable, lists, section, ok, *, job_id, device_name, stamp_of=None
+    scope,
+    translated,
+    unverifiable,
+    lists,
+    section,
+    ok,
+    *,
+    job_id,
+    device_id: int,
+    stamp_of=None,
 ):
     """Classify a CERTIFIED device-state *section* → (ok, failed, fails, status, evidence).
 
@@ -1983,14 +2039,26 @@ def _classify_fetched_section(
     status = _verifier_section_status(section)
     if status == "error":
         logger.warning(
-            "apply.reader_compare_error", job_id=job_id, device=device_name, scope=scope, error="section status=error"
+            "apply.reader_compare_error",
+            job_id=job_id,
+            **device_fields(device_id=device_id),
+            scope=scope,
+            error="section status=error",
         )
         return ok, 0, [], "error", {}
     if status == "unknown":  # the NED does not export this family
-        logger.info("apply.reader_compare_unknown", job_id=job_id, device=device_name, scope=scope)
+        logger.info("apply.reader_compare_unknown", job_id=job_id, **device_fields(device_id=device_id), scope=scope)
         return ok, 0, [], "unknown", {}
     return _reader_compare_walk(
-        scope, translated, unverifiable, section, lists, ok, job_id=job_id, device_name=device_name, stamp_of=stamp_of
+        scope,
+        translated,
+        unverifiable,
+        section,
+        lists,
+        ok,
+        job_id=job_id,
+        device_id=device_id,
+        stamp_of=stamp_of,
     )
 
 

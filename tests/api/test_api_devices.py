@@ -3,9 +3,31 @@
 
 from __future__ import annotations
 
+from nso_adapter.domain.diagnostics import device_ref
 from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
+
+
+async def test_list_devices_exposes_correlatable_device_ref(adapter_client):
+    name = "ref-list-rtr"
+    device_id = await seed_device(nso_instance="nso-dev", nso_device_name=name, netbox_device_id=68)
+
+    resp = await adapter_client.get("/api/v1/devices", headers=AUTH)
+
+    assert resp.status_code == 200
+    device = next(item for item in resp.json() if item["id"] == device_id)
+    assert device["device_ref"] == device_ref("nso-dev", name)
+
+
+async def test_get_device_exposes_correlatable_device_ref(adapter_client):
+    name = "ref-detail-rtr"
+    device_id = await seed_device(nso_instance="nso-dev", nso_device_name=name, netbox_device_id=69)
+
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}", headers=AUTH)
+
+    assert resp.status_code == 200
+    assert resp.json()["device_ref"] == device_ref("nso-dev", name)
 
 
 async def test_get_device_includes_failover_block(adapter_client):

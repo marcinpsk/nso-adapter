@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.bindings.netbox.mapper import bulk_ensure_interfaces
+from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.store.models import (
     DbInterface,
     Device,
@@ -153,8 +154,7 @@ async def ensure_topology_interfaces(
     ensured = await bulk_ensure_interfaces(nb_client, device.netbox_device_id, sorted(names))
     logger.info(
         "topology_interfaces.ensured",
-        device_id=device.id,
-        nso_device_name=device.nso_device_name,
+        **device_fields(device_id=device.id),
         cfg_ports=len(cfg_ports),
         bound_ports=len(bound_ports),
         lag_parents=len(lag_names),
@@ -165,7 +165,6 @@ async def ensure_topology_interfaces(
     if skipped_unbound:
         logger.debug(
             "topology_interfaces.skipped_unbound",
-            device_id=device.id,
-            names=sorted(skipped_unbound),
+            **device_fields(device_id=device.id),
         )
     return ensured

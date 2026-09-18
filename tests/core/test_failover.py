@@ -12,11 +12,13 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from structlog.testing import capture_logs
 
 import nso_adapter.core.failover as failover
 from nso_adapter.config import SchedulerConfig
 from nso_adapter.core.failover import FlipBudget, _next_due, run_failover_tick, step_failback, step_failover
 from nso_adapter.store.models import ActiveAddress, Device, DeviceFailover
+from tests._secret_discipline import assert_records_free_of
 
 _BASE = datetime(2026, 6, 18, 12, 0, 0, tzinfo=UTC)
 
@@ -488,7 +490,7 @@ class _FlakyNso(FakeNso):
         raise RuntimeError("get boom")
 
 
-async def test_switch_tolerates_flaky_side_calls(monkeypatch):
+async def test_switch_tolerates_flaky_side_calls(monkeypatch, debug_logs):
     cfg = SchedulerConfig()
     _stub_probe(monkeypatch, reachable=False)
     dev, fo, client = _device(), _failover_row(), _FlakyNso()
@@ -497,6 +499,21 @@ async def test_switch_tolerates_flaky_side_calls(monkeypatch):
     # switched despite disconnect/sync-from/get-address all raising
     assert fo.active_address == ActiveAddress.oob.value
     assert client.address == "192.0.2.5"
+    events = {
+        "failover.probe",
+        "failover.disconnect_ignored",
+        "failover.switch.session_drop_failed",
+        "failover.sync_from_failed",
+        "failover.switch",
+    }
+    records = [record for record in debug_logs if record["event"] in events]
+    assert {record["event"] for record in records} == events
+    assert all(record["device_id"] == fo.device_id for record in records)
+    assert (
+        next(record for record in records if record["event"] == "failover.switch.session_drop_failed")["role"] == "oob"
+    )
+    assert next(record for record in records if record["event"] == "failover.switch")["role"] == "oob"
+    assert_records_free_of(records, [dev.nso_device_name, fo.primary_ip, fo.oob_ip])
 
 
 # ── Reachability-aware onboarding (_bootstrap_address) ───────────────────────
@@ -758,3 +775,134 @@ async def test_a_recovered_address_read_clears_the_stale_unreadable_reason(monke
 
     assert fo.manual_override is True
     assert fo.failback_blocked_reason is None
+
+
+async def test_manual_override_clear_diagnostic_uses_device_id_and_primary_role(monkeypatch):
+    cfg = SchedulerConfig()
+    _stub_probe(monkeypatch, reachable=True)
+    dev = _device()
+    fo = _failover_row(manual_override=True)
+    client = FakeNso(address=fo.primary_ip)
+
+    with capture_logs() as logs:
+        await _tick(dev, fo, client, cfg, now=_BASE, primary_due=False, oob_due=False)
+
+    record = next(record for record in logs if record["event"] == "failover.manual_override_cleared")
+    assert record["device_id"] == fo.device_id
+    assert record["role"] == "primary"
+    assert_records_free_of([record], [dev.nso_device_name, fo.primary_ip, fo.oob_ip])
+
+
+async def test_failback_diagnostics_use_device_id_and_primary_role(monkeypatch, debug_logs):
+    cfg = SchedulerConfig()
+    _stub_probe(monkeypatch, reachable=True)
+    dev = _device()
+    fo = _failover_row(
+        active=ActiveAddress.oob.value,
+        consecutive_successes=cfg.failover_success_threshold - 1,
+    )
+    client = FakeNso(address=fo.oob_ip)
+
+    await _tick(dev, fo, client, cfg, now=_BASE)
+
+    events = {"failover.flip_probe", "failover.failback"}
+    records = [record for record in debug_logs if record["event"] in events]
+    assert {record["event"] for record in records} == events
+    assert all(record["device_id"] == fo.device_id for record in records)
+    assert next(record for record in records if record["event"] == "failover.failback")["role"] == "primary"
+    assert_records_free_of(records, [dev.nso_device_name, fo.primary_ip, fo.oob_ip])
+
+
+async def test_unreadable_failback_diagnostic_uses_device_id(monkeypatch):
+    cfg = SchedulerConfig()
+    _stub_probe(monkeypatch, reachable=True)
+    dev = _device()
+    fo = _failover_row(active=ActiveAddress.oob.value)
+    client = _UnreadableAddressNso(address=fo.oob_ip)
+
+    with capture_logs() as logs:
+        await _tick(dev, fo, client, cfg, now=_BASE)
+
+    record = next(record for record in logs if record["event"] == "failover.failback_blocked")
+    assert record["device_id"] == fo.device_id
+    assert_records_free_of([record], [dev.nso_device_name, fo.primary_ip, fo.oob_ip])
+
+
+@pytest.mark.parametrize(
+    ("active", "primary_due", "oob_due", "event"),
+    [
+        (ActiveAddress.oob.value, False, True, "failover.probe"),
+        (ActiveAddress.primary.value, False, True, "failover.flip_probe"),
+    ],
+)
+async def test_oob_probe_diagnostic_uses_device_id(monkeypatch, debug_logs, active, primary_due, oob_due, event):
+    cfg = SchedulerConfig()
+    _stub_probe(monkeypatch, reachable=True)
+    dev = _device()
+    fo = _failover_row(active=active)
+    client = FakeNso(address=fo.oob_ip if active == ActiveAddress.oob.value else fo.primary_ip)
+
+    await _tick(dev, fo, client, cfg, now=_BASE, primary_due=primary_due, oob_due=oob_due)
+
+    record = next(record for record in debug_logs if record["event"] == event and record["target"] == "oob")
+    assert record["device_id"] == fo.device_id
+    assert_records_free_of([record], [dev.nso_device_name, fo.primary_ip, fo.oob_ip])
+
+
+class _SecondAddressWriteFailsNso(FakeNso):
+    async def set_address(self, name: str, address: str, port: int | None = None) -> None:
+        self.calls.append(("set_address", address))
+        if len(_set_address_calls(self)) == 2:
+            # A real NSO failure quotes what it was asked to write, so the assertion below
+            # only means something when the injected exception carries it too.
+            raise RuntimeError(f"address restore failed for {name} at {address}")
+        self.address = address
+
+
+@pytest.mark.parametrize(
+    ("active", "primary_due", "oob_due", "expected_role"),
+    [
+        (ActiveAddress.primary.value, False, True, "primary"),
+        (ActiveAddress.oob.value, True, False, "oob"),
+    ],
+)
+async def test_revert_failure_diagnostic_uses_the_caller_role(
+    monkeypatch,
+    active,
+    primary_due,
+    oob_due,
+    expected_role,
+):
+    cfg = SchedulerConfig()
+    _stub_probe(monkeypatch, reachable=False)
+    dev = _device()
+    fo = _failover_row(active=active)
+    client = _SecondAddressWriteFailsNso(address=fo.oob_ip if active == ActiveAddress.oob.value else fo.primary_ip)
+
+    with capture_logs() as logs:
+        await _tick(dev, fo, client, cfg, now=_BASE, primary_due=primary_due, oob_due=oob_due)
+
+    record = next(record for record in logs if record["event"] == "failover.revert_failed")
+    assert record["device_id"] == fo.device_id
+    assert record["role"] == expected_role
+    assert_records_free_of([record], [dev.nso_device_name, fo.primary_ip, fo.oob_ip])
+
+
+async def test_revert_failure_diagnostic_omits_an_unknown_role():
+    class AddressWriteFails:
+        async def set_address(self, name, address):
+            raise RuntimeError(f"address restore failed for {name} at {address}")
+
+    with capture_logs() as logs:
+        await failover._revert_address(
+            AddressWriteFails(),
+            "placeholder-device",
+            "198.18.0.10",
+            device_id=17,
+            role=None,
+        )
+
+    record = next(record for record in logs if record["event"] == "failover.revert_failed")
+    assert record["device_id"] == 17
+    assert "role" not in record
+    assert_records_free_of([record], ["placeholder-device", "198.18.0.10"])

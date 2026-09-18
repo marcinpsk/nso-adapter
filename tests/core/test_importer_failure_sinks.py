@@ -40,11 +40,16 @@ _COVERAGE_DOC = Path(__file__).resolve().parents[2] / ".opengrep" / "README.md"
 _RULES = Path(__file__).resolve().parents[2] / ".opengrep" / "nso-rules.yaml"
 _IMPORTER = Path(__file__).resolve().parents[2] / "nso_adapter" / "core" / "importer.py"
 _NSO_CLIENT = Path(__file__).resolve().parents[2] / "nso_adapter" / "nso" / "client.py"
+_NETBOX_CLIENT = Path(__file__).resolve().parents[2] / "nso_adapter" / "bindings" / "netbox" / "client.py"
 _GUARDED_LOG_SINKS = (
     Path(__file__).resolve().parents[2] / "nso_adapter" / "main.py",
     *(
         Path(__file__).resolve().parents[2] / "nso_adapter" / "core" / name
-        for name in ("generation.py", "refresh_engine.py", "redistribution.py", "removal.py")
+        for name in ("failover.py", "generation.py", "refresh_engine.py", "redistribution.py", "removal.py")
+    ),
+    *(
+        Path(__file__).resolve().parents[2] / "nso_adapter" / "bindings" / "netbox" / name
+        for name in ("client.py", "mapper.py", "writer.py")
     ),
     *(
         Path(__file__).resolve().parents[2] / "nso_adapter" / "notifications" / name
@@ -53,16 +58,13 @@ _GUARDED_LOG_SINKS = (
 )
 
 
+#: One-argument callables whose result is an approved closed classification for a log field.
+#: Every name here has its definition pinned below, so widening this set is a reviewed act.
+_APPROVED_CLASSIFIERS = frozenset({"failure_detail", "http_status_of", "rejection_detail"})
+
+
 def _is_closed_exception_classification(value: ast.expr) -> bool:
     """Return whether the expression keeps only an approved closed classification."""
-    if (
-        isinstance(value, ast.Call)
-        and isinstance(value.func, ast.Name)
-        and value.func.id == "failure_detail"
-        and len(value.args) == 1
-        and not value.keywords
-    ):
-        return True
     if (
         isinstance(value, ast.Attribute)
         and value.attr == "__name__"
@@ -76,7 +78,7 @@ def _is_closed_exception_classification(value: ast.expr) -> bool:
     return (
         isinstance(value, ast.Call)
         and isinstance(value.func, ast.Name)
-        and value.func.id == "http_status_of"
+        and value.func.id in _APPROVED_CLASSIFIERS
         and len(value.args) == 1
         and not value.keywords
     )
@@ -1241,6 +1243,14 @@ def test_review_guards_cover_each_authored_error_boundary() -> None:
     assert alias_paths == outcome_paths
     assert "nso_adapter/core/generation.py" in outcome_paths
     assert "nso_adapter/core/removal.py" in outcome_paths
+    # The C1c round widened the allowlist to the sinks that log a raised NSO/NetBox call:
+    # each takes the device or interface identity as an argument, so the error repeats it.
+    assert {
+        "nso_adapter/core/failover.py",
+        "nso_adapter/bindings/netbox/client.py",
+        "nso_adapter/bindings/netbox/writer.py",
+    } <= outcome_paths
+    assert {path.name for path in _GUARDED_LOG_SINKS} <= {path.rsplit("/", maxsplit=1)[-1] for path in outcome_paths}
     identifier_paths = set(rules["nso-diagnostic-raw-identifier"]["paths"]["include"])
     assert {
         "nso_adapter/core/importer.py",
@@ -1308,27 +1318,27 @@ def test_the_identifier_guard_leaves_the_operator_authored_instance_name_alone()
     sources = _rule_patterns(rules["nso-diagnostic-raw-identifier-alias"]["pattern-sources"])
     instance_sources = {pattern for pattern in sources if pattern.rsplit(".", maxsplit=1)[-1] == "nso_instance"}
 
-    assert fields == {"device_name", "device", "stream", "stream_url", "url"}
+    assert fields == {"device_name", "device", "nso_device", "stream", "stream_url", "url"}
     assert instance_sources == set(), "the alias rule must not carry an instance source either"
 
 
-def _binds_formatter_name(node: ast.AST) -> bool:
+def _binds_formatter_name(node: ast.AST, name: str = "failure_detail") -> bool:
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return node.name == "failure_detail"
+        return node.name == name
     if isinstance(node, ast.Name):
-        return node.id == "failure_detail" and isinstance(node.ctx, (ast.Store, ast.Del))
+        return node.id == name and isinstance(node.ctx, (ast.Store, ast.Del))
     if isinstance(node, ast.alias):
         imported_name = node.asname or node.name.split(".", maxsplit=1)[0]
-        return imported_name == "failure_detail" or node.name == "*"
+        return imported_name == name or node.name == "*"
     return False
 
 
-def _failure_detail_definition_ast(source: str) -> str:
+def _formatter_definition_ast(source: str, name: str = "failure_detail") -> str:
     """Return the one effective formatter definition with its docstring normalized."""
     tree = ast.parse(source)
-    bindings = [node for node in ast.walk(tree) if _binds_formatter_name(node)]
+    bindings = [node for node in ast.walk(tree) if _binds_formatter_name(node, name)]
     if len(bindings) != 1 or bindings[0] not in tree.body or not isinstance(bindings[0], ast.FunctionDef):
-        raise ValueError("failure_detail must have one direct module function binding")
+        raise ValueError(f"{name} must have one direct module function binding")
     formatter = copy.deepcopy(bindings[0])
     if formatter.body and isinstance(formatter.body[0], ast.Expr) and isinstance(formatter.body[0].value, ast.Constant):
         formatter.body[0].value.value = "<docstring>"
@@ -1346,14 +1356,55 @@ def failure_detail(exc: BaseException) -> str:
             return f"NsoActionFailedError({kind.value!r})"
     return type(exc).__name__
 '''
-_APPROVED_FAILURE_DETAIL_AST = _failure_detail_definition_ast(_APPROVED_FAILURE_DETAIL)
+_APPROVED_FAILURE_DETAIL_AST = _formatter_definition_ast(_APPROVED_FAILURE_DETAIL)
+
+
+_APPROVED_REJECTION_DETAIL = '''\
+def rejection_detail(body: object) -> str:
+    """Approved formatter contract."""
+    if isinstance(body, dict):
+        names = sorted(str(key) for key in body)
+        return f"fields: {', '.join(names)}" if names else "fields: none"
+    if isinstance(body, list):
+        return f"errors: {len(body)}"
+    return "unparsed"
+'''
+_APPROVED_REJECTION_DETAIL_AST = _formatter_definition_ast(_APPROVED_REJECTION_DETAIL, "rejection_detail")
 
 
 def test_failure_detail_reads_only_closed_exception_properties() -> None:
     """Any executable change to the ratified formatter shape requires an explicit review."""
-    actual = _failure_detail_definition_ast(_NSO_CLIENT.read_text(encoding="utf-8"))
+    actual = _formatter_definition_ast(_NSO_CLIENT.read_text(encoding="utf-8"))
 
     assert actual == _APPROVED_FAILURE_DETAIL_AST
+
+
+def test_rejection_detail_keeps_only_the_field_names_of_a_rejection_body() -> None:
+    """The NetBox rejection classifier is pinned: its messages carry the submitted values."""
+    actual = _formatter_definition_ast(_NETBOX_CLIENT.read_text(encoding="utf-8"), "rejection_detail")
+
+    assert actual == _APPROVED_REJECTION_DETAIL_AST
+
+
+@pytest.mark.parametrize(
+    "unsafe_body",
+    [
+        "    return str(body)\n",
+        '    return f"{body}"\n',
+        '    if isinstance(body, dict):\n        return ", ".join(f"{k}={v}" for k, v in body.items())\n    return "unparsed"\n',
+    ],
+)
+def test_rejection_detail_guard_rejects_unratified_shapes(unsafe_body: str) -> None:
+    candidate = f"def rejection_detail(body):\n{unsafe_body}"
+
+    assert _formatter_definition_ast(candidate, "rejection_detail") != _APPROVED_REJECTION_DETAIL_AST
+
+
+def test_rejection_detail_guard_rejects_an_alternate_binding() -> None:
+    rebind = "\nrejection_detail = lambda body: str(body)\n"
+
+    with pytest.raises(ValueError, match="one direct module function binding"):
+        _formatter_definition_ast(_APPROVED_REJECTION_DETAIL + rebind, "rejection_detail")
 
 
 @pytest.mark.parametrize(
@@ -1378,7 +1429,7 @@ def test_failure_detail_reads_only_closed_exception_properties() -> None:
 def test_failure_detail_guard_rejects_unratified_shapes(unsafe_body: str) -> None:
     candidate = f"def failure_detail(exc):\n{unsafe_body}"
 
-    assert _failure_detail_definition_ast(candidate) != _APPROVED_FAILURE_DETAIL_AST
+    assert _formatter_definition_ast(candidate) != _APPROVED_FAILURE_DETAIL_AST
 
 
 @pytest.mark.parametrize(
@@ -1390,7 +1441,7 @@ def test_failure_detail_guard_rejects_unratified_shapes(unsafe_body: str) -> Non
 )
 def test_failure_detail_guard_rejects_an_alternate_binding(rebind: str) -> None:
     with pytest.raises(ValueError, match="one direct module function binding"):
-        _failure_detail_definition_ast(_APPROVED_FAILURE_DETAIL + rebind)
+        _formatter_definition_ast(_APPROVED_FAILURE_DETAIL + rebind)
 
 
 @pytest.mark.parametrize(
@@ -1402,13 +1453,13 @@ def test_failure_detail_guard_rejects_an_alternate_binding(rebind: str) -> None:
 )
 def test_failure_detail_guard_rejects_a_conditional_binding(rebind: str) -> None:
     with pytest.raises(ValueError, match="one direct module function binding"):
-        _failure_detail_definition_ast(_APPROVED_FAILURE_DETAIL + rebind)
+        _formatter_definition_ast(_APPROVED_FAILURE_DETAIL + rebind)
 
 
 def test_failure_detail_guard_rejects_a_decorator() -> None:
     decorated = _APPROVED_FAILURE_DETAIL.replace("def failure_detail", "@unsafe\ndef failure_detail", 1)
 
-    assert _failure_detail_definition_ast(decorated) != _APPROVED_FAILURE_DETAIL_AST
+    assert _formatter_definition_ast(decorated) != _APPROVED_FAILURE_DETAIL_AST
 
 
 @asynccontextmanager
