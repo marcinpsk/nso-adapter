@@ -28,6 +28,7 @@ _MISSING_OPENGREP = "opengrep-that-this-test-never-installs"
 _REMOTE_ZIZMOR_HOOK = "https://github.com/zizmorcore/zizmor-pre-commit"
 _ZIZMOR_UV_PREFIX = ["uv", "run", "--locked", "--native-tls", "--", "zizmor"]
 _ZIZMOR_COLLECTIONS = {"workflows", "actions", "dependabot"}
+_INTERPRETER_NAMES = {"bash", "env", "python", "python3", "sh", "zsh"}
 
 
 def _pinned_partial_paths() -> set[str]:
@@ -132,6 +133,41 @@ def test_review_pattern_hook_resolves_its_interpreter_through_the_restricted_pat
     assert os.path.dirname(_SCAN_ARGV[0]) == "", "the interpreter must resolve through the supplied PATH"
 
 
+def test_subprocess_argv_literals_resolve_interpreters_through_path() -> None:
+    violations = []
+    for source_path in sorted((ROOT / "tests").rglob("*.py")):
+        tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+        for call in ast.walk(tree):
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "subprocess"
+                and call.func.attr in {"Popen", "check_output", "run"}
+            ):
+                continue
+            argv = (
+                call.args[0]
+                if call.args
+                else next(
+                    (keyword.value for keyword in call.keywords if keyword.arg == "args"),
+                    None,
+                )
+            )
+            if not isinstance(argv, (ast.List, ast.Tuple)) or not argv.elts:
+                continue
+            interpreter = argv.elts[0]
+            if (
+                isinstance(interpreter, ast.Constant)
+                and isinstance(interpreter.value, str)
+                and interpreter.value.startswith("/")
+                and Path(interpreter.value).name in _INTERPRETER_NAMES
+            ):
+                violations.append(f"{source_path.relative_to(ROOT)}:{call.lineno}")
+
+    assert not violations, "absolute interpreter argv literals:\n" + "\n".join(violations)
+
+
 def test_review_pattern_hook_explains_its_opengrep_prerequisite() -> None:
     result = subprocess.run(
         _SCAN_ARGV,
@@ -187,7 +223,7 @@ def test_review_pattern_scan_rejects_partial_parse_drift(
     stub, _invocations = _write_opengrep_stub(tmp_path, partial_paths)
 
     result = subprocess.run(
-        ["/usr/bin/bash", str(REVIEW_PATTERNS), "scan"],
+        _SCAN_ARGV,
         check=False,
         capture_output=True,
         text=True,
@@ -206,7 +242,7 @@ def test_review_pattern_scan_accepts_the_pinned_partial_paths(tmp_path: Path) ->
     stub, _invocations = _write_opengrep_stub(tmp_path, _EXPECTED_PARTIAL_PATHS)
 
     result = subprocess.run(
-        ["/usr/bin/bash", str(REVIEW_PATTERNS), "scan"],
+        _SCAN_ARGV,
         check=False,
         capture_output=True,
         text=True,
@@ -235,7 +271,7 @@ def test_review_pattern_targeted_scan_checks_only_pins_in_scope(
     stub, invocations = _write_opengrep_stub(tmp_path, partial_paths)
 
     result = subprocess.run(
-        ["/usr/bin/bash", str(REVIEW_PATTERNS), "scan", target],
+        _SCAN_ARGV + [target],
         check=False,
         capture_output=True,
         text=True,
@@ -254,7 +290,7 @@ def test_review_pattern_targeted_scan_rejects_a_new_partial_parse(tmp_path: Path
     stub, _invocations = _write_opengrep_stub(tmp_path, {target})
 
     result = subprocess.run(
-        ["/usr/bin/bash", str(REVIEW_PATTERNS), "scan", target],
+        _SCAN_ARGV + [target],
         check=False,
         capture_output=True,
         text=True,
@@ -287,7 +323,7 @@ def test_review_pattern_scan_renders_findings_from_one_json_scan(tmp_path: Path)
     )
 
     result = subprocess.run(
-        ["/usr/bin/bash", str(REVIEW_PATTERNS), "scan"],
+        _SCAN_ARGV,
         check=False,
         capture_output=True,
         text=True,
@@ -316,7 +352,7 @@ def test_the_scan_fails_when_opengrep_drops_a_malformed_rule(tmp_path: Path):
     )
 
     result = subprocess.run(
-        ["/usr/bin/bash", str(REVIEW_PATTERNS), "scan"],
+        _SCAN_ARGV,
         check=False,
         capture_output=True,
         text=True,
