@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ast
+from functools import cache
 from pathlib import Path
 
 import pytest
@@ -19,45 +20,49 @@ from tests._secret_discipline import assert_chain_free_of, exception_chain
 
 _SECRET = "placeholder-vault-secret"
 _TEST_ROOT = Path(__file__).resolve().parent
-_NON_DISCLOSURE_TESTS = (
-    _TEST_ROOT / "api" / "test_actions_direct.py",
-    _TEST_ROOT / "api" / "test_api.py",
-    _TEST_ROOT / "api" / "test_api_capability.py",
-    _TEST_ROOT / "api" / "test_api_lag_config.py",
-    _TEST_ROOT / "api" / "test_api_onboarding.py",
-    _TEST_ROOT / "api" / "test_api_provision_async.py",
-    _TEST_ROOT / "api" / "test_api_secrets.py",
-    _TEST_ROOT / "api" / "test_api_snmp_intent.py",
-    _TEST_ROOT / "api" / "test_api_vlan.py",
-    _TEST_ROOT / "core" / "test_action_apply_promotion.py",
-    _TEST_ROOT / "core" / "test_apply_error_secrets.py",
-    _TEST_ROOT / "core" / "test_capability.py",
-    _TEST_ROOT / "core" / "test_envelope_classification.py",
-    _TEST_ROOT / "core" / "test_onboarding.py",
-    _TEST_ROOT / "core" / "test_redistribution.py",
-    _TEST_ROOT / "core" / "test_refresh_engine_envelope.py",
-    _TEST_ROOT / "core" / "test_vlan.py",
-    _TEST_ROOT / "nso" / "test_apply_send.py",
-    _TEST_ROOT / "nso" / "test_device_state_client.py",
-    _TEST_ROOT / "nso" / "test_nso_client_methods.py",
-    _TEST_ROOT / "nso" / "test_persistent_subscriber.py",
-    _TEST_ROOT / "nso" / "test_sse_subscriber.py",
-    _TEST_ROOT / "secrets" / "test_local.py",
-    _TEST_ROOT / "secrets" / "test_refs.py",
-    _TEST_ROOT / "test_main_lifespan.py",
-    _TEST_ROOT / "test_secret_discipline.py",
-    _TEST_ROOT / "test_vault_provider.py",
-)
-_INSPECTED_ATTRIBUTES = {"json", "read_failures", "text", "value"}
-_INSPECTED_CALLS = {"repr", "str"}
-_NON_DISCLOSURE_HELPERS = {"assert_chain_free_of", "assert_records_free_of", "assert_text_free_of"}
 #: How this repository writes protected material into a test (see the placeholder convention). A
 #: body that names one is handling something protected, whether or not it calls a helper.
 _PROTECTED_LITERAL_PREFIX = "placeholder-"
+_NON_DISCLOSURE_HELPERS = {"assert_chain_free_of", "assert_records_free_of", "assert_text_free_of"}
+
+
+def _handles_protected_material(tree: ast.AST) -> bool:
+    """True when a module holds something protected, by either way this repository says so."""
+    return any(
+        (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _NON_DISCLOSURE_HELPERS)
+        or (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value.startswith(_PROTECTED_LITERAL_PREFIX)
+        )
+        for node in ast.walk(tree)
+    )
+
+
+@cache
+def _guarded_modules() -> tuple[Path, ...]:
+    """The modules both rules below read, DERIVED from what each one handles.
+
+    A hand-kept list omits a module the moment it starts handling protected material, and both
+    rules then skip it in silence: that is how ``core/test_capability.py`` reached review with
+    neither rule covering it. Deriving the membership removes the omission rather than the
+    symptom. A blanket sweep of every test module is a different rule with a different cost,
+    so the derivation stays on what a module actually holds.
+    """
+    return tuple(
+        path
+        for path in sorted(_TEST_ROOT.rglob("test_*.py"))
+        if _handles_protected_material(ast.parse(path.read_text(encoding="utf-8")))
+    )
+
+
+_INSPECTED_ATTRIBUTES = {"json", "read_failures", "text", "value"}
+_INSPECTED_CALLS = {"repr", "str"}
 
 
 def test_main_lifespan_is_in_the_non_disclosure_registry() -> None:
-    assert _TEST_ROOT / "test_main_lifespan.py" in _NON_DISCLOSURE_TESTS
+    """It calls the helpers, so the derivation has to pick it up without anyone listing it."""
+    assert _TEST_ROOT / "test_main_lifespan.py" in _guarded_modules()
 
 
 class _InspectedSurfaceReader(ast.NodeVisitor):
@@ -589,9 +594,26 @@ def _assertion_comparisons(test: ast.expr) -> list[ast.Compare]:
     return comparisons
 
 
+def test_the_guarded_membership_is_derived_from_what_a_module_handles() -> None:
+    """A module that starts holding protected material joins both rules with no edit here."""
+    helper_call = "def t():\n    assert_text_free_of(resp.text, [protected])\n"
+    placeholder_literal = 'def t():\n    secret = "placeholder-token"\n'
+    neither = "def t():\n    assert resp.status_code == 200\n"
+
+    assert _handles_protected_material(ast.parse(helper_call))
+    assert _handles_protected_material(ast.parse(placeholder_literal))
+    assert not _handles_protected_material(ast.parse(neither))
+
+    every_module = set(_TEST_ROOT.rglob("test_*.py"))
+    guarded = set(_guarded_modules())
+    assert Path(__file__).resolve() in guarded, "this module holds material and must guard itself"
+    assert guarded < every_module, "a derivation of what is held, not a blanket sweep"
+    assert len(guarded) > 40, "the derivation must reach the modules that hold material"
+
+
 def test_non_disclosure_checks_do_not_use_rewritten_assertions() -> None:
     violations = []
-    for path in _NON_DISCLOSURE_TESTS:
+    for path in _guarded_modules():
         violations.extend(
             f"{path.relative_to(_TEST_ROOT.parent)}:{line}"
             for line in _non_disclosure_assertion_lines(path.read_text(encoding="utf-8"))
@@ -827,7 +849,7 @@ def _ordering_violations_in(scope: ast.AST) -> list[tuple[int, str]]:
 def test_non_disclosure_checks_run_before_the_diagnostics() -> None:
     """pytest prints a failing assertion's operands, so the helper has to clear the value first."""
     violations = []
-    for path in _NON_DISCLOSURE_TESTS:
+    for path in _guarded_modules():
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for scope in ast.walk(tree):
             if not isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef):
