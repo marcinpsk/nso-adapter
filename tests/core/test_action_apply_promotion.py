@@ -859,14 +859,14 @@ async def test_interface_config_generation_refuses_unresolvable_attribute_eligib
     assert await _jobs(device_id) == []
     assert (await _stream(device_id, "interface_config")).authorized_revision == 0
     warning = next(log for log in logs if log["event"] == "generation.interface_eligibility_unresolved")
+    non_device_fields = {key: value for key, value in warning.items() if key != "device_id"}
+    assert_text_free_of(non_device_fields, [str(iface_id), "description"])
     assert warning["device_id"] == device_id
     assert warning["error"] == "InterfaceEligibilityUnresolved"
     assert "detail" not in warning
     assert "exc_info" not in warning
     identifier_fields = {"interface_id", "interface_name", "netbox_interface_id", "nso_if_key"}
     assert identifier_fields.isdisjoint(warning)
-    non_device_fields = {key: value for key, value in warning.items() if key != "device_id"}
-    assert_text_free_of(non_device_fields, [str(iface_id), "description"])
 
 
 async def test_unrelated_promotion_preserves_recorded_interface_eligibility(adapter_client):
