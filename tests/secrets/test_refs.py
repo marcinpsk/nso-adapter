@@ -75,6 +75,11 @@ def test_rejected_reference_is_not_repeated_in_the_exception():
 def test_require_secret_fingerprint_owns_its_pattern_and_diagnostic():
     from nso_adapter.secrets.refs import require_secret_fingerprint
 
+    rejected = "not-a-fingerprint"
+
     assert require_secret_fingerprint("0123456789abcdef") == "0123456789abcdef"
-    with pytest.raises(ValueError, match="^secret fingerprint must be 16 lowercase hexadecimal characters$"):
-        require_secret_fingerprint("not-a-fingerprint")
+    with pytest.raises(ValueError) as caught:
+        require_secret_fingerprint(rejected)
+
+    assert_text_free_of(caught.value, [rejected])
+    assert str(caught.value) == "secret fingerprint must be 16 lowercase hexadecimal characters"
