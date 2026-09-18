@@ -30,6 +30,17 @@ ABSORBED_SPAN_LOCK_TIMEOUT_MS = 3_000
 ABSORBED_SPAN_STATEMENT_TIMEOUT_MS = 4_000
 
 
+def _violated_constraint(exc: BaseException) -> str | None:
+    """Return the constraint an integrity error names, or None when the driver reports none."""
+    current: BaseException | None = exc
+    while current is not None:
+        name = getattr(current, "constraint_name", None)
+        if isinstance(name, str) and name:
+            return name
+        current = current.__cause__
+    return None
+
+
 async def execute_dml(db: AsyncSession, statement: UpdateBase) -> CursorResult[Any]:
     """Execute one DML statement and return its row-count-bearing result."""
     return cast(CursorResult[Any], await db.execute(statement))

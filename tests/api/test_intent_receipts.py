@@ -274,8 +274,12 @@ async def test_o2b_9_an_unknown_section_is_refused_rather_than_served_empty(adap
     Answering an unknown name with an empty page would let that mismatch read as "this key
     has no receipt", which the restore resolves by replaying normally — the wrong branch.
     """
-    resp = await adapter_client.get(f"{URL}?section=interface", headers=AUTH)
+    from tests._secret_discipline import assert_text_free_of
 
+    submitted = "placeholder-unknown-intent-section"
+    resp = await adapter_client.get(f"{URL}?section={submitted}", headers=AUTH)
+
+    assert_text_free_of(resp.text, [submitted])
     assert resp.status_code == 422
     assert resp.json()["error"]["detail"]["reason"] == "unknown_section"
     assert "interface_config" in resp.json()["error"]["detail"]["sections"]

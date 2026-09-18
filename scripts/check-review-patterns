@@ -20,14 +20,104 @@ case "$mode" in
       set -- nso_adapter
     fi
     require_opengrep
-    exec "$scan_bin" scan --config .opengrep/nso-rules.yaml --error -- "$@"
+    scan_output="$(mktemp)"
+    trap 'rm -f "$scan_output"' EXIT
+    if "$scan_bin" scan --config .opengrep/nso-rules.yaml --error --quiet --json -- "$@" >"$scan_output"; then
+      scan_status=0
+    else
+      scan_status=$?
+    fi
+    if python3 - "$scan_output" "$@" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+# PEP 695 syntax OpenGrep cannot parse (kb #1718). Which of these it actually reports depends
+# on the RULESET, not only on the tree: adding nso-vault-payload-unvalidated made it parse
+# timestamps.py, where `def latest_refreshed[RowT: RefreshStamped]` has always been unparsable.
+expected_partial_paths = {
+    "nso_adapter/api/timestamps.py",
+    "nso_adapter/core/failover.py",
+    "nso_adapter/core/refresh_engine.py",
+}
+
+report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+repo_root = Path.cwd().resolve()
+scan_targets = [Path(target).resolve() for target in sys.argv[2:]]
+for finding in report.get("results", []):
+    print(
+        f"{finding['path']}:{finding['start']['line']}  "
+        f"{finding['check_id']}  {finding['extra']['message']}"
+    )
+
+def _is_partial_parsing(error):
+    kind = error.get("type")
+    return bool(kind) and (kind == "PartialParsing" or kind[0] == "PartialParsing")
+
+
+# A malformed rule is reported here and NOWHERE else: OpenGrep drops the rule, scans with the
+# rest and still exits 0, so the gate goes green with the guard silently disabled.
+rule_errors = [error for error in report.get("errors", []) if not _is_partial_parsing(error)]
+if rule_errors:
+    print("OpenGrep reported errors that are not partial parsing:", file=sys.stderr)
+    for error in rule_errors:
+        print(f"  {error.get('type')}: {error.get('message', '')}".rstrip(), file=sys.stderr)
+    sys.exit(1)
+
+partial_paths = {error["path"] for error in report.get("errors", []) if _is_partial_parsing(error)}
+new_partial_paths = partial_paths - expected_partial_paths
+scoped_partial_paths = {
+    path
+    for path in expected_partial_paths
+    if any((repo_root / path).resolve().is_relative_to(target) for target in scan_targets)
+}
+resolved_partial_paths = scoped_partial_paths - partial_paths
+if new_partial_paths or resolved_partial_paths:
+    print("OpenGrep partial parsing changed. Inspect kb #1718 and update the pin by hand.", file=sys.stderr)
+    if new_partial_paths:
+        print("New partially analysed files:", file=sys.stderr)
+        for path in sorted(new_partial_paths):
+            print(f"  {path}", file=sys.stderr)
+    if resolved_partial_paths:
+        print("Expected partially analysed files no longer reported:", file=sys.stderr)
+        for path in sorted(resolved_partial_paths):
+            print(f"  {path}", file=sys.stderr)
+    raise SystemExit(1)
+
+if scoped_partial_paths == expected_partial_paths:
+    print(f"OpenGrep partial-parse pin matches exactly ({len(partial_paths)} files).")
+else:
+    partial_count = len(partial_paths)
+    noun = "file" if partial_count == 1 else "files"
+    print(f"OpenGrep partial-parse pin matches scan scope ({partial_count} {noun}).")
+PY
+    then
+      report_status=0
+    else
+      report_status=$?
+    fi
+    if (( scan_status )); then
+      exit "$scan_status"
+    fi
+    exit "$report_status"
     ;;
   test)
     if (( $# )); then echo "test does not accept arguments" >&2; exit 2; fi
     require_opengrep
     staging_dir="$(mktemp -d)"
     trap 'rm -rf "$staging_dir"' EXIT
-    cp .opengrep/nso-rules.yaml "$staging_dir/review-patterns.yaml"
+    python3 - .opengrep/nso-rules.yaml "$staging_dir/review-patterns.yaml" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+import yaml
+
+source = Path(sys.argv[1])
+target = Path(sys.argv[2])
+rules = json.loads(json.dumps(yaml.safe_load(source.read_text(encoding="utf-8"))))
+target.write_text(yaml.safe_dump(rules, sort_keys=False), encoding="utf-8")
+PY
     cp .opengrep/tests/review-patterns.py "$staging_dir/review-patterns.py"
     "$scan_bin" test "$staging_dir"
     ;;

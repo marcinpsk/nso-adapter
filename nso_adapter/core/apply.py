@@ -667,7 +667,7 @@ async def _static_route_snapshot(client, device, document: dict, plan) -> tuple[
     if certified.inconclusive:
         raise NsoApplyError(
             SNAPSHOT_INCONCLUSIVE,
-            f"static_route: could not certify the live service instance on {device.nso_device_name!r}; "
+            "static_route: could not certify the live service instance; "
             "refusing to build a device-intent PUT from an uncertified read",
             detail={"device": device.nso_device_name},
         )
@@ -1556,7 +1556,11 @@ async def _commit_document(
         verify = await guarded_device_write(client, device, containers, allowed=allowed, current=body.snapshot)
     except RemovalBlockedError as exc:
         logger.error("apply.blocked_collateral", job_id=job_id, device=device_name, orphans=exc.orphans)
-        commit_error = NsoApplyError("removal_blocked_collateral", str(exc), detail={"orphans": exc.orphans})
+        commit_error = NsoApplyError(
+            "removal_blocked_collateral",
+            "PUT-replace would retract rows not in intent",
+            detail={"orphans": exc.orphans},
+        )
         blocked = True
     except NsoApplyError as exc:
         commit_error = exc

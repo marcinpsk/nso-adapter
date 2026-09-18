@@ -194,7 +194,7 @@ async def report_read_capability(body: ReadCapabilityReport, db: AsyncSession = 
     if not devices:
         raise api_error(404, "not_found", "Device not found")
     if len(devices) > 1:
-        raise api_error(409, "ambiguous_device", "Several devices match; pass nso_instance")
+        raise api_error(409, "ambiguous_device", "Device name is ambiguous; pass nso_instance")
     device = devices[0]
     ned_id = capability._clean_capability_key(device.ned_id)
     sw_version = capability._clean_capability_key(device.sw_version)

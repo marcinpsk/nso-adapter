@@ -40,6 +40,32 @@ _RICH_A = wire(A, metric=10, tag=101)
 _RICH_A["interface-next-hop"] = "GigabitEthernet0/3"
 
 
+async def test_inconclusive_snapshot_error_does_not_echo_the_device(monkeypatch):
+    from types import SimpleNamespace
+
+    from nso_adapter.core import apply as apply_module
+    from nso_adapter.core import static_route_reader
+    from nso_adapter.core.static_route_reader import CertifiedSection
+    from nso_adapter.nso.apply import NsoApplyError
+    from tests._secret_discipline import assert_chain_free_of
+
+    device_name = "placeholder-snapshot-device"
+
+    async def inconclusive(client, device):
+        return CertifiedSection("inconclusive", None)
+
+    monkeypatch.setattr(static_route_reader, "certified_static_route_section", inconclusive)
+    with pytest.raises(NsoApplyError) as caught:
+        await apply_module._static_route_snapshot(
+            None,
+            SimpleNamespace(nso_device_name=device_name),
+            {},
+            SimpleNamespace(tombstones=[], rows=[]),
+        )
+
+    assert_chain_free_of(caught.value, [device_name])
+
+
 async def _carrier_for(device_id: int, triple, **kwargs) -> int:
     """A live carrier claiming *triple*, with the fragment its deletion push authorized."""
     return await seed_tomb(device_id, triple, **kwargs)

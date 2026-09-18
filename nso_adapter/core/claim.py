@@ -53,7 +53,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.store.db import execute_dml
+from nso_adapter.store.db import _violated_constraint, execute_dml
 from nso_adapter.store.device_settle import MissingSettleCounter, allocate_settle_seq
 from nso_adapter.store.models import DeviceClaim, GenerationStatus, Job, JobStatus, JobType
 
@@ -65,6 +65,8 @@ PURPOSES = frozenset({"job", "intent_put", "teardown", "sweep", "failover"})
 # PostgreSQL's lock_not_available. Read from the SQLSTATE rather than matched in the
 # message, which is locale- and version-dependent.
 _LOCK_NOT_AVAILABLE = "55P03"
+# Job.__table_args__ declares this partial unique index.
+_QUEUED_JOB_CONSTRAINT = "uq_job_queued_per_device_type"
 
 # ── timing (the derivation the claim cutoff depends on) ──────────────────────
 #
@@ -326,7 +328,7 @@ async def acquire_claim(
             # race). "Cannot claim" is the honest answer; raising would abort a whole
             # sweep — at startup, the whole lifespan. Scoped to THIS constraint so a
             # bad job_id still surfaces.
-            if getattr(getattr(exc.orig, "__cause__", None), "constraint_name", None) == "device_claim_device_id_fkey":
+            if _violated_constraint(exc) == "device_claim_device_id_fkey":
                 logger.info("claim.device_vanished", device_id=device_id, purpose=purpose)
                 return None
             raise
@@ -868,7 +870,9 @@ async def terminalize_running(
                     run_attempt=expected_attempt,
                     values=values,
                 )
-        except IntegrityError:
+        except IntegrityError as exc:
+            if _violated_constraint(exc) != _QUEUED_JOB_CONSTRAINT:
+                raise
             # A successor was admitted between the lookup and the UPDATE. The savepoint
             # absorbed it; re-read and re-issue as the coalesced failure.
             successor_id = await _queued_successor_id(db, *coalescible) if coalescible else None

@@ -507,6 +507,26 @@ async def test_provision_admission_retries_when_the_winner_finishes(adapter_clie
     assert created is True and second.id != first.id
 
 
+async def test_provision_admission_exhaustion_does_not_repeat_the_device_name(adapter_client, monkeypatch):
+    from nso_adapter.core import jobs as jobs_mod
+    from tests._secret_discipline import assert_chain_free_of
+
+    device_name = "placeholder-provision-admission-device"
+    params = {**_PROVISION, "device_name": device_name, "address": "198.18.0.1"}
+    async with session() as db:
+        await jobs_mod.enqueue_provision_job(params, db)
+
+    async def _hide_active_job(instance, name, db):
+        return None
+
+    monkeypatch.setattr(jobs_mod, "get_active_provision_job", _hide_active_job)
+    async with session() as db:
+        with pytest.raises(RuntimeError) as caught:
+            await jobs_mod.enqueue_provision_job(params, db)
+
+    assert_chain_free_of(caught.value, [device_name])
+
+
 async def test_a_failing_insert_does_not_poison_the_caller(adapter_client):
     """What the SAVEPOINT is actually for.
 

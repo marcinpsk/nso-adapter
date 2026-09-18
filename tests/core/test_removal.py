@@ -39,6 +39,7 @@ from nso_adapter.store.models import (
     RoutePolicyObjectIntent,
     VlanIntent,
 )
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import SNMP_COMMUNITY as _COMMUNITY
 from tests.conftest import SNMP_VAULT_REF as _REF
 from tests.conftest import note_projection_write, session
@@ -651,15 +652,20 @@ async def test_run_removal_dispatches_and_marks_succeeded(adapter_client):
 
 
 async def test_run_removal_records_failure(adapter_client):
-    """A handler error is recorded on the real job, not raised."""
+    """A handler error is classified in the log and recorded on the real job."""
+    from structlog.testing import capture_logs
+
     from nso_adapter.core.removal import run_removal
+    from tests._secret_discipline import assert_records_free_of, assert_text_free_of
 
     device_id = await _seed_device(nso_device_name="sw3")
     job_id = await _seed_removal_job(device_id, "vlan")
+    route_key = "198.18.9.0/24"
 
     with (
+        capture_logs() as logs,
         patch("nso_adapter.core.importer.get_nso_client", return_value=_CLIENT),
-        patch("nso_adapter.core.removal._dispatch_scope", new=AsyncMock(side_effect=RuntimeError("boom"))),
+        patch("nso_adapter.core.removal._dispatch_scope", new=AsyncMock(side_effect=RuntimeError(route_key))),
     ):
         await run_removal(job_id=job_id, device_id=device_id)
 
@@ -667,6 +673,10 @@ async def test_run_removal_records_failure(adapter_client):
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.error["code"] == "removal_failed"
+        assert_text_free_of(job.error, [route_key])
+    failures = [entry for entry in logs if entry["event"] == "removal.failed"]
+    assert failures and failures[0]["error"] == "RuntimeError"
+    assert_records_free_of(failures, [route_key])
 
 
 @pytest.mark.parametrize("scope", ["vlan", "static_route"])
@@ -703,9 +713,9 @@ async def test_run_removal_refuses_a_job_that_carries_no_generation(adapter_clie
         assert job.status == JobStatus.failed
         assert job.error["code"] == "removal_failed"
         assert job.error["detail"]["scope"] == scope
-    # The wire message is redacted; the cause is named in the structured log.
+    # The wire message and log detail are both classified.
     failures = [entry for entry in logs if entry["event"] == "removal.failed"]
-    assert failures and "carries no generation to deploy" in failures[0]["error"], failures
+    assert failures and failures[0]["error"] == "RuntimeError"
 
 
 async def test_run_removal_refuses_a_static_route_force_job_that_carries_no_generation(adapter_client):
@@ -742,7 +752,7 @@ async def test_run_removal_refuses_a_static_route_force_job_that_carries_no_gene
         assert job.error["code"] == "removal_failed"
         assert job.error["detail"]["scope"] == "static_route"
     failures = [entry for entry in logs if entry["event"] == "removal.failed"]
-    assert failures and "carries no generation to deploy" in failures[0]["error"], failures
+    assert failures and failures[0]["error"] == "RuntimeError"
     sender.assert_not_awaited()
 
 
@@ -917,7 +927,9 @@ async def test_isis_removal_force_skips_guard(adapter_client):
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
     assert len(_commits(sender)) == 1
-    assert "lo0" not in str(_sent(sender)), "the flush omits the orphan instead of re-asserting it"
+    # The flush omits the orphan instead of re-asserting it. The sent document carries every
+    # interface name, so a regression must not print it.
+    assert_text_free_of(_sent(sender), ["lo0"])
 
 
 async def test_isis_removal_without_service_instance_proceeds(adapter_client):

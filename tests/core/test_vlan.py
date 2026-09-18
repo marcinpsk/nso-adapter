@@ -109,7 +109,7 @@ async def test_a_malformed_item_is_named_by_its_FIELD_and_never_repeated_verbati
     carries that content into every surface that records the refusal. The field name and
     the received type say what is wrong and carry no payload.
     """
-    from tests._secret_discipline import assert_chain_free_of
+    from tests._secret_discipline import assert_chain_free_of, assert_text_free_of
 
     device_id = await seed_device(nso_device_name="vsw-sink", netbox_device_id=1309)
     async with _device_session(device_id) as (db, device):
@@ -123,10 +123,11 @@ async def test_a_malformed_item_is_named_by_its_FIELD_and_never_repeated_verbati
             await refresh_vlan_database_for_device(db, device, nso)
 
     message = str(caught.value)
-    for repeated in ("placeholder-server-text", "NO-ID"):
-        assert repeated not in message, "the refusal repeats the wire item verbatim"
-    assert "vlan-id" in message, "the diagnostic must still name the field"
-    assert "NoneType" in message, "the diagnostic must still name the received type"
+    assert_text_free_of(message, ["placeholder-server-text", "NO-ID"])
+    if "vlan-id" not in message:
+        raise AssertionError("the refusal does not name the vlan-id field")
+    if "NoneType" not in message:
+        raise AssertionError("the refusal does not name the received type")
     assert_chain_free_of(caught.value, ["placeholder-server-text"])
 
 
@@ -164,7 +165,7 @@ async def test_a_malformed_UNTAGGED_VLAN_is_named_by_its_field_and_never_repeate
     ``sync.surface_refresh_failed`` records the exception repr, so whatever the NED emitted in
     ``untagged-vlan`` reached the operator log through it.
     """
-    from tests._secret_discipline import assert_chain_free_of, assert_records_free_of
+    from tests._secret_discipline import assert_chain_free_of, assert_records_free_of, assert_text_free_of
 
     device_id = await seed_device(nso_device_name="vsw-untagged-sink", netbox_device_id=1311)
     raised, logs = await _switchport_surface_failure(
@@ -173,9 +174,11 @@ async def test_a_malformed_UNTAGGED_VLAN_is_named_by_its_field_and_never_repeate
     )
 
     message = str(raised)
-    assert _UNTAGGED_TEXT not in message, "the refusal repeats the device's own leaf"
-    assert "untagged-vlan" in message, "the diagnostic must still name the field"
-    assert "type str" in message, "the diagnostic must still name the received type"
+    assert_text_free_of(message, [_UNTAGGED_TEXT])
+    if "untagged-vlan" not in message:
+        raise AssertionError("the refusal does not name the untagged-vlan field")
+    if "type str" not in message:
+        raise AssertionError("the refusal does not name the received type")
     assert_chain_free_of(raised, [_UNTAGGED_TEXT])
     reported = [record for record in logs if record["event"] == "sync.surface_refresh_failed"]
     assert reported, "the failed surface was not reported at all"
@@ -185,7 +188,7 @@ async def test_a_malformed_UNTAGGED_VLAN_is_named_by_its_field_and_never_repeate
 @pytest.mark.anyio
 async def test_a_malformed_TAGGED_VLAN_entry_is_named_by_its_field_and_never_repeated(adapter_client):
     """Reject a non-wire tagged shape without repeating its device-served entries."""
-    from tests._secret_discipline import assert_chain_free_of, assert_records_free_of
+    from tests._secret_discipline import assert_chain_free_of, assert_records_free_of, assert_text_free_of
 
     device_id = await seed_device(nso_device_name="vsw-tagged-sink", netbox_device_id=1312)
     raised, logs = await _switchport_surface_failure(
@@ -194,9 +197,11 @@ async def test_a_malformed_TAGGED_VLAN_entry_is_named_by_its_field_and_never_rep
     )
 
     message = str(raised)
-    assert _TAGGED_TEXT not in message, "the refusal repeats the device's own leaf"
-    assert "tagged-vlans" in message, "the diagnostic must still name the field"
-    assert "type list" in message, "the diagnostic must still name the received type"
+    assert_text_free_of(message, [_TAGGED_TEXT])
+    if "tagged-vlans" not in message:
+        raise AssertionError("the refusal does not name the tagged-vlans field")
+    if "type list" not in message:
+        raise AssertionError("the refusal does not name the received type")
     assert_chain_free_of(raised, [_TAGGED_TEXT])
     reported = [record for record in logs if record["event"] == "sync.surface_refresh_failed"]
     assert reported, "the failed surface was not reported at all"

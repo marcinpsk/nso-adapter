@@ -211,7 +211,7 @@ async def native_dry_run(
         if strict and 400 <= resp.status_code < 500:
             raise NsoApplyError(
                 "dry_run_rejected",
-                f"dry-run for {device_name!r} rejected with status {resp.status_code}",
+                "NSO rejected the dry-run request",
                 detail={"nso_error": err},
             )
         return None
@@ -268,7 +268,7 @@ async def _verify_native_or_raise(
         logger.error("nso.apply.verify_mismatch", scope=scope, device=device_name, delta=delta)
         raise NsoApplyError(
             "verify_mismatch",
-            f"{scope}: applied intent did not land on {device_name!r} — NSO would still push changes to the device",
+            f"{scope}: applied intent did not land; NSO would still push changes to the device",
             detail={"device_delta": delta},
         )
     logger.info("nso.apply.verify_ok", scope=scope, device=device_name)
@@ -505,22 +505,22 @@ def build_interface_ip_body(
     ipv4_entries = []
     ipv6_entries = []
     for row in ip_intent_rows:
-        # Validate ip/prefix up front: a malformed address would otherwise raise a bare
-        # ValueError that, on the atomic path, aborts the WHOLE combined commit with an
-        # opaque error. Surface a descriptive NsoApplyError naming the interface instead.
+        # Validate ip/prefix before the atomic path can fail with an opaque ValueError.
         if "/" not in (row.address or ""):
             raise NsoApplyError(
                 "invalid_ip_address",
-                f"{interface_name}: IP intent address {row.address!r} is not in ip/prefix-length form",
+                "IP intent address is not in ip/prefix-length form",
             )
         addr, plen_str = row.address.rsplit("/", 1)
         try:
             prefix_len = int(plen_str)
-        except ValueError as exc:
+        except ValueError:
+            prefix_len = None
+        if prefix_len is None:
             raise NsoApplyError(
                 "invalid_ip_address",
-                f"{interface_name}: IP intent address {row.address!r} has a non-numeric prefix length",
-            ) from exc
+                "IP intent address has a non-numeric prefix length",
+            )
         if row.family == "ipv4":
             # A None `secondary` must serialize as JSON false, never null (a boolean YANG
             # leaf rejects null and would 400 the whole interface's IP apply).
@@ -532,7 +532,7 @@ def build_interface_ip_body(
             # stamped in_sync while never emitted. Fail loud so the bad row is fixed.
             raise NsoApplyError(
                 "unsupported_ip_family",
-                f"{interface_name}: unsupported IP family {row.family!r} for {row.address}",
+                "IP intent address has an unsupported family",
             )
 
     if ipv4_entries:
@@ -552,18 +552,18 @@ _SNMP_VERSION = {"1": "v1", "v1": "v1", "2": "v2c", "2c": "v2c", "v2c": "v2c", "
 _SNMP_NOTIFY = {"trap": "traps", "traps": "traps", "inform": "informs", "informs": "informs"}
 
 
-def _snmp_enum(value, mapping: dict[str, str], field: str, owner: str) -> str:
+def _snmp_enum(value, mapping: dict[str, str], field: str) -> str:
     """Normalize an SNMP intent enum to its YANG spelling; raise on unknown values."""
     normalized = mapping.get(str(value).strip().lower())
     if normalized is None:
         raise NsoApplyError(
             "invalid_snmp_intent",
-            f"SNMP intent {owner!r}: unsupported {field} value {value!r}",
+            f"SNMP intent has an unsupported {field} value",
         )
     return normalized
 
 
-def _snmp_vault_triple(vault_ref: str, prefix: str, owner: str) -> dict[str, str]:
+def _snmp_vault_triple(vault_ref: str, prefix: str) -> dict[str, str]:
     """Split a fully-qualified ``mount/path#key`` ref into the YANG triple leaves.
 
     The triples are mandatory for communities, so a ref that cannot be split must
@@ -578,7 +578,7 @@ def _snmp_vault_triple(vault_ref: str, prefix: str, owner: str) -> dict[str, str
     if ref is None:
         raise NsoApplyError(
             "invalid_vault_ref",
-            f"SNMP intent {owner!r}: vault_ref must be a valid mount/path#key reference",
+            "SNMP intent vault_ref must be a valid mount/path#key reference",
         )
     return {
         f"{prefix}vault-mount": ref.mount,
@@ -862,8 +862,9 @@ def _parse_asn(asn) -> int:
             hi, lo = s.split(".", 1)
             return int(hi) * 65536 + int(lo)
         return int(s)
-    except ValueError as exc:
-        raise NsoApplyError("invalid_asn", f"BGP ASN {asn!r} is not a valid AS number") from exc
+    except ValueError:
+        pass
+    raise NsoApplyError("invalid_asn", "BGP ASN is not a valid AS number")
 
 
 def _bgp_redistribute_entry(row) -> dict:
@@ -1083,9 +1084,9 @@ def encode_snmp(rows: SectionRows, execution: SectionExecution) -> dict:
         entry["community"] = [
             {
                 "name": c.label,
-                "access": _snmp_enum(c.access, _SNMP_ACCESS, "access", c.label),
+                "access": _snmp_enum(c.access, _SNMP_ACCESS, "access"),
                 **({"acl": c.acl} if c.acl else {}),
-                **_snmp_vault_triple(c.vault_ref, "", f"community {c.label}"),
+                **_snmp_vault_triple(c.vault_ref, ""),
             }
             for c in community_intents
         ]
@@ -1097,8 +1098,8 @@ def encode_snmp(rows: SectionRows, execution: SectionExecution) -> dict:
                 **({"group": u.group_name} if u.group_name else {}),
                 **({"auth-protocol": u.auth_protocol} if u.auth_protocol else {}),
                 **({"priv-protocol": u.priv_protocol} if u.priv_protocol else {}),
-                **(_snmp_vault_triple(u.auth_vault_ref, "auth-", f"v3-user {u.username}") if u.auth_vault_ref else {}),
-                **(_snmp_vault_triple(u.priv_vault_ref, "priv-", f"v3-user {u.username}") if u.priv_vault_ref else {}),
+                **(_snmp_vault_triple(u.auth_vault_ref, "auth-") if u.auth_vault_ref else {}),
+                **(_snmp_vault_triple(u.priv_vault_ref, "priv-") if u.priv_vault_ref else {}),
             }
             for u in v3_user_intents
         ]
@@ -1107,8 +1108,8 @@ def encode_snmp(rows: SectionRows, execution: SectionExecution) -> dict:
         entry["host"] = [
             {
                 "address": h.address,
-                "version": _snmp_enum(h.version, _SNMP_VERSION, "version", h.address),
-                "notify-type": _snmp_enum(h.notify_type, _SNMP_NOTIFY, "notify_type", h.address),
+                "version": _snmp_enum(h.version, _SNMP_VERSION, "version"),
+                "notify-type": _snmp_enum(h.notify_type, _SNMP_NOTIFY, "notify_type"),
                 # optional leaf: a binding-less host (ArcOS targets bind via
                 # target-parameters, not the target) must omit it, not send null
                 **({"community-or-user": h.community_or_user} if h.community_or_user else {}),
@@ -1316,12 +1317,12 @@ def encode_bgp(rows: SectionRows, execution: SectionExecution) -> dict:
     return {"router": routers}
 
 
-def _community_member(entry: object, name: str) -> str:
+def _community_member(entry: object) -> str:
     """Validate one stored community member for both encoding and reporting."""
     if not isinstance(entry, dict) or not isinstance(entry.get("community"), str):
         raise NsoApplyError(
             "invalid_route_policy_intent",
-            f"Community list {name!r} has an entry without a string community key",
+            "Community list has an entry without a string community key",
         )
     return entry["community"]
 
@@ -1337,7 +1338,7 @@ def unrenderable_route_policy_members(rows: SectionRows, dialect: CommunityDiale
         if row.family != "community_list":
             continue
         for entry in row.entries:
-            member = _community_member(entry, row.name)
+            member = _community_member(entry)
             if dialect.from_canonical(member) is UNREPRESENTABLE:
                 skipped.append((row.name, member))
     return skipped
@@ -1362,7 +1363,7 @@ def encode_route_policy(rows: SectionRows, execution: SectionExecution) -> dict:
     def _community_list_entry(obj: dict) -> dict:
         kept: list = []
         for entry in obj["entries"]:
-            member = _community_member(entry, obj["name"])
+            member = _community_member(entry)
             wire = execution.dialect.from_canonical(member)
             if wire is UNREPRESENTABLE:
                 continue
@@ -1489,9 +1490,11 @@ def encode_interface_config(rows: SectionRows, execution: SectionExecution) -> d
             # The managed scope is data, so the store CAN hold an attribute this writer has
             # no leaf for. Refusing is the only honest answer: emitting the entry without it
             # would stamp the row in_sync for a leaf that never reached the device (#26).
+            # The attribute is caller-controlled (PUT /scope and PUT /intent both store the
+            # submitted name), so it travels in `detail`, never in the message str()/repr() render.
             raise NsoApplyError(
                 "unsupported_attribute",
-                f"interface_config: attribute {row.attribute!r} on {iface.name!r} has no wire leaf",
+                "interface_config: an attribute in the managed scope has no wire leaf",
                 detail={"interface": iface.name, "attribute": row.attribute},
             )
         entry = _entry(iface.name)

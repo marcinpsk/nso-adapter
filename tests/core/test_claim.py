@@ -266,6 +266,30 @@ async def test_acquire_claim_skips_a_device_deleted_between_discovery_and_now(ad
     assert await acquire_claim(986000, "sweep") is None
 
 
+async def test_constraint_helper_matches_the_claim_fk_exception_shape(adapter_client):
+    """The shared walk and claim's fixed lookup must identify the same real FK failure."""
+    from sqlalchemy.exc import IntegrityError
+
+    from nso_adapter.store.db import _violated_constraint
+    from nso_adapter.store.models import DeviceClaim
+
+    async with session() as db:
+        db.add(
+            DeviceClaim(
+                device_id=9_860_001,
+                claim_token="constraint-shape",
+                purpose="sweep",
+                job_id=None,
+            )
+        )
+        with pytest.raises(IntegrityError) as caught:
+            await db.flush()
+
+    original = getattr(getattr(caught.value.orig, "__cause__", None), "constraint_name", None)
+    assert original == "device_claim_device_id_fkey"
+    assert _violated_constraint(caught.value) == original
+
+
 async def test_lock_claim_passes_for_the_holder(adapter_client):
     device_id = await seed_device(nso_device_name="cl-lock-ok", netbox_device_id=9905)
     reg = await acquire_claim(device_id, "job")

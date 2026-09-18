@@ -64,14 +64,18 @@ async def test_put_route_policy_intent_requires_objects_list(adapter_client):
 
 @pytest.mark.anyio
 async def test_put_route_policy_intent_rejects_unknown_family(adapter_client):
+    from tests._secret_discipline import assert_text_free_of
+
+    submitted = "placeholder-unknown-policy-family"
     device_id = await seed_device(nso_device_name="rp-badfam", netbox_device_id=7951)
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
         headers=AUTH | push_seq(),
-        json={"objects": [_obj("bogus_family", "X")]},
+        json={"objects": [_obj(submitted, "X")]},
     )
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "invalid_family"
+    assert_text_free_of(resp.text, [submitted])
 
 
 @pytest.mark.anyio
@@ -88,14 +92,18 @@ async def test_put_route_policy_intent_rejects_empty_name(adapter_client):
 
 @pytest.mark.anyio
 async def test_put_route_policy_intent_rejects_non_list_entries(adapter_client):
+    from tests._secret_discipline import assert_text_free_of
+
+    submitted = "placeholder-policy-object-name"
     device_id = await seed_device(nso_device_name="rp-badentries", netbox_device_id=7953)
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
         headers=AUTH | push_seq(),
-        json={"objects": [{"family": "prefix_list", "name": "PL", "entries": "nope"}]},
+        json={"objects": [{"family": "prefix_list", "name": submitted, "entries": "nope"}]},
     )
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "invalid_entries"
+    assert_text_free_of(resp.text, [submitted])
 
 
 # ── behavior matrix: validation PRECEDENCE ──────────────────────────────────────

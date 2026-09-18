@@ -9,7 +9,7 @@ This scanner is deliberately aggressive. It flags case-insensitive admin literal
 in credential assignments, dictionary values, defaults, and keyword arguments.
 Positional string arguments and their tuple/list members are potential credentials,
 including client constructors, auth tuples, and environment setters. It does not
-resolve callable signatures or follow values through variables.
+resolve callable signatures. It follows constant strings within one lexical scope.
 
 There are two carve-outs:
 
@@ -29,7 +29,17 @@ import re
 import sys
 import tokenize
 from dataclasses import dataclass
+from itertools import product
 from pathlib import Path
+
+from tests._ast_scanner_support import (
+    argument_names,
+    match_capture_names,
+    pattern_is_irrefutable,
+    scope_bound_names,
+    statement_may_raise,
+    walrus_target_names,
+)
 
 TESTS_ROOT = Path(__file__).resolve().parent
 _OBSOLETE_BASELINE_PATH = TESTS_ROOT / "credential_discipline_baseline.txt"
@@ -77,24 +87,26 @@ def _name(node: ast.AST) -> str:
     return ""
 
 
-def _constant_string(node: ast.AST) -> str | None:
-    """Return the value of a statically constant string expression."""
+def _constant_strings(node: ast.AST, aliases: dict[str, set[str]] | None = None) -> set[str] | None:
+    """Return every possible value of a statically constant string expression."""
+    if isinstance(node, ast.Name) and aliases is not None:
+        return aliases.get(node.id)
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
+        return {node.value}
     if isinstance(node, ast.FormattedValue):
         if node.conversion in (-1, ord("s")) and node.format_spec is None:
-            return _constant_string(node.value)
+            return _constant_strings(node.value, aliases)
         return None
     if isinstance(node, ast.JoinedStr):
-        parts = [_constant_string(value) for value in node.values]
+        parts = [_constant_strings(value, aliases) for value in node.values]
         if all(part is not None for part in parts):
-            return "".join(part for part in parts if part is not None)
+            return {"".join(values) for values in product(*(part for part in parts if part is not None))}
         return None
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left = _constant_string(node.left)
-        right = _constant_string(node.right)
+        left = _constant_strings(node.left, aliases)
+        right = _constant_strings(node.right, aliases)
         if left is not None and right is not None:
-            return left + right
+            return {first + second for first in left for second in right}
     if (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -102,9 +114,9 @@ def _constant_string(node: ast.AST) -> str | None:
         and not node.args
         and not node.keywords
     ):
-        value = _constant_string(node.func.value)
+        value = _constant_strings(node.func.value, aliases)
         if value is not None:
-            return value.lower()
+            return {item.lower() for item in value}
     if (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -113,10 +125,11 @@ def _constant_string(node: ast.AST) -> str | None:
         and len(node.args) == 1
         and isinstance(node.args[0], (ast.List, ast.Tuple))
     ):
-        separator = _constant_string(node.func.value)
-        parts = [_constant_string(item) for item in node.args[0].elts]
+        separator = _constant_strings(node.func.value, aliases)
+        parts = [_constant_strings(item, aliases) for item in node.args[0].elts]
         if separator is not None and all(part is not None for part in parts):
-            return separator.join(part for part in parts if part is not None)
+            choices = list(product(*(part for part in parts if part is not None)))
+            return {joiner.join(values) for joiner in separator for values in choices}
     return None
 
 
@@ -128,7 +141,13 @@ class _Scanner(ast.NodeVisitor):
         self._lines = src.splitlines()
         self._comments = _comment_lines(src)
         self._scope: list[str] = []
+        self._constant_scopes: list[dict[str, set[str]]] = [{}]
         self._hits: dict[tuple[int, int], Violation] = {}
+        self._try_handler_inputs: list[dict[str, set[str]]] = []
+        self._loop_break_states: list[list[dict[str, set[str]]]] = []
+        self._loop_continue_states: list[list[dict[str, set[str]]]] = []
+        self._class_enclosing_constants: list[dict[str, set[str]]] = []
+        self._try_exception_inputs: list[dict[str, set[str]]] = []
 
     @property
     def hits(self) -> list[Violation]:
@@ -143,22 +162,103 @@ class _Scanner(ast.NodeVisitor):
             if value is not None and _credential_name(arg.arg):
                 self._check_value(value, value)
 
+    def _visit_enclosing_expressions(self, expressions) -> None:
+        for expression in expressions:
+            if expression is None:
+                continue
+            self.visit(expression)
+            self._record_handler_input()
+
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self._scope.append(node.name)
         self._check_defaults(node.args)
-        self.generic_visit(node)
+        self._visit_enclosing_expressions(
+            (
+                *node.decorator_list,
+                *node.args.defaults,
+                *node.args.kw_defaults,
+                *(argument.annotation for argument in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)),
+                node.args.vararg.annotation if node.args.vararg is not None else None,
+                node.args.kwarg.annotation if node.args.kwarg is not None else None,
+                node.returns,
+                *getattr(node, "type_params", ()),
+            )
+        )
+        outer_constants = self._constant_scopes[-1]
+        outer_handler_inputs = self._try_handler_inputs
+        outer_exception_inputs = self._try_exception_inputs
+        outer_class_enclosing_constants = self._class_enclosing_constants
+        enclosing_constants = (
+            self._class_enclosing_constants[-1] if self._class_enclosing_constants else outer_constants
+        )
+        local_names = scope_bound_names(list(node.body)) | argument_names(node.args)
+        inherited = {name: values.copy() for name, values in enclosing_constants.items() if name not in local_names}
+        self._scope.append(node.name)
+        self._constant_scopes.append(inherited)
+        self._try_handler_inputs = []
+        self._try_exception_inputs = []
+        self._class_enclosing_constants = []
+        self._visit_statements(node.body)
+        self._class_enclosing_constants = outer_class_enclosing_constants
+        self._try_exception_inputs = outer_exception_inputs
+        self._try_handler_inputs = outer_handler_inputs
+        self._constant_scopes.pop()
         self._scope.pop()
+        outer_constants.pop(node.name, None)
 
     visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
         self._check_defaults(node.args)
-        self.generic_visit(node)
+        self._visit_enclosing_expressions((*node.args.defaults, *node.args.kw_defaults))
+        outer_constants = self._constant_scopes[-1]
+        outer_handler_inputs = self._try_handler_inputs
+        outer_exception_inputs = self._try_exception_inputs
+        outer_class_enclosing_constants = self._class_enclosing_constants
+        enclosing_constants = (
+            self._class_enclosing_constants[-1] if self._class_enclosing_constants else outer_constants
+        )
+        local_names = scope_bound_names([node.body]) | argument_names(node.args)
+        inherited = {name: values.copy() for name, values in enclosing_constants.items() if name not in local_names}
+        self._constant_scopes.append(inherited)
+        self._try_handler_inputs = []
+        self._try_exception_inputs = []
+        self._class_enclosing_constants = []
+        self.visit(node.body)
+        self._class_enclosing_constants = outer_class_enclosing_constants
+        self._try_exception_inputs = outer_exception_inputs
+        self._try_handler_inputs = outer_handler_inputs
+        self._constant_scopes.pop()
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._visit_enclosing_expressions(
+            (
+                *node.decorator_list,
+                *node.bases,
+                *(keyword.value for keyword in node.keywords),
+                *getattr(node, "type_params", ()),
+            )
+        )
+        outer_constants = self._constant_scopes[-1]
+        outer_handler_inputs = self._try_handler_inputs
+        outer_exception_inputs = self._try_exception_inputs
+        class_enclosing_constants = (
+            self._class_enclosing_constants[-1] if self._class_enclosing_constants else outer_constants
+        )
+        inherited = {name: values.copy() for name, values in class_enclosing_constants.items()}
         self._scope.append(node.name)
-        self.generic_visit(node)
+        self._constant_scopes.append(inherited)
+        self._try_handler_inputs = []
+        self._try_exception_inputs = []
+        self._class_enclosing_constants.append(
+            {name: values.copy() for name, values in class_enclosing_constants.items()}
+        )
+        self._visit_statements(node.body)
+        self._class_enclosing_constants.pop()
+        self._try_exception_inputs = outer_exception_inputs
+        self._try_handler_inputs = outer_handler_inputs
+        self._constant_scopes.pop()
         self._scope.pop()
+        outer_constants.pop(node.name, None)
 
     def _is_marked(self, node: ast.AST) -> bool:
         start = node.lineno
@@ -175,20 +275,79 @@ class _Scanner(ast.NodeVisitor):
     def _check_value(self, value: ast.AST, statement: ast.AST) -> None:
         if self._is_marked(statement):
             return
-        if isinstance(value, (ast.Tuple, ast.List)):
+        if isinstance(value, ast.Starred):
+            self._check_value(value.value, statement)
+        elif isinstance(value, (ast.Tuple, ast.List)):
             for item in value.elts:
                 self._check_value(item, statement)
-        elif (literal := _constant_string(value)) is not None and literal.casefold() == "admin":
+        elif (literals := _constant_strings(value, self._constant_scopes[-1])) is not None and any(
+            literal.casefold() == "admin" for literal in literals
+        ):
             self._hits[(value.lineno, value.col_offset)] = Violation(
                 self._rel, value.lineno, ".".join(self._scope) or "<module>"
             )
+
+    def _track_constant(self, target: ast.AST, value: ast.AST) -> None:
+        self._track_constant_values(target, _constant_strings(value, self._constant_scopes[-1]))
+
+    def _track_constant_values(self, target: ast.AST, literals: set[str] | None) -> None:
+        if isinstance(target, ast.Starred):
+            self._track_constant_values(target.value, literals)
+            return
+        if not isinstance(target, ast.Name):
+            return
+        aliases = self._constant_scopes[-1]
+        if literals is None:
+            aliases.pop(target.id, None)
+        else:
+            aliases[target.id] = literals.copy()
+
+    def _copy_constants(self) -> dict[str, set[str]]:
+        return {name: values.copy() for name, values in self._constant_scopes[-1].items()}
+
+    @staticmethod
+    def _merge_constants(*states: dict[str, set[str]]) -> dict[str, set[str]]:
+        merged: dict[str, set[str]] = {}
+        for state in states:
+            for name, values in state.items():
+                merged.setdefault(name, set()).update(values)
+        return merged
+
+    def _record_handler_input(self) -> None:
+        if self._try_handler_inputs:
+            self._try_handler_inputs[-1] = self._merge_constants(
+                self._try_handler_inputs[-1], self._constant_scopes[-1]
+            )
+
+    def _visit_statements(self, statements: list[ast.stmt]) -> bool:
+        for statement in statements:
+            if statement_may_raise(statement):
+                self._record_handler_input()
+                if self._try_exception_inputs:
+                    self._try_exception_inputs[-1] = self._merge_constants(
+                        self._try_exception_inputs[-1], self._constant_scopes[-1]
+                    )
+            if self.visit(statement) is False:
+                return False
+        return True
+
+    def _clear_target(self, target: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            self._constant_scopes[-1].pop(target.id, None)
+        elif isinstance(target, (ast.List, ast.Tuple)):
+            for element in target.elts:
+                self._clear_target(element)
+        elif isinstance(target, ast.Starred):
+            self._clear_target(target.value)
 
     def _assignment(self, target: ast.AST, value: ast.AST, statement: ast.AST) -> None:
         if isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
             for item, supplied in zip(target.elts, value.elts):
                 self._assignment(item, supplied, statement)
-        elif _credential_name(_name(target)):
-            self._check_value(value, statement)
+        else:
+            if _credential_name(_name(target)):
+                self._check_value(value, statement)
+            self._track_constant(target, value)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         for target in node.targets:
@@ -202,10 +361,321 @@ class _Scanner(ast.NodeVisitor):
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         # Python forbids a tuple target here, so the check runs directly rather than through
-        # _assignment: the value is what is APPENDED, never the whole new value of the name.
+        # _assignment: the value is what is APPENDED, never the whole new value of the name,
+        # and _assignment would re-track the alias as a plain assignment.
         if _credential_name(_name(node.target)):
             self._check_value(node.value, node)
+        if isinstance(node.target, ast.Name):
+            aliases = self._constant_scopes[-1]
+            left = aliases.get(node.target.id)
+            right = _constant_strings(node.value, aliases)
+            if isinstance(node.op, ast.Add) and left is not None and right is not None:
+                aliases[node.target.id] = {first + second for first in left for second in right}
+            else:
+                aliases.pop(node.target.id, None)
         self.generic_visit(node)
+
+    def visit_If(self, node: ast.If) -> bool:
+        self.visit(node.test)
+        incoming = {name: values.copy() for name, values in self._constant_scopes[-1].items()}
+
+        self._constant_scopes[-1] = {name: values.copy() for name, values in incoming.items()}
+        body_falls_through = self._visit_statements(node.body)
+        body_state = self._constant_scopes[-1]
+
+        self._constant_scopes[-1] = {name: values.copy() for name, values in incoming.items()}
+        else_falls_through = self._visit_statements(node.orelse)
+        else_state = self._constant_scopes[-1]
+
+        fallthrough_states = []
+        if body_falls_through:
+            fallthrough_states.append(body_state)
+        if else_falls_through:
+            fallthrough_states.append(else_state)
+        self._constant_scopes[-1] = self._merge_constants(*fallthrough_states)
+        return body_falls_through or else_falls_through
+
+    def _visit_loop(self, node: ast.For | ast.AsyncFor | ast.While) -> bool:
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            self.visit(node.iter)
+        else:
+            self.visit(node.test)
+        incoming = self._copy_constants()
+        loop_inputs = incoming
+        break_states: list[dict[str, set[str]]] = []
+        max_passes = len({part.id for part in ast.walk(node) if isinstance(part, ast.Name)}) + 2
+
+        for _ in range(max_passes):
+            self._constant_scopes[-1] = {name: values.copy() for name, values in loop_inputs.items()}
+            if isinstance(node, (ast.For, ast.AsyncFor)):
+                # Clear first so a tuple or starred target drops every stale name, then bind
+                # the iterable's constants the way _visit_comprehension already does.
+                self._clear_target(node.target)
+                self._track_constant_values(node.target, self._iteration_constants(node.iter))
+
+            self._loop_break_states.append([])
+            self._loop_continue_states.append([])
+            body_falls_through = self._visit_statements(node.body)
+            continue_states = self._loop_continue_states.pop()
+            break_states.extend(self._loop_break_states.pop())
+
+            next_states = [incoming]
+            if body_falls_through:
+                next_states.append(self._copy_constants())
+            next_states.extend(continue_states)
+            merged = self._merge_constants(loop_inputs, *next_states)
+            if merged == loop_inputs:
+                break
+            loop_inputs = merged
+
+        self._constant_scopes[-1] = loop_inputs
+        else_falls_through = self._visit_statements(node.orelse)
+        exit_states = break_states
+        if else_falls_through:
+            exit_states.append(self._copy_constants())
+        self._constant_scopes[-1] = self._merge_constants(*exit_states)
+        return True
+
+    def visit_For(self, node: ast.For) -> bool:
+        return self._visit_loop(node)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> bool:
+        return self._visit_loop(node)
+
+    def visit_While(self, node: ast.While) -> bool:
+        return self._visit_loop(node)
+
+    def visit_Break(self, node: ast.Break) -> bool:
+        if self._loop_break_states:
+            self._loop_break_states[-1].append(self._copy_constants())
+        return False
+
+    def visit_Continue(self, node: ast.Continue) -> bool:
+        if self._loop_continue_states:
+            self._loop_continue_states[-1].append(self._copy_constants())
+        return False
+
+    def visit_Return(self, node: ast.Return) -> bool:
+        self.generic_visit(node)
+        return False
+
+    def visit_Raise(self, node: ast.Raise) -> bool:
+        self.generic_visit(node)
+        return False
+
+    def _iteration_constants(self, expression: ast.AST) -> set[str] | None:
+        if isinstance(expression, (ast.List, ast.Tuple)):
+            values = [_constant_strings(element, self._constant_scopes[-1]) for element in expression.elts]
+            if all(value is not None for value in values):
+                return set().union(*(value for value in values if value is not None))
+            return None
+        return _constant_strings(expression, self._constant_scopes[-1])
+
+    def _visit_comprehension(self, node: ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp) -> None:
+        outer_constants = self._constant_scopes[-1]
+        outer_handler_inputs = self._try_handler_inputs
+        first_generator, *remaining_generators = node.generators
+        self.visit(first_generator.iter)
+        self._record_handler_input()
+        outer_after_iter = self._copy_constants()
+
+        target_names = {
+            part.id
+            for generator in node.generators
+            for part in ast.walk(generator.target)
+            if isinstance(part, ast.Name)
+        }
+        inherited = {name: values.copy() for name, values in outer_after_iter.items() if name not in target_names}
+        self._constant_scopes.append(inherited)
+        self._try_handler_inputs = []
+        self._track_constant_values(first_generator.target, self._iteration_constants(first_generator.iter))
+        for condition in first_generator.ifs:
+            self.visit(condition)
+        for generator in remaining_generators:
+            self.visit(generator.iter)
+            self._track_constant_values(generator.target, self._iteration_constants(generator.iter))
+            for condition in generator.ifs:
+                self.visit(condition)
+        if isinstance(node, ast.DictComp):
+            self.visit(node.key)
+            self.visit(node.value)
+        else:
+            self.visit(node.elt)
+        self._try_handler_inputs = outer_handler_inputs
+        body_constants = self._constant_scopes.pop()
+        outer_constants.clear()
+        outer_constants.update(outer_after_iter)
+        # A walrus in the body binds in THIS scope (PEP 572); the generator targets do not.
+        for name in walrus_target_names(node):
+            if name in body_constants:
+                outer_constants[name] = body_constants[name]
+            else:
+                outer_constants.pop(name, None)
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension(node)
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_comprehension(node)
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension(node)
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension(node)
+
+    def visit_Match(self, node: ast.Match) -> bool:
+        self.visit(node.subject)
+        incoming = self._copy_constants()
+        subject_values = _constant_strings(node.subject, incoming)
+        case_states: list[dict[str, set[str]]] = []
+        exhaustive = False
+        falls_through = False
+
+        for case in node.cases:
+            self._constant_scopes[-1] = {name: values.copy() for name, values in incoming.items()}
+            for name in match_capture_names(case.pattern):
+                if subject_values is None:
+                    self._constant_scopes[-1].pop(name, None)
+                else:
+                    self._constant_scopes[-1][name] = subject_values.copy()
+            if case.guard is not None:
+                self.visit(case.guard)
+            case_falls_through = self._visit_statements(case.body)
+            if case_falls_through:
+                case_states.append(self._copy_constants())
+                falls_through = True
+            exhaustive |= case.guard is None and pattern_is_irrefutable(case.pattern)
+
+        if not exhaustive:
+            case_states.append(incoming)
+            falls_through = True
+        self._constant_scopes[-1] = self._merge_constants(*case_states)
+        return falls_through
+
+    def _visit_with(self, node: ast.With | ast.AsyncWith) -> bool:
+        for item in node.items:
+            self._record_handler_input()
+            self.visit(item.context_expr)
+            self._record_handler_input()
+            if item.optional_vars is not None:
+                self._clear_target(item.optional_vars)
+        falls_through = self._visit_statements(node.body)
+        self._record_handler_input()
+        return falls_through
+
+    def visit_With(self, node: ast.With) -> bool:
+        return self._visit_with(node)
+
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> bool:
+        return self._visit_with(node)
+
+    def _visit_try_handlers(
+        self, handlers: list[ast.ExceptHandler], handler_input: dict[str, set[str]]
+    ) -> tuple[list[dict[str, set[str]]], list[dict[str, set[str]]]]:
+        normal_states: list[dict[str, set[str]]] = []
+        exceptional_states: list[dict[str, set[str]]] = []
+        for handler in handlers:
+            self._constant_scopes[-1] = {name: values.copy() for name, values in handler_input.items()}
+            handler_exception_input: dict[str, set[str]] = {}
+            self._try_exception_inputs.append(handler_exception_input)
+            handler_falls_through = self.visit(handler) is not False
+            handler_exception_input = self._try_exception_inputs.pop()
+            if handler.name is not None:
+                handler_exception_input.pop(handler.name, None)
+            exceptional_states.append(handler_exception_input)
+            if handler_falls_through:
+                normal_states.append(self._copy_constants())
+        return normal_states, exceptional_states
+
+    def _visit_try(self, node: ast.Try | ast.TryStar) -> bool:
+        break_bucket = self._loop_break_states[-1] if self._loop_break_states else None
+        continue_bucket = self._loop_continue_states[-1] if self._loop_continue_states else None
+        break_start = len(break_bucket) if break_bucket is not None else 0
+        continue_start = len(continue_bucket) if continue_bucket is not None else 0
+        incoming = self._copy_constants()
+        handler_input = incoming
+
+        self._constant_scopes[-1] = {name: values.copy() for name, values in incoming.items()}
+        self._try_handler_inputs.append(handler_input)
+        body_exception_input: dict[str, set[str]] = {}
+        self._try_exception_inputs.append(body_exception_input)
+        body_falls_through = self._visit_statements(node.body)
+        body_exception_input = self._try_exception_inputs.pop()
+        handler_input = self._try_handler_inputs.pop()
+        normal_states: list[dict[str, set[str]]] = []
+        exceptional_states: list[dict[str, set[str]]] = []
+        if not any(handler.type is None for handler in node.handlers):
+            exceptional_states.append(body_exception_input)
+
+        if body_falls_through:
+            else_exception_input: dict[str, set[str]] = {}
+            self._try_exception_inputs.append(else_exception_input)
+            else_falls_through = self._visit_statements(node.orelse)
+            else_exception_input = self._try_exception_inputs.pop()
+            exceptional_states.append(else_exception_input)
+            if else_falls_through:
+                normal_states.append(self._copy_constants())
+
+        handler_states, handler_exception_states = self._visit_try_handlers(node.handlers, handler_input)
+        normal_states.extend(handler_states)
+        exceptional_states.extend(handler_exception_states)
+
+        break_states = break_bucket[break_start:] if break_bucket is not None else []
+        continue_states = continue_bucket[continue_start:] if continue_bucket is not None else []
+        if break_bucket is not None:
+            del break_bucket[break_start:]
+        if continue_bucket is not None:
+            del continue_bucket[continue_start:]
+
+        normal_falls_through = False
+        normal_state: dict[str, set[str]] = {}
+        if normal_states:
+            self._constant_scopes[-1] = self._merge_constants(*normal_states)
+            normal_falls_through = self._visit_statements(node.finalbody)
+            if normal_falls_through:
+                normal_state = self._copy_constants()
+
+        exceptional_state = self._merge_constants(*exceptional_states)
+        propagated_exception_state: dict[str, set[str]] = {}
+        if exceptional_state:
+            self._constant_scopes[-1] = exceptional_state
+            if self._visit_statements(node.finalbody):
+                propagated_exception_state = self._copy_constants()
+        if propagated_exception_state and self._try_exception_inputs:
+            self._try_exception_inputs[-1] = self._merge_constants(
+                self._try_exception_inputs[-1], propagated_exception_state
+            )
+        if propagated_exception_state and self._try_handler_inputs:
+            self._try_handler_inputs[-1] = self._merge_constants(
+                self._try_handler_inputs[-1], propagated_exception_state
+            )
+
+        for bucket, states in ((break_bucket, break_states), (continue_bucket, continue_states)):
+            if bucket is None or not states:
+                continue
+            self._constant_scopes[-1] = self._merge_constants(*states)
+            if self._visit_statements(node.finalbody):
+                bucket.append(self._copy_constants())
+
+        self._constant_scopes[-1] = normal_state
+        return normal_falls_through
+
+    def visit_Try(self, node: ast.Try) -> bool:
+        return self._visit_try(node)
+
+    def visit_TryStar(self, node: ast.TryStar) -> bool:
+        return self._visit_try(node)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> bool:
+        if node.type is not None:
+            self.visit(node.type)
+        if node.name is not None:
+            self._constant_scopes[-1].pop(node.name, None)
+        falls_through = self._visit_statements(node.body)
+        if node.name is not None:
+            self._constant_scopes[-1].pop(node.name, None)
+        return falls_through
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self._assignment(node.target, node.value, node)

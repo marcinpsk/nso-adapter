@@ -32,6 +32,7 @@ from nso_adapter.core.claim import (
 from nso_adapter.core.families import ALL_FAMILY_KEYS
 from nso_adapter.nso.client import failure_detail
 from nso_adapter.store import outcome_store
+from nso_adapter.store.db import _violated_constraint
 from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import (
     ActiveAddress,
@@ -67,17 +68,6 @@ _IDENTITY_CLAIMED = "The target NSO identity is already claimed by another devic
 #: The DB constraint that decides an identity race, taken from the model so the two cannot drift.
 _IDENTITY_CONSTRAINT = "uq_device_nso_identity"
 _NETBOX_DEVICE_ID_CONSTRAINT = "uq_device_netbox_device_id"
-
-
-def _violated_constraint(exc: BaseException) -> str | None:
-    """Return the constraint an integrity error names, or None when the driver reports none."""
-    current: BaseException | None = exc
-    while current is not None:
-        name = getattr(current, "constraint_name", None)
-        if isinstance(name, str) and name:
-            return name
-        current = current.__cause__
-    return None
 
 
 _READ_MIRROR_ROOTS = (
@@ -284,7 +274,7 @@ async def onboard_device(
     cfg = get_config()
     known_instances = {inst.name for inst in cfg.nso_instances}
     if nso_instance not in known_instances:
-        raise ValueError(f"NSO instance {nso_instance!r} not found in config")
+        raise ValueError("NSO instance not found in config")
 
     if reg is not None:
         return await _onboard_under_claim(db, nso_instance, nso_device_name, netbox_device_id, reg, job_id)
@@ -462,7 +452,7 @@ async def _onboard_under_claim(
                 nso_device=nso_device_name,
                 waited_s=get_config().intent_claim_wait_seconds,
             )
-            raise ClaimUnavailableError(f"NSO device {nso_device_name!r} is claimed by another operation")
+            raise ClaimUnavailableError("NSO device is claimed by another operation")
         # Never past the deadline: the budget is the whole wait, polling included.
         await asyncio.sleep(min(CLAIM_WAIT_POLL_INTERVAL_S, max(0.0, deadline - time.monotonic())))
 
@@ -669,7 +659,7 @@ async def provision_nso_device(
 
     known = {inst.name for inst in get_config().nso_instances}
     if nso_instance not in known:
-        raise ValueError(f"NSO instance {nso_instance!r} not found in config")
+        raise ValueError("NSO instance not found in config")
 
     device_type = resolve_device_type(ned_id, ned_type)
 
@@ -928,7 +918,7 @@ async def rekey_device(
     known_instances = {inst.name for inst in cfg.nso_instances}
 
     if nso_instance is not None and nso_instance not in known_instances:
-        raise ValueError(f"NSO instance {nso_instance!r} not found in config")
+        raise ValueError("NSO instance not found in config")
 
     device_id = device.id
     for family in ALL_FAMILY_KEYS:

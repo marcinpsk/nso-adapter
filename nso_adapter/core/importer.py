@@ -739,8 +739,7 @@ async def _resolve_ned_id(db: AsyncSession, device: Device, client: NsoClient) -
     device.last_sync_at = _utcnow()
     device.last_sync_status = LastSyncStatus.failed
     await db.commit()
-    # The worker renders repr(exc); the stored id is the correlatable identity, the name is not ours.
-    raise ValueError(f"device {device.id} not found in NSO or has no NED ID")
+    raise ValueError("NSO device not found or has no NED ID")
 
 
 async def _ensure_netbox_interfaces(nb_client, device: Device, device_id: int, interfaces) -> dict[str, int]:

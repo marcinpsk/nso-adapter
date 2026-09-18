@@ -22,6 +22,14 @@ import pytest
 import yaml
 
 from nso_adapter.store.models import Device
+from tests._ast_scanner_support import (
+    argument_names,
+    match_capture_names,
+    pattern_is_irrefutable,
+    scope_bound_names,
+    statement_may_raise,
+    walrus_target_names,
+)
 from tests.conftest import seed_device, session
 
 #: A URL and reason phrase a real NSO would put in the httpx message.
@@ -36,7 +44,7 @@ _GUARDED_LOG_SINKS = (
     Path(__file__).resolve().parents[2] / "nso_adapter" / "main.py",
     *(
         Path(__file__).resolve().parents[2] / "nso_adapter" / "core" / name
-        for name in ("generation.py", "refresh_engine.py", "redistribution.py")
+        for name in ("generation.py", "refresh_engine.py", "redistribution.py", "removal.py")
     ),
     *(
         Path(__file__).resolve().parents[2] / "nso_adapter" / "notifications" / name
@@ -75,15 +83,34 @@ def _is_closed_exception_classification(value: ast.expr) -> bool:
 
 
 class _RawLogExceptionVisitor(ast.NodeVisitor):
-    """Track exception values through simple assignments while visiting log calls."""
+    """Track exception aliases through control flow while visiting log calls."""
 
     def __init__(self) -> None:
         self.aliases = {"exc"}
         self.violations: list[int] = []
+        self._try_handler_inputs: list[set[str]] = []
+        self._loop_break_aliases: list[list[set[str]]] = []
+        self._loop_continue_aliases: list[list[set[str]]] = []
+        self._class_enclosing_aliases: list[set[str]] = []
+        self._try_exception_inputs: list[set[str]] = []
 
     def _record_violation(self, lineno: int) -> None:
         if lineno not in self.violations:
             self.violations.append(lineno)
+
+    def _record_handler_input(self) -> None:
+        if self._try_handler_inputs:
+            self._try_handler_inputs[-1].update(self.aliases)
+
+    def _visit_statements(self, statements: list[ast.stmt]) -> bool:
+        for statement in statements:
+            if statement_may_raise(statement):
+                self._record_handler_input()
+                if self._try_exception_inputs:
+                    self._try_exception_inputs[-1].update(self.aliases)
+            if self.visit(statement) is False:
+                return False
+        return True
 
     def _aliases_exception(self, values: ast.expr | list[ast.expr]) -> bool:
         if not isinstance(values, list):
@@ -94,57 +121,120 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
             for value in values
         )
 
-    def _bind_target(self, target: ast.expr, values: ast.expr | list[ast.expr]) -> None:
+    def _bind_target_from_verdict(self, target: ast.expr, aliases_exception: bool) -> None:
         if isinstance(target, ast.Name):
-            if self._aliases_exception(values):
-                self.aliases.add(target.id)
-            else:
-                self.aliases.discard(target.id)
+            self._bind_names({target.id}, aliases_exception)
         elif isinstance(target, ast.Starred):
-            self._bind_target(target.value, values)
+            self._bind_target_from_verdict(target.value, aliases_exception)
         elif isinstance(target, (ast.List, ast.Tuple)):
-            if isinstance(values, (ast.List, ast.Tuple)):
-                self._bind_sequence(target.elts, values.elts)
-            else:
-                for element in target.elts:
-                    self._bind_target(element, values)
+            for element in target.elts:
+                self._bind_target_from_verdict(element, aliases_exception)
+
+    def _bind_assignment_target(self, target: ast.expr, values: ast.expr | list[ast.expr]) -> None:
+        if isinstance(target, ast.Starred):
+            self._bind_assignment_target(target.value, values)
+        elif isinstance(target, (ast.List, ast.Tuple)) and isinstance(values, (ast.List, ast.Tuple)):
+            self._bind_sequence(target.elts, values.elts)
+        else:
+            self._bind_target_from_verdict(target, self._aliases_exception(values))
 
     def _bind_sequence(self, targets: list[ast.expr], values: list[ast.expr]) -> None:
         starred = next((index for index, target in enumerate(targets) if isinstance(target, ast.Starred)), None)
         if starred is None:
             if len(targets) == len(values):
                 for target, value in zip(targets, values, strict=True):
-                    self._bind_target(target, value)
+                    self._bind_assignment_target(target, value)
                 return
         elif len(values) >= len(targets) - 1:
             trailing = len(targets) - starred - 1
             for target, value in zip(targets[:starred], values[:starred], strict=True):
-                self._bind_target(target, value)
+                self._bind_assignment_target(target, value)
             starred_end = len(values) - trailing if trailing else len(values)
-            self._bind_target(targets[starred], values[starred:starred_end])
+            self._bind_assignment_target(targets[starred], values[starred:starred_end])
             if trailing:
                 for target, value in zip(targets[-trailing:], values[-trailing:], strict=True):
-                    self._bind_target(target, value)
+                    self._bind_assignment_target(target, value)
             return
+        aliases_exception = self._aliases_exception(values)
         for target in targets:
-            self._bind_target(target, values)
+            self._bind_target_from_verdict(target, aliases_exception)
+
+    def _bind_names(self, names: set[str], aliases_exception: bool) -> None:
+        if aliases_exception:
+            self.aliases.update(names)
+        else:
+            self.aliases.difference_update(names)
 
     def _assignment(self, targets: list[ast.expr], value: ast.expr) -> None:
         for target in targets:
-            self._bind_target(target, value)
+            self._bind_assignment_target(target, value)
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        for expression in (
+            *node.decorator_list,
+            *node.args.defaults,
+            *(default for default in node.args.kw_defaults if default is not None),
+        ):
+            self.visit(expression)
         outer_aliases = self.aliases
-        self.aliases = {"exc"}
-        for statement in node.body:
-            self.visit(statement)
+        outer_handler_inputs = self._try_handler_inputs
+        outer_exception_inputs = self._try_exception_inputs
+        outer_class_enclosing_aliases = self._class_enclosing_aliases
+        enclosing_aliases = self._class_enclosing_aliases[-1] if self._class_enclosing_aliases else outer_aliases
+        local_names = scope_bound_names(list(node.body)) | argument_names(node.args)
+        self.aliases = (enclosing_aliases - local_names) | {"exc"}
+        self._try_handler_inputs = []
+        self._try_exception_inputs = []
+        self._class_enclosing_aliases = []
+        self._visit_statements(node.body)
+        self._class_enclosing_aliases = outer_class_enclosing_aliases
+        self._try_exception_inputs = outer_exception_inputs
+        self._try_handler_inputs = outer_handler_inputs
         self.aliases = outer_aliases
+        self.aliases.discard(node.name)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802 - ast visitor API
         self._visit_function(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:  # noqa: N802 - ast visitor API
         self._visit_function(node)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802 - ast visitor API
+        for expression in (*node.args.defaults, *(value for value in node.args.kw_defaults if value is not None)):
+            self.visit(expression)
+        outer_aliases = self.aliases
+        outer_handler_inputs = self._try_handler_inputs
+        outer_exception_inputs = self._try_exception_inputs
+        outer_class_enclosing_aliases = self._class_enclosing_aliases
+        enclosing_aliases = self._class_enclosing_aliases[-1] if self._class_enclosing_aliases else outer_aliases
+        local_names = scope_bound_names([node.body]) | argument_names(node.args)
+        self.aliases = (enclosing_aliases - local_names) | {"exc"}
+        self._try_handler_inputs = []
+        self._try_exception_inputs = []
+        self._class_enclosing_aliases = []
+        self.visit(node.body)
+        self._class_enclosing_aliases = outer_class_enclosing_aliases
+        self._try_exception_inputs = outer_exception_inputs
+        self._try_handler_inputs = outer_handler_inputs
+        self.aliases = outer_aliases
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802 - ast visitor API
+        for expression in (*node.decorator_list, *node.bases, *(keyword.value for keyword in node.keywords)):
+            self.visit(expression)
+        outer_aliases = self.aliases
+        outer_handler_inputs = self._try_handler_inputs
+        outer_exception_inputs = self._try_exception_inputs
+        class_enclosing_aliases = self._class_enclosing_aliases[-1] if self._class_enclosing_aliases else outer_aliases
+        self.aliases = class_enclosing_aliases.copy()
+        self._try_handler_inputs = []
+        self._try_exception_inputs = []
+        self._class_enclosing_aliases.append(class_enclosing_aliases.copy())
+        self._visit_statements(node.body)
+        self._class_enclosing_aliases.pop()
+        self._try_exception_inputs = outer_exception_inputs
+        self._try_handler_inputs = outer_handler_inputs
+        self.aliases = outer_aliases
+        self.aliases.discard(node.name)
 
     def visit_Assign(self, node: ast.Assign) -> None:  # noqa: N802 - ast visitor API
         self.visit(node.value)
@@ -162,28 +252,282 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
         if target_was_alias and isinstance(node.target, ast.Name):
             self.aliases.add(node.target.id)
 
-    def visit_If(self, node: ast.If) -> None:  # noqa: N802 - ast visitor API
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:  # noqa: N802 - ast visitor API
+        self.visit(node.value)
+        self._assignment([node.target], node.value)
+
+    def visit_If(self, node: ast.If) -> bool:  # noqa: N802 - ast visitor API
         self.visit(node.test)
         incoming = self.aliases.copy()
 
         self.aliases = incoming.copy()
-        for statement in node.body:
-            self.visit(statement)
+        body_falls_through = self._visit_statements(node.body)
         body_aliases = self.aliases
 
         self.aliases = incoming.copy()
-        for statement in node.orelse:
-            self.visit(statement)
-        self.aliases |= body_aliases
+        else_falls_through = self._visit_statements(node.orelse)
+        else_aliases = self.aliases
 
-    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:  # noqa: N802 - ast visitor API
+        self.aliases = set()
+        if body_falls_through:
+            self.aliases |= body_aliases
+        if else_falls_through:
+            self.aliases |= else_aliases
+        return body_falls_through or else_falls_through
+
+    def _visit_loop(self, node: ast.For | ast.AsyncFor | ast.While) -> bool:
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            self.visit(node.iter)
+            iter_aliases_exception = self._aliases_exception(node.iter)
+        else:
+            self.visit(node.test)
+            iter_aliases_exception = False
+        incoming = self.aliases.copy()
+        loop_aliases = incoming.copy()
+        break_aliases: set[str] = set()
+        max_passes = len({part.id for part in ast.walk(node) if isinstance(part, ast.Name)}) + 2
+
+        for _ in range(max_passes):
+            self.aliases = loop_aliases.copy()
+            if isinstance(node, (ast.For, ast.AsyncFor)):
+                self._bind_target_from_verdict(node.target, iter_aliases_exception)
+
+            self._loop_break_aliases.append([])
+            self._loop_continue_aliases.append([])
+            body_falls_through = self._visit_statements(node.body)
+            continue_aliases = self._loop_continue_aliases.pop()
+            current_break_aliases = self._loop_break_aliases.pop()
+
+            for aliases in current_break_aliases:
+                break_aliases |= aliases
+            next_aliases = incoming.copy()
+            if body_falls_through:
+                next_aliases |= self.aliases
+            for aliases in continue_aliases:
+                next_aliases |= aliases
+            if next_aliases <= loop_aliases:
+                break
+            loop_aliases |= next_aliases
+
+        self.aliases = loop_aliases
+        else_falls_through = self._visit_statements(node.orelse)
+        else_aliases = self.aliases.copy()
+        self.aliases = break_aliases
+        if else_falls_through:
+            self.aliases |= else_aliases
+        return True
+
+    def visit_For(self, node: ast.For) -> bool:  # noqa: N802 - ast visitor API
+        return self._visit_loop(node)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> bool:  # noqa: N802 - ast visitor API
+        return self._visit_loop(node)
+
+    def visit_While(self, node: ast.While) -> bool:  # noqa: N802 - ast visitor API
+        return self._visit_loop(node)
+
+    def visit_Break(self, node: ast.Break) -> bool:  # noqa: N802 - ast visitor API
+        if self._loop_break_aliases:
+            self._loop_break_aliases[-1].append(self.aliases.copy())
+        return False
+
+    def visit_Continue(self, node: ast.Continue) -> bool:  # noqa: N802 - ast visitor API
+        if self._loop_continue_aliases:
+            self._loop_continue_aliases[-1].append(self.aliases.copy())
+        return False
+
+    def visit_Return(self, node: ast.Return) -> bool:  # noqa: N802 - ast visitor API
+        self.generic_visit(node)
+        return False
+
+    def visit_Raise(self, node: ast.Raise) -> bool:  # noqa: N802 - ast visitor API
+        self.generic_visit(node)
+        return False
+
+    def _visit_comprehension(self, node: ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp) -> None:
+        outer_aliases = self.aliases
+        first_generator, *remaining_generators = node.generators
+        self.visit(first_generator.iter)
+        outer_after_iter = self.aliases.copy()
+
+        self.aliases = outer_after_iter.copy()
+        self._bind_target_from_verdict(first_generator.target, self._aliases_exception(first_generator.iter))
+        for condition in first_generator.ifs:
+            self.visit(condition)
+        for generator in remaining_generators:
+            self.visit(generator.iter)
+            self._bind_target_from_verdict(generator.target, self._aliases_exception(generator.iter))
+            for condition in generator.ifs:
+                self.visit(condition)
+        if isinstance(node, ast.DictComp):
+            self.visit(node.key)
+            self.visit(node.value)
+        else:
+            self.visit(node.elt)
+
+        body_aliases = self.aliases
+        outer_aliases.clear()
+        outer_aliases.update(outer_after_iter)
+        # A walrus in the body binds in THIS scope (PEP 572); the generator targets do not.
+        for name in walrus_target_names(node):
+            if name in body_aliases:
+                outer_aliases.add(name)
+            else:
+                outer_aliases.discard(name)
+        self.aliases = outer_aliases
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:  # noqa: N802 - ast visitor API
+        self._visit_comprehension(node)
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:  # noqa: N802 - ast visitor API
+        self._visit_comprehension(node)
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:  # noqa: N802 - ast visitor API
+        self._visit_comprehension(node)
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:  # noqa: N802 - ast visitor API
+        self._visit_comprehension(node)
+
+    def _visit_with(self, node: ast.With | ast.AsyncWith) -> bool:
+        for item in node.items:
+            self._record_handler_input()
+            self.visit(item.context_expr)
+            self._record_handler_input()
+            if item.optional_vars is not None:
+                self._bind_target_from_verdict(item.optional_vars, self._aliases_exception(item.context_expr))
+        falls_through = self._visit_statements(node.body)
+        self._record_handler_input()
+        return falls_through
+
+    def visit_With(self, node: ast.With) -> bool:  # noqa: N802 - ast visitor API
+        return self._visit_with(node)
+
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> bool:  # noqa: N802 - ast visitor API
+        return self._visit_with(node)
+
+    def visit_Match(self, node: ast.Match) -> bool:  # noqa: N802 - ast visitor API
+        self.visit(node.subject)
+        incoming = self.aliases.copy()
+        subject_aliases_exception = self._aliases_exception(node.subject)
+        surviving: set[str] = set()
+        exhaustive = False
+        falls_through = False
+        for case in node.cases:
+            self.aliases = incoming.copy()
+            self._bind_names(match_capture_names(case.pattern), subject_aliases_exception)
+            if case.guard is not None:
+                self.visit(case.guard)
+            case_falls_through = self._visit_statements(case.body)
+            if case_falls_through:
+                surviving |= self.aliases
+                falls_through = True
+            exhaustive |= case.guard is None and pattern_is_irrefutable(case.pattern)
+        if not exhaustive:
+            surviving |= incoming
+            falls_through = True
+        self.aliases = surviving
+        return falls_through
+
+    def _visit_try_handlers(
+        self, handlers: list[ast.ExceptHandler], handler_input: set[str]
+    ) -> tuple[list[set[str]], set[str]]:
+        normal_states: list[set[str]] = []
+        exceptional_aliases: set[str] = set()
+        for handler in handlers:
+            self.aliases = handler_input.copy()
+            handler_exception_input: set[str] = set()
+            self._try_exception_inputs.append(handler_exception_input)
+            handler_falls_through = self.visit(handler) is not False
+            self._try_exception_inputs.pop()
+            if handler.name is not None:
+                handler_exception_input.discard(handler.name)
+            exceptional_aliases |= handler_exception_input
+            if handler_falls_through:
+                normal_states.append(self.aliases.copy())
+        return normal_states, exceptional_aliases
+
+    def _visit_try(self, node: ast.Try | ast.TryStar) -> bool:
+        break_bucket = self._loop_break_aliases[-1] if self._loop_break_aliases else None
+        continue_bucket = self._loop_continue_aliases[-1] if self._loop_continue_aliases else None
+        break_start = len(break_bucket) if break_bucket is not None else 0
+        continue_start = len(continue_bucket) if continue_bucket is not None else 0
+        incoming = self.aliases.copy()
+        handler_input = incoming.copy()
+
+        self.aliases = incoming.copy()
+        self._try_handler_inputs.append(handler_input)
+        body_exception_input: set[str] = set()
+        self._try_exception_inputs.append(body_exception_input)
+        body_falls_through = self._visit_statements(node.body)
+        self._try_exception_inputs.pop()
+        handler_input = self._try_handler_inputs.pop()
+        normal_states: list[set[str]] = []
+        exceptional_aliases: set[str] = set()
+        if not any(handler.type is None for handler in node.handlers):
+            exceptional_aliases |= body_exception_input
+
+        if body_falls_through:
+            else_exception_input: set[str] = set()
+            self._try_exception_inputs.append(else_exception_input)
+            else_falls_through = self._visit_statements(node.orelse)
+            self._try_exception_inputs.pop()
+            exceptional_aliases |= else_exception_input
+            if else_falls_through:
+                normal_states.append(self.aliases.copy())
+
+        handler_states, handler_exception_aliases = self._visit_try_handlers(node.handlers, handler_input)
+        normal_states.extend(handler_states)
+        exceptional_aliases |= handler_exception_aliases
+
+        break_aliases = break_bucket[break_start:] if break_bucket is not None else []
+        continue_aliases = continue_bucket[continue_start:] if continue_bucket is not None else []
+        if break_bucket is not None:
+            del break_bucket[break_start:]
+        if continue_bucket is not None:
+            del continue_bucket[continue_start:]
+
+        normal_falls_through = False
+        normal_aliases: set[str] = set()
+        if normal_states:
+            self.aliases = set().union(*normal_states)
+            normal_falls_through = self._visit_statements(node.finalbody)
+            if normal_falls_through:
+                normal_aliases = self.aliases.copy()
+
+        propagated_exception_aliases: set[str] = set()
+        if exceptional_aliases:
+            self.aliases = exceptional_aliases
+            if self._visit_statements(node.finalbody):
+                propagated_exception_aliases = self.aliases.copy()
+        if propagated_exception_aliases and self._try_exception_inputs:
+            self._try_exception_inputs[-1].update(propagated_exception_aliases)
+        if propagated_exception_aliases and self._try_handler_inputs:
+            self._try_handler_inputs[-1].update(propagated_exception_aliases)
+
+        for bucket, states in ((break_bucket, break_aliases), (continue_bucket, continue_aliases)):
+            if bucket is None or not states:
+                continue
+            self.aliases = set().union(*states)
+            if self._visit_statements(node.finalbody):
+                bucket.append(self.aliases.copy())
+
+        self.aliases = normal_aliases
+        return normal_falls_through
+
+    def visit_Try(self, node: ast.Try) -> bool:  # noqa: N802 - ast visitor API
+        return self._visit_try(node)
+
+    def visit_TryStar(self, node: ast.TryStar) -> bool:  # noqa: N802 - ast visitor API
+        return self._visit_try(node)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> bool:  # noqa: N802 - ast visitor API
         handler_name = node.name
         if handler_name is not None:
             self.aliases.add(handler_name)
-        for statement in node.body:
-            self.visit(statement)
+        falls_through = self._visit_statements(node.body)
         if handler_name is not None:
             self.aliases.discard(handler_name)
+        return falls_through
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 - ast visitor API
         if isinstance(node.func, ast.Attribute) and _is_logger_receiver(node.func.value):
@@ -340,6 +684,36 @@ def test_raw_exception_log_guard_tracks_structured_assignment_elements(source: s
     assert _raw_log_exception_renderers(source) == [2]
 
 
+@pytest.mark.parametrize("exit_statement", ["return", "raise RuntimeError"], ids=["return", "raise"])
+def test_raw_exception_log_guard_drops_a_returned_or_raised_branch(exit_statement: str) -> None:
+    """A branch that leaves through `return` or `raise` cannot reach the statement after it.
+
+    Only break and continue answered the fall-through protocol, so the scanner merged the
+    exceptional state of an unreachable path and reported a renderer that cannot run.
+    """
+    unreachable = (
+        "def handler():\n"
+        "    try:\n"
+        "        work()\n"
+        "    except Exception as exc:\n"
+        '        detail = "authored detail"\n'
+        "        if condition:\n"
+        "            detail = exc\n"
+        f"            {exit_statement}\n"
+        '        logger.warning("event", detail=detail)\n'
+    )
+    reachable = unreachable.replace(f"            {exit_statement}\n", "")
+
+    assert _raw_log_exception_renderers(unreachable) == []
+    assert _raw_log_exception_renderers(reachable) == [8]
+
+
+def test_raw_exception_log_guard_still_reads_a_returned_expression() -> None:
+    """Cutting the path must not stop the scanner reading what the statement itself renders."""
+    source = 'def handler():\n    try:\n        work()\n    except Exception as exc:\n        return logger.warning("event", detail=exc)\n'
+    assert _raw_log_exception_renderers(source) == [5]
+
+
 def test_raw_exception_log_guard_rejects_bound_logger_calls() -> None:
     source = 'logger.bind(component="sync").warning("event", detail=exc)'
     assert _raw_log_exception_renderers(source) == [1]
@@ -406,6 +780,360 @@ def test_raw_exception_log_guard_preserves_conditional_flow(source: str, expecte
     assert _raw_log_exception_renderers(source) == expected
 
 
+@pytest.mark.parametrize(
+    ("source", "expected_line"),
+    [
+        (
+            """\
+for detail in [exc]:
+    logger.warning("event", detail=detail)
+""",
+            2,
+        ),
+        (
+            """\
+for detail, authored in [(exc, "authored detail")]:
+    logger.warning("event", detail=authored)
+""",
+            2,
+        ),
+        (
+            """\
+for [detail, authored] in [(exc, "authored detail")]:
+    logger.warning("event", detail=authored)
+""",
+            2,
+        ),
+        (
+            """\
+async def run():
+    async for detail in exception_stream(exc):
+        logger.warning("event", detail=detail)
+""",
+            3,
+        ),
+    ],
+)
+def test_raw_exception_log_guard_tracks_loop_target_aliases(source: str, expected_line: int) -> None:
+    assert _raw_log_exception_renderers(source) == [expected_line]
+
+
+def test_raw_exception_log_guard_clears_loop_targets_bound_from_clean_iterables() -> None:
+    source = """\
+detail = exc
+for detail in ["authored detail"]:
+    logger.warning("event", detail=detail)
+"""
+
+    assert _raw_log_exception_renderers(source) == []
+
+
+@pytest.mark.parametrize("exit_statement", ["break", "continue"])
+def test_raw_exception_log_guard_preserves_loop_exit_aliases(exit_statement: str) -> None:
+    source = f"""\
+for item in items:
+    detail = exc
+    {exit_statement}
+    detail = "authored detail"
+logger.warning("event", detail=detail)
+"""
+
+    assert _raw_log_exception_renderers(source) == [5]
+
+
+def test_raw_exception_log_guard_checks_aliases_from_previous_loop_iterations() -> None:
+    source = """\
+for item in items:
+    logger.warning("event", detail=detail)
+    detail = exc
+"""
+
+    assert _raw_log_exception_renderers(source) == [2]
+
+
+@pytest.mark.parametrize("exit_statement", ["break", "continue"])
+def test_raw_exception_log_guard_accepts_loop_paths_that_all_clear_aliases(exit_statement: str) -> None:
+    source = f"""\
+detail = exc
+for item in items:
+    detail = "authored detail"
+    {exit_statement}
+else:
+    detail = "also authored"
+logger.warning("event", detail=detail)
+"""
+
+    assert _raw_log_exception_renderers(source) == []
+
+
+@pytest.mark.parametrize("handler_keyword", ["except", "except*"])
+@pytest.mark.parametrize("exit_statement", ["break", "continue"])
+def test_raw_exception_log_guard_checks_finally_for_loop_exit(handler_keyword: str, exit_statement: str) -> None:
+    source = f"""\
+for item in items:
+    detail = "authored detail"
+    try:
+        if condition:
+            detail = exc
+            {exit_statement}
+    {handler_keyword} Exception:
+        detail = "authored detail"
+    finally:
+        logger.warning("event", detail=detail)
+"""
+
+    assert _raw_log_exception_renderers(source) == [10]
+
+
+def test_raw_exception_log_guard_finally_can_replace_a_pending_loop_exit() -> None:
+    source = """\
+detail = exc
+for item in items:
+    try:
+        break
+    finally:
+        detail = "authored detail"
+        continue
+else:
+    detail = "also authored"
+logger.warning("event", detail=detail)
+"""
+
+    assert _raw_log_exception_renderers(source) == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        '[logger.warning("event", detail=detail) for detail in [exc]]',
+        '{logger.warning("event", detail=detail) for detail in [exc]}',
+        '{detail: logger.warning("event", detail=detail) for detail in [exc]}',
+        '(logger.warning("event", detail=detail) for detail in [exc])',
+    ],
+)
+def test_raw_exception_log_guard_tracks_comprehension_target_aliases(source: str) -> None:
+    assert _raw_log_exception_renderers(source) == [1]
+
+
+def test_raw_exception_log_guard_isolates_comprehension_target_aliases() -> None:
+    source = """\
+detail = exc
+[logger.warning("event", detail=detail) for detail in ["authored detail"]]
+logger.warning("event", detail=detail)
+"""
+
+    assert _raw_log_exception_renderers(source) == [3]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_line"),
+    [
+        (
+            """\
+with exc as detail:
+    logger.warning("event", detail=detail)
+""",
+            2,
+        ),
+        (
+            """\
+with exc as (detail, authored):
+    logger.warning("event", detail=authored)
+""",
+            2,
+        ),
+        (
+            """\
+async def run():
+    async with exc as detail:
+        logger.warning("event", detail=detail)
+""",
+            3,
+        ),
+    ],
+)
+def test_raw_exception_log_guard_tracks_with_target_aliases(source: str, expected_line: int) -> None:
+    assert _raw_log_exception_renderers(source) == [expected_line]
+
+
+def test_raw_exception_log_guard_clears_with_targets_bound_from_clean_contexts() -> None:
+    source = """\
+detail = exc
+with context() as detail:
+    logger.warning("event", detail=detail)
+"""
+
+    assert _raw_log_exception_renderers(source) == []
+
+
+def test_raw_exception_log_guard_tracks_walrus_aliases() -> None:
+    source = """\
+if detail := exc:
+    logger.warning("event", detail=detail)
+"""
+
+    assert _raw_log_exception_renderers(source) == [2]
+
+
+def test_raw_exception_log_guard_clears_walrus_targets_bound_from_clean_values() -> None:
+    source = """\
+detail = exc
+if detail := "authored detail":
+    logger.warning("event", detail=detail)
+"""
+
+    assert _raw_log_exception_renderers(source) == []
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_line"),
+    [
+        (
+            """\
+match exc:
+    case detail:
+        logger.warning("event", detail=detail)
+""",
+            3,
+        ),
+        (
+            """\
+match [exc, "authored detail"]:
+    case [detail, authored]:
+        logger.warning("event", detail=authored)
+""",
+            3,
+        ),
+        (
+            """\
+match [exc]:
+    case [*details]:
+        logger.warning("event", detail=details)
+""",
+            3,
+        ),
+        (
+            """\
+match {"detail": exc}:
+    case {"detail": detail, **remaining}:
+        logger.warning("event", detail=remaining)
+""",
+            3,
+        ),
+    ],
+)
+def test_raw_exception_log_guard_tracks_match_capture_aliases(source: str, expected_line: int) -> None:
+    assert _raw_log_exception_renderers(source) == [expected_line]
+
+
+def test_raw_exception_log_guard_clears_irrefutable_match_captures_bound_from_clean_subjects() -> None:
+    source = """\
+detail = exc
+match "authored detail":
+    case detail:
+        pass
+logger.warning("event", detail=detail)
+"""
+
+    assert _raw_log_exception_renderers(source) == []
+
+
+def test_raw_exception_log_guard_unions_handler_and_else_paths() -> None:
+    source = """\
+try:
+    work()
+except Exception as caught:
+    alias = caught
+else:
+    alias = "authored detail"
+logger.warning("event", detail=alias)
+"""
+    assert _raw_log_exception_renderers(source) == [7]
+
+
+def test_raw_exception_log_guard_preserves_taint_at_each_try_body_exit() -> None:
+    source = """\
+try:
+    alias = exc
+    work()
+    alias = "authored detail"
+except Exception:
+    pass
+else:
+    alias = "authored detail"
+logger.warning("event", detail=alias)
+"""
+    assert _raw_log_exception_renderers(source) == [9]
+
+
+def test_raw_exception_log_guard_preserves_nested_try_body_taint() -> None:
+    source = """\
+try:
+    if condition:
+        alias = exc
+        work()
+        alias = "authored detail"
+except Exception:
+    pass
+logger.warning("event", detail=alias)
+"""
+    assert _raw_log_exception_renderers(source) == [8]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_line"),
+    [
+        (
+            """\
+try:
+    with context():
+        alias = exc
+        work()
+        alias = "authored detail"
+except Exception:
+    pass
+logger.warning("event", detail=alias)
+""",
+            8,
+        ),
+        (
+            """\
+try:
+    match value:
+        case _:
+            alias = exc
+            work()
+            alias = "authored detail"
+except Exception:
+    pass
+logger.warning("event", detail=alias)
+""",
+            9,
+        ),
+    ],
+)
+def test_raw_exception_log_guard_preserves_taint_in_nested_statement_containers(
+    source: str, expected_line: int
+) -> None:
+    assert _raw_log_exception_renderers(source) == [expected_line]
+
+
+def test_raw_exception_log_guard_preserves_the_post_with_body_state_for_exit_failures() -> None:
+    source = """\
+alias = "authored detail"
+try:
+    with context():
+        alias = exc
+except Exception:
+    pass
+else:
+    alias = "authored detail"
+logger.warning("event", detail=alias)
+"""
+
+    assert _raw_log_exception_renderers(source) == [9]
+
+
 def test_raw_exception_log_guard_does_not_leak_aliases_between_functions() -> None:
     source = """\
 def first():
@@ -450,6 +1178,45 @@ def test_the_action_section_code_is_derived_in_exactly_one_place() -> None:
     assert offenders == [], "derive the code via read_outcome.section_absence_code, never in the caller"
 
 
+@pytest.mark.anyio
+async def test_discovery_error_uses_the_configured_instance_identity(db_session, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from structlog.testing import capture_logs
+
+    from nso_adapter.config import NsoInstanceConfig
+    from nso_adapter.core import importer
+    from nso_adapter.nso.client import NsoClient
+    from tests._secret_discipline import assert_records_free_of
+
+    provider_device = "placeholder-provider-device"
+    configured = NsoInstanceConfig(
+        name="configured-discovery-instance",
+        base_url="http://nso.invalid:8080",
+        username_ref="NSO_USERNAME",
+        password_ref="NSO_PASSWORD",
+    )
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            503,
+            request=request,
+            extensions={"reason_phrase": provider_device.encode()},
+        )
+    )
+    client = NsoClient(configured, "placeholder-user", "placeholder-password")
+    client._client = lambda timeout=None: httpx.AsyncClient(transport=transport, base_url=configured.base_url)
+    monkeypatch.setattr(importer, "get_config", lambda: SimpleNamespace(nso_instances=[configured]))
+    monkeypatch.setitem(importer._nso_clients, configured.name, client)
+
+    with capture_logs() as logs:
+        await importer.discover_devices(db_session)
+
+    record = next(item for item in logs if item["event"] == "discover.error")
+    assert_records_free_of([record], [provider_device])
+    assert record["instance"] == configured.name
+    assert record["error"] == "HTTPStatusError (HTTP 503)"
+
+
 def test_guarded_modules_are_documented() -> None:
     coverage = _COVERAGE_DOC.read_text(encoding="utf-8").split("## Coverage", maxsplit=1)[1]
     for path in (_IMPORTER, *_GUARDED_LOG_SINKS):
@@ -473,12 +1240,45 @@ def test_review_guards_cover_each_authored_error_boundary() -> None:
     alias_paths = set(rules["nso-outcome-raw-exception-alias-renderer"]["paths"]["include"])
     assert alias_paths == outcome_paths
     assert "nso_adapter/core/generation.py" in outcome_paths
+    assert "nso_adapter/core/removal.py" in outcome_paths
     identifier_paths = set(rules["nso-diagnostic-raw-identifier"]["paths"]["include"])
     assert {
         "nso_adapter/core/importer.py",
         "nso_adapter/core/redistribution.py",
         "nso_adapter/nso/client.py",
     } <= identifier_paths
+
+
+def test_the_raised_message_guard_keeps_its_vocabulary_and_its_narrow_sink() -> None:
+    """The raise guard is pinned whole: a silent narrowing is how this class came back before.
+
+    Both sinks matter. It sinks on the MESSAGE, so a `detail=` field stays a separate
+    question, and it carries no module allowlist, so the class cannot be scoped away one
+    module at a time.
+    """
+    rules = {rule["id"]: rule for rule in yaml.safe_load(_RULES.read_text(encoding="utf-8"))["rules"]}
+    rule = rules["nso-raised-message-raw-identifier"]
+
+    assert set(_rule_patterns(rule["pattern-sources"])) == {
+        "$D.nso_device_name",
+        "$D.ned_id",
+        "$D.sw_version",
+        "device_name",
+        "stream_url",
+    }
+    assert set(_rule_patterns(rule["pattern-sanitizers"])) == {"$D.id", "$RESPONSE.status_code"}, (
+        "a response body is NOT sanitized: a device-named URL lets the server echo the name back"
+    )
+    assert "paths" not in rule, "the class applies to every module; an allowlist would scope it away"
+
+    sink = rule["pattern-sinks"][0]["patterns"]
+    assert {"pattern-inside": "raise $EXC(...)"} in sink, "the sink must stay inside a raise"
+    assert set(_rule_patterns(sink)) == {
+        'f"..."',
+        "$TEMPLATE.format(...)",
+        "$TEMPLATE % $VALUES",
+        "$LEFT + $RIGHT",
+    }, "the sink is the message expression, never the whole raise"
 
 
 def _rule_patterns(node: object) -> list[str]:

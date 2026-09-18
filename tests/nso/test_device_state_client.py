@@ -122,8 +122,8 @@ async def test_section_404_with_healthy_container_is_device_absent(patch_client)
     # BOUNDED: without ?depth=1 the bare container GET serializes the whole fleet x 18 sections.
     assert len(transport.requests) == 2
     probe_url = str(transport.requests[1].url)
-    assert "/device=" not in probe_url
-    assert "depth=1" in probe_url
+    # One positive assertion says both halves: the bare container (no /device=) and bounded.
+    assert probe_url.endswith("/restconf/data/network-state-export:device-state?depth=1")
 
 
 async def test_section_404_with_dead_container_raises_export_unavailable(patch_client):
@@ -266,19 +266,26 @@ def _action(output: dict) -> dict:
 
 async def test_action_non_atomic_response_is_a_contract_violation(patch_client):
     client = _make_client()
-    body = _action({"device-name": "sw01", "ospf-config": {"status": "ok"}})  # no atomic:true
+    submitted_device = "placeholder-non-atomic-device"
+    body = _action({"device-name": submitted_device, "ospf-config": {"status": "ok"}})  # no atomic:true
     with patch_client(client, EnvelopeTransport(action_body=body)):
-        with pytest.raises(NsoReadContractError):
-            await client.run_device_state_read("sw01", ["ospf-config"])
+        with pytest.raises(NsoReadContractError) as caught:
+            await client.run_device_state_read(submitted_device, ["ospf-config"])
+
+    assert_chain_free_of(caught.value, [submitted_device])
 
 
 async def test_action_wrong_device_echo_is_a_contract_violation(patch_client):
     """A version-skewed response for ANOTHER device must never be read as this device's state."""
     client = _make_client()
-    body = _action({"atomic": True, "device-name": "other", "ospf-config": {"status": "ok"}})
+    submitted_device = "placeholder-requested-device"
+    provider_device = "placeholder-provider-device"
+    body = _action({"atomic": True, "device-name": provider_device, "ospf-config": {"status": "ok"}})
     with patch_client(client, EnvelopeTransport(action_body=body)):
-        with pytest.raises(NsoReadContractError):
-            await client.run_device_state_read("sw01", ["ospf-config"])
+        with pytest.raises(NsoReadContractError) as caught:
+            await client.run_device_state_read(submitted_device, ["ospf-config"])
+
+    assert_chain_free_of(caught.value, [submitted_device, provider_device])
 
 
 async def test_action_missing_device_echo_is_a_contract_violation(patch_client):
