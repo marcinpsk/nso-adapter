@@ -39,6 +39,9 @@ def _pinned_partial_paths() -> set[str]:
 
 
 _EXPECTED_PARTIAL_PATHS = _pinned_partial_paths()
+_PINNED_PARTIAL_PATH = sorted(_EXPECTED_PARTIAL_PATHS)[0]
+_UNPINNED_PARTIAL_PATH = "scratch/unpinned-review-pattern.py"
+assert _UNPINNED_PARTIAL_PATH not in _EXPECTED_PARTIAL_PATHS
 
 
 def _write_opengrep_stub(
@@ -208,8 +211,8 @@ def test_the_opengrep_prerequisite_holds_where_opengrep_is_on_the_path(tmp_path)
             "New partially analysed files:",
         ),
         (
-            _EXPECTED_PARTIAL_PATHS - {"nso_adapter/core/refresh_engine.py"},
-            "nso_adapter/core/refresh_engine.py",
+            _EXPECTED_PARTIAL_PATHS - {_PINNED_PARTIAL_PATH},
+            _PINNED_PARTIAL_PATH,
             "Expected partially analysed files no longer reported:",
         ),
     ],
@@ -258,8 +261,8 @@ def test_review_pattern_scan_accepts_the_pinned_partial_paths(tmp_path: Path) ->
 @pytest.mark.parametrize(
     ("target", "partial_paths", "expected_count"),
     [
-        ("nso_adapter/core/vlan.py", set(), 0),
-        ("nso_adapter/core/failover.py", {"nso_adapter/core/failover.py"}, 1),
+        (_UNPINNED_PARTIAL_PATH, set(), 0),
+        (_PINNED_PARTIAL_PATH, {_PINNED_PARTIAL_PATH}, 1),
     ],
 )
 def test_review_pattern_targeted_scan_checks_only_pins_in_scope(
@@ -286,7 +289,7 @@ def test_review_pattern_targeted_scan_checks_only_pins_in_scope(
 
 
 def test_review_pattern_targeted_scan_rejects_a_new_partial_parse(tmp_path: Path) -> None:
-    target = "nso_adapter/core/vlan.py"
+    target = _UNPINNED_PARTIAL_PATH
     stub, _invocations = _write_opengrep_stub(tmp_path, {target})
 
     result = subprocess.run(
