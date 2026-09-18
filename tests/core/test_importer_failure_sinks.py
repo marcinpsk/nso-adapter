@@ -1353,7 +1353,7 @@ def test_the_identifier_guard_leaves_the_operator_authored_instance_name_alone()
     sources = _rule_patterns(rules["nso-diagnostic-raw-identifier-alias"]["pattern-sources"])
     instance_sources = {pattern for pattern in sources if pattern.rsplit(".", maxsplit=1)[-1] == "nso_instance"}
 
-    assert fields == {"device_name", "device", "stream", "stream_url", "url"}
+    assert fields == {"device_name", "device", "nso_device", "stream", "stream_url", "url"}
     assert instance_sources == set(), "the alias rule must not carry an instance source either"
 
 
