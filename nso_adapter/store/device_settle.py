@@ -26,9 +26,13 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.store.db import _violated_constraint
 from nso_adapter.store.models import Device, DeviceSettleCounter
 
 logger = structlog.get_logger(__name__)
+
+# PostgreSQL name for the device foreign key declared by migration d3a7f1c58e42.
+_DEVICE_FOREIGN_KEY_CONSTRAINT = "device_settle_counter_device_id_fkey"
 
 
 class MissingSettleCounter(RuntimeError):
@@ -85,7 +89,9 @@ async def ensure_settle_counters() -> int:
                         .values(device_id=device_id, last_seq=0)
                         .on_conflict_do_nothing(index_elements=["device_id"]),
                     )
-            except IntegrityError:
+            except IntegrityError as exc:
+                if _violated_constraint(exc) != _DEVICE_FOREIGN_KEY_CONSTRAINT:
+                    raise
                 # The device was offboarded while this insert waited on its row lock.
                 logger.info("settle_counter.device_vanished", device_id=device_id)
                 continue

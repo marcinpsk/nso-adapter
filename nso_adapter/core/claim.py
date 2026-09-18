@@ -65,6 +65,8 @@ PURPOSES = frozenset({"job", "intent_put", "teardown", "sweep", "failover"})
 # PostgreSQL's lock_not_available. Read from the SQLSTATE rather than matched in the
 # message, which is locale- and version-dependent.
 _LOCK_NOT_AVAILABLE = "55P03"
+# Job.__table_args__ declares this partial unique index.
+_QUEUED_JOB_CONSTRAINT = "uq_job_queued_per_device_type"
 
 # ── timing (the derivation the claim cutoff depends on) ──────────────────────
 #
@@ -868,7 +870,9 @@ async def terminalize_running(
                     run_attempt=expected_attempt,
                     values=values,
                 )
-        except IntegrityError:
+        except IntegrityError as exc:
+            if _violated_constraint(exc) != _QUEUED_JOB_CONSTRAINT:
+                raise
             # A successor was admitted between the lookup and the UPDATE. The savepoint
             # absorbed it; re-read and re-issue as the coalesced failure.
             successor_id = await _queued_successor_id(db, *coalescible) if coalescible else None
