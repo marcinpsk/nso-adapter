@@ -64,6 +64,20 @@ named. Both rules guard the same module list.
 These records use `device_id` when a stored device exists and omit the external
 identifier otherwise.
 
+`nso-raised-message-raw-identifier` covers the other publication path: a RAISED
+message. Both identifier rules above sink on `logger.*`, so neither sees a name
+interpolated into an exception, which `str(exc)`, `repr(exc)` and any formatted
+traceback then publish with no handler able to take it back out. The rule carries the
+same identifier vocabulary into the message expression of a `raise`, through
+f-strings, `format`, `%` and concatenation, and through a local alias.
+
+It sinks on the MESSAGE, not on the `raise`: a `detail=` field is a different
+question, answered by whether its consumer renders it. It is the only guard here with
+no module allowlist, because the class applies to every module and the rule is silent
+over the whole package. `$D.id` and `$RESPONSE.status_code` are sanitized, the
+adapter's own identifier and a closed integer; `$RESPONSE.text` is deliberately not,
+because a device-named URL lets the server echo the submitted name straight back.
+
 `nso-api-validation-error-raw-exception-renderer` rejects every supported raw
 renderer in device validation responses. `nso-api-validation-error-raw-data-alias`
 tracks request and exception values through aliases to the same response field.

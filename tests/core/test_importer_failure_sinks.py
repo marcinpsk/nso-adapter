@@ -1249,6 +1249,38 @@ def test_review_guards_cover_each_authored_error_boundary() -> None:
     } <= identifier_paths
 
 
+def test_the_raised_message_guard_keeps_its_vocabulary_and_its_narrow_sink() -> None:
+    """The raise guard is pinned whole: a silent narrowing is how this class came back before.
+
+    Both sinks matter. It sinks on the MESSAGE, so a `detail=` field stays a separate
+    question, and it carries no module allowlist, so the class cannot be scoped away one
+    module at a time.
+    """
+    rules = {rule["id"]: rule for rule in yaml.safe_load(_RULES.read_text(encoding="utf-8"))["rules"]}
+    rule = rules["nso-raised-message-raw-identifier"]
+
+    assert set(_rule_patterns(rule["pattern-sources"])) == {
+        "$D.nso_device_name",
+        "$D.ned_id",
+        "$D.sw_version",
+        "device_name",
+        "stream_url",
+    }
+    assert set(_rule_patterns(rule["pattern-sanitizers"])) == {"$D.id", "$RESPONSE.status_code"}, (
+        "a response body is NOT sanitized: a device-named URL lets the server echo the name back"
+    )
+    assert "paths" not in rule, "the class applies to every module; an allowlist would scope it away"
+
+    sink = rule["pattern-sinks"][0]["patterns"]
+    assert {"pattern-inside": "raise $EXC(...)"} in sink, "the sink must stay inside a raise"
+    assert set(_rule_patterns(sink)) == {
+        'f"..."',
+        "$TEMPLATE.format(...)",
+        "$TEMPLATE % $VALUES",
+        "$LEFT + $RIGHT",
+    }, "the sink is the message expression, never the whole raise"
+
+
 def _rule_patterns(node: object) -> list[str]:
     """Every `pattern:` string anywhere under one rule clause, however it is nested."""
     if isinstance(node, dict):

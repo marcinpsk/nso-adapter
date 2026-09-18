@@ -607,6 +607,79 @@ def aliased_raw_diagnostic_identifiers(logger, device, body, stream_url):
     logger.info("family.refresh.done", device_id=device.id)
 
 
+def raised_messages_naming_the_caller(device, device_name, stream_url, wire, code, client, containers):
+    # ruleid: nso-raised-message-raw-identifier
+    raise NsoReadContractError(f"device-state-read for {device_name!r} did not certify")
+
+
+def raised_message_via_attribute(device):
+    # ruleid: nso-raised-message-raw-identifier
+    raise NsoReadContractError(f"echoed a different device than {device.nso_device_name!r}")
+
+
+def raised_message_after_a_code(device_name, code):
+    # ruleid: nso-raised-message-raw-identifier
+    raise NsoApplyError(code, f"dry-run for {device_name!r} rejected")
+
+
+def raised_message_through_api_error(device_name):
+    # ruleid: nso-raised-message-raw-identifier
+    raise api_error(404, "device_not_found", f"no device named {device_name}")
+
+
+def raised_message_by_concatenation(device_name):
+    # ruleid: nso-raised-message-raw-identifier
+    raise ValueError("unresolved device " + device_name)
+
+
+def raised_message_by_format(stream_url):
+    # ruleid: nso-raised-message-raw-identifier
+    raise ValueError("stream {} is unreachable".format(stream_url))
+
+
+def raised_message_from_an_alias(device):
+    name = device.nso_device_name
+    # ruleid: nso-raised-message-raw-identifier
+    raise ValueError(f"unresolved device {name}")
+
+
+def raised_message_from_a_response_body(client, device_name):
+    resp = client.put(f"/restconf/data/devices/device={device_name}/intent")
+    # The URL names the device, so the server can echo it back in the body.
+    # ruleid: nso-raised-message-raw-identifier
+    raise NsoApplyError("nso_put_failed", f"NSO refused: {resp.text}")
+
+
+def a_structured_field_is_not_the_message(device):
+    # ok: nso-raised-message-raw-identifier
+    raise NsoApplyError(
+        "snapshot_inconclusive",
+        "static_route: could not certify the live service instance",
+        detail={"device": device.nso_device_name},
+    )
+
+
+def the_adapters_own_id_is_not_caller_text(device):
+    # ok: nso-raised-message-raw-identifier
+    raise api_error(404, "community_not_found", f"no community in the mirror of device {device.id}")
+
+
+def a_status_code_is_a_closed_integer(client, device_name, containers):
+    resp = client.put(f"/restconf/data/devices/device={device_name}/intent", json=containers)
+    # ok: nso-raised-message-raw-identifier
+    raise NsoApplyError("nso_put_failed", f"NSO device-intent PUT failed with status {resp.status_code}")
+
+
+def an_authored_message_names_nothing(code):
+    # ok: nso-raised-message-raw-identifier
+    raise NsoReadContractError("device-state-read did not certify an atomic snapshot")
+
+
+def an_authored_family_name_is_ours(wire):
+    # ok: nso-raised-message-raw-identifier
+    raise NsoReadContractError(f"device-state-read section {wire!r} is not a dict")
+
+
 async def legacy_query_api(session, model, select):
     # ruleid: nso-store-legacy-query-api
     session.query(model).all()
