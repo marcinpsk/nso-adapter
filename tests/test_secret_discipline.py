@@ -30,10 +30,15 @@ _NON_DISCLOSURE_TESTS = (
     _TEST_ROOT / "core" / "test_redistribution.py",
     _TEST_ROOT / "core" / "test_refresh_engine_envelope.py",
     _TEST_ROOT / "nso" / "test_device_state_client.py",
+    _TEST_ROOT / "nso" / "test_nso_client_methods.py",
+    _TEST_ROOT / "nso" / "test_persistent_subscriber.py",
+    _TEST_ROOT / "nso" / "test_sse_subscriber.py",
     _TEST_ROOT / "test_secret_discipline.py",
     _TEST_ROOT / "test_vault_provider.py",
 )
 _INSPECTED_ATTRIBUTES = {"json", "read_failures", "text", "value"}
+_INSPECTED_CALLS = {"repr", "str"}
+_NON_DISCLOSURE_HELPERS = {"assert_chain_free_of", "assert_records_free_of", "assert_text_free_of"}
 
 
 def _reads_an_inspected_surface(node: ast.AST) -> bool:
@@ -42,7 +47,7 @@ def _reads_an_inspected_surface(node: ast.AST) -> bool:
         and part.attr in _INSPECTED_ATTRIBUTES
         or isinstance(part, ast.Call)
         and isinstance(part.func, ast.Name)
-        and part.func.id in {"repr", "str"}
+        and part.func.id in _INSPECTED_CALLS
         for part in ast.walk(node)
     )
 
@@ -122,6 +127,212 @@ def test_non_disclosure_checks_do_not_use_rewritten_assertions() -> None:
             ):
                 violations.append(f"{path.relative_to(_TEST_ROOT.parent)}:{node.lineno}")
     assert violations == []
+
+
+def _protected_roots(call: ast.Call) -> set[str]:
+    """The names a non-disclosure helper was asked to clear, e.g. ``response`` for ``response.text``."""
+    if not call.args:
+        return set()
+    return {part.id for part in ast.walk(call.args[0]) if isinstance(part, ast.Name)}
+
+
+def _own_body(scope: ast.AST):
+    """Every node of *scope* except the bodies of functions nested inside it.
+
+    Line order is execution order only within one body. A callback defined before a clearing call
+    runs after it, so judging its assertions by line number would report the wrong answer twice
+    over: a false positive on the callback, and a false negative for a clear placed inside one.
+    """
+    stack = list(ast.iter_child_nodes(scope))
+    while stack:
+        node = stack.pop()
+        yield node
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+            stack.extend(ast.iter_child_nodes(node))
+
+
+def _rebinding_lines(scope: ast.AST, root: str) -> list[int]:
+    """The lines of *scope*'s own body that bind *root* to a new value."""
+    lines = []
+    for node in _own_body(scope):
+        targets: list[ast.AST] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, ast.AnnAssign | ast.AugAssign | ast.NamedExpr):
+            targets = [node.target]
+        elif isinstance(node, ast.For | ast.AsyncFor):
+            targets = [node.target]
+        elif isinstance(node, ast.withitem):
+            targets = [node.optional_vars] if node.optional_vars is not None else []
+        for target in targets:
+            if any(isinstance(part, ast.Name) and part.id == root for part in ast.walk(target)):
+                lines.append(getattr(node, "lineno", 0) or 0)
+    return lines
+
+
+def _renders_root(node: ast.AST, root: str) -> bool:
+    """True when *node* renders *root* whole: the bare name, a text surface, or str/repr of it."""
+    for part in ast.walk(node):
+        if isinstance(part, ast.Name) and part.id == root:
+            return True
+        if isinstance(part, ast.Attribute) and part.attr in _INSPECTED_ATTRIBUTES:
+            if any(isinstance(inner, ast.Name) and inner.id == root for inner in ast.walk(part)):
+                return True
+    return False
+
+
+def _renders_root_through_a_surface(node: ast.AST, root: str) -> bool:
+    """True when *root* is rendered through a text surface or an explicit str/repr, never bare."""
+    for part in ast.walk(node):
+        reads_surface = (isinstance(part, ast.Attribute) and part.attr in _INSPECTED_ATTRIBUTES) or (
+            isinstance(part, ast.Call) and isinstance(part.func, ast.Name) and part.func.id in _INSPECTED_CALLS
+        )
+        if reads_surface and any(isinstance(inner, ast.Name) and inner.id == root for inner in ast.walk(part)):
+            return True
+    return False
+
+
+def _discloses_protected_value(node: ast.Assert, root: str) -> bool:
+    """True when a FAILURE of *node* prints the protected surface whole.
+
+    Scoped to what the syntax decides on its own. A failure message is printed verbatim, and an
+    operand that is the bare protected name renders all of it. A membership test is judged on how
+    it reads the name: ``protected not in str(record)`` renders the record, while
+    ``"device_id" not in record`` asks whether a KEY is absent and renders a boolean.
+
+    A narrowed operand such as ``resp.json()["error"]["code"]`` is not decidable here, and neither
+    is a plain string local like ``secret not in detail``: whether that value can carry protected
+    text is a question about the value, not about the expression. Those stay a review matter.
+    """
+    if node.msg is not None and _renders_root(node.msg, root):
+        return True
+    for part in ast.walk(node.test):
+        if not isinstance(part, ast.Compare):
+            continue
+        operands = (part.left, *part.comparators)
+        if any(isinstance(operator, ast.In | ast.NotIn) for operator in part.ops):
+            if any(_renders_root_through_a_surface(operand, root) for operand in operands):
+                return True
+            continue
+        if any(isinstance(operand, ast.Name) and operand.id == root for operand in operands):
+            return True
+    return False
+
+
+def _ordering_violations_in(scope: ast.AST) -> list[tuple[int, str]]:
+    """The assertions in *scope*'s own body that render a protected value before it is cleared.
+
+    A clearing call protects the value it was given from that line on. Re-binding the name after
+    the clear produces a value nothing has checked, so the next assertion on it counts again.
+    """
+    clears: dict[str, list[int]] = {}
+    asserts: list[ast.Assert] = []
+    for part in _own_body(scope):
+        if isinstance(part, ast.Call) and isinstance(part.func, ast.Name) and part.func.id in _NON_DISCLOSURE_HELPERS:
+            for root in _protected_roots(part):
+                clears.setdefault(root, []).append(part.lineno)
+        elif isinstance(part, ast.Assert):
+            asserts.append(part)
+
+    violations = []
+    for node in asserts:
+        for root, lines in clears.items():
+            if not _discloses_protected_value(node, root):
+                continue
+            earlier = [line for line in lines if line < node.lineno]
+            if not earlier:
+                violations.append((node.lineno, root))
+                continue
+            if any(max(earlier) < line < node.lineno for line in _rebinding_lines(scope, root)):
+                violations.append((node.lineno, root))
+    return sorted(set(violations))
+
+
+def test_non_disclosure_checks_run_before_the_diagnostics() -> None:
+    """pytest prints a failing assertion's operands, so the helper has to clear the value first."""
+    violations = []
+    for path in _NON_DISCLOSURE_TESTS:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for scope in ast.walk(tree):
+            if not isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            for lineno, root in _ordering_violations_in(scope):
+                violations.append(f"{path.relative_to(_TEST_ROOT.parent)}:{lineno} discloses {root!r}")
+    assert violations == []
+
+
+def _ordering_violations(source: str) -> list[int]:
+    """Run the SAME rule the test above runs, over one snippet."""
+    return [lineno for lineno, _ in _ordering_violations_in(ast.parse(source).body[0])]
+
+
+def test_the_ordering_rule_reads_the_shapes_that_disclose_and_no_others() -> None:
+    """A failure message and a bare operand render the value; a key test renders a boolean."""
+    message = """\
+def t():
+    assert resp.status_code == 422, resp.text
+    assert_text_free_of(resp.text, [protected])
+"""
+    bare_operand = """\
+def t():
+    assert detail == "authored text"
+    assert_text_free_of(detail, [protected])
+"""
+    key_membership = """\
+def t():
+    assert "device_id" not in record
+    assert_records_free_of([record], [protected])
+"""
+    narrowed_operand = """\
+def t():
+    assert record["error"] == "ReadTimeout"
+    assert_records_free_of([record], [protected])
+"""
+    rendered_membership = """\
+def t():
+    assert "wanted" in str(caught.value)
+    assert_chain_free_of(caught.value, [protected])
+"""
+
+    assert _ordering_violations(message) == [2]
+    assert _ordering_violations(bare_operand) == [2]
+    assert _ordering_violations(rendered_membership) == [2]
+    assert _ordering_violations(key_membership) == []
+    assert _ordering_violations(narrowed_operand) == []
+
+
+def test_a_name_rebound_after_its_clear_is_unchecked_again() -> None:
+    """The first clear protects the value it was given, not every later value of that name."""
+    rebound = """\
+def t():
+    resp = post(a)
+    assert_text_free_of(resp.text, [protected])
+    resp = post(b)
+    assert resp == expected
+    assert_text_free_of(resp.text, [protected])
+"""
+    not_rebound = """\
+def t():
+    assert_text_free_of(caught.value, [protected])
+    assert "wanted" in str(caught.value)
+    assert_chain_free_of(caught.value, [protected])
+"""
+
+    assert _ordering_violations(rebound) == [5], "the value after the re-bind was never cleared"
+    assert _ordering_violations(not_rebound) == [], "one clear covers the assertions after it"
+
+
+def test_ordering_is_judged_per_body_because_a_callback_runs_later() -> None:
+    """A closure defined before the clear runs after it, so its line number proves nothing."""
+    callback_defined_early = """\
+def t():
+    def on_event(record):
+        assert record == expected
+    run(on_event)
+    assert_records_free_of([record], [protected])
+"""
+
+    assert _ordering_violations(callback_defined_early) == [], "the callback is not part of this body"
 
 
 def test_text_non_disclosure_failure_does_not_echo_the_material() -> None:

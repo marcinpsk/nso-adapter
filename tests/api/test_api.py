@@ -50,11 +50,11 @@ async def test_jobs_list_invalid_status_is_refused_without_the_value(adapter_cli
         headers={"Authorization": f"Bearer {VALID_TOKEN}"},
     )
 
-    assert resp.status_code == 422, resp.text
+    assert_text_free_of(resp.text, ["placeholder-status-value"])
+    assert resp.status_code == 422
     error = resp.json()["error"]
     assert error["code"] == "validation_error"
     assert error["message"] == "Invalid job status"
-    assert_text_free_of(resp.text, ["placeholder-status-value"])
 
 
 async def test_job_not_found(adapter_client):

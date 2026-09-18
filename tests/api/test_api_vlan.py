@@ -580,9 +580,9 @@ async def test_apply_switchport_refusal_states_the_reason_and_not_the_root(adapt
         {"interfaces": [], "deleted_roots": ["placeholder-unauthorized-root"]},
     )
 
-    assert response.status_code == 422, response.text
+    assert_text_free_of(response.text, ["placeholder-unauthorized-root"])
+    assert response.status_code == 422
     error = response.json()["error"]
     assert error["code"] == "validation_error"
     assert error["message"] == "a deleted root is not authorized on this device"
     assert error["detail"] == {"reason": "root_not_authorized"}
-    assert_text_free_of(response.text, ["placeholder-unauthorized-root"])

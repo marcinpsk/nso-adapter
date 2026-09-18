@@ -515,11 +515,11 @@ async def test_apply_lag_config_refuses_an_invalid_deletion_authority(adapter_cl
         {"bundles": _PREPARE_A["bundles"], "deleted_roots": deleted_roots},
     )
 
-    assert response.status_code == 422, response.text
+    assert_text_free_of(response.text, deleted_roots)
+    assert response.status_code == 422
     assert response.json()["error"]["code"] == "validation_error"
     assert reason in response.json()["error"]["message"]
     assert response.json()["error"]["detail"] == {"reason": code}, "the three refusals must stay distinguishable"
-    assert_text_free_of(response.text, deleted_roots)
     row = await _stream_row(device_id)
     assert (row.desired_revision, row.prepared_revision) == (1, 1), "a refusal leaves every revision untouched"
 
@@ -829,10 +829,10 @@ async def test_switching_apply_refuses_many_duplicate_roots_promptly(adapter_cli
     response = await adapter_client.post(f"/api/v1/devices/{device_id}/{route}/apply", json=body, headers=AUTH)
     elapsed = perf_counter() - started
 
-    assert response.status_code == 422, response.text
+    assert_text_free_of(response.text, ["root-z", "root-a", "root-once"])
+    assert response.status_code == 422
     assert response.json()["error"]["message"] == "deleted_roots repeats a root"
     assert response.json()["error"]["detail"] == {"reason": "repeated_root"}
-    assert_text_free_of(response.text, ["root-z", "root-a", "root-once"])
     assert elapsed < 5.0, f"80,000 deletion entries took {elapsed:.3f}s; expected less than 5s"
     async with session() as db:
         counts = (

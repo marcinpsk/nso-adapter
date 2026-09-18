@@ -172,8 +172,8 @@ async def test_persistent_subscriber_retries_after_transport_error(monkeypatch: 
     assert attempts == 2
     assert wait_for_calls == [5.0]
     record = next(record for record in logs if record["event"] == "sse.reconnect_after_error")
-    assert record["error"] == "HTTPStatusError (HTTP 503)"
     assert_records_free_of([record], ["placeholder-secret", "placeholder-stream-secret"])
+    assert record["error"] == "HTTPStatusError (HTTP 503)"
 
 
 async def test_persistent_subscriber_caps_exponential_backoff(monkeypatch: pytest.MonkeyPatch):

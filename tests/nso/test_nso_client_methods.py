@@ -24,6 +24,7 @@ from nso_adapter.nso.client import (
     failure_detail,
 )
 from nso_adapter.nso.read_outcome import Unavailable, UnavailableReason
+from tests._secret_discipline import assert_text_free_of
 
 
 def _make_cfg(base_url: str = "http://nso:8080", ca_cert=None, host_header=None):
@@ -678,18 +679,17 @@ async def test_the_host_key_refusal_names_only_the_failure_kind(patch_client, pa
             await client.fetch_host_keys(requested_device)
 
     detail = failure_detail(caught.value)
+    assert_text_free_of(detail, [requested_device, "refused by", "203.0.113.9"])
     assert caught.value.kind is expected_kind
     assert detail == f"NsoActionFailedError({expected_kind.value!r})"
-    assert requested_device not in detail, "the request value must not reach a persistent failure sink"
-    assert "refused by" not in detail and "203.0.113.9" not in detail, "the action's own words never travel"
 
 
 @pytest.mark.parametrize("error_type", [NsoReadContractError, NsoExportUnavailableError])
 def test_failure_detail_does_not_preserve_read_exception_messages(error_type):
     detail = failure_detail(error_type("placeholder-secret caller text"))
 
+    assert_text_free_of(detail, ["placeholder-secret"])
     assert detail == error_type.__name__
-    assert "placeholder-secret" not in detail
 
 
 @pytest.mark.parametrize(

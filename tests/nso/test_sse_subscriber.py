@@ -205,9 +205,9 @@ async def test_post_header_idle_raises_sse_idle_timeout():
         sub._client = original
 
     record = next(record for record in logs if record["event"] == "sse_idle_timeout")
-    assert record["error"] == "ReadTimeout"
     assert_records_free_of([record], ["placeholder-secret", "placeholder-stream-secret"])
     assert_chain_free_of(caught.value, ["placeholder-secret", SECRET_STREAM_URL])
+    assert record["error"] == "ReadTimeout"
 
 
 async def test_pre_header_read_timeout_stays_a_transport_error():
@@ -231,9 +231,8 @@ async def test_pre_header_read_timeout_stays_a_transport_error():
         sub._client = original
 
     record = next(record for record in logs if record["event"] == "sse_subscribe_error")
+    assert_records_free_of([record], ["placeholder-secret", "placeholder-stream-secret"])
     assert record["error"] == "ReadTimeout"
-    assert "placeholder-secret" not in str(record)
-    assert "placeholder-stream-secret" not in str(record)
 
 
 async def test_subscribe_calls_on_event_for_each_sse_block():
@@ -309,8 +308,8 @@ async def test_subscribe_raises_on_http_error():
         sub._client = original
 
     record = next(record for record in logs if record["event"] == "sse_subscribe_error")
-    assert record["error"] == "HTTPStatusError (HTTP 503)"
     assert_records_free_of([record], ["placeholder-secret", "placeholder-stream-secret"])
+    assert record["error"] == "HTTPStatusError (HTTP 503)"
 
 
 async def test_subscribe_empty_stream_calls_no_events():

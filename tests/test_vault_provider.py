@@ -367,9 +367,9 @@ def test_a_VAULT_OUTAGE_refuses_by_type_and_attaches_no_hvac_exception(fake_hvac
     with pytest.raises(SecretResolutionError) as caught:
         _provider(mount=_STARTUP_MOUNT).get(_STARTUP_REF)
 
-    assert "the Vault read failed (RuntimeError)" in str(caught.value), "the TYPE tells an outage from a miss"
     assert_text_free_of(caught.value, _STARTUP_PARTS)
     assert_chain_free_of(caught.value, _STARTUP_PARTS)
+    assert "the Vault read failed (RuntimeError)" in str(caught.value), "the TYPE tells an outage from a miss"
     assert exception_chain(caught.value) == [caught.value], "the hvac exception must not stay on the chain"
 
 
@@ -394,10 +394,10 @@ def test_a_FAILED_STARTUP_resolution_names_the_CONFIG_SLOT(fake_hvac):
     with pytest.raises(SecretResolutionError) as caught:
         _build_nso_clients(cfg, _provider(mount=_STARTUP_MOUNT))
 
-    assert caught.value.slot == "nso_instances[nso-a].username_ref"
-    assert "nso_instances[nso-a].username_ref" in str(caught.value), "the operator must learn WHICH slot"
     assert_text_free_of(caught.value, _STARTUP_PARTS)
     assert_chain_free_of(caught.value, _STARTUP_PARTS)
+    assert caught.value.slot == "nso_instances[nso-a].username_ref"
+    assert "nso_instances[nso-a].username_ref" in str(caught.value), "the operator must learn WHICH slot"
 
 
 @pytest.mark.parametrize("payload", ["plaintext", ["ab", "cd"], 42, None])
