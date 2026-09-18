@@ -39,6 +39,9 @@ _NON_DISCLOSURE_TESTS = (
 _INSPECTED_ATTRIBUTES = {"json", "read_failures", "text", "value"}
 _INSPECTED_CALLS = {"repr", "str"}
 _NON_DISCLOSURE_HELPERS = {"assert_chain_free_of", "assert_records_free_of", "assert_text_free_of"}
+#: How this repository writes protected material into a test (see the placeholder convention). A
+#: body that names one is handling something protected, whether or not it calls a helper.
+_PROTECTED_LITERAL_PREFIX = "placeholder-"
 
 
 def _reads_an_inspected_surface(node: ast.AST) -> bool:
@@ -219,6 +222,16 @@ def _discloses_protected_value(node: ast.Assert, root: str) -> bool:
     return False
 
 
+def _declares_protected_material(scope: ast.AST) -> bool:
+    """True when *scope*'s own body writes protected material by the placeholder convention."""
+    return any(
+        isinstance(part, ast.Constant)
+        and isinstance(part.value, str)
+        and part.value.startswith(_PROTECTED_LITERAL_PREFIX)
+        for part in _own_body(scope)
+    )
+
+
 def _ordering_violations_in(scope: ast.AST) -> list[tuple[int, str]]:
     """The assertions in *scope*'s own body that render a protected value before it is cleared.
 
@@ -234,9 +247,20 @@ def _ordering_violations_in(scope: ast.AST) -> list[tuple[int, str]]:
         elif isinstance(part, ast.Assert):
             asserts.append(part)
 
+    # A helper call names what the author is protecting. A body that writes protected material but
+    # renders a surface into a diagnostic never named it, so take the surface itself as the root:
+    # that assertion prints the value and no call has cleared it.
+    candidates = dict(clears)
+    if _declares_protected_material(scope):
+        for node in asserts:
+            if node.msg is not None and _reads_an_inspected_surface(node.msg):
+                for part in ast.walk(node.msg):
+                    if isinstance(part, ast.Name):
+                        candidates.setdefault(part.id, [])
+
     violations = []
     for node in asserts:
-        for root, lines in clears.items():
+        for root, lines in candidates.items():
             if not _discloses_protected_value(node, root):
                 continue
             earlier = [line for line in lines if line < node.lineno]
@@ -320,6 +344,32 @@ def t():
 
     assert _ordering_violations(rebound) == [5], "the value after the re-bind was never cleared"
     assert _ordering_violations(not_rebound) == [], "one clear covers the assertions after it"
+
+
+def test_a_body_holding_protected_material_needs_no_helper_call_to_be_judged() -> None:
+    """A diagnostic that renders a response is uncleared even when no helper names it."""
+    protected_and_uncleared = """\
+def t():
+    resp = post({"community": "placeholder-secret"})
+    assert resp.status_code == 200, resp.text
+"""
+    protected_and_cleared = """\
+def t():
+    resp = post({"community": "placeholder-secret"})
+    assert_text_free_of(resp.text, ["placeholder-secret"])
+    assert resp.status_code == 200, resp.text
+"""
+    no_protected_material = """\
+def t():
+    resp = post({"name": "seed-device"})
+    assert resp.status_code == 200, resp.text
+"""
+
+    assert _ordering_violations(protected_and_uncleared) == [3]
+    assert _ordering_violations(protected_and_cleared) == []
+    assert _ordering_violations(no_protected_material) == [], (
+        "the ordinary status-and-body idiom is not a disclosure check"
+    )
 
 
 def test_ordering_is_judged_per_body_because_a_callback_runs_later() -> None:
