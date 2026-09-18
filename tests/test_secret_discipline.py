@@ -46,8 +46,14 @@ def _guarded_modules() -> tuple[Path, ...]:
     A hand-kept list omits a module the moment it starts handling protected material, and both
     rules then skip it in silence: that is how ``core/test_capability.py`` reached review with
     neither rule covering it. Deriving the membership removes the omission rather than the
-    symptom. A blanket sweep of every test module is a different rule with a different cost,
-    so the derivation stays on what a module actually holds.
+    symptom.
+
+    The signal is what a module HOLDS, by the two ways this repository says so. A module that
+    writes a non-disclosure check while holding neither is not selected until it calls a helper,
+    which is what ``api/test_error_codes.py`` now does. Selecting on the check itself instead
+    needs the narrower rendered-TEXT surface set, because over a parsed container
+    ``"local_as" not in peer`` asks whether a KEY is absent and would report ~20 assertions that
+    disclose nothing.
     """
     return tuple(
         path

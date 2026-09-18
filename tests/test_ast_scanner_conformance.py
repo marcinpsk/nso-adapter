@@ -307,6 +307,19 @@ CASES = (
         "for value in [SOURCE]:\n    SINK",
         "for value in [CLEAN]:\n    SINK",
     ),
+    # The iterable is evaluated ONCE, on entry: rebinding a name it reads inside the body cannot
+    # reach the target. Checked against CPython, not inferred from the scanners - a scanner that
+    # recomputes the verdict per fixed-point pass reports the clean form, which is a false
+    # positive and would force a rewrite that prevents no disclosure.
+    ConformanceCase(
+        "binding-loop-target-is-read-once",
+        "holder = SOURCE\nfor value in [holder]:\n    SINK",
+        "holder = CLEAN\nfor value in [holder]:\n    SINK\n    holder = SOURCE",
+        {
+            "credential": "recomputes the iterable verdict per pass, so it over-approximates a rebinding",
+            "non-disclosure": "the scanner unions a scope's bindings and does not model control flow",
+        },
+    ),
     # `return` and `raise` end the path, so the state of the branch they leave behind must not
     # merge into the code that follows.
     ConformanceCase(
@@ -404,6 +417,10 @@ OPENGREP_XFAILS = {
         "scope-function-shadow-by-import-alias",
         False,
     ): "OpenGrep does not treat an import alias as a local binding that shadows an inherited alias",
+    (
+        "binding-loop-target-is-read-once",
+        False,
+    ): "OpenGrep re-reads the iterable per iteration and taints the target from a later rebinding",
     (
         "control-break-in-try",
         True,

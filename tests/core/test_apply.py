@@ -30,6 +30,7 @@ from nso_adapter.store.models import (
     JobType,
     SyncState,
 )
+from tests._secret_discipline import assert_text_omits
 from tests.conftest import attach_apply_generation, note_projection_write, session
 
 
@@ -1365,8 +1366,9 @@ async def test_run_apply_unexpected_send_exception_is_recorded_as_internal(adapt
         assert job.result["vlan_count_by_outcome"]["apply_failed"] == 1
         rows = (await db.execute(select(VlanIntent).where(VlanIntent.device_id == device_id))).scalars().all()
         assert rows[0].last_apply_error["code"] == "internal"
-        assert "kaboom" not in str(rows[0].last_apply_error), "exception text reached the persisted error"
-        assert "kaboom" not in str(job.error), "exception text reached the persisted failure items"
+        # the persisted error and the failure items are the surfaces; "kaboom" is only the marker
+        assert_text_omits(rows[0].last_apply_error, ["kaboom"])
+        assert_text_omits(job.error, ["kaboom"])
         assert rows[0].last_apply_error["message"] == "apply error (internal); see the server log"
 
 
@@ -1742,8 +1744,9 @@ async def test_run_apply_ip_unexpected_exception(adapter_client):
             .all()
         )
         assert rows[0].last_apply_error["code"] == "internal"
-        assert "transport exploded" not in str(rows[0].last_apply_error), "exception text reached the persisted error"
-        assert "transport exploded" not in str(job.error), "exception text reached the persisted failure items"
+        # the persisted error and the failure items are the surfaces; the phrase is only the marker
+        assert_text_omits(rows[0].last_apply_error, ["transport exploded"])
+        assert_text_omits(job.error, ["transport exploded"])
         assert rows[0].last_apply_error["message"] == "apply error (internal); see the server log"
 
 
