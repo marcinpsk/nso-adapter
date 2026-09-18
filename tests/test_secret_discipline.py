@@ -23,14 +23,10 @@ _TEST_ROOT = Path(__file__).resolve().parent
 #: Every test module. A fixed allowlist lets a new module's assertion escape the guard, and
 #: three review rounds found exactly that escape before this list was retired.
 _NON_DISCLOSURE_TESTS = tuple(sorted(_TEST_ROOT.rglob("test_*.py")))
-#: Surfaces whose value is rendered TEXT, so `protected not in surface` is a substring test — a
-#: non-disclosure check, and pytest prints both operands when it fails.
-#:
-#: A parsed container is deliberately NOT here. `"local_as" not in peer` asks whether a KEY is
-#: absent, which `assert_text_free_of` cannot express: it would substring-match the rendered
-#: mapping and pass or fail for an unrelated reason. Those assertions are a different kind, and
-#: flagging them would force a wrong rewrite rather than prevent a disclosure.
-_INSPECTED_ATTRIBUTES = {"text"}
+#: Only rendered text makes `protected not in surface` a substring disclosure check.
+_MEMBERSHIP_SURFACE_ATTRIBUTES = {"text"}
+#: These attributes and calls return the complete value that pytest prints in equality failures.
+_RENDERED_SURFACE_ATTRIBUTES = {"json", "read_failures", "text", "value"}
 _INSPECTED_CALLS = {"repr", "str"}
 _NON_DISCLOSURE_HELPERS = {"assert_chain_free_of", "assert_records_free_of", "assert_text_free_of"}
 #: How this repository writes protected material into a test (see the placeholder convention). A
@@ -56,7 +52,7 @@ class _InspectedSurfaceReader(ast.NodeVisitor):
         super().visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:  # noqa: N802 - ast visitor API
-        if node.attr in _INSPECTED_ATTRIBUTES:
+        if node.attr in _MEMBERSHIP_SURFACE_ATTRIBUTES:
             self.found = True
             return
         self.generic_visit(node)
@@ -900,7 +896,7 @@ def _renders_root(node: ast.AST, root: str) -> bool:
     for part in ast.walk(node):
         if isinstance(part, ast.Name) and part.id == root:
             return True
-        if isinstance(part, ast.Attribute) and part.attr in _INSPECTED_ATTRIBUTES:
+        if isinstance(part, ast.Attribute) and part.attr in _MEMBERSHIP_SURFACE_ATTRIBUTES:
             if any(isinstance(inner, ast.Name) and inner.id == root for inner in ast.walk(part)):
                 return True
     return False
@@ -909,7 +905,7 @@ def _renders_root(node: ast.AST, root: str) -> bool:
 def _renders_root_through_a_surface(node: ast.AST, root: str) -> bool:
     """True when *root* is rendered through a text surface or an explicit str/repr, never bare."""
     for part in ast.walk(node):
-        reads_surface = (isinstance(part, ast.Attribute) and part.attr in _INSPECTED_ATTRIBUTES) or (
+        reads_surface = (isinstance(part, ast.Attribute) and part.attr in _MEMBERSHIP_SURFACE_ATTRIBUTES) or (
             isinstance(part, ast.Call) and isinstance(part.func, ast.Name) and part.func.id in _INSPECTED_CALLS
         )
         if reads_surface and any(isinstance(inner, ast.Name) and inner.id == root for inner in ast.walk(part)):
@@ -925,10 +921,10 @@ def _rendered_surfaces(node: ast.AST) -> list[ast.AST]:
     ``caught.value.response.status_code`` renders an int and ``resp.json()["error"]["code"]``
     renders one authored string: neither reads a surface off anything.
     """
-    if isinstance(node, ast.Attribute) and node.attr in _INSPECTED_ATTRIBUTES:
+    if isinstance(node, ast.Attribute) and node.attr in _RENDERED_SURFACE_ATTRIBUTES:
         return [node.value]
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-        if node.func.attr in _INSPECTED_ATTRIBUTES:
+        if node.func.attr in _RENDERED_SURFACE_ATTRIBUTES:
             return [node.func.value]
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _INSPECTED_CALLS:
         return list(node.args)
@@ -1206,8 +1202,7 @@ def t():
     assert _ordering_violations(rendered_equality) == [2]
     assert _ordering_violations(sequence_element) == [2], "a list prints every element it holds"
     assert _ordering_violations(surface_equality) == [2]
-    # json is not a rendered text surface on this branch.
-    assert _ordering_violations(whole_json) == []
+    assert _ordering_violations(whole_json) == [2]
     assert _ordering_violations(narrowed_surface) == [], "a status code is not the exception"
     assert _ordering_violations(narrowed_json) == [], "one authored code is not the body"
 
@@ -1328,15 +1323,20 @@ def t():
     assert _ordering_violations(nested_clear) == [4]
 
 
-def test_a_KEY_MEMBERSHIP_test_over_a_parsed_container_is_not_a_disclosure_check() -> None:
+def test_membership_and_rendered_surface_rules_answer_separate_questions() -> None:
     """`"local_as" not in peer` asks whether a KEY is absent. `assert_text_free_of` cannot express
-    that — it substring-matches the rendered mapping and would pass or fail for an unrelated
-    reason — so flagging it would force a wrong rewrite instead of preventing a disclosure.
+    that. It substring-matches the rendered mapping and would pass or fail for an unrelated
+    reason. Whole-object equality prints the complete decoded response instead.
     """
     container = """\
 body = response.json()
 peer = body["peers"][0]
 assert "local_as" not in peer
+"""
+    whole_json = """\
+def t():
+    assert response.json() == expected
+    assert_text_free_of(response.text, [protected])
 """
     text = """\
 body = response.text
@@ -1345,6 +1345,7 @@ assert protected not in body
 
     assert _non_disclosure_assertion_lines(container) == []
     assert _non_disclosure_assertion_lines(text) == [2]
+    assert _ordering_violations(whole_json) == [2]
 
 
 def test_a_NOT_IN_used_as_a_comprehension_filter_is_not_a_disclosure_check() -> None:
