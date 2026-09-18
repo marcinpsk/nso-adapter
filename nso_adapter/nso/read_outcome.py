@@ -109,8 +109,22 @@ class ReadFailureCode(str, enum.Enum):
     action_output_not_atomic = "action_output_not_atomic"  # the action output is not a certified snapshot
 
 
-# Classified off a served 200 section, never off a raised read (see ReadFailure.__post_init__).
-_SERVED_SECTION_CODES = frozenset({ReadFailureCode.section_status_error, ReadFailureCode.section_status_unrecognized})
+# Which reads can author each code, and whether the details of a raised read may travel with it.
+# Read off the producers: classify_envelope_section reads a served 200 section, section_absence_code
+# and the action paths answer a device-state read, and the not-ready heal stamps its code onto a
+# failure the exception already classified, so that one keeps the type and the status.
+_CODE_PROVENANCE: dict[ReadFailureCode, tuple[frozenset[ReadOperation], bool]] = {
+    ReadFailureCode.section_status_error: (frozenset({ReadOperation.section_classify}), False),
+    ReadFailureCode.section_status_unrecognized: (frozenset({ReadOperation.section_classify}), False),
+    ReadFailureCode.section_malformed: (
+        frozenset({ReadOperation.section_classify, ReadOperation.doc_get, ReadOperation.device_state_read}),
+        False,
+    ),
+    ReadFailureCode.heal_action_failed: (frozenset({ReadOperation.device_state_read}), True),
+    ReadFailureCode.action_section_missing: (frozenset({ReadOperation.device_state_read}), False),
+    ReadFailureCode.action_returned_not_ready: (frozenset({ReadOperation.device_state_read}), False),
+    ReadFailureCode.action_output_not_atomic: (frozenset({ReadOperation.device_state_read}), False),
+}
 # The one exception the liveness probe raises. Named, not imported: this module is the
 # vocabulary the client-side consumes, so importing the client back inverts the layering. A test
 # pins the name against the class, so the two cannot drift.
@@ -138,24 +152,31 @@ class ReadFailure:
     def __post_init__(self) -> None:
         """Refuse a classification no reader can produce, so a fixture cannot bless one.
 
-        ``classify_envelope_section`` is the only producer of the two section-status codes, and it
-        reads a served 200 rather than a raised error. A code paired with an exception type
-        or an HTTP status therefore describes a read that cannot happen.
+        Each code names one way a read broke, and only some reads can break that way. A code
+        paired with the wrong operation, or carrying the details of a raised read when it is
+        authored off a served answer, describes a read that cannot happen. Such a failure is
+        persisted in ``RefreshOutcome.read_failures`` and read back as a false diagnostic.
         """
-        if self.code in _SERVED_SECTION_CODES:
-            conflicting = [
+        if self.code is None:
+            return
+        provenance = _CODE_PROVENANCE.get(self.code)
+        if provenance is None:  # a new code must declare where it can come from
+            raise ValueError(f"{self.code.value} has no entry in _CODE_PROVENANCE")
+        operations, raised_details_allowed = provenance
+        faults = []
+        if self.operation not in operations:
+            allowed = " or ".join(sorted(operation.value for operation in operations))
+            faults.append(f"operation must be {allowed} (got {self.operation.value})")
+        if not raised_details_allowed:
+            carried = [
                 name
                 for name, value in (("error_type", self.error_type), ("http_status", self.http_status))
                 if value is not None
             ]
-            wrong_operation = self.operation is not ReadOperation.section_classify
-            if wrong_operation or conflicting:
-                faults = []
-                if wrong_operation:
-                    faults.append(f"operation must be section_classify (got {self.operation.value})")
-                if conflicting:
-                    faults.append(f"{' and '.join(conflicting)} must be unset")
-                raise ValueError(f"{self.code.value} is classified from a served section: {', '.join(faults)}")
+            if carried:
+                faults.append(f"{' and '.join(carried)} must be unset")
+        if faults:
+            raise ValueError(f"{self.code.value} cannot come from this read: {', '.join(faults)}")
 
     def for_family(self, family: str) -> ReadFailure:
         """Narrow a whole-device read failure to the family it is being reported for."""

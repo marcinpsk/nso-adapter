@@ -99,7 +99,7 @@ class TestUnproducibleClassifications:
 
     def test_a_served_section_code_refuses_a_raised_read(self):
         """503 raises, so the reader never sees a section to take a status off."""
-        with pytest.raises(ValueError, match="classified from a served section"):
+        with pytest.raises(ValueError, match="cannot come from this read"):
             ReadFailure(
                 operation=ReadOperation.section_get,
                 device="rg03",
@@ -151,6 +151,34 @@ class TestUnproducibleClassifications:
                 ),
             )
 
+    def test_every_code_declares_where_it_can_come_from(self):
+        """A new code without an entry would otherwise be validated by nothing."""
+        from nso_adapter.nso.read_outcome import _CODE_PROVENANCE
+
+        assert set(_CODE_PROVENANCE) == set(ReadFailureCode)
+
+    def test_an_action_code_refuses_a_read_that_cannot_author_it(self):
+        """The action codes answer a device-state read, not a section GET."""
+        with pytest.raises(ValueError, match="operation must be device_state_read"):
+            ReadFailure(
+                operation=ReadOperation.section_get,
+                device="rg03",
+                family="bgp-config",
+                code=ReadFailureCode.action_returned_not_ready,
+            )
+
+    def test_the_heal_code_keeps_the_details_the_exception_classified(self):
+        """heal_action_failed is stamped onto a raised read, so the type and status travel."""
+        healed = ReadFailure(
+            operation=ReadOperation.device_state_read,
+            device="rg03",
+            family="bgp-config",
+            error_type="HTTPStatusError",
+            http_status=503,
+            code=ReadFailureCode.heal_action_failed,
+        )
+        assert healed.http_status == 503
+
     def test_the_pinned_exception_name_is_the_class_name(self):
         """The invariant names the exception instead of importing it; the two must not drift."""
         from nso_adapter.nso.read_outcome import _EXPORT_DOWN_ERROR_TYPE
@@ -167,9 +195,7 @@ class TestUnproducibleClassifications:
                 http_status=503,
                 code=ReadFailureCode.section_status_error,
             )
-        assert str(caught.value) == (
-            "section_status_error is classified from a served section: http_status must be unset"
-        )
+        assert str(caught.value) == ("section_status_error cannot come from this read: http_status must be unset")
 
     def test_export_down_accepts_the_outage_the_probe_does_raise(self):
         outage = Unavailable(
