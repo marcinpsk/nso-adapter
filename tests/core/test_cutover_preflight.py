@@ -24,11 +24,11 @@ async def test_cutover_refusal_identifies_each_parked_carrier():
     parked = [ParkedCarrier(7, 9, ((internal_vrf, internal_prefix, internal_next_hop),))]
     refusal = CutoverBlocked(parked)
 
+    assert_chain_free_of(refusal, [internal_vrf, internal_prefix, internal_next_hop])
     assert str(refusal) == (
         "1 static-route carrier(s) are parked and must drain first: device 7 tombstone 9 has 1 parked key(s)"
     )
     assert refusal.parked == parked
-    assert_chain_free_of(refusal, [internal_vrf, internal_prefix, internal_next_hop])
 
 
 async def _job(job_id: int):

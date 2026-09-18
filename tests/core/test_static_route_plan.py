@@ -832,8 +832,8 @@ def test_malformed_execution_key_error_names_the_shape_not_the_route():
     with pytest.raises(ValueError, match="must contain three values") as caught:
         _sr_key([route_identity])
 
-    assert str(caught.value) == "a static-route execution key must contain three values; got 1"
     assert_chain_free_of(caught.value, [route_identity])
+    assert str(caught.value) == "a static-route execution key must contain three values; got 1"
 
 
 async def test_a_frozen_removal_plan_round_trips_its_clears(adapter_client):
