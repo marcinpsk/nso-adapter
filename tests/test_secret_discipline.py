@@ -93,6 +93,8 @@ class _InspectedSurfaceReader(ast.NodeVisitor):
         if isinstance(node.func, ast.Name) and node.func.id in _INSPECTED_CALLS:
             self.found = True
             return
+        if isinstance(node.func, ast.Lambda):
+            self.visit(node.func.body)
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:  # noqa: N802 - ast visitor API
@@ -1080,6 +1082,17 @@ def t():
     assert _ordering_violations(callback_defined_early) == [], "the callback is not part of this body"
 
 
+def test_a_clear_inside_an_immediately_invoked_lambda_earns_no_credit() -> None:
+    nested_clear = """\
+def t():
+    protected = "placeholder-secret"
+    (lambda: assert_text_free_of(resp.text, [protected]))()
+    assert resp.status_code == 200, resp.text
+"""
+
+    assert _ordering_violations(nested_clear) == [4]
+
+
 def test_non_disclosure_aliases_converge_without_cross_scope_contamination() -> None:
     reversed_order = """\
 leaked = captured
@@ -1095,6 +1108,26 @@ assert protected not in captured
 
     assert _non_disclosure_assertion_lines(reversed_order) == [3]
     assert _non_disclosure_assertion_lines(cross_scope) == []
+
+
+def test_an_immediately_invoked_lambda_is_part_of_the_disclosure_surface() -> None:
+    immediately_invoked = """\
+def t():
+    protected = "placeholder-secret"
+    assert protected not in (lambda: resp.text)()
+"""
+
+    assert _non_disclosure_assertion_lines(immediately_invoked) == [3]
+
+
+def test_a_lambda_passed_as_a_value_is_not_part_of_the_disclosure_surface() -> None:
+    passed_as_a_value = """\
+def t():
+    protected = "placeholder-secret"
+    assert protected not in inspect_later(lambda: resp.text)
+"""
+
+    assert _non_disclosure_assertion_lines(passed_as_a_value) == []
 
 
 def test_a_for_target_carries_the_iterables_values() -> None:
