@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -65,6 +66,7 @@ def test_pre_commit_guard_selects_an_obsolete_baseline_file():
         'client.secret = "AdMiN"',
         'token: str = "admin"',
         'username, password = "admin", "placeholder"',
+        'password += "admin"',
         'config["password"] = "admin"',
         'config = {"username": "admin"}',
         'client(username="admin")',
@@ -174,3 +176,25 @@ def test_scan_tree_skips_only_its_own_files(tmp_path):
         "nested/test_credential_discipline.py",
         "test_example.py",
     ]
+
+
+def test_the_scanner_visits_every_ast_node_that_binds_a_value_to_a_target():
+    """A binding form with no visitor is a silent bypass, so the set comes from ``ast`` itself.
+
+    Three were reported one at a time (starred call arguments, a comprehension walrus, then an
+    augmented assignment), which is what listing the forms by hand costs.
+    """
+    binding = {
+        name
+        for name, member in vars(ast).items()
+        if isinstance(member, type)
+        and issubclass(member, ast.AST)
+        and "value" in getattr(member, "_fields", ())
+        and {"target", "targets"} & set(member._fields)
+    }
+
+    assert binding == {"Assign", "AnnAssign", "AugAssign", "NamedExpr"}, (
+        f"ast grew or lost a binding form; review the scanner against it: {sorted(binding)}"
+    )
+    missing = sorted(name for name in binding if not hasattr(credential_discipline._Scanner, f"visit_{name}"))
+    assert missing == [], f"a binding form the scanner never inspects: {missing}"

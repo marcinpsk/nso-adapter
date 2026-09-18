@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from uuid import uuid4
+
 import pytest
 from sqlalchemy import select
 
@@ -313,3 +315,27 @@ async def test_wrong_token_raises_401(adapter_client):
         headers={"Authorization": "Bearer wrong-token"},
     )
     assert resp.status_code == 401
+
+
+# ── the caller's own selection key never returns in the 422 ──────────────────
+
+
+async def test_an_INVALID_selected_ENTRY_keeps_the_callers_key_out_of_the_422(adapter_client):
+    """Pydantic reports a bad map entry at ``("body", "selected", <key>)``.
+
+    ``ActionApplyIn.selected`` is keyed by a name the caller chose, so an unregistered
+    location wrote that name straight back into the validation error.
+    """
+    device_id = await _seed_device("actions-selected-loc", 1360)
+
+    resp = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/apply",
+        json={"apply_attempt_id": str(uuid4()), "selected": {"placeholder-secret": "not-an-integer"}},
+        headers=AUTH,
+    )
+
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_error"
+    assert_text_free_of(resp.text, ["placeholder-secret"])
+    locations = [error["loc"] for error in resp.json()["error"]["detail"]["errors"]]
+    assert ["body", "selected", "[redacted]"] in locations, "the operator must still learn WHERE it broke"

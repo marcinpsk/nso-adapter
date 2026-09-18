@@ -200,6 +200,13 @@ class _Scanner(ast.NodeVisitor):
             self._assignment(node.target, node.value, node)
         self.generic_visit(node)
 
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        # Python forbids a tuple target here, so the check runs directly rather than through
+        # _assignment: the value is what is APPENDED, never the whole new value of the name.
+        if _credential_name(_name(node.target)):
+            self._check_value(node.value, node)
+        self.generic_visit(node)
+
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self._assignment(node.target, node.value, node)
         self.generic_visit(node)

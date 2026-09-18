@@ -219,17 +219,53 @@ def _renders_root_through_a_surface(node: ast.AST, root: str) -> bool:
     return False
 
 
+def _rendered_surfaces(node: ast.AST) -> list[ast.AST]:
+    """What *node* reads a rendered surface OFF, e.g. ``resp`` for ``resp.text``.
+
+    Decided by the OUTERMOST expression, unlike :func:`_renders_root_through_a_surface`.
+    Narrowing a surface produces a different, smaller value, so
+    ``caught.value.response.status_code`` renders an int and ``resp.json()["error"]["code"]``
+    renders one authored string: neither reads a surface off anything.
+    """
+    if isinstance(node, ast.Attribute) and node.attr in _INSPECTED_ATTRIBUTES:
+        return [node.value]
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _INSPECTED_CALLS:
+        return list(node.args)
+    if isinstance(node, ast.List | ast.Tuple | ast.Set):
+        return [source for element in node.elts for source in _rendered_surfaces(element)]
+    return []
+
+
+def _renders_root_whole(node: ast.AST, root: str) -> bool:
+    """True when *node* ITSELF is what pytest prints for *root*: the name, or a surface off it.
+
+    A sequence renders every element, which is how ``== [caught.value]`` prints the exception
+    and ``== [detail]`` prints the local.
+    """
+    if isinstance(node, ast.Name):
+        return node.id == root
+    if isinstance(node, ast.List | ast.Tuple | ast.Set):
+        return any(_renders_root_whole(element, root) for element in node.elts)
+    return any(
+        any(isinstance(inner, ast.Name) and inner.id == root for inner in ast.walk(source))
+        for source in _rendered_surfaces(node)
+    )
+
+
 def _discloses_protected_value(node: ast.Assert, root: str) -> bool:
     """True when a FAILURE of *node* prints the protected surface whole.
 
     Scoped to what the syntax decides on its own. A failure message is printed verbatim, and an
-    operand that is the bare protected name renders all of it. A membership test is judged on how
-    it reads the name: ``protected not in str(record)`` renders the record, while
-    ``"device_id" not in record`` asks whether a KEY is absent and renders a boolean.
+    operand that renders the protected value whole prints all of it: the bare name, a text
+    surface, an explicit ``str``/``repr``, or a sequence holding one of those.
 
-    A narrowed operand such as ``resp.json()["error"]["code"]`` is not decidable here, and neither
-    is a plain string local like ``secret not in detail``: whether that value can carry protected
-    text is a question about the value, not about the expression. Those stay a review matter.
+    The two operator kinds read their operands differently, so they are judged differently. A
+    membership operand is the HAYSTACK being searched for the protected value, so narrowing it
+    still renders text that came from the protected value: it is judged on the whole chain.
+    Every other operator compares a value against an authored one, so narrowing produces a
+    different, smaller value: it is judged on the operand's outermost expression. That is why
+    ``"device_id" not in record`` renders a boolean while ``record == expected`` renders the
+    record, and why ``resp.json()["error"]["code"] == "vault_error"`` renders neither.
     """
     if node.msg is not None and _renders_root(node.msg, root):
         return True
@@ -241,7 +277,7 @@ def _discloses_protected_value(node: ast.Assert, root: str) -> bool:
             if any(_renders_root_through_a_surface(operand, root) for operand in operands):
                 return True
             continue
-        if any(isinstance(operand, ast.Name) and operand.id == root for operand in operands):
+        if any(_renders_root_whole(operand, root) for operand in operands):
             return True
     return False
 
@@ -254,6 +290,26 @@ def _declares_protected_material(scope: ast.AST) -> bool:
         and part.value.startswith(_PROTECTED_LITERAL_PREFIX)
         for part in _own_body(scope)
     )
+
+
+def _unnamed_protected_roots(asserts: list[ast.Assert]) -> set[str]:
+    """The roots an assertion renders without any helper having named them.
+
+    A helper call names what the author is protecting. A body that writes protected material but
+    renders a surface into a diagnostic never named it, so the surface itself is the root: that
+    assertion prints the value and no call has cleared it. An operand renders a surface the same
+    way a message does, so both are read.
+    """
+    roots: set[str] = set()
+    for node in asserts:
+        sources = [node.msg] if node.msg is not None and _reads_an_inspected_surface(node.msg) else []
+        for part in ast.walk(node.test):
+            if isinstance(part, ast.Compare):
+                for operand in (part.left, *part.comparators):
+                    sources.extend(_rendered_surfaces(operand))
+        for source in sources:
+            roots.update(part.id for part in ast.walk(source) if isinstance(part, ast.Name))
+    return roots
 
 
 def _ordering_violations_in(scope: ast.AST) -> list[tuple[int, str]]:
@@ -271,16 +327,10 @@ def _ordering_violations_in(scope: ast.AST) -> list[tuple[int, str]]:
         elif isinstance(part, ast.Assert):
             asserts.append(part)
 
-    # A helper call names what the author is protecting. A body that writes protected material but
-    # renders a surface into a diagnostic never named it, so take the surface itself as the root:
-    # that assertion prints the value and no call has cleared it.
     candidates = dict(clears)
     if _declares_protected_material(scope):
-        for node in asserts:
-            if node.msg is not None and _reads_an_inspected_surface(node.msg):
-                for part in ast.walk(node.msg):
-                    if isinstance(part, ast.Name):
-                        candidates.setdefault(part.id, [])
+        for root in _unnamed_protected_roots(asserts):
+            candidates.setdefault(root, [])
 
     violations = []
     for node in asserts:
@@ -376,6 +426,58 @@ def t():
     assert _ordering_violations(rendered_membership) == [2]
     assert _ordering_violations(key_membership) == []
     assert _ordering_violations(narrowed_operand) == []
+
+
+def test_the_ordering_rule_reads_equality_operands_the_way_pytest_prints_them() -> None:
+    """Equality renders its operands too; only the OUTERMOST expression says what it prints."""
+    rendered_equality = """\
+def t():
+    assert str(caught.value) == expected
+    assert_chain_free_of(caught.value, [protected])
+"""
+    sequence_element = """\
+def t():
+    assert collected == [resp.text]
+    assert_text_free_of(resp.text, [protected])
+"""
+    surface_equality = """\
+def t():
+    assert resp.text == expected
+    assert_text_free_of(resp.text, [protected])
+"""
+    narrowed_surface = """\
+def t():
+    assert caught.value.response.status_code == 503
+    assert_chain_free_of(caught.value, [protected])
+"""
+    narrowed_json = """\
+def t():
+    assert resp.json()["error"]["code"] == "vault_error"
+    assert_text_free_of(resp.text, [protected])
+"""
+
+    assert _ordering_violations(rendered_equality) == [2]
+    assert _ordering_violations(sequence_element) == [2], "a list prints every element it holds"
+    assert _ordering_violations(surface_equality) == [2]
+    assert _ordering_violations(narrowed_surface) == [], "a status code is not the exception"
+    assert _ordering_violations(narrowed_json) == [], "one authored code is not the body"
+
+
+def test_an_operand_names_the_protected_root_when_no_helper_does() -> None:
+    """Candidate discovery reads operands, not only messages, or an equality assertion hides."""
+    operand_only = """\
+def t():
+    seeded = "placeholder-secret"
+    assert resp.text == expected
+"""
+    message_only = """\
+def t():
+    seeded = "placeholder-secret"
+    assert resp.status_code == 200, resp.text
+"""
+
+    assert _ordering_violations(operand_only) == [3]
+    assert _ordering_violations(message_only) == [3]
 
 
 def test_a_name_rebound_after_its_clear_is_unchecked_again() -> None:

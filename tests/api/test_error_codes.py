@@ -13,12 +13,14 @@ call sites ⊆ ERROR_CODES ⊆ api-contract.md.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from types import NoneType, UnionType
 from typing import Annotated, TypeAliasType, Union, get_args, get_origin
 
 import pytest
+from fastapi import FastAPI
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field, SecretStr, field_validator
 
 from nso_adapter.api.errors import ERROR_CODES, ErrorCode, api_error
@@ -29,43 +31,113 @@ AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _PKG_DIR = _REPO_ROOT / "nso_adapter"
 _CONTRACT_DOC = _REPO_ROOT / "docs" / "api-contract.md"
+#: Stands for the list index or map key a location gains when it passes through a container.
+_PER_REQUEST_SEGMENT = "<index>"
 
-type _SecretMapAlias = dict[str, SecretStr]
-type _CyclicSecretMapAlias = _CyclicSecretMapAlias
+type _CallerKeyedMapAlias = dict[str, SecretStr]
+type _CyclicCallerKeyedMapAlias = _CyclicCallerKeyedMapAlias
 
 
-def _is_secret_map_annotation(annotation: object) -> bool:
-    """Recognize a secret map after removing validation-path-transparent wrappers."""
+def _unwrap(annotation: object) -> object | None:
+    """Strip the wrappers pydantic reports THROUGH, or return None when it reports a segment.
 
-    def classify(candidate: object, seen_aliases: frozenset[int]) -> bool:
+    ``Annotated`` and ``X | None`` keep the location unchanged. A wider union makes pydantic
+    tag the failing member, so the location gains a segment this predicate cannot name.
+    """
+
+    def strip(candidate: object, seen_aliases: frozenset[int]) -> object | None:
         if isinstance(candidate, TypeAliasType):
             identity = id(candidate)
             if identity in seen_aliases:
-                return False
-            return classify(candidate.__value__, seen_aliases | {identity})
+                return None
+            return strip(candidate.__value__, seen_aliases | {identity})
 
         origin = get_origin(candidate)
         arguments = get_args(candidate)
-        if origin is dict:
-            return arguments == (str, SecretStr)
         if origin is Annotated:
-            return bool(arguments) and classify(arguments[0], seen_aliases)
+            return strip(arguments[0], seen_aliases) if arguments else None
         if origin in (Union, UnionType) and len(arguments) == 2 and NoneType in arguments:
             wrapped = arguments[0] if arguments[1] is NoneType else arguments[1]
-            return classify(wrapped, seen_aliases)
-        return False
+            return strip(wrapped, seen_aliases)
+        return candidate
 
-    return classify(annotation, frozenset())
+    return strip(annotation, frozenset())
 
 
-def _secret_map_locations(models: Iterable[type[BaseModel]]) -> set[tuple[str, ...]]:
-    """Find request fields whose validation locations contain caller-chosen secret keys."""
+def _is_caller_keyed_map_annotation(annotation: object) -> bool:
+    """Recognize a string-keyed map after removing validation-path-transparent wrappers.
+
+    The VALUE type is irrelevant: pydantic puts the caller's key in the location whether the
+    entry is a secret, an int or a nested model. A bare ``dict`` counts too: JSON object keys
+    are strings, so it is the same shape with the parameters left off.
+    """
+    candidate = _unwrap(annotation)
+    if candidate is dict:
+        return True
+    return get_origin(candidate) is dict and get_args(candidate)[:1] == (str,)
+
+
+def _api_routes(routes: Iterable[object]) -> Iterator[APIRoute]:
+    """Every APIRoute, including the ones an include_router() wrapper holds."""
+    for route in routes:
+        if isinstance(route, APIRoute):
+            yield route
+        included = getattr(route, "original_router", None)
+        if included is not None:
+            yield from _api_routes(included.routes)
+
+
+def _models_in(annotation: object) -> Iterator[type[BaseModel]]:
+    """Every BaseModel an annotation carries, at any depth of its type arguments."""
+    candidate = _unwrap(annotation)
+    if isinstance(candidate, type) and issubclass(candidate, BaseModel):
+        yield candidate
+        return
+    for argument in get_args(candidate):
+        yield from _models_in(argument)
+
+
+def _request_body_models(app: FastAPI) -> set[type[BaseModel]]:
+    """The models a caller's request body is validated against."""
     return {
-        ("body", name)
-        for model in models
-        for name, field in model.model_fields.items()
-        if _is_secret_map_annotation(field.annotation)
+        model
+        for route in _api_routes(app.routes)
+        for parameter in route.dependant.body_params
+        for model in _models_in(parameter.field_info.annotation)
     }
+
+
+def _caller_keyed_locations(models: Iterable[type[BaseModel]]) -> tuple[set[tuple[str, ...]], set[str]]:
+    """The body locations whose next segment is a caller-chosen key.
+
+    Returns the ones that can be written as a literal prefix, and separately the ones that
+    cannot: a map under a list or a map entry sits behind an index or key that varies per
+    request, so ``DYNAMIC_KEY_LOCATIONS`` has no way to name it. Reporting those instead of
+    dropping them keeps the derivation from becoming a prefix that silently never matches.
+    """
+    named: set[tuple[str, ...]] = set()
+    unnameable: set[str] = set()
+
+    def walk(model: type[BaseModel], prefix: tuple[str, ...], nameable: bool, seen: frozenset[type[BaseModel]]) -> None:
+        if model in seen:
+            return
+        for name, field in model.model_fields.items():
+            path = (*prefix, name)
+            if _is_caller_keyed_map_annotation(field.annotation):
+                if nameable:
+                    named.add(path)
+                else:
+                    unnameable.add(".".join(path))
+            unwrapped = _unwrap(field.annotation)
+            for nested in _models_in(field.annotation):
+                # A model the annotation IS gets its own field name; one it merely contains
+                # sits behind a segment (an index, a map key) this set cannot spell.
+                direct = nested is unwrapped
+                walk(nested, path if direct else (*path, _PER_REQUEST_SEGMENT), nameable and direct, seen | {model})
+
+    for model in models:
+        walk(model, ("body",), True, frozenset())
+    return named, unnameable
 
 
 # ---------------------------------------------------------------- envelope on 422
@@ -341,31 +413,28 @@ def test_version_single_source_matches_pyproject():
     assert pyproject["project"]["version"] == __version__
 
 
-def test_secret_maps_are_registered_for_loc_redaction():
-    """Every ``dict[str, SecretStr]`` request field must be in ``DYNAMIC_KEY_LOCATIONS``.
+def test_caller_keyed_maps_are_registered_for_loc_redaction():
+    """Every caller-keyed map a REQUEST body carries must be in ``DYNAMIC_KEY_LOCATIONS``.
 
     Pydantic reports a failing map entry at ``("body", <field>, <key>)``, and the key is a
-    name the caller chose. A new secret map added without registering it would put that key
-    straight into the 422, so the set is derived here from the app's own models.
+    name the caller chose whatever the entry's value type is. The set is derived from the
+    app's own routes, so a new map added without registering it fails here instead of
+    putting the caller's key into a 422. Response models are out: their validation failures
+    never reach this handler.
     """
-    import importlib
-    import pkgutil
-
-    import nso_adapter.api
     from nso_adapter.api.errors import DYNAMIC_KEY_LOCATIONS
+    from nso_adapter.main import app
 
-    models: list[type[BaseModel]] = []
-    for module in pkgutil.iter_modules(nso_adapter.api.__path__):
-        for member in vars(importlib.import_module(f"nso_adapter.api.{module.name}")).values():
-            if isinstance(member, type) and issubclass(member, BaseModel):
-                models.append(member)
+    found, unnameable = _caller_keyed_locations(_request_body_models(app))
 
-    found = _secret_map_locations(models)
-
-    assert found, "no secret map was found at all; the introspection stopped matching"
+    assert found, "no caller-keyed map was found at all; the introspection stopped matching"
     assert found <= DYNAMIC_KEY_LOCATIONS, (
         "a request field keyed by a caller-chosen name is not registered for loc redaction: "
         f"{sorted(found - DYNAMIC_KEY_LOCATIONS)}"
+    )
+    assert not unnameable, (
+        "a caller-keyed map sits behind a per-request segment, which DYNAMIC_KEY_LOCATIONS "
+        f"cannot express; _safe_loc has to grow that shape first: {sorted(unnameable)}"
     )
 
 
@@ -377,9 +446,15 @@ def test_secret_maps_are_registered_for_loc_redaction():
         (Union[dict[str, SecretStr], None], True),  # noqa: UP007 - exercise typing.Union
         (Annotated[dict[str, SecretStr], "marker"], True),
         (Annotated[dict[str, SecretStr] | None, "marker"], True),
-        (_SecretMapAlias, True),
-        (_SecretMapAlias | None, True),
-        (_CyclicSecretMapAlias, False),
+        (_CallerKeyedMapAlias, True),
+        (_CallerKeyedMapAlias | None, True),
+        # the key is the caller's string whatever the entry holds
+        (dict[str, str], True),
+        (dict[str, int], True),
+        (dict[str, Annotated[int, Field(ge=1)]], True),
+        (dict, True),
+        (dict | None, True),
+        (_CyclicCallerKeyedMapAlias, False),
         (dict[str, SecretStr] | int, False),
         (
             Union[  # noqa: UP007 - exercise a non-transparent typing.Union
@@ -391,15 +466,37 @@ def test_secret_maps_are_registered_for_loc_redaction():
         ),
         (list[dict[str, SecretStr]], False),
         (dict[int, SecretStr], False),
-        (dict[str, str], False),
     ],
 )
-def test_secret_map_annotation_recognizes_only_transparent_wrappers(annotation, expected):
-    assert _is_secret_map_annotation(annotation) is expected
+def test_caller_keyed_map_annotation_recognizes_only_transparent_wrappers(annotation, expected):
+    assert _is_caller_keyed_map_annotation(annotation) is expected
 
 
-def test_secret_map_location_discovery_uses_the_wrapped_annotation_predicate():
-    class WrappedSecretMapRequest(BaseModel):
-        values: _SecretMapAlias | None = None
+def test_caller_keyed_location_discovery_uses_the_wrapped_annotation_predicate():
+    class WrappedMapRequest(BaseModel):
+        values: _CallerKeyedMapAlias | None = None
+        selected: dict[str, int] = {}
 
-    assert _secret_map_locations([WrappedSecretMapRequest]) == {("body", "values")}
+    assert _caller_keyed_locations([WrappedMapRequest]) == ({("body", "values"), ("body", "selected")}, set())
+
+
+def test_caller_keyed_location_discovery_walks_nested_request_models():
+    class Inner(BaseModel):
+        entries: dict[str, int] = {}
+
+    class OuterRequest(BaseModel):
+        inner: Inner | None = None
+
+    assert _caller_keyed_locations([OuterRequest]) == ({("body", "inner", "entries")}, set())
+
+
+def test_a_map_behind_a_per_request_segment_is_reported_as_unnameable():
+    """A list index is not a literal, so the prefix cannot be registered: say so, never drop it."""
+
+    class Item(BaseModel):
+        entries: dict[str, int] = {}
+
+    class ListRequest(BaseModel):
+        items: list[Item] = []
+
+    assert _caller_keyed_locations([ListRequest]) == (set(), {"body.items.<index>.entries"})

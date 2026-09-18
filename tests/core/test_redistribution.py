@@ -728,6 +728,7 @@ async def test_mixed_replaced_and_error_retained_is_degraded_present(adapter_cli
         "replaced",
         True,
     ), "mixed replaced+error-retained is degraded-success on the wire, not unavailable"
+    assert_text_free_of(outcome.read_failures, ["placeholder-secret"])
     assert outcome.read_failures == [
         {
             "read_operation": "section_classify",
@@ -744,7 +745,6 @@ async def test_mixed_replaced_and_error_retained_is_degraded_present(adapter_cli
             "failure_code": None,
         },
     ]
-    assert_text_free_of(outcome.read_failures, ["placeholder-secret"])
 
 
 @pytest.mark.anyio

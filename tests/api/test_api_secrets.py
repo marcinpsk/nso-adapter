@@ -371,10 +371,10 @@ async def test_verify_ignores_a_non_string_sibling_when_the_selected_field_is_va
 @pytest.mark.anyio
 async def test_vault_permission_denied_returns_structured_502(vault_client):
     """A Vault policy denial (403 that survives re-auth) must map to a structured
-    error, not an unhandled 500 — live-observed on a path outside the AppRole's
-    policy. The error text carries only the ref/path, never values."""
+    error, not an unhandled 500 - live-observed on a path outside the AppRole's
+    policy. The response names the failure and nothing the caller sent."""
     client, store, kv = vault_client
-    store["credentials/other-svc"] = {"password": "x"}
+    store["credentials/other-svc"] = {"password": "placeholder-denied-value"}
     kv.forbid_always.add("credentials/other-svc")
 
     resp = await client.post(
@@ -383,7 +383,10 @@ async def test_vault_permission_denied_returns_structured_502(vault_client):
 
     assert resp.status_code == 502
     assert resp.json()["error"]["code"] == "vault_error"
-    assert_text_free_of(resp.json()["error"]["message"], ["x"])
+    assert_text_free_of(
+        resp.text,
+        ["placeholder-denied-value", "credentials/other-svc", "network/credentials/other-svc"],
+    )
 
 
 @pytest.mark.anyio

@@ -278,10 +278,11 @@ def unhandled_exception_response(request: Request, exc: BaseException) -> JSONRe
 
 #: Body fields whose entries are keyed by a CALLER-CHOSEN name. Pydantic reports a failing
 #: entry at ``("body", <field>, <key>)``, so the key itself lands in the 422. A caller
-#: that named a secret map entry after the secret would read it straight back out. Every
-#: ``dict[str, SecretStr]`` request field belongs here; ``test_secret_maps_are_registered_for_loc_redaction``
-#: derives the set from the app's own models and fails when one is added without it.
-DYNAMIC_KEY_LOCATIONS: frozenset[tuple[str, ...]] = frozenset({("body", "values")})
+#: that named the entry after a secret would read it straight back out. The key is the
+#: caller's own string whatever the value type is, so every ``dict[str, ...]`` field of a
+#: request body belongs here; ``test_caller_keyed_maps_are_registered_for_loc_redaction``
+#: derives the set from the app's own routes and fails when one is added without it.
+DYNAMIC_KEY_LOCATIONS: frozenset[tuple[str, ...]] = frozenset({("body", "selected"), ("body", "values")})
 
 #: What replaces a caller-chosen key in a reported location.
 REDACTED_LOC = "[redacted]"

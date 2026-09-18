@@ -918,10 +918,10 @@ async def test_a_RETRIED_action_keeps_the_FIRST_failure_off_the_second_chain(ada
 
     assert slept.await_count == 1, "the backed-off second attempt must still run"
     assert caught.value.response.status_code == 503, "the SECOND attempt's failure propagates"
+    assert_chain_free_of(caught.value, _STEP_SECRETS)
     assert exception_chain(caught.value) == [caught.value], (
         "the first attempt must not remain on the second failure's chain"
     )
-    assert_chain_free_of(caught.value, _STEP_SECRETS)
 
 
 async def test_a_REDIRECTED_host_key_fetch_records_the_STATUS_and_not_the_location(adapter_client_with_nso):
