@@ -667,9 +667,11 @@ async def test_collect_apply_diff_redacts_value_bearing_apply_error(adapter_clie
         async with session() as db:
             diffs = await collect_apply_diff(db, device_id)
 
+    from tests._secret_discipline import assert_records_free_of
+
+    assert_records_free_of([record.__dict__ for record in recorded_logs.records], [secret])
     assert "invalid_enabled_value" in diffs[PREVIEW_KEY]
     assert secret not in diffs[PREVIEW_KEY]
-    assert secret not in repr([record.__dict__ for record in recorded_logs.records])
 
 
 async def test_run_apply_all_succeed(adapter_client):

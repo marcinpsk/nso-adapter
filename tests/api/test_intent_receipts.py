@@ -279,10 +279,10 @@ async def test_o2b_9_an_unknown_section_is_refused_rather_than_served_empty(adap
     submitted = "placeholder-unknown-intent-section"
     resp = await adapter_client.get(f"{URL}?section={submitted}", headers=AUTH)
 
+    assert_text_free_of(resp.text, [submitted])
     assert resp.status_code == 422
     assert resp.json()["error"]["detail"]["reason"] == "unknown_section"
     assert "interface_config" in resp.json()["error"]["detail"]["sections"]
-    assert_text_free_of(resp.text, [submitted])
 
 
 async def test_o2b_9_an_empty_fleet_reports_null_maxima(adapter_client):
