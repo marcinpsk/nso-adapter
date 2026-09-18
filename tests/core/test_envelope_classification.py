@@ -9,10 +9,13 @@ per-family ``empty_policy`` — device-level absence (section None) now resolves
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from nso_adapter.nso.client import NsoExportUnavailableError
 from nso_adapter.nso.read_outcome import (
+    AbsentAuthoritative,
     Freshness,
     Present,
     ReadFailure,
@@ -208,3 +211,31 @@ class TestUnproducibleClassifications:
             ),
         )
         assert outage.failure.http_status is None
+
+
+class TestTheVocabularyDoesNotRenderTheDeviceItWasAskedFor:
+    """``repr`` is a diagnostic surface, and a generated one renders every field.
+
+    ``log_fields`` and ``persistence_fields`` are the projections a sink prints, and both
+    already omit the device. A default dataclass repr bypasses them, so anything that formats
+    an outcome (a log kwarg, an f-string, a pytest diff) publishes the caller's device name.
+    """
+
+    #: What the diagnostic-identity rule keeps out of a record: a caller-provided name, never
+    #: an adapter-owned id. The opengrep rule states it for ``logger`` kwargs; a repr is the
+    #: same sink reached a different way.
+    CALLER_PROVIDED = frozenset({"device", "device_name", "nso_device_name", "stream_url", "url"})
+
+    @pytest.mark.parametrize("kind", [Present, AbsentAuthoritative, Unavailable, ReadFailure])
+    def test_no_vocabulary_type_renders_a_caller_provided_identifier(self, kind):
+        rendered = [
+            field.name for field in dataclasses.fields(kind) if field.name in self.CALLER_PROVIDED and field.repr
+        ]
+        assert rendered == [], f"{kind.__name__} renders {rendered} in its repr"
+
+    def test_a_classified_failure_renders_its_classification_without_the_device(self):
+        outcome = classify_envelope_section({"status": "error", "error-reason": "extract boom"}, **_ASKED)
+
+        assert_text_free_of(repr(outcome), ["rg03", "extract boom"])
+        assert "section_status_error" in repr(outcome), "the classification itself must stay legible"
+        assert outcome.failure.device == "rg03", "the field still carries it for for_family and the join"

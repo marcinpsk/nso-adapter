@@ -143,7 +143,9 @@ class ReadFailure:
     """
 
     operation: ReadOperation
-    device: str
+    # Kept out of the generated repr: the caller's own device name, which the diagnostic-identity
+    # rule keeps out of a record. ``log_fields``/``persistence_fields`` already omit it.
+    device: str = field(repr=False)
     family: str
     error_type: str | None = None  # the raised type, when the read raised
     http_status: int | None = None  # the numeric status, when the server answered one
