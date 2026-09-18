@@ -262,6 +262,9 @@ def _rendered_surfaces(node: ast.AST) -> list[ast.AST]:
     """
     if isinstance(node, ast.Attribute) and node.attr in _INSPECTED_ATTRIBUTES:
         return [node.value]
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        if node.func.attr in _INSPECTED_ATTRIBUTES:
+            return [node.func.value]
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _INSPECTED_CALLS:
         return list(node.args)
     if isinstance(node, ast.List | ast.Tuple | ast.Set):
@@ -482,6 +485,11 @@ def t():
     assert resp.text == expected
     assert_text_free_of(resp.text, [protected])
 """
+    whole_json = """\
+def t():
+    assert resp.json() == expected
+    assert_text_free_of(resp.text, [protected])
+"""
     narrowed_surface = """\
 def t():
     assert caught.value.response.status_code == 503
@@ -496,6 +504,7 @@ def t():
     assert _ordering_violations(rendered_equality) == [2]
     assert _ordering_violations(sequence_element) == [2], "a list prints every element it holds"
     assert _ordering_violations(surface_equality) == [2]
+    assert _ordering_violations(whole_json) == [2]
     assert _ordering_violations(narrowed_surface) == [], "a status code is not the exception"
     assert _ordering_violations(narrowed_json) == [], "one authored code is not the body"
 
