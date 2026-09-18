@@ -20,6 +20,8 @@ REVIEW_PATTERNS = ROOT / "scripts" / "check-review-patterns"
 # Bare program name: subprocess resolves it through the PATH below, not the caller's.
 _SCAN_ARGV = ["bash", str(REVIEW_PATTERNS), "scan"]
 _RESTRICTED_PATH = "/usr/bin:/bin"
+# The PATH alone does not isolate the prerequisite: a host with /usr/bin/opengrep resolves it.
+_MISSING_OPENGREP = "opengrep-that-this-test-never-installs"
 
 _REMOTE_ZIZMOR_HOOK = "https://github.com/zizmorcore/zizmor-pre-commit"
 _ZIZMOR_UV_PREFIX = ["uv", "run", "--locked", "--native-tls", "--", "zizmor"]
@@ -88,7 +90,25 @@ def test_review_pattern_hook_explains_its_opengrep_prerequisite() -> None:
         check=False,
         capture_output=True,
         text=True,
-        env={"PATH": _RESTRICTED_PATH},
+        env={"PATH": _RESTRICTED_PATH, "OPENGREP_BIN": _MISSING_OPENGREP},
+    )
+
+    assert result.returncode == 127
+    assert result.stderr.strip() == "OpenGrep is required. Install it or set OPENGREP_BIN. See README.md."
+
+
+def test_the_opengrep_prerequisite_holds_where_opengrep_is_on_the_path(tmp_path):
+    """The restricted PATH is this host's layout, not a guarantee: some carry /usr/bin/opengrep."""
+    planted = tmp_path / "opengrep"
+    planted.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    planted.chmod(0o755)
+
+    result = subprocess.run(
+        _SCAN_ARGV,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{tmp_path}:{_RESTRICTED_PATH}", "OPENGREP_BIN": _MISSING_OPENGREP},
     )
 
     assert result.returncode == 127
