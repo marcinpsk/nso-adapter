@@ -38,7 +38,9 @@ def test_read_failure_representations_redact_the_device_from_every_container():
         family="static-route",
         error_type="NsoReadContractError",
         http_status=503,
-        code=ReadFailureCode.action_output_not_atomic,
+        # The heal is the one path that stamps a code onto a raised read, so it is the shape
+        # that carries every field this renderer has to redact and keep.
+        code=ReadFailureCode.heal_action_failed,
     )
     unavailable = Unavailable(UnavailableReason.read_error, failure)
     present = Present.composite({}, Freshness.stale, [unavailable])
@@ -47,7 +49,7 @@ def test_read_failure_representations_redact_the_device_from_every_container():
         assert_text_free_of(rendered, [device])
 
     classification = repr(failure)
-    for field in ("device_state_read", "static-route", "NsoReadContractError", "503", "action_output_not_atomic"):
+    for field in ("device_state_read", "static-route", "NsoReadContractError", "503", "heal_action_failed"):
         if field not in classification:
             raise AssertionError("the read failure representation omits an authored classification field")
 
