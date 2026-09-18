@@ -178,6 +178,34 @@ def _own_body(scope: ast.AST):
             stack.extend(ast.iter_child_nodes(node))
 
 
+_CONDITIONAL_CALL_CONTAINERS = (
+    ast.If
+    | ast.Try
+    | ast.TryStar
+    | ast.For
+    | ast.AsyncFor
+    | ast.While
+    | ast.Match
+    | ast.IfExp
+    | ast.BoolOp
+    | ast.ListComp
+    | ast.SetComp
+    | ast.DictComp
+    | ast.GeneratorExp
+)
+
+
+def _unconditional_calls(scope: ast.AST):
+    """Calls in *scope*'s function, with, or async with bodies only."""
+    stack = list(scope.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.Call):
+            yield node
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | _CONDITIONAL_CALL_CONTAINERS):
+            stack.extend(ast.iter_child_nodes(node))
+
+
 def _rebinding_lines(scope: ast.AST, root: str) -> list[int]:
     """The lines of *scope*'s own body that bind *root* to a new value."""
     lines = []
@@ -323,9 +351,13 @@ def _ordering_violations_in(scope: ast.AST) -> list[tuple[int, str]]:
     for part in _own_body(scope):
         if isinstance(part, ast.Call) and isinstance(part.func, ast.Name) and part.func.id in _NON_DISCLOSURE_HELPERS:
             for root in _protected_roots(part):
-                clears.setdefault(root, []).append(part.lineno)
+                clears.setdefault(root, [])
         elif isinstance(part, ast.Assert):
             asserts.append(part)
+    for call in _unconditional_calls(scope):
+        if isinstance(call.func, ast.Name) and call.func.id in _NON_DISCLOSURE_HELPERS:
+            for root in _protected_roots(call):
+                clears[root].append(call.lineno)
 
     candidates = dict(clears)
     if _declares_protected_material(scope):
@@ -499,6 +531,34 @@ def t():
 
     assert _ordering_violations(rebound) == [5], "the value after the re-bind was never cleared"
     assert _ordering_violations(not_rebound) == [], "one clear covers the assertions after it"
+
+
+def test_a_conditional_clear_does_not_protect_a_later_diagnostic() -> None:
+    conditional_clear = """\
+def t():
+    if should_clear:
+        assert_text_free_of(resp.text, [protected])
+    assert resp.status_code == 200, resp.text
+"""
+
+    assert _ordering_violations(conditional_clear) == [4]
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "assert_text_free_of(resp.text, [protected]) if should_clear else None",
+        "should_clear and assert_text_free_of(resp.text, [protected])",
+        "[assert_text_free_of(resp.text, [protected]) for item in items]",
+        "{assert_text_free_of(resp.text, [protected]) for item in items}",
+        "{item: assert_text_free_of(resp.text, [protected]) for item in items}",
+        "(assert_text_free_of(resp.text, [protected]) for item in items)",
+    ],
+)
+def test_expression_conditional_clears_do_not_protect_a_later_diagnostic(expression: str) -> None:
+    source = f"def t():\n    {expression}\n    assert resp.status_code == 200, resp.text\n"
+
+    assert _ordering_violations(source) == [3]
 
 
 def test_a_body_holding_protected_material_needs_no_helper_call_to_be_judged() -> None:
