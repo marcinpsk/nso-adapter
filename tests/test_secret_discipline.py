@@ -25,14 +25,18 @@ _NON_DISCLOSURE_TESTS = (
     _TEST_ROOT / "api" / "test_api_vlan.py",
     _TEST_ROOT / "core" / "test_action_apply_promotion.py",
     _TEST_ROOT / "core" / "test_apply_error_secrets.py",
+    _TEST_ROOT / "core" / "test_capability.py",
     _TEST_ROOT / "core" / "test_envelope_classification.py",
     _TEST_ROOT / "core" / "test_onboarding.py",
     _TEST_ROOT / "core" / "test_redistribution.py",
     _TEST_ROOT / "core" / "test_refresh_engine_envelope.py",
+    _TEST_ROOT / "nso" / "test_apply_send.py",
     _TEST_ROOT / "nso" / "test_device_state_client.py",
     _TEST_ROOT / "nso" / "test_nso_client_methods.py",
     _TEST_ROOT / "nso" / "test_persistent_subscriber.py",
     _TEST_ROOT / "nso" / "test_sse_subscriber.py",
+    _TEST_ROOT / "secrets" / "test_local.py",
+    _TEST_ROOT / "secrets" / "test_refs.py",
     _TEST_ROOT / "test_secret_discipline.py",
     _TEST_ROOT / "test_vault_provider.py",
 )
@@ -115,6 +119,27 @@ def test_a_CLEAN_chain_passes() -> None:
     assert_chain_free_of(caught, [_SECRET])
 
 
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
+
+
+def _assertion_comparisons(test: ast.expr) -> list[ast.Compare]:
+    """The assertion's own comparisons, skipping any inside a comprehension.
+
+    A `not in` used as a comprehension filter is a per-element test. The assertion renders the
+    comprehension's RESULT - a count, a list - never the element, so it discloses nothing.
+    """
+    comparisons: list[ast.Compare] = []
+    stack: list[ast.AST] = [test]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, _COMPREHENSIONS):
+            continue
+        if isinstance(node, ast.Compare):
+            comparisons.append(node)
+        stack.extend(ast.iter_child_nodes(node))
+    return comparisons
+
+
 def test_non_disclosure_checks_do_not_use_rewritten_assertions() -> None:
     violations = []
     for path in _NON_DISCLOSURE_TESTS:
@@ -122,11 +147,10 @@ def test_non_disclosure_checks_do_not_use_rewritten_assertions() -> None:
         for node in ast.walk(tree):
             if not isinstance(node, ast.Assert):
                 continue
-            comparisons = [part for part in ast.walk(node.test) if isinstance(part, ast.Compare)]
             if any(
                 any(isinstance(operator, ast.NotIn) for operator in comparison.ops)
                 and any(_reads_an_inspected_surface(value) for value in comparison.comparators)
-                for comparison in comparisons
+                for comparison in _assertion_comparisons(node.test)
             ):
                 violations.append(f"{path.relative_to(_TEST_ROOT.parent)}:{node.lineno}")
     assert violations == []
@@ -283,6 +307,35 @@ def test_non_disclosure_checks_run_before_the_diagnostics() -> None:
             for lineno, root in _ordering_violations_in(scope):
                 violations.append(f"{path.relative_to(_TEST_ROOT.parent)}:{lineno} discloses {root!r}")
     assert violations == []
+
+
+def _rewritten_check_lines(source: str) -> list[int]:
+    """Run the SAME rule ``test_non_disclosure_checks_do_not_use_rewritten_assertions`` runs."""
+    return [
+        node.lineno
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Assert)
+        and any(
+            any(isinstance(operator, ast.NotIn) for operator in comparison.ops)
+            and any(_reads_an_inspected_surface(value) for value in comparison.comparators)
+            for comparison in _assertion_comparisons(node.test)
+        )
+    ]
+
+
+def test_the_rewritten_assertion_rule_reads_the_assertion_and_not_its_filters() -> None:
+    """A rendered surface discloses whatever the left operand is; a filter renders only a count."""
+    named_value = "assert protected not in resp.text"
+    marker_in_a_surface = 'assert "dry-run=native" not in str(request.url)'
+    rendered_call = "assert secret not in repr(record)"
+    comprehension_filter = 'assert len([r for r in requests if "dry-run" not in str(r.url)]) == 1'
+    key_membership = 'assert "device_id" not in record'
+
+    assert _rewritten_check_lines(named_value) == [1]
+    assert _rewritten_check_lines(marker_in_a_surface) == [1], "the URL carries the device name"
+    assert _rewritten_check_lines(rendered_call) == [1]
+    assert _rewritten_check_lines(comprehension_filter) == []
+    assert _rewritten_check_lines(key_membership) == []
 
 
 def _ordering_violations(source: str) -> list[int]:
