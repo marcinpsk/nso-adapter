@@ -41,6 +41,7 @@ from collections.abc import Mapping
 import anyio.to_thread
 import structlog
 
+from nso_adapter.secrets.base import selected_secret_value
 from nso_adapter.secrets.refs import parse_vault_ref, secret_fingerprint
 
 logger = structlog.get_logger(__name__)
@@ -62,8 +63,9 @@ def get_secrets_provider():
 def _resolve_one(provider, ref: str) -> str | None:
     """Plaintext behind one fully-qualified ``mount/path#key`` ref, or None if it can't be read."""
     parsed = parse_vault_ref(ref, require_key=True)
+    assert parsed.key is not None
     data = provider.read_path(parsed.mount, parsed.path)
-    return data.get(parsed.key)
+    return selected_secret_value(data, parsed.key)
 
 
 def _fingerprints_blocking(provider, refs: Mapping[str, str]) -> dict[str, str]:

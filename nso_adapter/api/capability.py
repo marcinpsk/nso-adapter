@@ -118,10 +118,14 @@ async def _device_and_client(device_id: int, db: AsyncSession):
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
+    unavailable = None
     try:
         client = get_nso_client(device.nso_instance)
     except RuntimeError:
-        raise api_error(409, "no_nso_client", f"No NSO client for instance {device.nso_instance!r}")
+        # Built in the handler, raised after it: a raise inside attaches the caught exception.
+        unavailable = api_error(409, "no_nso_client", "No NSO client is registered")
+    if unavailable is not None:
+        raise unavailable
     return device, client
 
 
@@ -188,18 +192,16 @@ async def report_read_capability(body: ReadCapabilityReport, db: AsyncSession = 
         stmt = stmt.where(Device.nso_instance == body.nso_instance)
     devices = (await db.execute(stmt)).scalars().all()
     if not devices:
-        raise api_error(404, "not_found", f"No device named {body.nso_device_name!r}")
+        raise api_error(404, "not_found", "Device not found")
     if len(devices) > 1:
-        raise api_error(
-            409, "ambiguous_device", f"{body.nso_device_name!r} exists in several instances — pass nso_instance"
-        )
+        raise api_error(409, "ambiguous_device", "Several devices match; pass nso_instance")
     device = devices[0]
     ned_id = capability._clean_capability_key(device.ned_id)
     sw_version = capability._clean_capability_key(device.sw_version)
     if not ned_id:
         raise api_error(409, "no_ned_id", "Device has no learned NED id yet — sync or probe it first")
     count = await capability.record_read_capability(db, ned_id, sw_version, [el.model_dump() for el in body.elements])
-    logger.info("capability.read_report", device=body.nso_device_name, ned_id=ned_id, sw_version=sw_version, rows=count)
+    logger.info("capability.read_report", device_id=device.id, rows=count)
     return {"ned_id": ned_id, "sw_version": sw_version, "count": count}
 
 

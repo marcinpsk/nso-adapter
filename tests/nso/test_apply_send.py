@@ -41,6 +41,7 @@ from nso_adapter.nso.apply import (
 from nso_adapter.nso.client import DEVICE_INTENT_ROOT, NsoClient
 from nso_adapter.nso.nso_json import NSO_LEX_CHUNK, straddling_bare_tokens
 from nso_adapter.store.models import OspfInstanceIntent, OspfInterfaceIntent, RedistributionIntent
+from tests._secret_discipline import assert_text_omits
 
 _EMPTY_DRYRUN = {"dry-run-result": {"native": {}}}
 
@@ -91,7 +92,7 @@ def _client_with(transport: _RecordingTransport) -> NsoClient:
         password_ref="NSO_PASSWORD",
         host_header=None,
     )
-    client = NsoClient(cfg, "admin", "secret")
+    client = NsoClient(cfg, "placeholder-user", "secret")
     client._client = lambda timeout=None: httpx.AsyncClient(transport=transport, base_url="http://nso")
     return client
 
@@ -510,13 +511,11 @@ def test_snmp_rejects_a_malformed_vault_ref(bad_ref):
             _PLAIN,
         )
 
-    import traceback
-
     from tests._secret_discipline import assert_chain_free_of
 
+    # The chain walk IS the traceback check: it renders every reachable node and its notes,
+    # which is what a formatted traceback prints, without copying either into a failure.
     if bad_ref:
-        assert bad_ref not in str(caught.value)
-        assert bad_ref not in "".join(traceback.format_exception(caught.value))
         assert_chain_free_of(caught.value, [bad_ref])
 
 
@@ -723,7 +722,7 @@ async def test_a_real_ospf_commit_puts_then_verifies():
     assert result == VERIFY_CONCLUSIVE  # the verdict rides out of the committing send
     put_req = transport.requests[0]
     assert put_req.method == "PUT"
-    assert "dry-run=native" not in str(put_req.url)
+    assert_text_omits(put_req.url, ["dry-run=native"])  # the URL carries the device name
     assert "reconcile=" in str(put_req.url)
     assert _sent(transport, "ospf")["process-config"][0]["enabled"] is False
     # a verify dry-run followed the commit

@@ -12,10 +12,20 @@ from __future__ import annotations
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from nso_adapter.store.models import DbInterface, Device, InterfaceAttrState, ManagedScope
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import session
+
+
+async def _reject_non_null_netbox_device_ids(db) -> None:
+    """Install an unrelated constraint that onboarding must not classify as a race."""
+    await db.execute(
+        text("ALTER TABLE devices ADD CONSTRAINT ck_device_test_netbox_id_null CHECK (netbox_device_id IS NULL)")
+    )
+    await db.commit()
+
 
 # ── onboard_device ───────────────────────────────────────────────────────────
 
@@ -68,6 +78,56 @@ async def test_onboard_raises_for_duplicate_nso_device_name(adapter_client_with_
             await onboard_device(db, "nso-dev", "taken-name", 201)
 
 
+async def test_claimed_onboard_refusal_names_no_netbox_link(adapter_client_with_nso):
+    """The provision path refuses under the claim, and that refusal reached the job result.
+
+    Its message named the NetBox device the row is linked to, which the request never sent
+    and the job record then persisted. The refusal states the reason; the link is logged.
+    """
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.claim import ClaimRegistration
+    from nso_adapter.core.onboarding import DeviceIdentityRefused, onboard_device
+    from tests.conftest import seed_device
+
+    await seed_device(nso_instance="nso-dev", nso_device_name="placeholder-claimed-node", netbox_device_id=46431)
+
+    async with session() as db:
+        with capture_logs() as logs, pytest.raises(DeviceIdentityRefused) as caught:
+            await onboard_device(
+                db,
+                "nso-dev",
+                "placeholder-claimed-node",
+                46432,
+                reg=ClaimRegistration(run_attempt=1),
+            )
+
+    assert_text_free_of(caught.value, ["46431"])  # first: the assertions below render the message
+    assert str(caught.value) == "The NSO device is already onboarded to a different NetBox device"
+    assert caught.value.reason == "onboarded_elsewhere"
+    refused = [record for record in logs if record["event"] == "device.onboard_refused"]
+    assert refused and refused[0]["linked_netbox_device_id"] == 46431
+
+
+async def test_claimed_onboard_reraises_another_integrity_failure(adapter_client_with_nso):
+    from sqlalchemy.exc import IntegrityError
+
+    from nso_adapter.core.claim import ClaimRegistration
+    from nso_adapter.core.onboarding import onboard_device
+
+    async with session() as db:
+        await _reject_non_null_netbox_device_ids(db)
+
+        with pytest.raises(IntegrityError):
+            await onboard_device(
+                db,
+                "nso-dev",
+                "claimed-onboard-other-constraint",
+                46433,
+                reg=ClaimRegistration(run_attempt=1),
+            )
+
+
 async def test_onboard_adopts_unlinked_existing_device(adapter_client_with_nso):
     """A device provisioned INTO NSO without a NetBox link (netbox_device_id IS NULL) must be
     ADOPTED when the operator later marks it managed: onboard_device fills the mapping in on the
@@ -92,6 +152,62 @@ async def test_onboard_adopts_unlinked_existing_device(adapter_client_with_nso):
         rows = (await db.execute(select(Device).where(Device.nso_device_name == "preprovisioned"))).scalars().all()
         assert len(rows) == 1
         assert rows[0].netbox_device_id == 77
+
+
+async def test_onboard_existing_adoption_reports_a_late_netbox_conflict(adapter_client_with_nso):
+    """A competing owner committed after the pre-check produces the public conflict."""
+    from nso_adapter.core.onboarding import onboard_device
+    from tests.conftest import seed_device
+
+    existing_id = await seed_device(
+        nso_instance="nso-dev",
+        nso_device_name="existing-adoption-winner",
+        netbox_device_id=None,
+    )
+    owner_id = None
+    async with session() as db:
+        original_commit = db.commit
+
+        async def commit_after_the_target_is_claimed():
+            nonlocal owner_id
+            owner_id = await seed_device(
+                nso_instance="nso-dev",
+                nso_device_name="existing-adoption-owner",
+                netbox_device_id=78,
+            )
+            db.commit = original_commit
+            await original_commit()
+
+        db.commit = commit_after_the_target_is_claimed
+        with pytest.raises(LookupError, match="NetBox device 78 is already onboarded") as caught:
+            await onboard_device(db, "nso-dev", "existing-adoption-winner", 78)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert owner_id is not None
+    async with session() as db:
+        existing = await db.get(Device, existing_id)
+        owner = await db.get(Device, owner_id)
+        assert existing is not None and existing.netbox_device_id is None
+        assert owner is not None and owner.netbox_device_id == 78
+
+
+async def test_onboard_existing_adoption_reraises_another_integrity_failure(adapter_client_with_nso):
+    from sqlalchemy.exc import IntegrityError
+
+    from nso_adapter.core.onboarding import onboard_device
+    from tests.conftest import seed_device
+
+    await seed_device(
+        nso_instance="nso-dev",
+        nso_device_name="existing-adoption-other-constraint",
+        netbox_device_id=None,
+    )
+    async with session() as db:
+        await _reject_non_null_netbox_device_ids(db)
+
+        with pytest.raises(IntegrityError):
+            await onboard_device(db, "nso-dev", "existing-adoption-other-constraint", 79)
 
 
 async def test_onboard_is_idempotent_for_same_link(adapter_client_with_nso):
@@ -122,7 +238,124 @@ async def test_onboard_resolves_a_lost_insert_race(adapter_client_with_nso):
     INSERT land first, and the rival would then block on OUR uncommitted key instead of
     racing us to it.
     """
+    from structlog.testing import capture_logs
+
     from nso_adapter.core.onboarding import onboard_device
+    from tests._secret_discipline import assert_records_free_of
+    from tests.conftest import seed_device
+
+    submitted_name = "placeholder-caller-raced-device"
+    async with session() as db:
+        original_flush = db.flush
+        winner_id = {}
+
+        async def flush_after_a_competing_insert():
+            if not winner_id:
+                winner_id["id"] = await seed_device(
+                    nso_instance="nso-dev", nso_device_name=submitted_name, netbox_device_id=91
+                )
+            db.flush = original_flush
+            await original_flush()
+
+        db.flush = flush_after_a_competing_insert
+        with capture_logs() as logs:
+            device = await onboard_device(db, "nso-dev", submitted_name, 91)
+        assert device.id == winner_id["id"]  # the winner's row, not a second one
+    assert_records_free_of(logs, [submitted_name])
+
+    async with session() as db:
+        rows = (await db.execute(select(Device).where(Device.nso_device_name == submitted_name))).scalars().all()
+        assert len(rows) == 1  # exactly one survivor
+
+
+async def test_onboard_adopts_an_unlinked_lost_insert_winner(adapter_client_with_nso):
+    """The losing insert must complete the requested link on an unlinked winner."""
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.onboarding import onboard_device
+    from nso_adapter.store.models import MappingStatus
+    from tests._secret_discipline import assert_records_free_of
+    from tests.conftest import seed_device
+
+    submitted_name = "placeholder-caller-unlinked-device"
+    async with session() as db:
+        original_flush = db.flush
+        winner_id = {}
+
+        async def flush_after_an_unlinked_competing_insert():
+            if not winner_id:
+                winner_id["id"] = await seed_device(
+                    nso_instance="nso-dev",
+                    nso_device_name=submitted_name,
+                    netbox_device_id=None,
+                )
+            db.flush = original_flush
+            await original_flush()
+
+        db.flush = flush_after_an_unlinked_competing_insert
+        with capture_logs() as logs:
+            device = await onboard_device(db, "nso-dev", submitted_name, 190)
+
+        assert device.id == winner_id["id"]
+        assert device.netbox_device_id == 190
+        assert device.mapping_status is MappingStatus.mapped
+    assert_records_free_of(logs, [submitted_name])
+
+    async with session() as db:
+        rows = (await db.execute(select(Device).where(Device.nso_device_name == submitted_name))).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].netbox_device_id == 190
+
+
+async def test_onboard_reports_a_late_netbox_conflict_after_losing_the_insert(adapter_client_with_nso):
+    """A target claimed after the adoption pre-check must retain the public conflict contract."""
+    from nso_adapter.core.onboarding import onboard_device
+    from tests.conftest import seed_device
+
+    async with session() as db:
+        original_flush = db.flush
+        original_commit = db.commit
+        winner_id = {}
+        owner_id = {}
+
+        async def flush_after_an_unlinked_competing_insert():
+            if not winner_id:
+                winner_id["id"] = await seed_device(
+                    nso_instance="nso-dev",
+                    nso_device_name="late-conflict-winner",
+                    netbox_device_id=None,
+                )
+            db.flush = original_flush
+            await original_flush()
+
+        async def commit_after_the_target_is_claimed():
+            if not owner_id:
+                owner_id["id"] = await seed_device(
+                    nso_instance="nso-dev",
+                    nso_device_name="late-conflict-owner",
+                    netbox_device_id=193,
+                )
+            db.commit = original_commit
+            await original_commit()
+
+        db.flush = flush_after_an_unlinked_competing_insert
+        db.commit = commit_after_the_target_is_claimed
+        with pytest.raises(LookupError, match="NetBox device 193 is already onboarded") as caught:
+            await onboard_device(db, "nso-dev", "late-conflict-winner", 193)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+    async with session() as db:
+        winner = await db.get(Device, winner_id["id"])
+        owner = await db.get(Device, owner_id["id"])
+        assert winner is not None and winner.netbox_device_id is None
+        assert owner is not None and owner.netbox_device_id == 193
+
+
+async def test_onboard_same_identity_race_reports_identity_refusal(adapter_client_with_nso):
+    """The losing request must report that the NSO identity belongs to another link."""
+    from nso_adapter.core.onboarding import DeviceIdentityRefused, onboard_device
     from tests.conftest import seed_device
 
     async with session() as db:
@@ -132,18 +365,31 @@ async def test_onboard_resolves_a_lost_insert_race(adapter_client_with_nso):
         async def flush_after_a_competing_insert():
             if not winner_id:
                 winner_id["id"] = await seed_device(
-                    nso_instance="nso-dev", nso_device_name="raced-rtr", netbox_device_id=91
+                    nso_instance="nso-dev",
+                    nso_device_name="raced-identity",
+                    netbox_device_id=192,
                 )
             db.flush = original_flush
             await original_flush()
 
         db.flush = flush_after_a_competing_insert
-        device = await onboard_device(db, "nso-dev", "raced-rtr", 91)
-        assert device.id == winner_id["id"]  # the winner's row, not a second one
+        with pytest.raises(DeviceIdentityRefused) as caught:
+            await onboard_device(db, "nso-dev", "raced-identity", 191)
+
+    assert caught.value.reason == "onboarded_elsewhere"
+    assert str(caught.value) == "The NSO device is already onboarded to a different NetBox device"
+
+
+async def test_onboard_new_device_reraises_another_integrity_failure(adapter_client_with_nso):
+    from sqlalchemy.exc import IntegrityError
+
+    from nso_adapter.core.onboarding import onboard_device
 
     async with session() as db:
-        rows = (await db.execute(select(Device).where(Device.nso_device_name == "raced-rtr"))).scalars().all()
-        assert len(rows) == 1  # exactly one survivor
+        await _reject_non_null_netbox_device_ids(db)
+
+        with pytest.raises(IntegrityError):
+            await onboard_device(db, "nso-dev", "new-device-other-constraint", 194)
 
 
 async def test_duplicate_nso_identity_is_rejected_by_the_database(adapter_client_with_nso):
@@ -232,6 +478,76 @@ async def test_rekey_changes_device_name(adapter_client_with_nso):
         assert updated.last_sync_at is None
         assert updated.degraded_surfaces is None
         assert updated.source_epoch == 2
+
+
+async def test_rekey_reports_identity_refusal_when_the_target_is_claimed_after_the_precheck(
+    adapter_client_with_nso,
+):
+    """The family fences lock (device_id, family); they do not serialize two devices on one identity.
+
+    The pre-check and the commit are select-then-write, so a rival can claim the target pair in
+    between and `uq_device_nso_identity` is what actually decides. Simulated by committing the
+    competing row right after this caller's pre-check, which is exactly what losing looks like.
+    """
+    from nso_adapter.core.onboarding import DeviceIdentityRefused, rekey_device
+    from tests._secret_discipline import assert_chain_free_of
+    from tests.conftest import seed_device
+
+    device_id = await seed_device(nso_instance="nso-dev", nso_device_name="rekey-loser", netbox_device_id=301)
+
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        original_execute = db.execute
+        state = {"saw_precheck": False, "seeded": False}
+
+        async def execute_racing_the_precheck(statement, *args, **kwargs):
+            # Seed on the first statement AFTER the dup pre-check, so the pre-check misses the
+            # rival and our own identity UPDATE is the one the constraint refuses.
+            if state["saw_precheck"] and not state["seeded"]:
+                state["seeded"] = True
+                await seed_device(nso_instance="nso-dev", nso_device_name="rekey-winner", netbox_device_id=302)
+            if "devices.id !=" in str(statement):
+                state["saw_precheck"] = True
+            return await original_execute(statement, *args, **kwargs)
+
+        db.execute = execute_racing_the_precheck
+        with pytest.raises(DeviceIdentityRefused) as caught:
+            await rekey_device(db, device, nso_device_name="rekey-winner")
+
+    assert state["seeded"], "the race was never injected; the test proves nothing"
+    assert caught.value.reason == "identity_claimed"
+    # The IntegrityError names the colliding key, so the refusal is raised OUTSIDE the handler:
+    # chaining it would republish the device name through every sink that renders the chain.
+    assert_chain_free_of(caught.value, ["rekey-winner", "uq_device_nso_identity"])
+
+
+async def test_rekey_reraises_an_integrity_error_from_another_constraint(adapter_client_with_nso):
+    """The try covers the teardown deletes too, so only the identity constraint means a lost race.
+
+    A non-identity violation reported as `identity_claimed` would answer 409 and hide a real
+    fault. The identity path itself is proven against the live constraint by the race test above.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from nso_adapter.core.onboarding import rekey_device
+    from tests.conftest import seed_device
+
+    class _OtherConstraint(Exception):
+        constraint_name = "uq_some_other_constraint"
+
+    device_id = await seed_device(nso_instance="nso-dev", nso_device_name="rekey-other", netbox_device_id=303)
+
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        original_commit = db.commit
+
+        async def commit_violating_another_constraint():
+            db.commit = original_commit
+            raise IntegrityError("UPDATE devices", {}, _OtherConstraint()) from _OtherConstraint()
+
+        db.commit = commit_violating_another_constraint
+        with pytest.raises(IntegrityError):
+            await rekey_device(db, device, nso_device_name="rekey-other-target")
 
 
 async def test_rekey_same_source_is_true_noop(adapter_client_with_nso):
@@ -657,3 +973,213 @@ async def test_set_scope_empty_list_clears_scope(adapter_client_with_nso):
         device = await db.get(Device, device_id)
         result = await set_scope(db, device, [])
         assert result == []
+
+
+# ── _seed_onboarding_failover: the persisted step carries no store diagnostics ──
+
+
+async def test_failover_seed_failure_step_classifies_the_store_error(adapter_client_with_nso, monkeypatch):
+    """A failed seed reports the failure TYPE, never the driver's repr.
+
+    The step is best-effort, so it is persisted and served rather than raised. A SQLAlchemy
+    error repeats the statement it ran and the parameters it bound, and this row's parameters
+    are the device's management addresses.
+    """
+    from nso_adapter.config import get_config
+    from nso_adapter.core.onboarding import _seed_onboarding_failover
+
+    monkeypatch.setattr(get_config().scheduler, "enable_failover", True)
+    absent_device_id = 987654321  # no devices row, so the seed's INSERT violates its FK
+
+    async with session() as db:
+        step = await _seed_onboarding_failover(db, absent_device_id, "198.51.100.10", "203.0.113.10", "primary")
+
+    assert step == {"step": "failover_seed", "status": "failed", "failure": "IntegrityError"}
+
+
+async def test_failover_seed_success_step_is_unchanged(adapter_client_with_nso, monkeypatch):
+    """The ok path still reports the address it seeded: only the failure branch changed."""
+    from nso_adapter.config import get_config
+    from nso_adapter.core.onboarding import _seed_onboarding_failover, onboard_device
+
+    monkeypatch.setattr(get_config().scheduler, "enable_failover", True)
+
+    async with session() as db:
+        device = await onboard_device(db, "nso-dev", f"seed-{uuid4().hex[:8]}", int(uuid4().int % 10**8))
+        await db.commit()
+        step = await _seed_onboarding_failover(db, device.id, "198.51.100.10", "203.0.113.10", "oob")
+
+    assert step == {"step": "failover_seed", "status": "ok", "detail": "oob"}
+
+
+async def test_the_PROVISIONED_record_carries_step_names_and_statuses_but_no_step_DETAIL(
+    adapter_client_with_nso,
+):
+    """`steps` is a collection, so the identifier policy has to reach inside it.
+
+    Step details carry caller-supplied text — the requested admin-state, the derived
+    device-type — and the failover-bootstrap branch renders both the primary and the OOB
+    address. The terminal record is a diagnostic sink, so it gets the fixed step names and
+    status classifications and nothing else; the caller still reads the full steps list off
+    the job result, which is a response, not a sink.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.onboarding import provision_nso_device
+    from nso_adapter.nso.client import NsoClient
+    from tests._secret_discipline import assert_records_free_of
+
+    submitted_name = "placeholder-caller-provisioned-device"
+    submitted_admin_state = "placeholder-caller-admin-state"
+    client = AsyncMock(spec=NsoClient)
+    client.device_exists.return_value = False
+    client.sync_from.return_value = True
+
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
+        async with session() as db:
+            with capture_logs() as logs:
+                result = await provision_nso_device(
+                    db,
+                    nso_instance="nso-dev",
+                    device_name=submitted_name,
+                    address="198.51.100.20",
+                    ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+                    authgroup="network",
+                    netbox_device_id=int(uuid4().int % 10**8),
+                    admin_state=submitted_admin_state,
+                )
+
+    assert result["ok"] is True
+    provisioned = [record for record in logs if record["event"] == "device.provisioned"]
+    assert len(provisioned) == 1
+    assert provisioned[0]["steps"] == [
+        {"step": "create", "status": "ok"},
+        {"step": "admin_state", "status": "ok"},
+        {"step": "fetch_host_keys", "status": "ok"},
+        {"step": "sync_from", "status": "ok"},
+        {"step": "adapter_mapping", "status": "ok"},
+    ]
+    # The TERMINAL record is this finding's scope. The six other `nso_device=` sites in this
+    # module pre-date the stack on main and belong to the diagnostic-identity migration, which
+    # needs the keyed reference to name a device that has no adapter row yet.
+    assert_records_free_of(provisioned, [submitted_name, submitted_admin_state, "device-type=", "198.51.100.20"])
+    assert provisioned[0]["device_id"] is not None, "the record must stay correlatable"
+    # The response keeps what the sink drops.
+    assert {"step": "admin_state", "status": "ok", "detail": submitted_admin_state} in result["steps"]
+
+
+async def test_an_UNLINKED_provision_is_still_correlatable_without_a_device_id(adapter_client_with_nso):
+    """A provision with no NetBox link creates no adapter row, so `device_id` is None.
+
+    Dropping the submitted name would leave that record unaddressable, which is the failure mode
+    the identity design warns about. `job_id` is adapter-owned and carries it instead.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.onboarding import provision_nso_device
+    from nso_adapter.nso.client import NsoClient
+    from tests._secret_discipline import assert_records_free_of
+
+    submitted_name = "placeholder-caller-unlinked-provision"
+    client = AsyncMock(spec=NsoClient)
+    client.device_exists.return_value = False
+    client.sync_from.return_value = True
+
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
+        async with session() as db:
+            with capture_logs() as logs:
+                result = await provision_nso_device(
+                    db,
+                    nso_instance="nso-dev",
+                    device_name=submitted_name,
+                    address="198.51.100.22",
+                    ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+                    authgroup="network",
+                    netbox_device_id=None,
+                    job_id=4242,
+                )
+
+    assert result["ok"] is True
+    assert result["device_id"] is None  # no NetBox link, so no adapter row
+    record = next(r for r in logs if r["event"] == "device.provisioned")
+    assert record["device_id"] is None
+    assert record["job_id"] == 4242, "the record must stay correlatable without a device row"
+    assert_records_free_of([record], [submitted_name])
+
+
+async def test_a_NONFATAL_step_failure_keeps_its_CLASSIFICATION_in_the_record(adapter_client_with_nso):
+    """sync-from is non-fatal, so its failure only ever surfaces through the terminal record.
+
+    Dropping the whole step payload would make an auth failure and an outage read identically
+    there. `failure` is authored by `failure_detail`, so it stays; `detail` is descriptive and
+    does not.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    import httpx
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.onboarding import provision_nso_device
+    from nso_adapter.nso.client import NsoClient
+    from tests._secret_discipline import assert_records_free_of
+
+    submitted_name = "placeholder-caller-unsynced-device"
+    request = httpx.Request("POST", "https://nso.invalid/restconf/placeholder-sync-url")
+    client = AsyncMock(spec=NsoClient)
+    client.device_exists.return_value = False
+    client.sync_from.side_effect = httpx.HTTPStatusError(
+        "placeholder-server-text", request=request, response=httpx.Response(401, request=request)
+    )
+
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
+        async with session() as db:
+            with capture_logs() as logs:
+                result = await provision_nso_device(
+                    db,
+                    nso_instance="nso-dev",
+                    device_name=submitted_name,
+                    address="198.51.100.21",
+                    ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+                    authgroup="network",
+                    netbox_device_id=int(uuid4().int % 10**8),
+                )
+
+    assert result["ok"] is True  # sync-from is non-fatal
+    record = next(r for r in logs if r["event"] == "device.provisioned")
+    sync_step = next(s for s in record["steps"] if s["step"] == "sync_from")
+    assert sync_step == {"step": "sync_from", "status": "failed", "failure": "HTTPStatusError (HTTP 401)"}
+    assert not any("detail" in step for step in record["steps"]), "descriptive detail is not a sink field"
+    assert_records_free_of(
+        [record], [submitted_name, "placeholder-server-text", "placeholder-sync-url", "device-type="]
+    )
+
+
+def test_every_production_provision_call_carries_the_job_correlator() -> None:
+    """`device.provisioned` is addressable only through `device_id` or `job_id`.
+
+    `device_id` is absent for a provision with no NetBox link, so `job_id` is the only
+    correlator left on that path. Both default to `None` on the signature, which makes an
+    unaddressable success record representable. The one production caller passes `job_id`;
+    this pins that rather than rejecting a combination no caller can reach.
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "nso_adapter"
+    missing = []
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", None)
+            if name != "provision_nso_device":
+                continue
+            if not any(keyword.arg == "job_id" for keyword in node.keywords):
+                missing.append(f"{path.relative_to(root)}:{node.lineno}")
+
+    assert missing == [], "a provision that reaches NSO must carry job_id, or its record is unaddressable"

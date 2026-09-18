@@ -997,10 +997,13 @@ def section_context(document: dict, section: str) -> dict:
     ned_id = context["ned_id"]
     if ned_id is not None and not isinstance(ned_id, str):
         raise ValueError(f"document section {section!r} records a non-string ned_id")
+    unregistered = None
     try:
         community_dialect_by_name(context["dialect"])
-    except ValueError as exc:
-        raise ValueError(f"document section {section!r} names an unregistered dialect: {exc}") from None
+    except ValueError:
+        unregistered = ValueError(f"document section {section!r} names an unregistered dialect")
+    if unregistered is not None:
+        raise unregistered
     return context
 
 

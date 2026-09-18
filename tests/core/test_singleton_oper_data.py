@@ -314,7 +314,7 @@ def test_attrs_to_interface_list_singleton_bare_object():
         "device-name": "sw01",
         "interface": {"interface-name": "GigabitEthernet0/1", "description": "uplink", "enabled": True},
     }
-    result = _attrs_to_interface_list(entry)
+    result = _attrs_to_interface_list(entry, device_id=1)
     assert len(result) == 1
     assert result[0].name == "GigabitEthernet0/1"
     assert result[0].nso.description == "uplink"
@@ -493,7 +493,7 @@ async def test_snmp_singleton_bare_objects(adapter_client):
         nso_client = AsyncMock()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
-            "community": {"name": "abcdef012345", "access": "RO"},
+            "community": {"name": "abcdef0123456789", "access": "RO"},
             "v3-user": {"username": "obs", "has-auth-secret": True, "has-priv-secret": False},
             "host": {"address": "10.0.0.53", "version": "3", "user": "obs"},
         }
@@ -502,7 +502,7 @@ async def test_snmp_singleton_bare_objects(adapter_client):
         assert ok is True
 
         comms = (await db.execute(select(SnmpCommunity).where(SnmpCommunity.device_id == device.id))).scalars().all()
-        assert [c.community_hash for c in comms] == ["abcdef012345"]
+        assert [c.community_hash for c in comms] == ["abcdef0123456789"]
         users = (await db.execute(select(SnmpV3User).where(SnmpV3User.device_id == device.id))).scalars().all()
         assert [u.username for u in users] == ["obs"]
         hosts = (await db.execute(select(SnmpHost).where(SnmpHost.device_id == device.id))).scalars().all()

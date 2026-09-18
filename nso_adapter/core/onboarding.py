@@ -30,6 +30,7 @@ from nso_adapter.core.claim import (
     resolve_claim_by_token,
 )
 from nso_adapter.core.families import ALL_FAMILY_KEYS
+from nso_adapter.nso.client import failure_detail
 from nso_adapter.store import outcome_store
 from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import (
@@ -44,6 +45,40 @@ from nso_adapter.store.models import (
 )
 
 logger = structlog.get_logger(__name__)
+
+
+class DeviceIdentityRefused(LookupError):
+    """A conflict whose real detail is server-side link state, so the message is authored.
+
+    The caller sent an identity and a NetBox device id; what refuses the request is the link
+    the adapter already holds, which the caller never sent and must not be told. The message
+    repeats none of it, ``reason`` names the refusal for the client, and the full detail goes
+    to the log at the raise site (every caller of onboarding gets it, not just the API).
+    """
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+#: The authored answers. Each states the refusal and interpolates nothing.
+_ONBOARDED_ELSEWHERE = "The NSO device is already onboarded to a different NetBox device"
+_IDENTITY_CLAIMED = "The target NSO identity is already claimed by another device"
+#: The DB constraint that decides an identity race, taken from the model so the two cannot drift.
+_IDENTITY_CONSTRAINT = "uq_device_nso_identity"
+_NETBOX_DEVICE_ID_CONSTRAINT = "uq_device_netbox_device_id"
+
+
+def _violated_constraint(exc: BaseException) -> str | None:
+    """Return the constraint an integrity error names, or None when the driver reports none."""
+    current: BaseException | None = exc
+    while current is not None:
+        name = getattr(current, "constraint_name", None)
+        if isinstance(name, str) and name:
+            return name
+        current = current.__cause__
+    return None
+
 
 _READ_MIRROR_ROOTS = (
     "interfaces",
@@ -77,6 +112,9 @@ _READ_MIRROR_ROOTS = (
 )
 
 
+#: The failures whose message the adapter WROTE: it names the failure and repeats nothing
+#: the server said. Every other exception is classified by its type alone. A decode of a
+#: malformed answer carries the server's bytes, and a store failure carries the statement.
 async def _bootstrap_address(client, device_name: str, primary: str, oob_ip: str | None) -> tuple[str, dict | None]:
     """Reachability-aware initial management address.
 
@@ -96,7 +134,11 @@ async def _bootstrap_address(client, device_name: str, primary: str, oob_ip: str
         await client.set_address(device_name, oob_ip)
         await client.disconnect(device_name)
     except Exception as exc:
-        return ActiveAddress.primary.value, {"step": "failover_bootstrap", "status": "failed", "detail": repr(exc)}
+        return ActiveAddress.primary.value, {
+            "step": "failover_bootstrap",
+            "status": "failed",
+            "failure": failure_detail(exc),
+        }
     return ActiveAddress.oob.value, {
         "step": "failover_bootstrap",
         "status": "oob",
@@ -116,15 +158,99 @@ async def _once_with_retry(action, *, backoff: float = _ONBOARD_RETRY_BACKOFF_SE
     for which ``ok(value)`` is falsy — covers both fetch-host-keys (raises) and
     sync-from (returns a bool). The second attempt's exception/result propagates.
     """
+    result = None
+    retry = False
     try:
         result = await action()
     except Exception:
-        await asyncio.sleep(backoff)
-        return await action()
-    if ok is not None and not ok(result):
+        retry = True
+    if not retry and ok is not None and not ok(result):
+        retry = True
+    # Deliberately AFTER the handler: a second failure raised here carries no __context__, so
+    # the first attempt's exception (and any server text in it) never joins the second's chain.
+    if retry:
         await asyncio.sleep(backoff)
         return await action()
     return result
+
+
+async def _commit_adoption_or_conflict(db: AsyncSession, netbox_device_id: int) -> LookupError | None:
+    """Commit an adoption or return a late NetBox ownership conflict."""
+    ownership_conflict = False
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        if _violated_constraint(exc) != _NETBOX_DEVICE_ID_CONSTRAINT:
+            raise
+        ownership_conflict = True
+
+    if ownership_conflict:
+        return LookupError(f"NetBox device {netbox_device_id} is already onboarded")
+    return None
+
+
+async def _commit_lost_insert_adoption(
+    db: AsyncSession,
+    winner: Device,
+    netbox_device_id: int,
+) -> Device | LookupError:
+    """Commit a lost-insert adoption or report a late NetBox ownership conflict."""
+    conflict = await _commit_adoption_or_conflict(db, netbox_device_id)
+    if conflict is not None:
+        return conflict
+
+    await db.refresh(winner)
+    logger.info(
+        "device.onboard_race_resolved",
+        device_id=winner.id,
+        adopted=True,
+    )
+    return winner
+
+
+async def _resolve_lost_insert(
+    db: AsyncSession,
+    nso_instance: str,
+    nso_device_name: str,
+    netbox_device_id: int,
+) -> Device | LookupError:
+    """Resolve the database winner without raising inside the failed insert handler."""
+    winner = (
+        await db.execute(
+            select(Device)
+            .where(
+                Device.nso_instance == nso_instance,
+                Device.nso_device_name == nso_device_name,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if winner is None:
+        return LookupError(f"NetBox device {netbox_device_id} is already onboarded")
+    if winner.netbox_device_id is None:
+        dup_nb = await db.scalar(
+            select(Device.id).where(
+                Device.netbox_device_id == netbox_device_id,
+                Device.id != winner.id,
+            )
+        )
+        if dup_nb is not None:
+            return LookupError(f"NetBox device {netbox_device_id} is already onboarded")
+        winner.netbox_device_id = netbox_device_id
+        winner.mapping_status = MappingStatus.mapped
+        return await _commit_lost_insert_adoption(db, winner, netbox_device_id)
+    if winner.netbox_device_id != netbox_device_id:
+        logger.warning(
+            "device.onboard_refused",
+            reason="onboarded_elsewhere",
+            device_id=winner.id,
+            linked_netbox_device_id=winner.netbox_device_id,
+            requested_netbox_device_id=netbox_device_id,
+        )
+        return DeviceIdentityRefused(_ONBOARDED_ELSEWHERE, reason="onboarded_elsewhere")
+    logger.info("device.onboard_race_resolved", device_id=winner.id)
+    return winner
 
 
 async def onboard_device(
@@ -149,8 +275,8 @@ async def onboard_device(
 
     Raises:
         ValueError: if the NSO instance is unknown.
-        LookupError: if netbox_device_id is already onboarded elsewhere, or the NSO node is already
-            linked to a DIFFERENT NetBox device.
+        DeviceIdentityRefused: if the NSO node is already linked to a different NetBox device.
+        LookupError: if netbox_device_id is already onboarded elsewhere.
         ClaimUnavailableError: provision mode only — the device stayed claimed for the whole
             wait budget, so the mapping is refused rather than performed unserialized.
 
@@ -184,10 +310,14 @@ async def onboard_device(
             return existing
         # Linked to a DIFFERENT NetBox device → genuine conflict; never silently repoint it.
         if existing.netbox_device_id is not None:
-            raise LookupError(
-                f"NSO device {nso_device_name!r} on {nso_instance!r} is already onboarded "
-                f"to NetBox device {existing.netbox_device_id}"
+            logger.warning(
+                "device.onboard_refused",
+                reason="onboarded_elsewhere",
+                device_id=existing.id,
+                linked_netbox_device_id=existing.netbox_device_id,
+                requested_netbox_device_id=netbox_device_id,
             )
+            raise DeviceIdentityRefused(_ONBOARDED_ELSEWHERE, reason="onboarded_elsewhere")
         # Unlinked leftover — provisioned INTO NSO without a NetBox link (netbox_device_id NULL).
         # ADOPT it: fill the mapping in on the same row. Rejecting here left the plugin's onboard
         # POST failing with 409, which it swallowed, so the device never onboarded. The target
@@ -201,7 +331,9 @@ async def onboard_device(
             raise LookupError(f"NetBox device {netbox_device_id} is already onboarded")
         existing.netbox_device_id = netbox_device_id
         existing.mapping_status = MappingStatus.mapped
-        await db.commit()
+        conflict = await _commit_adoption_or_conflict(db, netbox_device_id)
+        if conflict is not None:
+            raise conflict
         await db.refresh(existing)
         logger.info(
             "device.adopted", device_id=existing.id, nso_device=nso_device_name, netbox_device_id=netbox_device_id
@@ -220,32 +352,27 @@ async def onboard_device(
         mapping_status=MappingStatus.mapped,
     )
     db.add(device)
+    recovered: Device | LookupError | None = None
     try:
         # The settle counter is created WITH the device, in this same transaction: a terminal
         # write may never create it (Appendix S §3.3), so every insert site owes one.
         await db.flush()
         await create_counter(db, device.id)
         await db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         # Lost a race with a concurrent onboard of the same device. The checks above are
         # select-then-insert, so both callers can find nothing and both insert; the DB
         # constraints (uq_device_nso_identity / uq_device_netbox_device_id) are what actually
-        # decide. Re-read the winner and return it — onboarding is idempotent by contract, and
-        # a duplicate row here would be permanent (the scope reconcile keeps every row it sees).
+        # decide. Re-read the winner under a row lock and finish any missing link. A duplicate
+        # row here would be permanent (the scope reconcile keeps every row it sees).
         await db.rollback()
-        winner = (
-            await db.execute(
-                select(Device).where(
-                    Device.nso_instance == nso_instance,
-                    Device.nso_device_name == nso_device_name,
-                )
-            )
-        ).scalar_one_or_none()
-        if winner is None or winner.netbox_device_id not in (None, netbox_device_id):
-            # The conflict was on netbox_device_id instead: another NSO node claimed it.
-            raise LookupError(f"NetBox device {netbox_device_id} is already onboarded") from None
-        logger.info("device.onboard_race_resolved", device_id=winner.id, nso_device=nso_device_name)
-        return winner
+        if _violated_constraint(exc) not in {_IDENTITY_CONSTRAINT, _NETBOX_DEVICE_ID_CONSTRAINT}:
+            raise
+        recovered = await _resolve_lost_insert(db, nso_instance, nso_device_name, netbox_device_id)
+    if isinstance(recovered, LookupError):
+        raise recovered
+    if recovered is not None:
+        return recovered
     await db.refresh(device)
     logger.info("device.onboarded", device_id=device.id, nso_device=nso_device_name)
     return device
@@ -390,9 +517,11 @@ async def _insert_device_with_claim(
         # Same transaction as the device, like every other insert site (Appendix S §3.3).
         await create_counter(db, device.id)
         await db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         # Provably before COMMIT: a concurrent onboard of the same node or netbox id won.
         await db.rollback()
+        if _violated_constraint(exc) not in {_IDENTITY_CONSTRAINT, _NETBOX_DEVICE_ID_CONSTRAINT}:
+            raise
         return None
     except BaseException as exc:
         # In doubt: the COMMIT may have landed with both rows, and a CANCELLATION delivered
@@ -440,10 +569,9 @@ async def _link_existing_under_claim(
         return None
     # Snapshotted: ending the transaction below expires the instance, and an implicit lazy
     # load on an async session raises MissingGreenlet instead of the intended error.
-    linked_to, nso_device_name, nso_instance = (
+    linked_to, nso_device_name = (
         existing.netbox_device_id,
         existing.nso_device_name,
-        existing.nso_instance,
     )
 
     # Already linked to THIS NetBox device → idempotent no-op; nothing to write.
@@ -454,9 +582,14 @@ async def _link_existing_under_claim(
     # Linked to a DIFFERENT NetBox device → genuine conflict; never silently repoint it.
     if linked_to is not None:
         await db.rollback()
-        raise LookupError(
-            f"NSO device {nso_device_name!r} on {nso_instance!r} is already onboarded to NetBox device {linked_to}"
+        logger.warning(
+            "device.onboard_refused",
+            reason="onboarded_elsewhere",
+            device_id=device_id,
+            linked_netbox_device_id=linked_to,
+            requested_netbox_device_id=netbox_device_id,
         )
+        raise DeviceIdentityRefused(_ONBOARDED_ELSEWHERE, reason="onboarded_elsewhere")
     dup_nb = await db.scalar(
         select(Device.id).where(Device.netbox_device_id == netbox_device_id, Device.id != device_id)
     )
@@ -466,7 +599,9 @@ async def _link_existing_under_claim(
 
     existing.netbox_device_id = netbox_device_id
     existing.mapping_status = MappingStatus.mapped
-    await db.commit()
+    conflict = await _commit_adoption_or_conflict(db, netbox_device_id)
+    if conflict is not None:
+        raise conflict
     reg.register(*acquired.identity())
     await db.refresh(existing)
     logger.info(
@@ -477,6 +612,16 @@ async def _link_existing_under_claim(
         claimed=True,
     )
     return existing
+
+
+#: The step keys a diagnostic sink may carry. `detail` is deliberately absent: it holds the
+#: requested admin-state, the derived device-type, or a failover bootstrap's address pair.
+_SAFE_STEP_KEYS = ("step", "status", "failure", "reason")
+
+
+def _step_classifications(steps: list[dict]) -> list[dict[str, str]]:
+    """Return each step's authored classifications, dropping its descriptive detail."""
+    return [{key: step[key] for key in _SAFE_STEP_KEYS if key in step} for step in steps]
 
 
 async def provision_nso_device(
@@ -531,10 +676,19 @@ async def provision_nso_device(
     client = get_nso_client(nso_instance)
     steps: list[dict] = []
 
-    def _step(name: str, status: str, detail: str | None = None) -> None:
+    def _step(name: str, status: str, detail: str | None = None, *, failure: str | None = None) -> None:
+        """Record one step.
+
+        ``detail`` is descriptive text — a derived device-type, the requested admin-state, an
+        address pair — and never reaches a diagnostic sink. ``failure`` is a classification from
+        :func:`failure_detail`, which is authored, so the terminal record still tells a 401 from
+        a 503.
+        """
         entry = {"step": name, "status": status}
         if detail:
             entry["detail"] = detail
+        if failure:
+            entry["failure"] = failure
         steps.append(entry)
 
     def _result(ok: bool, device_id: int | None = None) -> dict:
@@ -548,7 +702,7 @@ async def provision_nso_device(
             await client.create_device(device_name, address, ned_id, authgroup, ned_type=device_type, port=port)
             _step("create", "ok", f"device-type={device_type}")
     except Exception as exc:
-        _step("create", "failed", repr(exc))
+        _step("create", "failed", failure=failure_detail(exc))
         return _result(False)
 
     # 2. admin-state unlocked — blocking. MUST precede fetch-host-keys: a newly
@@ -558,7 +712,7 @@ async def provision_nso_device(
         await client.set_admin_state(device_name, admin_state)
         _step("admin_state", "ok", admin_state)
     except Exception as exc:
-        _step("admin_state", "failed", repr(exc))
+        _step("admin_state", "failed", failure=failure_detail(exc))
         return _result(False)
 
     # 2b. reachability-aware address: bootstrap a fresh device over OOB if primary is
@@ -574,7 +728,7 @@ async def provision_nso_device(
         await _once_with_retry(lambda: client.fetch_host_keys(device_name))
         _step("fetch_host_keys", "ok")
     except Exception as exc:
-        _step("fetch_host_keys", "failed", repr(exc))
+        _step("fetch_host_keys", "failed", failure=failure_detail(exc))
         # If the bootstrap pinned NSO to the OOB address, don't strand the device: map it and
         # seed the failover row so the loop can fail it back to primary once in-band recovers.
         if active_address == ActiveAddress.oob.value:
@@ -601,7 +755,7 @@ async def provision_nso_device(
             sync_ok = bool(await _once_with_retry(lambda: client.sync_from(device_name), ok=bool))
             _step("sync_from", "ok" if sync_ok else "failed")
         except Exception as exc:
-            _step("sync_from", "failed", repr(exc))
+            _step("sync_from", "failed", failure=failure_detail(exc))
 
     # 5-6. adapter mapping row (so the read pipeline manages it henceforth) + failover row
     #      (IPs + bootstrapped address) so the failover loop can manage it.
@@ -626,7 +780,15 @@ async def provision_nso_device(
     if sync_ok and device_id is not None:
         await _initial_mirror_refresh(db, device_id, client, reg=reg)
 
-    logger.info("device.provisioned", nso_device=device_name, instance=nso_instance, steps=steps)
+    # Both correlators are adapter-owned. `device_id` is absent for a provision with no NetBox
+    # link, so `job_id` carries the record on that path rather than leaving it unaddressable.
+    logger.info(
+        "device.provisioned",
+        device_id=device_id,
+        job_id=job_id,
+        instance=nso_instance,
+        steps=_step_classifications(steps),
+    )
     return _result(True, device_id)
 
 
@@ -673,7 +835,8 @@ async def _initial_mirror_refresh(
         raise
     except Exception as exc:  # noqa: BLE001 — never fail provisioning on a mirror-read hiccup
         await db.rollback()
-        logger.warning("device.onboard_mirror.failed", device_id=device_id, error=repr(exc))
+        # The mirror read is HTTP against NSO, so the same classification applies here.
+        logger.warning("device.onboard_mirror.failed", device_id=device_id, error=failure_detail(exc))
 
 
 async def _map_and_seed_failover(
@@ -705,8 +868,17 @@ async def _map_and_seed_failover(
             row = await onboard_device(db, nso_instance, device_name, netbox_device_id, reg=reg, job_id=job_id)
             device_id = row.id
             steps.append({"step": "adapter_mapping", "status": "ok"})
+        except DeviceIdentityRefused as exc:
+            steps.append(
+                {
+                    "step": "adapter_mapping",
+                    "status": "exists",
+                    "failure": failure_detail(exc),
+                    "reason": exc.reason,
+                }
+            )
         except LookupError as exc:
-            steps.append({"step": "adapter_mapping", "status": "exists", "detail": repr(exc)})
+            steps.append({"step": "adapter_mapping", "status": "exists", "failure": failure_detail(exc)})
     fo_seed = await _seed_onboarding_failover(db, device_id, address, oob_ip, active_address, reg=reg)
     if fo_seed:
         steps.append(fo_seed)
@@ -740,7 +912,7 @@ async def _seed_onboarding_failover(
         # transaction has to go, or the mirror refresh and the runner's terminal write both
         # die of PendingRollbackError on a device that mapped perfectly well.
         await db.rollback()
-        return {"step": "failover_seed", "status": "failed", "detail": repr(exc)}
+        return {"step": "failover_seed", "status": "failed", "failure": failure_detail(exc)}
 
 
 async def rekey_device(
@@ -779,68 +951,96 @@ async def rekey_device(
             Device.id != device.id,
         )
     )
-    if dup.scalar_one_or_none():
-        raise LookupError(f"NSO device {target_name!r} on {target_instance!r} is already claimed by another device")
-
-    device.nso_instance = target_instance
-    device.nso_device_name = target_name
-    device.source_epoch += 1
-
-    # Child rows use ON DELETE CASCADE where applicable. Interfaces retain the
-    # established explicit cleanup because their oldest FKs predate DB cascades.
-    iface_ids_result = await db.execute(select(DbInterface.id).where(DbInterface.device_id == device.id))
-    iface_ids = list(iface_ids_result.scalars().all())
-    if iface_ids:
-        from nso_adapter.store.models import InterfaceAttrState, InterfaceIntent, InterfaceIpIntent
-
-        await db.execute(delete(InterfaceAttrState).where(InterfaceAttrState.interface_id.in_(iface_ids)))
-        intent_iface_ids = set(
-            (await db.execute(select(InterfaceIntent.interface_id).where(InterfaceIntent.interface_id.in_(iface_ids))))
-            .scalars()
-            .all()
+    conflicting = dup.scalar_one_or_none()
+    if conflicting is not None:
+        logger.warning(
+            "device.rekey_refused",
+            reason="identity_claimed",
+            device_id=device_id,
+            conflicting_device_id=conflicting.id,
         )
-        intent_iface_ids.update(
-            (
+        raise DeviceIdentityRefused(_IDENTITY_CLAIMED, reason="identity_claimed")
+
+    # The fences lock (device_id, family) and cannot serialize two devices onto one identity,
+    # so uq_device_nso_identity is what actually decides a lost race. The violation can surface
+    # at any autoflush in the teardown below, not only at the commit.
+    identity_claimed = False
+    try:
+        device.nso_instance = target_instance
+        device.nso_device_name = target_name
+        device.source_epoch += 1
+
+        # Child rows use ON DELETE CASCADE where applicable. Interfaces retain the
+        # established explicit cleanup because their oldest FKs predate DB cascades.
+        iface_ids_result = await db.execute(select(DbInterface.id).where(DbInterface.device_id == device.id))
+        iface_ids = list(iface_ids_result.scalars().all())
+        if iface_ids:
+            from nso_adapter.store.models import InterfaceAttrState, InterfaceIntent, InterfaceIpIntent
+
+            await db.execute(delete(InterfaceAttrState).where(InterfaceAttrState.interface_id.in_(iface_ids)))
+            intent_iface_ids = set(
+                (
+                    await db.execute(
+                        select(InterfaceIntent.interface_id).where(InterfaceIntent.interface_id.in_(iface_ids))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            intent_iface_ids.update(
+                (
+                    await db.execute(
+                        select(InterfaceIpIntent.interface_id).where(InterfaceIpIntent.interface_id.in_(iface_ids))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            # Interface intents are operator-owned state, not a read mirror. Keep their
+            # minimal interface identity anchor so the next source read reuses the
+            # same row by name and the intent/history survives the rekey.
+            if intent_iface_ids:
                 await db.execute(
-                    select(InterfaceIpIntent.interface_id).where(InterfaceIpIntent.interface_id.in_(iface_ids))
+                    delete(DbInterface).where(
+                        DbInterface.device_id == device.id,
+                        DbInterface.id.not_in(intent_iface_ids),
+                    )
                 )
-            )
-            .scalars()
-            .all()
-        )
-        # Interface intents are operator-owned state, not a read mirror. Keep their
-        # minimal interface identity anchor so the next source read reuses the
-        # same row by name and the intent/history survives the rekey.
-        if intent_iface_ids:
-            await db.execute(
-                delete(DbInterface).where(
-                    DbInterface.device_id == device.id,
-                    DbInterface.id.not_in(intent_iface_ids),
+                await db.execute(
+                    update(DbInterface)
+                    .where(DbInterface.id.in_(intent_iface_ids))
+                    .values(parent_binding=None, kind=None, encap_tag=None, vrf=None, service=None)
                 )
-            )
-            await db.execute(
-                update(DbInterface)
-                .where(DbInterface.id.in_(intent_iface_ids))
-                .values(parent_binding=None, kind=None, encap_tag=None, vrf=None, service=None)
-            )
-        else:
-            await db.execute(delete(DbInterface).where(DbInterface.device_id == device.id))
-    for table_name in _READ_MIRROR_ROOTS:
-        if table_name == "interfaces":
-            continue  # handled above so operator-owned interface-intent anchors survive
-        table = Base.metadata.tables[table_name]
-        await db.execute(delete(table).where(table.c.device_id == device.id))
-    await db.execute(delete(RefreshOutcomePointer).where(RefreshOutcomePointer.device_id == device.id))
-    await db.execute(delete(ManagedScope).where(ManagedScope.device_id == device.id))
+            else:
+                await db.execute(delete(DbInterface).where(DbInterface.device_id == device.id))
+        for table_name in _READ_MIRROR_ROOTS:
+            if table_name == "interfaces":
+                continue  # handled above so operator-owned interface-intent anchors survive
+            table = Base.metadata.tables[table_name]
+            await db.execute(delete(table).where(table.c.device_id == device.id))
+        await db.execute(delete(RefreshOutcomePointer).where(RefreshOutcomePointer.device_id == device.id))
+        await db.execute(delete(ManagedScope).where(ManagedScope.device_id == device.id))
 
-    device.ned_id = None
-    device.sw_version = None
-    device.mapping_status = MappingStatus.mapped
-    device.last_sync_at = None
-    device.last_sync_status = None
-    device.degraded_surfaces = None
+        device.ned_id = None
+        device.sw_version = None
+        device.mapping_status = MappingStatus.mapped
+        device.last_sync_at = None
+        device.last_sync_status = None
+        device.degraded_surfaces = None
 
-    await db.commit()
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        # The try covers the whole mutation, teardown deletes included, so only the identity
+        # constraint may be reported as a lost identity race. Anything else is a real fault.
+        if _violated_constraint(exc) != _IDENTITY_CONSTRAINT:
+            raise
+        identity_claimed = True
+
+    if identity_claimed:
+        logger.warning("device.rekey_refused", reason="identity_claimed", device_id=device_id)
+        raise DeviceIdentityRefused(_IDENTITY_CLAIMED, reason="identity_claimed")
+
     await db.refresh(device)
     logger.info("device.rekeyed", device_id=device.id, nso_device=device.nso_device_name)
     return device

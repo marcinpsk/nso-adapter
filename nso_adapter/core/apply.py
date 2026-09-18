@@ -47,6 +47,7 @@ from nso_adapter.core.static_route_plan import (
     recorded_static_route_apply_mode,
 )
 from nso_adapter.nso.apply import NsoApplyError
+from nso_adapter.nso.client import failure_detail
 from nso_adapter.store.models import (
     DbInterface,
     Device,
@@ -211,7 +212,8 @@ async def _static_route_device_state(client, device) -> tuple[str, dict]:
         # carry on to the bookkeeping under ownership it no longer has.
         raise
     except Exception as exc:  # noqa: BLE001 — a read-side failure is inconclusive, never a green
-        logger.warning("static_route.device_state_read_failed", device_id=device.id, error=repr(exc))
+        # Metadata only: any exception from the reader can repeat what the server said.
+        logger.warning("static_route.device_state_read_failed", device_id=device.id, error=failure_detail(exc))
         return "error", {}
 
 
@@ -972,9 +974,9 @@ async def _maybe_sync_from(db: AsyncSession, client, device_name: str, device_id
         return
     try:
         await client.sync_from(device_name)
-        logger.info("apply.sync_from.done", device=device_name)
+        logger.info("apply.sync_from.done", device_id=device_id)
     except Exception as exc:
-        logger.warning("apply.sync_from.failed", device=device_name, error=str(exc))
+        logger.warning("apply.sync_from.failed", device_id=device_id, error=failure_detail(exc))
 
 
 class _AttributeApply(NamedTuple):
@@ -1329,7 +1331,11 @@ async def _document_reader_compare(
             preps[section] = await _reader_compare_prepare(section, apply_rows.sent, apply_rows.ned_id)
         except Exception as exc:  # noqa: BLE001 — a family's translation must never fail the apply
             logger.warning(
-                "apply.reader_compare_error", job_id=job_id, device=device_name, scope=section, error=repr(exc)
+                "apply.reader_compare_error",
+                job_id=job_id,
+                device_id=device.id,
+                scope=section,
+                error=failure_detail(exc),
             )
             preps[section] = "error"
 
@@ -1341,7 +1347,7 @@ async def _document_reader_compare(
             fetched = await _live_family_sections(client, device.nso_device_name, wires, timeout=_VERIFY_BATCH_TIMEOUT)
         except Exception as exc:  # noqa: BLE001 — a batched read failure fails no family's apply
             action_error = exc
-            logger.warning("apply.reader_compare_error", job_id=job_id, device=device_name, error=repr(exc))
+            logger.warning("apply.reader_compare_error", job_id=job_id, device_id=device.id, error=failure_detail(exc))
 
     reader_compare: dict[str, str] = {}
     reader_compare_unverifiable: dict[str, list[str]] = {}
@@ -1378,7 +1384,11 @@ async def _document_reader_compare(
                 )
             except Exception as exc:  # noqa: BLE001 — a read-side glitch never fails a good commit
                 logger.warning(
-                    "apply.reader_compare_error", job_id=job_id, device=device_name, scope=section, error=repr(exc)
+                    "apply.reader_compare_error",
+                    job_id=job_id,
+                    device_id=device.id,
+                    scope=section,
+                    error=failure_detail(exc),
                 )
                 n_ok, n_failed, fails, status, evidence = s_ok, 0, [], "error", {}
         reader_compare[section] = status
@@ -2279,7 +2289,7 @@ async def _post_apply_refresh_and_notify(db: AsyncSession, device_id: int) -> No
         # Revocation is not a runner error: recovery already owns the disposition.
         raise
     except Exception as exc:  # noqa: BLE001 — best-effort; never fail an already-finalized Apply
-        logger.warning("apply.post_refresh_failed", device_id=device_id, error=repr(exc))
+        logger.warning("apply.post_refresh_failed", device_id=device_id, error=failure_detail(exc))
 
 
 async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -> None:

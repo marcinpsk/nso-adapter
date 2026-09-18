@@ -129,7 +129,7 @@ async def test_snmp_config_v3_users_returned(adapter_client):
         device_id,
         v3_users=[
             {"username": "monitor", "has_auth_secret": True, "has_priv_secret": False},
-            {"username": "admin", "has_auth_secret": True, "has_priv_secret": True},
+            {"username": "placeholder-user", "has_auth_secret": True, "has_priv_secret": True},
         ],
     )
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}/snmp-config", headers=AUTH)
@@ -138,7 +138,7 @@ async def test_snmp_config_v3_users_returned(adapter_client):
     by_name = {u["username"]: u for u in body["v3_users"]}
     assert by_name["monitor"]["has_auth_secret"] is True
     assert by_name["monitor"]["has_priv_secret"] is False
-    assert by_name["admin"]["has_priv_secret"] is True
+    assert by_name["placeholder-user"]["has_priv_secret"] is True
 
 
 @pytest.mark.anyio

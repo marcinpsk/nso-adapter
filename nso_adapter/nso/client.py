@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import NamedTuple
 from urllib.parse import quote
 
@@ -26,16 +27,56 @@ class NsoExportUnavailableError(RuntimeError):
     """
 
 
-class NsoReadContractError(RuntimeError):
-    """A ``device-state-read`` action response that the server did not certify (READSEM 1328).
+class NsoActionFailureKind(StrEnum):
+    """A closed adapter-authored reason for a failed NSO action."""
 
-    The action's contract is a single ATOMIC, device-scoped snapshot whose every section carries a
-    TERMINAL status (``ok|unsupported|error`` — never ``stale``/``not-ready``). A response that is
-    non-atomic, echoes the wrong device, or carries a non-terminal/malformed section is a
-    version-skew / proxy-garbage failure, NOT authoritative data. Raised so every consumer — the
-    not-ready escalation, the atomic importer, and the apply/removal verifiers — abstains and KEEPS
-    rows rather than materializing a fabricated section (an ok-empty one would wipe a pop family).
+    host_key_not_stored = "fetch-host-keys did not report a stored key"
+    host_key_fingerprint_missing = "fetch-host-keys reported a stored key with no fingerprint"
+
+
+class NsoActionFailedError(RuntimeError):
+    """An NSO action answered 200 while its output reports the work did not happen.
+
+    The closed failure kind is adapter-authored. The action's own
+    ``info``/``error``/``result`` text is never repeated.
     """
+
+    def __init__(self, kind: NsoActionFailureKind) -> None:
+        if type(kind) is not NsoActionFailureKind:
+            raise TypeError("kind must be an NsoActionFailureKind")
+        self.kind = kind
+        super().__init__(kind.value)
+
+
+class NsoReadContractError(RuntimeError):
+    """A device-state response that violates the certified read contract (READSEM 1328).
+
+    The action response must be one atomic, device-scoped snapshot whose every section carries a
+    terminal status (``ok|unsupported|error``, never ``stale`` or ``not-ready``). The record-served
+    document response must contain exactly the requested device. A non-atomic response, a wrong
+    device, or a malformed section is a version-skew or proxy-garbage failure, not authoritative
+    data. Raised so every consumer abstains and keeps rows instead of materializing fabricated data.
+    """
+
+
+def failure_detail(exc: BaseException) -> str:
+    """Classify a failure for a log record, a job step or a response.
+
+    ``repr()`` on an httpx failure carries the reason phrase, the request URL and, on a
+    redirect, the ``Location`` the server chose; a decode failure quotes the bytes the server
+    sent. None of that is ours to print, and every one of these sinks is persisted or served.
+    The numeric status stays, because an operator has to tell an auth refusal from an outage,
+    and a closed action failure kind stays, because the constructor prevents caller text.
+    Anything else travels as its TYPE: the caller's own context already says which part of
+    the work failed.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"{type(exc).__name__} (HTTP {exc.response.status_code})"
+    if type(exc) is NsoActionFailedError:
+        kind = getattr(exc, "kind", None)
+        if type(kind) is NsoActionFailureKind:
+            return f"NsoActionFailedError({kind.value!r})"
+    return type(exc).__name__
 
 
 # The only statuses a device-state-read action section may carry: the build is a terminal
@@ -70,8 +111,8 @@ DEVICE_INTENT_ROOT = "device-intent:device-intent"
 DEVICE_INTENT_PATH = f"/restconf/data/{DEVICE_INTENT_ROOT}"
 
 
-def _inconclusive(device_name: str, reason: str) -> ServiceInstanceState:
-    logger.warning("nso.service_instance_inconclusive", service=DEVICE_INTENT_PATH, device=device_name, reason=reason)
+def _inconclusive(reason: str) -> ServiceInstanceState:
+    logger.warning("nso.service_instance_inconclusive", service=DEVICE_INTENT_PATH, reason=reason)
     return ServiceInstanceState("inconclusive", None)
 
 
@@ -86,10 +127,10 @@ def _certify_device_state_output(output: object, device_name: str, wire_families
     """
     if not isinstance(output, dict) or output.get("atomic") is not True:
         raise NsoReadContractError(f"device-state-read for {device_name!r} did not certify an atomic snapshot")
-    echoed = output.get("device-name")
-    if echoed != device_name:
+    if output.get("device-name") != device_name:
+        # The echo is the server's own value: name the device we asked for, never the one it sent.
         raise NsoReadContractError(
-            f"device-state-read echoed device {echoed!r}, expected {device_name!r} — refusing a "
+            f"device-state-read echoed a different device than {device_name!r}; refusing a "
             "version-skewed / wrong-device snapshot"
         )
     for wire in wire_families:
@@ -98,10 +139,10 @@ def _certify_device_state_output(output: object, device_name: str, wire_families
             continue
         if not isinstance(section, dict):
             raise NsoReadContractError(f"device-state-read section {wire!r} is not a dict")
-        status = section.get("status")
-        if status not in _TERMINAL_SECTION_STATUSES:
+        if section.get("status") not in _TERMINAL_SECTION_STATUSES:
+            # The status is the server's own value; the section name is ours and says enough.
             raise NsoReadContractError(
-                f"device-state-read section {wire!r} has non-terminal status {status!r} "
+                f"device-state-read section {wire!r} has a non-terminal status "
                 f"(expected one of {sorted(_TERMINAL_SECTION_STATUSES)})"
             )
 
@@ -309,7 +350,7 @@ class NsoClient:
             except Exception:
                 data = None
             if not isinstance(data, dict):
-                return _inconclusive(device_name, "unparseable body")
+                return _inconclusive("unparseable body")
             entries = data.get(DEVICE_INTENT_ROOT)
             if entries is None:
                 entries = data.get(DEVICE_INTENT_ROOT.split(":", 1)[-1])
@@ -319,12 +360,13 @@ class NsoClient:
                 # picking [0] would compute retention and collateral from another device's
                 # instance — a PUT that omits this device's real rows.
                 got = len(entries) if isinstance(entries, list) else "no recognized root"
-                return _inconclusive(device_name, f"expected one instance, got {got}")
+                return _inconclusive(f"expected one instance, got {got}")
             entry = entries[0]
             if not isinstance(entry, dict) or not entry:
-                return _inconclusive(device_name, "empty instance entry")
+                return _inconclusive("empty instance entry")
             if entry.get("device") != device_name:
-                return _inconclusive(device_name, f"instance echoes device {entry.get('device')!r}")
+                # The echo is the server's own value: name the mismatch, never what it sent.
+                return _inconclusive("the instance echoes a different device")
             return ServiceInstanceState("present", entry)
 
     # ── device-state envelope (READSEM S3) — status-declared per-family reads ─────────
@@ -352,10 +394,7 @@ class NsoClient:
                 # so the depth-truncation trap does not apply).
                 probe = await c.get(f"{base}?depth=1")
                 if probe.status_code == 404:
-                    raise NsoExportUnavailableError(
-                        f"network-state-export:device-state is not exported by NSO — refusing to "
-                        f"read {device_name!r}'s 404 as 'device absent'."
-                    )
+                    raise NsoExportUnavailableError("network-state-export:device-state is unavailable")
                 probe.raise_for_status()
                 return None
             resp.raise_for_status()
@@ -377,14 +416,16 @@ class NsoClient:
             if resp.status_code == 404:
                 probe = await c.get(f"{base}?depth=1")  # liveness only — see get_device_state_section
                 if probe.status_code == 404:
-                    raise NsoExportUnavailableError(
-                        f"network-state-export:device-state is not exported by NSO — refusing to "
-                        f"read {device_name!r}'s 404 as 'device absent'."
-                    )
+                    raise NsoExportUnavailableError("network-state-export:device-state is unavailable")
                 probe.raise_for_status()
                 return None
             resp.raise_for_status()
-            data = resp.json()
+            try:
+                data = resp.json()
+            except ValueError:
+                data = None
+            if not isinstance(data, dict):
+                raise NsoReadContractError("device-state GET returned a malformed body")
             entries = data.get("network-state-export:device") or data.get("device", [])
             # A 200 whose body lacks exactly this device is a MALFORMED response (truncated
             # doc, wrong namespace, proxy garbage) - never device absence. None is reserved
@@ -396,9 +437,7 @@ class NsoClient:
                 or not isinstance(entries[0], dict)
                 or entries[0].get("device-name") != device_name
             ):
-                raise NsoExportUnavailableError(
-                    f"device-state GET for {device_name!r} returned 200 with a malformed body"
-                )
+                raise NsoReadContractError("device-state GET returned a malformed body")
             return entries[0]
 
     async def run_device_state_read(
@@ -514,11 +553,13 @@ class NsoClient:
         body = out.get("tailf-ncs:output", {}) if isinstance(out, dict) else {}
         result = body.get("result")
         if result not in ("updated", "unchanged") or not body.get("fingerprint"):
-            info = body.get("info") or body.get("error") or ""
-            raise RuntimeError(
-                f"fetch-host-keys for {device_name!r} did not store a key "
-                f"(result={result!r}){f': {info}' if info else ''}"
+            # The action's info/error/result are the server's own text; name the failure kind.
+            kind = (
+                NsoActionFailureKind.host_key_not_stored
+                if result not in ("updated", "unchanged")
+                else NsoActionFailureKind.host_key_fingerprint_missing
             )
+            raise NsoActionFailedError(kind)
         return out
 
     async def sync_from(self, device_name: str) -> bool:

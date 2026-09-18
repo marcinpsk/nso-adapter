@@ -10,10 +10,13 @@ which would fabricate any attribute and let a broken read path stay green.
 from __future__ import annotations
 
 import types
+from typing import cast
 
 import pytest
 
+from nso_adapter.secrets.base import SecretResolutionError
 from nso_adapter.secrets.vault import VaultSecretsProvider
+from tests._secret_discipline import assert_text_free_of
 
 
 class _FakeForbidden(Exception):
@@ -33,6 +36,8 @@ class _FakeKvV2:
         self.read_mounts: list[str] = []
         self.write_calls: list[tuple[str, str, dict]] = []
         self.versions: dict[str, int] = {}
+        self.omit_metadata: set[str] = set()
+        self.malformed: dict[str, object] = {}
 
     def read_secret_version(self, *, mount_point, path, raise_on_deleted_version):
         self.read_paths.append(path)
@@ -42,14 +47,14 @@ class _FakeKvV2:
         if path in self.forbid_once:
             self.forbid_once.discard(path)  # token "expired" exactly once
             raise _FakeForbidden()
+        if path in self.malformed:
+            return {"data": {"data": self.malformed[path]}}
         if path not in self._store:
             raise _FakeInvalidPath(path)
-        return {
-            "data": {
-                "data": dict(self._store[path]),
-                "metadata": {"version": self.versions.get(path, 1)},
-            }
-        }
+        data = {"data": dict(self._store[path])}
+        if path not in self.omit_metadata:
+            data["metadata"] = {"version": self.versions.get(path, 1)}
+        return {"data": data}
 
     def create_or_update_secret(self, *, mount_point, path, secret):
         # Mirrors real KV v2 semantics: the write REPLACES the whole data dict.
@@ -125,8 +130,8 @@ def test_get_resolves_path_field_and_logs_in_once(fake_hvac):
     assert kv.read_paths == ["credentials/svc"]
 
 
-def test_get_without_hash_raises_value_error(fake_hvac):
-    with pytest.raises(ValueError, match="expected 'path#field'"):
+def test_get_without_hash_refuses_by_the_broken_RULE(fake_hvac):
+    with pytest.raises(SecretResolutionError, match="not in 'path#field' form"):
         _provider().get("no-hash-here")
 
 
@@ -141,21 +146,44 @@ def test_get_caches_path_serving_multiple_fields_with_one_read(fake_hvac):
     assert len(state["logins"]) == 1
 
 
-def test_get_unknown_field_raises_key_error(fake_hvac):
+def test_get_unknown_field_refuses(fake_hvac):
     _, store, _ = fake_hvac
     store["credentials/svc"] = {"user": "svc-netbox"}
-    with pytest.raises(KeyError, match="missing"):
+    with pytest.raises(SecretResolutionError, match="not at the referenced path"):
         _provider().get("credentials/svc#missing")
 
 
-def test_get_unknown_field_on_cached_path_raises_key_error(fake_hvac):
+def test_get_unknown_field_on_cached_path_refuses(fake_hvac):
     _, store, kv = fake_hvac
     store["credentials/svc"] = {"user": "svc-netbox"}
     provider = _provider()
     provider.get("credentials/svc#user")  # primes the cache
-    with pytest.raises(KeyError, match="missing"):
+    with pytest.raises(SecretResolutionError, match="not at the referenced path"):
         provider.get("credentials/svc#missing")
     assert kv.read_paths == ["credentials/svc"]  # no second read for the cached path
+
+
+def test_get_rejects_a_non_string_selected_field_without_rejecting_its_siblings(fake_hvac):
+    _, store, _ = fake_hvac
+    store["credentials/svc"] = cast(
+        dict[str, str],
+        {"netbox_token": 42, "placeholder-metadata": 7, "user": "placeholder-user"},
+    )
+    provider = _provider()
+
+    with pytest.raises(SecretResolutionError, match="selected secret field is not a string"):
+        provider.get("credentials/svc#netbox_token")
+    assert provider.get("credentials/svc#user") == "placeholder-user"
+
+
+def test_read_path_metadata_distinguishes_absence_from_an_unversioned_empty_path(fake_hvac):
+    _, store, kv = fake_hvac
+    store["credentials/empty"] = {}
+    kv.omit_metadata.add("credentials/empty")
+    provider = _provider()
+
+    assert provider.read_path_meta("secret", "credentials/missing") is None
+    assert provider.read_path_meta("secret", "credentials/empty") == ({}, None)
 
 
 def test_get_reauthenticates_on_forbidden(fake_hvac):
@@ -167,6 +195,28 @@ def test_get_reauthenticates_on_forbidden(fake_hvac):
     assert provider.get("credentials/svc#netbox_token") == "s3cr3t"
     assert len(state["logins"]) == 2  # initial login + re-auth after the 403
     assert kv.read_paths == ["credentials/svc", "credentials/svc"]
+
+
+def test_the_reauthentication_warning_reaches_the_structlog_pipeline(fake_hvac):
+    """The module logged through stdlib logging, so the app's structlog sink never saw it.
+
+    ``nso_adapter.main.lifespan`` configures structlog, and the 403 re-auth is the one
+    operational event this provider reports; it must land in the same stream as the rest.
+    """
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
+    _state, store, kv = fake_hvac
+    store["credentials/svc"] = {"netbox_token": "placeholder-vault-value"}
+    kv.forbid_once.add("credentials/svc")  # first read 403s, retry succeeds
+
+    with capture_logs() as logs:
+        assert _provider().get("credentials/svc#netbox_token") == "placeholder-vault-value"
+
+    assert_records_free_of(logs, ["credentials/svc", "netbox_token", "placeholder-vault-value"])
+    reauth = [record for record in logs if record["event"] == "vault.reauthenticating"]
+    assert reauth == [{"event": "vault.reauthenticating", "cause": "forbidden", "log_level": "warning"}]
 
 
 def test_namespace_forwarded_to_client(fake_hvac):
@@ -254,3 +304,175 @@ def test_write_path_reauthenticates_on_forbidden(fake_hvac):
 
     assert version == 1
     assert len(state["logins"]) == 2
+
+
+# ── the reference reaches no startup diagnostic ──────────────────────────────
+
+_STARTUP_MOUNT = "placeholder-mount"
+_STARTUP_PATH = "placeholder-path/placeholder-leaf"
+_STARTUP_FIELD = "placeholder-secret-field"
+_STARTUP_REF = f"{_STARTUP_PATH}#{_STARTUP_FIELD}"
+_STARTUP_PARTS = [
+    _STARTUP_REF,
+    _STARTUP_PATH,
+    _STARTUP_MOUNT,
+    _STARTUP_FIELD,
+    "placeholder-path",
+    "placeholder-leaf",
+]
+
+
+def test_a_MISSING_field_refuses_without_the_mount_the_path_or_the_key(fake_hvac):
+    """The KeyError named ``{field} not found at {mount}/{path}``, the whole address.
+
+    ``get()`` sits outside the sanitized API wrapper, so nothing downstream redacts it.
+    """
+    from tests._secret_discipline import assert_chain_free_of, exception_chain
+
+    _, store, _ = fake_hvac
+    store[_STARTUP_PATH] = {"other": "value"}
+
+    with pytest.raises(SecretResolutionError) as caught:
+        _provider(mount=_STARTUP_MOUNT).get(_STARTUP_REF)
+
+    assert_text_free_of(caught.value, _STARTUP_PARTS)
+    assert "not at the referenced path" in str(caught.value), "the caller must still learn WHAT failed"
+    assert_chain_free_of(caught.value, _STARTUP_PARTS)
+    assert exception_chain(caught.value) == [caught.value], "an upstream exception must not stay attached"
+
+
+def test_an_INVALID_reference_refuses_without_the_input(fake_hvac):
+    """The ValueError repeated the complete input, secret included."""
+    from tests._secret_discipline import assert_chain_free_of
+
+    with pytest.raises(SecretResolutionError) as caught:
+        _provider(mount=_STARTUP_MOUNT).get("placeholder-secret-pasted-into-the-ref")
+
+    assert_text_free_of(caught.value, ["placeholder-secret-pasted-into-the-ref"])
+    assert "not in 'path#field' form" in str(caught.value)
+    assert_chain_free_of(caught.value, ["placeholder-secret-pasted-into-the-ref"])
+
+
+def test_a_VAULT_OUTAGE_refuses_by_type_and_attaches_no_hvac_exception(fake_hvac):
+    """hvac's own text repeats the request URL, and the URL carries the path."""
+    from tests._secret_discipline import assert_chain_free_of, exception_chain
+
+    _, _store, kv = fake_hvac
+
+    def _boom(**kwargs):
+        raise RuntimeError(f"vault: GET https://vault.example.com/v1/{_STARTUP_MOUNT}/data/{_STARTUP_PATH} failed")
+
+    kv.read_secret_version = _boom
+
+    with pytest.raises(SecretResolutionError) as caught:
+        _provider(mount=_STARTUP_MOUNT).get(_STARTUP_REF)
+
+    assert_text_free_of(caught.value, _STARTUP_PARTS)
+    assert_chain_free_of(caught.value, _STARTUP_PARTS)
+    assert "the Vault read failed (RuntimeError)" in str(caught.value), "the TYPE tells an outage from a miss"
+    assert exception_chain(caught.value) == [caught.value], "the hvac exception must not stay on the chain"
+
+
+def test_a_FAILED_STARTUP_resolution_names_the_CONFIG_SLOT(fake_hvac):
+    """The provider refuses without the reference, so the CALLER says which slot broke.
+
+    ``_build_nso_clients`` runs on the startup path and knows which configured reference it
+    was loading; the provider does not. Without the slot the operator gets a refusal with no
+    address at all, which is the other half of the same failure.
+    """
+    from types import SimpleNamespace
+
+    from nso_adapter.main import _build_nso_clients
+    from tests._secret_discipline import assert_chain_free_of
+
+    _, store, _ = fake_hvac
+    store[_STARTUP_PATH] = {"other": "value"}
+    cfg = SimpleNamespace(
+        nso_instances=[SimpleNamespace(name="nso-a", username_ref=_STARTUP_REF, password_ref=_STARTUP_REF)]
+    )
+
+    with pytest.raises(SecretResolutionError) as caught:
+        _build_nso_clients(cfg, _provider(mount=_STARTUP_MOUNT))
+
+    assert_text_free_of(caught.value, _STARTUP_PARTS)
+    assert_chain_free_of(caught.value, _STARTUP_PARTS)
+    assert caught.value.slot == "nso_instances[nso-a].username_ref"
+    assert "nso_instances[nso-a].username_ref" in str(caught.value), "the operator must learn WHICH slot"
+
+
+@pytest.mark.parametrize("payload", ["plaintext", ["ab", "cd"], 42, None])
+def test_a_NON_MAPPING_payload_is_one_classified_refusal_not_a_TypeError(fake_hvac, payload):
+    """hvac types the response ``Any``, so nothing between Vault and here proves the shape.
+
+    Unvalidated, the payload reaches ``selected_secret_value`` OUTSIDE ``get``'s classifier and
+    raises TypeError, and ``dict(["ab", "cd"])`` quietly builds ``{"a": "b", "c": "d"}`` — a
+    mapping that was never a secret.
+    """
+    _, _, kv = fake_hvac
+    kv.malformed["credentials/svc"] = payload
+    provider = _provider()
+
+    with pytest.raises(SecretResolutionError) as caught:
+        provider.get("credentials/svc#netbox_token")
+
+    assert_text_free_of(caught.value, ["credentials/svc", "netbox_token"])
+    assert caught.value.reason == "the Vault read failed (ValueError)"
+
+
+def test_a_NON_MAPPING_payload_is_never_CACHED(fake_hvac):
+    """The cached branch reads OUTSIDE the classifier, so caching a bad payload makes every
+    later call raise TypeError from a line that never read Vault."""
+    _, store, kv = fake_hvac
+    kv.malformed["credentials/svc"] = ["ab", "cd"]
+    provider = _provider()
+
+    with pytest.raises(SecretResolutionError):
+        provider.get("credentials/svc#netbox_token")
+
+    del kv.malformed["credentials/svc"]
+    store["credentials/svc"] = {"netbox_token": "placeholder-token"}
+    assert provider.get("credentials/svc#netbox_token") == "placeholder-token"
+
+
+def test_read_path_refuses_a_NON_MAPPING_payload(fake_hvac):
+    """The mount-explicit sibling of _fetch_path: ``dict()`` accepts a pair sequence, so an
+    unguarded read answers the SNMP verification path with a fabricated mapping."""
+    _, _, kv = fake_hvac
+    kv.malformed["netbox/snmp/community/prod-ro"] = ["ab", "cd"]
+    provider = _provider()
+
+    with pytest.raises(ValueError, match="not a mapping"):
+        provider.read_path("network", "netbox/snmp/community/prod-ro")
+
+
+def test_a_NON_MAPPING_METADATA_envelope_is_REFUSED_not_read_as_unversioned(fake_hvac):
+    """``metadata`` is payload too, and a malformed one is not the same state as an absent one.
+
+    Absent metadata means an unversioned path, which `/secrets/verify` reports and a merge-write
+    acts on. Reading a malformed block as "unversioned" would let both proceed on a payload
+    nothing understood, so it refuses instead.
+    """
+    _, store, kv = fake_hvac
+    store["netbox/snmp/community/prod-ro"] = {"community": "placeholder-community"}
+    original = kv.read_secret_version
+
+    def _with_bad_metadata(**kwargs):
+        secret = original(**kwargs)
+        return {"data": {**secret["data"], "metadata": "not-a-mapping"}}
+
+    kv.read_secret_version = _with_bad_metadata
+
+    with pytest.raises(ValueError, match="not a mapping"):
+        _provider().read_path_meta("network", "netbox/snmp/community/prod-ro")
+
+
+def test_an_ABSENT_metadata_block_still_reads_as_an_UNVERSIONED_path(fake_hvac):
+    """The other half: absence keeps its own meaning, so the refusal above is not over-broad."""
+    _, store, kv = fake_hvac
+    store["netbox/snmp/community/prod-ro"] = {"community": "placeholder-community"}
+    kv.omit_metadata.add("netbox/snmp/community/prod-ro")
+
+    data, version = _provider().read_path_meta("network", "netbox/snmp/community/prod-ro")
+
+    assert data == {"community": "placeholder-community"}
+    assert version is None

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import VALID_TOKEN, seed_device
 
 
@@ -39,6 +40,21 @@ async def test_jobs_list_empty(adapter_client):
     resp = await adapter_client.get("/api/v1/jobs", headers={"Authorization": f"Bearer {VALID_TOKEN}"})
     assert resp.status_code == 200
     assert resp.json() == []
+
+
+async def test_jobs_list_invalid_status_is_refused_without_the_value(adapter_client):
+    """The 422 quoted the caller's own filter value straight back into the answer."""
+    resp = await adapter_client.get(
+        "/api/v1/jobs",
+        params={"status": "placeholder-status-value"},
+        headers={"Authorization": f"Bearer {VALID_TOKEN}"},
+    )
+
+    assert_text_free_of(resp.text, ["placeholder-status-value"])
+    assert resp.status_code == 422
+    error = resp.json()["error"]
+    assert error["code"] == "validation_error"
+    assert error["message"] == "Invalid job status"
 
 
 async def test_job_not_found(adapter_client):

@@ -1262,7 +1262,10 @@ class SnmpCommunity(Base):
     """Read mirror of SNMP community entries from NSO oper-data.
 
     Full-replace on every refresh: all rows for a device are deleted then re-inserted.
-    The community string is NEVER stored; community_hash is a SHA-256 opaque identifier.
+    The community string is NEVER stored. ``community_hash`` holds the cross-repo secret
+    fingerprint validated by :func:`nso_adapter.secrets.refs.require_secret_fingerprint`:
+    the first 16 lowercase hexadecimal characters of the SHA-256 digest, not the full
+    64-character digest.
     """
 
     __tablename__ = "snmp_community"
@@ -2953,6 +2956,9 @@ class RefreshOutcome(Base):
         String(32), nullable=True
     )  # export_down|read_error|not_authoritative
     freshness: Mapped[str | None] = mapped_column(String(16), nullable=True)  # fresh | aged
+    read_failures: Mapped[list[dict[str, str | int | None]] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
     # Phase 2 — the terminal materialization result. NULL until phase 2 is recorded.
     result: Mapped[str | None] = mapped_column(

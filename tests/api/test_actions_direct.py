@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from uuid import uuid4
+
 import pytest
 from sqlalchemy import select
 
@@ -16,6 +18,7 @@ from nso_adapter.api.actions import (
 )
 from nso_adapter.api.errors import ApiError
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import VALID_TOKEN, session
 from tests.core.removal_helpers import authorize_stream
 
@@ -167,16 +170,19 @@ async def test_action_force_removal_enqueues_forced_removal_job(adapter_client):
 
 
 async def test_action_force_removal_rejects_unknown_scope(adapter_client):
-    from nso_adapter.api.actions import ForceRemovalBody, action_force_removal
-
     device_id = await _seed_device("actions-frm-02", 1341)
-    async with session() as db:
-        try:
-            await action_force_removal(device_id=device_id, body=ForceRemovalBody(scope="nonsense"), db=db)
-        except Exception as exc:
-            assert getattr(exc, "status_code", None) == 400
-        else:
-            raise AssertionError("unknown scope must be rejected")
+    submitted = "placeholder-secret-scope"
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/force-removal",
+        json={"scope": submitted},
+        headers=AUTH,
+    )
+
+    assert_text_free_of(response.text, [submitted])
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error == {"code": "bad_request", "message": "Unknown removal scope", "detail": {}}
 
 
 async def test_action_force_removal_interface_config_needs_no_interface_list(adapter_client):
@@ -220,17 +226,22 @@ async def test_action_force_removal_refuses_a_family_nothing_authorized(adapter_
     a document that carries no such section. Creating the generation anyway would delete the
     carrier and record nothing, so the request is refused before any job exists.
     """
-    from nso_adapter.api.actions import ForceRemovalBody, action_force_removal
-
     device_id = await _seed_device("actions-frm-05", 1344)
-    async with session() as db:
-        try:
-            await action_force_removal(device_id=device_id, body=ForceRemovalBody(scope="isis"), db=db)
-        except Exception as exc:
-            assert getattr(exc, "status_code", None) == 400
-            assert exc.detail["error"]["detail"] == {"scope": "isis", "reason": "no_authorized_section"}
-        else:
-            raise AssertionError("a flush of a never-authorized family must be refused")
+    submitted = "isis"
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/force-removal",
+        json={"scope": submitted},
+        headers=AUTH,
+    )
+
+    assert_text_free_of(response.text, [submitted])
+    assert response.status_code == 400
+    assert response.json()["error"] == {
+        "code": "bad_request",
+        "message": "Nothing is authorized for this removal scope on this device, so there is nothing to flush",
+        "detail": {"reason": "no_authorized_section"},
+    }
     async with session() as db:
         jobs = (await db.execute(select(Job).where(Job.device_id == device_id))).scalars().all()
         assert list(jobs) == [], "the refusal must leave no job behind"
@@ -304,3 +315,27 @@ async def test_wrong_token_raises_401(adapter_client):
         headers={"Authorization": "Bearer wrong-token"},
     )
     assert resp.status_code == 401
+
+
+# ── the caller's own selection key never returns in the 422 ──────────────────
+
+
+async def test_an_INVALID_selected_ENTRY_keeps_the_callers_key_out_of_the_422(adapter_client):
+    """Pydantic reports a bad map entry at ``("body", "selected", <key>)``.
+
+    ``ActionApplyIn.selected`` is keyed by a name the caller chose, so an unregistered
+    location wrote that name straight back into the validation error.
+    """
+    device_id = await _seed_device("actions-selected-loc", 1360)
+
+    resp = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/apply",
+        json={"apply_attempt_id": str(uuid4()), "selected": {"placeholder-secret": "not-an-integer"}},
+        headers=AUTH,
+    )
+
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_error"
+    assert_text_free_of(resp.text, ["placeholder-secret"])
+    locations = [error["loc"] for error in resp.json()["error"]["detail"]["errors"]]
+    assert ["body", "selected", "[redacted]"] in locations, "the operator must still learn WHERE it broke"
