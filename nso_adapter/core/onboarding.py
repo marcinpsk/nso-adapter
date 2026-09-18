@@ -32,6 +32,7 @@ from nso_adapter.core.claim import (
 from nso_adapter.core.families import ALL_FAMILY_KEYS
 from nso_adapter.nso.client import failure_detail
 from nso_adapter.store import outcome_store
+from nso_adapter.store.db import _violated_constraint
 from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import (
     ActiveAddress,
@@ -67,17 +68,6 @@ _IDENTITY_CLAIMED = "The target NSO identity is already claimed by another devic
 #: The DB constraint that decides an identity race, taken from the model so the two cannot drift.
 _IDENTITY_CONSTRAINT = "uq_device_nso_identity"
 _NETBOX_DEVICE_ID_CONSTRAINT = "uq_device_netbox_device_id"
-
-
-def _violated_constraint(exc: BaseException) -> str | None:
-    """Return the constraint an integrity error names, or None when the driver reports none."""
-    current: BaseException | None = exc
-    while current is not None:
-        name = getattr(current, "constraint_name", None)
-        if isinstance(name, str) and name:
-            return name
-        current = current.__cause__
-    return None
 
 
 _READ_MIRROR_ROOTS = (

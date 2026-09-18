@@ -53,7 +53,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.store.db import execute_dml
+from nso_adapter.store.db import _violated_constraint, execute_dml
 from nso_adapter.store.device_settle import MissingSettleCounter, allocate_settle_seq
 from nso_adapter.store.models import DeviceClaim, GenerationStatus, Job, JobStatus, JobType
 
@@ -326,7 +326,7 @@ async def acquire_claim(
             # race). "Cannot claim" is the honest answer; raising would abort a whole
             # sweep — at startup, the whole lifespan. Scoped to THIS constraint so a
             # bad job_id still surfaces.
-            if getattr(getattr(exc.orig, "__cause__", None), "constraint_name", None) == "device_claim_device_id_fkey":
+            if _violated_constraint(exc) == "device_claim_device_id_fkey":
                 logger.info("claim.device_vanished", device_id=device_id, purpose=purpose)
                 return None
             raise
