@@ -24,6 +24,7 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field, SecretStr, field_validator
 
 from nso_adapter.api.errors import ERROR_CODES, ErrorCode, api_error
+from tests._secret_discipline import assert_records_free_of, assert_text_free_of
 from tests.conftest import VALID_TOKEN, push_seq
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -211,8 +212,8 @@ async def test_validation_error_does_not_echo_validator_text():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/_test/validation-secret", json={"value": secret})
 
+    assert_text_free_of(response.text, [secret])
     assert response.status_code == 422
-    assert secret not in response.text
     assert response.json()["error"]["detail"]["errors"] == [
         {"type": "value_error", "loc": ["body", "value"], "msg": "Invalid value"}
     ]
@@ -249,14 +250,14 @@ async def test_an_unhandled_exception_uses_the_envelope_and_never_echoes_the_exc
         with capture_logs() as logs:
             resp = await client.get("/_test/boom")
 
+    assert_text_free_of(resp.text, [secret])
+    assert_records_free_of(logs, [secret])
     assert resp.status_code == 500
     assert resp.json() == {"error": {"code": "internal", "message": "Internal server error", "detail": {}}}
-    assert secret not in resp.text
 
     (record,) = [log for log in logs if log["event"] == "api.unhandled_exception"]
     assert record["exception_type"] == "RuntimeError"
     assert not record.get("exc_info"), "the raw exception reaches the log renderer"
-    assert secret not in repr(logs)
 
     # Locations only — the frames must name where it broke without quoting anything from it.
     where = record["where"]
