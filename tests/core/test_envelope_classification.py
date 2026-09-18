@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import pytest
 
+from nso_adapter.nso.client import NsoExportUnavailableError
 from nso_adapter.nso.read_outcome import (
     Freshness,
     Present,
+    ReadFailure,
     ReadFailureCode,
     ReadOperation,
     Unavailable,
@@ -90,3 +92,93 @@ class TestStoredStringValues:
         assert Freshness.stale.value == "stale"
         assert UnavailableReason.unsupported.value == "unsupported"
         assert UnavailableReason.not_ready.value == "not_ready"
+
+
+class TestUnproducibleClassifications:
+    """A fixture that blesses a shape no reader emits hides the regression it was added to catch."""
+
+    def test_a_served_section_code_refuses_a_raised_read(self):
+        """503 raises, so the reader never sees a section to take a status off."""
+        with pytest.raises(ValueError, match="classified from a served section"):
+            ReadFailure(
+                operation=ReadOperation.section_get,
+                device="rg03",
+                family="bgp-config",
+                error_type="HTTPStatusError",
+                http_status=503,
+                code=ReadFailureCode.section_status_error,
+            )
+
+    def test_a_served_section_code_refuses_the_wrong_operation(self):
+        with pytest.raises(ValueError, match="operation must be section_classify"):
+            ReadFailure(
+                operation=ReadOperation.section_get,
+                device="rg03",
+                family="bgp-config",
+                code=ReadFailureCode.section_status_unrecognized,
+            )
+
+    def test_the_classifier_still_builds_its_own_verdict(self):
+        """Not vacuous: the one real producer of these codes stays constructible."""
+        outcome = classify_envelope_section({"status": "error"}, **_ASKED)
+        assert outcome.failure.code is ReadFailureCode.section_status_error
+        assert outcome.failure.operation is ReadOperation.section_classify
+
+    def test_export_down_refuses_a_failure_the_liveness_probe_cannot_raise(self):
+        """export_down is reached only by the container 404; a 503 is a read_error."""
+        with pytest.raises(ValueError, match="confirmed by the liveness probe"):
+            Unavailable(
+                UnavailableReason.export_down,
+                failure=ReadFailure(
+                    operation=ReadOperation.doc_get,
+                    device="rg03",
+                    family="bgp-config",
+                    error_type="HTTPStatusError",
+                    http_status=503,
+                ),
+            )
+
+    def test_export_down_refuses_a_failure_that_names_no_exception(self):
+        """An authored code alone is not the liveness probe's verdict."""
+        with pytest.raises(ValueError, match="confirmed by the liveness probe"):
+            Unavailable(
+                UnavailableReason.export_down,
+                failure=ReadFailure(
+                    operation=ReadOperation.device_state_read,
+                    device="rg03",
+                    family="bgp-config",
+                    code=ReadFailureCode.action_output_not_atomic,
+                ),
+            )
+
+    def test_the_pinned_exception_name_is_the_class_name(self):
+        """The invariant names the exception instead of importing it; the two must not drift."""
+        from nso_adapter.nso.read_outcome import _EXPORT_DOWN_ERROR_TYPE
+
+        assert _EXPORT_DOWN_ERROR_TYPE == NsoExportUnavailableError.__name__
+
+    def test_the_refusal_names_only_the_fault_it_found(self):
+        """A correct operation must not be reported as the problem."""
+        with pytest.raises(ValueError) as caught:
+            ReadFailure(
+                operation=ReadOperation.section_classify,
+                device="rg03",
+                family="bgp-config",
+                http_status=503,
+                code=ReadFailureCode.section_status_error,
+            )
+        assert str(caught.value) == (
+            "section_status_error is classified from a served section: http_status must be unset"
+        )
+
+    def test_export_down_accepts_the_outage_the_probe_does_raise(self):
+        outage = Unavailable(
+            UnavailableReason.export_down,
+            failure=ReadFailure(
+                operation=ReadOperation.doc_get,
+                device="rg03",
+                family="bgp-config",
+                error_type=NsoExportUnavailableError.__name__,
+            ),
+        )
+        assert outage.failure.http_status is None

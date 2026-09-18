@@ -20,7 +20,6 @@ from nso_adapter.nso.read_outcome import (
     Freshness,
     Present,
     ReadFailure,
-    ReadFailureCode,
     ReadOperation,
     Unavailable,
     UnavailableReason,
@@ -88,27 +87,28 @@ async def test_record_read_outcome_phase1_flushed_in_session(adapter_client):
 async def test_unavailable_read_reason_recorded(adapter_client):
     """An unavailable read records its authored classification in a fresh session."""
     device_id = await seed_device(nso_device_name="oc-unavail", netbox_device_id=8802)
+    # The shape a 503 actually produces: the status raises, so read_error is the verdict and
+    # the type plus the number are all the reader knows (an authored code needs a served section).
     failure = ReadFailure(
         operation=ReadOperation.section_get,
         device="oc-unavail",
         family="bgp-config",
         error_type="HTTPStatusError",
         http_status=503,
-        code=ReadFailureCode.section_status_error,
     )
     async with session() as db:
         attempt_id = await outcome_store.record_read_outcome(
             db,
             device_id,
             "bgp",
-            Unavailable(UnavailableReason.export_down, failure=failure),
+            Unavailable(UnavailableReason.read_error, failure=failure),
             refresh_source="sse",
         )
         await outcome_store.record_result(db, attempt_id, result="kept", succeeded=False, row_count=None)
     async with session() as db:
         row = await db.get(RefreshOutcome, attempt_id)
     assert row.read_outcome == "unavailable"
-    assert row.read_reason == "export_down"
+    assert row.read_reason == "read_error"
     assert row.freshness is None
     assert row.read_failures == [
         {
@@ -116,7 +116,7 @@ async def test_unavailable_read_reason_recorded(adapter_client):
             "component_family": "bgp-config",
             "error_type": "HTTPStatusError",
             "http_status": 503,
-            "failure_code": "section_status_error",
+            "failure_code": None,
         }
     ]
 

@@ -109,6 +109,14 @@ class ReadFailureCode(str, enum.Enum):
     action_output_not_atomic = "action_output_not_atomic"  # the action output is not a certified snapshot
 
 
+# Classified off a served 200 section, never off a raised read (see ReadFailure.__post_init__).
+_SERVED_SECTION_CODES = frozenset({ReadFailureCode.section_status_error, ReadFailureCode.section_status_unrecognized})
+# The one exception the liveness probe raises. Named, not imported: this module is the
+# vocabulary the client-side consumes, so importing the client back inverts the layering. A test
+# pins the name against the class, so the two cannot drift.
+_EXPORT_DOWN_ERROR_TYPE = "NsoExportUnavailableError"
+
+
 @dataclass(frozen=True)
 class ReadFailure:
     """The AUTHORED classification of ONE failed read. Every field is ours; none is the server's.
@@ -126,6 +134,28 @@ class ReadFailure:
     error_type: str | None = None  # the raised type, when the read raised
     http_status: int | None = None  # the numeric status, when the server answered one
     code: ReadFailureCode | None = None  # the contract reason, when the read broke a rule
+
+    def __post_init__(self) -> None:
+        """Refuse a classification no reader can produce, so a fixture cannot bless one.
+
+        ``classify_envelope_section`` is the only producer of the two section-status codes, and it
+        reads a served 200 rather than a raised error. A code paired with an exception type
+        or an HTTP status therefore describes a read that cannot happen.
+        """
+        if self.code in _SERVED_SECTION_CODES:
+            conflicting = [
+                name
+                for name, value in (("error_type", self.error_type), ("http_status", self.http_status))
+                if value is not None
+            ]
+            wrong_operation = self.operation is not ReadOperation.section_classify
+            if wrong_operation or conflicting:
+                faults = []
+                if wrong_operation:
+                    faults.append(f"operation must be section_classify (got {self.operation.value})")
+                if conflicting:
+                    faults.append(f"{' and '.join(conflicting)} must be unset")
+                raise ValueError(f"{self.code.value} is classified from a served section: {', '.join(faults)}")
 
     def for_family(self, family: str) -> ReadFailure:
         """Narrow a whole-device read failure to the family it is being reported for."""
@@ -198,6 +228,18 @@ class Unavailable:
     # the operator log. None for a DECLARED state (unsupported / not-ready / device-absent),
     # which is not a failure. Excluded from equality so tests can assert on reason alone.
     failure: ReadFailure | None = field(default=None, compare=False)
+
+    def __post_init__(self) -> None:
+        """``export_down`` is the confirmed-outage verdict: only the 404 liveness probe reaches it."""
+        if (
+            self.reason is UnavailableReason.export_down
+            and self.failure is not None
+            and self.failure.error_type != _EXPORT_DOWN_ERROR_TYPE
+        ):
+            raise ValueError(
+                f"export_down is confirmed by the liveness probe raising {_EXPORT_DOWN_ERROR_TYPE}, "
+                f"not by {self.failure.error_type}"
+            )
 
 
 ReadOutcome = Present | AbsentAuthoritative | Unavailable

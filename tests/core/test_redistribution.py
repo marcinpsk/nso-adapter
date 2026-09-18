@@ -880,6 +880,19 @@ def _read_failure(family: str):
     )
 
 
+def _export_down_failure(family: str):
+    """The outage shape: the container 404 raises, so there is no status to carry."""
+    from nso_adapter.nso.client import NsoExportUnavailableError
+    from nso_adapter.nso.read_outcome import ReadFailure, ReadOperation
+
+    return ReadFailure(
+        operation=ReadOperation.section_get,
+        device="rd-outage-carry",
+        family=family,
+        error_type=NsoExportUnavailableError.__name__,
+    )
+
+
 @pytest.mark.anyio
 async def test_the_export_down_composite_carries_the_outage_classification(adapter_client, monkeypatch):
     """The tier-1 abort built a bare Unavailable, dropping what the failing read classified.
@@ -897,7 +910,7 @@ async def test_the_export_down_composite_carries_the_outage_classification(adapt
         return
 
     monkeypatch.setattr(redistribution, "_record_composite", _record)
-    failure = _read_failure("redistribution.ospf")
+    failure = _export_down_failure("redistribution.ospf")
 
     async with _device_session(device_id) as (db, device):
         await refresh_redistribution_from_outcomes(
