@@ -12,11 +12,20 @@ from __future__ import annotations
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from nso_adapter.store.models import DbInterface, Device, InterfaceAttrState, ManagedScope
 from tests._secret_discipline import assert_text_free_of
 from tests.conftest import session
+
+
+async def _reject_non_null_netbox_device_ids(db) -> None:
+    """Install an unrelated constraint that onboarding must not classify as a race."""
+    await db.execute(
+        text("ALTER TABLE devices ADD CONSTRAINT ck_device_test_netbox_id_null CHECK (netbox_device_id IS NULL)")
+    )
+    await db.commit()
+
 
 # ── onboard_device ───────────────────────────────────────────────────────────
 
@@ -100,6 +109,25 @@ async def test_claimed_onboard_refusal_names_no_netbox_link(adapter_client_with_
     assert refused and refused[0]["linked_netbox_device_id"] == 46431
 
 
+async def test_claimed_onboard_reraises_another_integrity_failure(adapter_client_with_nso):
+    from sqlalchemy.exc import IntegrityError
+
+    from nso_adapter.core.claim import ClaimRegistration
+    from nso_adapter.core.onboarding import onboard_device
+
+    async with session() as db:
+        await _reject_non_null_netbox_device_ids(db)
+
+        with pytest.raises(IntegrityError):
+            await onboard_device(
+                db,
+                "nso-dev",
+                "claimed-onboard-other-constraint",
+                46433,
+                reg=ClaimRegistration(run_attempt=1),
+            )
+
+
 async def test_onboard_adopts_unlinked_existing_device(adapter_client_with_nso):
     """A device provisioned INTO NSO without a NetBox link (netbox_device_id IS NULL) must be
     ADOPTED when the operator later marks it managed: onboard_device fills the mapping in on the
@@ -162,6 +190,24 @@ async def test_onboard_existing_adoption_reports_a_late_netbox_conflict(adapter_
         owner = await db.get(Device, owner_id)
         assert existing is not None and existing.netbox_device_id is None
         assert owner is not None and owner.netbox_device_id == 78
+
+
+async def test_onboard_existing_adoption_reraises_another_integrity_failure(adapter_client_with_nso):
+    from sqlalchemy.exc import IntegrityError
+
+    from nso_adapter.core.onboarding import onboard_device
+    from tests.conftest import seed_device
+
+    await seed_device(
+        nso_instance="nso-dev",
+        nso_device_name="existing-adoption-other-constraint",
+        netbox_device_id=None,
+    )
+    async with session() as db:
+        await _reject_non_null_netbox_device_ids(db)
+
+        with pytest.raises(IntegrityError):
+            await onboard_device(db, "nso-dev", "existing-adoption-other-constraint", 79)
 
 
 async def test_onboard_is_idempotent_for_same_link(adapter_client_with_nso):
@@ -332,6 +378,18 @@ async def test_onboard_same_identity_race_reports_identity_refusal(adapter_clien
 
     assert caught.value.reason == "onboarded_elsewhere"
     assert str(caught.value) == "The NSO device is already onboarded to a different NetBox device"
+
+
+async def test_onboard_new_device_reraises_another_integrity_failure(adapter_client_with_nso):
+    from sqlalchemy.exc import IntegrityError
+
+    from nso_adapter.core.onboarding import onboard_device
+
+    async with session() as db:
+        await _reject_non_null_netbox_device_ids(db)
+
+        with pytest.raises(IntegrityError):
+            await onboard_device(db, "nso-dev", "new-device-other-constraint", 194)
 
 
 async def test_duplicate_nso_identity_is_rejected_by_the_database(adapter_client_with_nso):

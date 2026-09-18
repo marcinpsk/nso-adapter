@@ -66,6 +66,7 @@ _ONBOARDED_ELSEWHERE = "The NSO device is already onboarded to a different NetBo
 _IDENTITY_CLAIMED = "The target NSO identity is already claimed by another device"
 #: The DB constraint that decides an identity race, taken from the model so the two cannot drift.
 _IDENTITY_CONSTRAINT = "uq_device_nso_identity"
+_NETBOX_DEVICE_ID_CONSTRAINT = "uq_device_netbox_device_id"
 
 
 def _violated_constraint(exc: BaseException) -> str | None:
@@ -178,8 +179,10 @@ async def _commit_adoption_or_conflict(db: AsyncSession, netbox_device_id: int) 
     ownership_conflict = False
     try:
         await db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         await db.rollback()
+        if _violated_constraint(exc) != _NETBOX_DEVICE_ID_CONSTRAINT:
+            raise
         ownership_conflict = True
 
     if ownership_conflict:
@@ -356,13 +359,15 @@ async def onboard_device(
         await db.flush()
         await create_counter(db, device.id)
         await db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         # Lost a race with a concurrent onboard of the same device. The checks above are
         # select-then-insert, so both callers can find nothing and both insert; the DB
         # constraints (uq_device_nso_identity / uq_device_netbox_device_id) are what actually
         # decide. Re-read the winner under a row lock and finish any missing link. A duplicate
         # row here would be permanent (the scope reconcile keeps every row it sees).
         await db.rollback()
+        if _violated_constraint(exc) not in {_IDENTITY_CONSTRAINT, _NETBOX_DEVICE_ID_CONSTRAINT}:
+            raise
         recovered = await _resolve_lost_insert(db, nso_instance, nso_device_name, netbox_device_id)
     if isinstance(recovered, LookupError):
         raise recovered
@@ -512,9 +517,11 @@ async def _insert_device_with_claim(
         # Same transaction as the device, like every other insert site (Appendix S §3.3).
         await create_counter(db, device.id)
         await db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         # Provably before COMMIT: a concurrent onboard of the same node or netbox id won.
         await db.rollback()
+        if _violated_constraint(exc) not in {_IDENTITY_CONSTRAINT, _NETBOX_DEVICE_ID_CONSTRAINT}:
+            raise
         return None
     except BaseException as exc:
         # In doubt: the COMMIT may have landed with both rows, and a CANCELLATION delivered
