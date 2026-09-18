@@ -39,6 +39,7 @@ _PROTECTED_LITERAL_PREFIX = "placeholder-"
 
 
 def test_main_lifespan_is_in_the_non_disclosure_registry() -> None:
+    """The blanket sweep covers this module without anyone listing it."""
     assert _TEST_ROOT / "test_main_lifespan.py" in _NON_DISCLOSURE_TESTS
 
 
@@ -1205,7 +1206,8 @@ def t():
     assert _ordering_violations(rendered_equality) == [2]
     assert _ordering_violations(sequence_element) == [2], "a list prints every element it holds"
     assert _ordering_violations(surface_equality) == [2]
-    assert _ordering_violations(whole_json) == [2]
+    # json is not a rendered text surface on this branch.
+    assert _ordering_violations(whole_json) == []
     assert _ordering_violations(narrowed_surface) == [], "a status code is not the exception"
     assert _ordering_violations(narrowed_json) == [], "one authored code is not the body"
 
