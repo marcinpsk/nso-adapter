@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import subprocess
@@ -15,6 +16,10 @@ ROOT = Path(__file__).parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 PRE_COMMIT = ROOT / ".pre-commit-config.yaml"
 REVIEW_PATTERNS = ROOT / "scripts" / "check-review-patterns"
+
+# Bare program name: subprocess resolves it through the PATH below, not the caller's.
+_SCAN_ARGV = ["bash", str(REVIEW_PATTERNS), "scan"]
+_RESTRICTED_PATH = "/usr/bin:/bin"
 
 _REMOTE_ZIZMOR_HOOK = "https://github.com/zizmorcore/zizmor-pre-commit"
 _ZIZMOR_UV_PREFIX = ["uv", "run", "--locked", "--native-tls", "--", "zizmor"]
@@ -72,13 +77,18 @@ def test_zizmor_consumers_share_locked_uv_dependency():
     assert collections == _ZIZMOR_COLLECTIONS
 
 
+def test_review_pattern_hook_resolves_its_interpreter_through_the_restricted_path() -> None:
+    """``/usr/bin/bash`` is absent on macOS, and an absolute program ignores the PATH below."""
+    assert os.path.dirname(_SCAN_ARGV[0]) == "", "the interpreter must resolve through the supplied PATH"
+
+
 def test_review_pattern_hook_explains_its_opengrep_prerequisite() -> None:
     result = subprocess.run(
-        ["/usr/bin/bash", str(REVIEW_PATTERNS), "scan"],
+        _SCAN_ARGV,
         check=False,
         capture_output=True,
         text=True,
-        env={"PATH": "/usr/bin:/bin"},
+        env={"PATH": _RESTRICTED_PATH},
     )
 
     assert result.returncode == 127
