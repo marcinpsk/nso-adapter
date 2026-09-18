@@ -43,7 +43,7 @@ class ConformanceCase:
     name: str
     tainted: str
     clean: str
-    gaps: dict[str, str] | None = None
+    gaps: dict[tuple[str, bool], str] | None = None
 
 
 def _credential_verdict(source: str) -> bool:
@@ -235,13 +235,27 @@ CASES = (
         "scope-comprehension-inward",
         "value = SOURCE\n[EXPRESSION_SINK for _ in items]",
         "value = CLEAN\n[EXPRESSION_SINK for _ in items]",
-        {"non-disclosure": "the scanner checks assert statements, which comprehensions cannot contain"},
+        {
+            (
+                "non-disclosure",
+                True,
+            ): "the scanner checks assert statements, which comprehensions cannot contain",
+            (
+                "non-disclosure",
+                False,
+            ): "the scanner checks assert statements, which comprehensions cannot contain",
+        },
     ),
     ConformanceCase(
         "scope-comprehension-outward",
         "[EXPRESSION_SINK for value in [SOURCE]]",
         "[value for value in [SOURCE]]\nvalue = CLEAN\nSINK",
-        {"non-disclosure": "the scanner checks assert statements, which comprehensions cannot contain"},
+        {
+            (
+                "non-disclosure",
+                True,
+            ): "the scanner checks assert statements, which comprehensions cannot contain",
+        },
     ),
     ConformanceCase(
         "control-try-except",
@@ -297,7 +311,12 @@ CASES = (
         "control-finally-replaces-exit",
         "value = CLEAN\nfor item in items:\n    try:\n        value = SOURCE\n        break\n    finally:\n        pass\nelse:\n    value = CLEAN\nSINK",
         "value = SOURCE\nfor item in items:\n    try:\n        break\n    finally:\n        value = CLEAN\n        continue\nelse:\n    value = CLEAN\nSINK",
-        {"non-disclosure": "the scanner is lexical and does not model control-flow overwrites"},
+        {
+            (
+                "non-disclosure",
+                False,
+            ): "the scanner is lexical and does not model control-flow overwrites",
+        },
     ),
     # A `for` target binds the iterable's values, exactly as a comprehension target does. The
     # two loop forms disagreed, so one spelling of the same value was reported and the other
@@ -316,8 +335,14 @@ CASES = (
         "holder = SOURCE\nfor value in [holder]:\n    SINK",
         "holder = CLEAN\nfor value in [holder]:\n    SINK\n    holder = SOURCE",
         {
-            "credential": "recomputes the iterable verdict per pass, so it over-approximates a rebinding",
-            "non-disclosure": "the scanner unions a scope's bindings and does not model control flow",
+            (
+                "credential",
+                False,
+            ): "recomputes the iterable verdict per pass, so it over-approximates a rebinding",
+            (
+                "non-disclosure",
+                False,
+            ): "the scanner unions a scope's bindings and does not model control flow",
         },
     ),
     # `return` and `raise` end the path, so the state of the branch they leave behind must not
@@ -326,13 +351,23 @@ CASES = (
         "control-return-exits-branch",
         "def nested():\n    value = CLEAN\n    if condition:\n        value = SOURCE\n    SINK",
         "def nested():\n    value = CLEAN\n    if condition:\n        value = SOURCE\n        return\n    SINK",
-        {"non-disclosure": "the scanner unions a scope's bindings and does not model control flow"},
+        {
+            (
+                "non-disclosure",
+                False,
+            ): "the scanner unions a scope's bindings and does not model control flow",
+        },
     ),
     ConformanceCase(
         "control-raise-exits-branch",
         "value = CLEAN\nif condition:\n    value = SOURCE\nSINK",
         "value = CLEAN\nif condition:\n    value = SOURCE\n    raise RuntimeError\nSINK",
-        {"non-disclosure": "the scanner unions a scope's bindings and does not model control flow"},
+        {
+            (
+                "non-disclosure",
+                False,
+            ): "the scanner unions a scope's bindings and does not model control flow",
+        },
     ),
     ConformanceCase(
         "control-if-body",
@@ -497,10 +532,19 @@ def _scanner_case_parameters() -> list[object]:
     parameters = []
     for scanner in SCANNERS:
         for case in CASES:
-            gap_reason = (case.gaps or {}).get(scanner.name)
-            if gap_reason:
-                continue
-            parameters.append(pytest.param(scanner, case, id=f"{case.name}-{scanner.name}"))
+            for tainted in (True, False):
+                marks = []
+                if reason := (case.gaps or {}).get((scanner.name, tainted)):
+                    marks.append(pytest.mark.xfail(reason=reason, strict=True))
+                parameters.append(
+                    pytest.param(
+                        scanner,
+                        case,
+                        tainted,
+                        marks=marks,
+                        id=f"{case.name}-{scanner.name}-{'tainted' if tainted else 'clean'}",
+                    )
+                )
     return parameters
 
 
@@ -654,8 +698,7 @@ def opengrep_credential_verdicts(tmp_path_factory: pytest.TempPathFactory) -> se
     return {line_owners[finding["start"]["line"]] for finding in report["results"]}
 
 
-@pytest.mark.parametrize(("scanner", "case"), _scanner_case_parameters())
-@pytest.mark.parametrize("tainted", [True, False], ids=["tainted", "clean"])
+@pytest.mark.parametrize(("scanner", "case", "tainted"), _scanner_case_parameters())
 def test_scanner_conformance(scanner: ScannerSpec, case: ConformanceCase, tainted: bool) -> None:
     source = _render(case.tainted if tainted else case.clean, scanner)
 
