@@ -2582,6 +2582,7 @@ async def test_an_apply_is_blocked_when_the_document_would_flush_a_live_orphan(a
         assert row.last_apply_error["detail"]["orphans"] == {"vlan/vlan": [["999"]]}
     blocked = next(record for record in logs if record["event"] == "apply.blocked_collateral")
     failed = next(record for record in logs if record["event"] == "apply.atomic_failed")
+    assert_records_free_of([blocked, failed], ["sw01-collateral", "999"])
     assert blocked == {
         "device_id": device_id,
         "event": "apply.blocked_collateral",
@@ -2590,7 +2591,6 @@ async def test_an_apply_is_blocked_when_the_document_would_flush_a_live_orphan(a
     }
     assert failed["device_id"] == device_id
     assert failed["job_id"] == job_id
-    assert_records_free_of([blocked, failed], ["sw01-collateral", "999"])
 
 
 async def test_a_failed_commit_marks_both_the_subif_and_its_address(adapter_client):
