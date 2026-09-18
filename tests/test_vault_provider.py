@@ -214,9 +214,9 @@ def test_the_reauthentication_warning_reaches_the_structlog_pipeline(fake_hvac):
     with capture_logs() as logs:
         assert _provider().get("credentials/svc#netbox_token") == "placeholder-vault-value"
 
+    assert_records_free_of(logs, ["credentials/svc", "netbox_token", "placeholder-vault-value"])
     reauth = [record for record in logs if record["event"] == "vault.reauthenticating"]
     assert reauth == [{"event": "vault.reauthenticating", "cause": "forbidden", "log_level": "warning"}]
-    assert_records_free_of(logs, ["credentials/svc", "netbox_token", "placeholder-vault-value"])
 
 
 def test_namespace_forwarded_to_client(fake_hvac):
@@ -415,8 +415,8 @@ def test_a_NON_MAPPING_payload_is_one_classified_refusal_not_a_TypeError(fake_hv
     with pytest.raises(SecretResolutionError) as caught:
         provider.get("credentials/svc#netbox_token")
 
-    assert caught.value.reason == "the Vault read failed (ValueError)"
     assert_text_free_of(caught.value, ["credentials/svc", "netbox_token"])
+    assert caught.value.reason == "the Vault read failed (ValueError)"
 
 
 def test_a_NON_MAPPING_payload_is_never_CACHED(fake_hvac):

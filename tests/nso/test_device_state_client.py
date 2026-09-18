@@ -18,7 +18,7 @@ import pytest
 
 from nso_adapter.config import NsoInstanceConfig
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError, NsoReadContractError
-from tests._secret_discipline import assert_text_free_of
+from tests._secret_discipline import assert_chain_free_of, assert_text_free_of
 
 
 def _make_client() -> NsoClient:
@@ -174,7 +174,7 @@ async def test_doc_404_with_dead_container_raises_export_unavailable(patch_clien
         with pytest.raises(NsoExportUnavailableError) as caught:
             await client.get_device_state_doc("placeholder-secret-device")
 
-    assert_text_free_of(caught.value, ["placeholder-secret"])
+    assert_chain_free_of(caught.value, ["placeholder-secret"])
     assert caught.value.__context__ is None, "the malformed response must not stay attached"
 
 

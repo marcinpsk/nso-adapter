@@ -177,10 +177,10 @@ async def test_action_force_removal_rejects_unknown_scope(adapter_client):
         headers=AUTH,
     )
 
+    assert_text_free_of(response.text, [submitted])
     assert response.status_code == 400
     error = response.json()["error"]
     assert error == {"code": "bad_request", "message": "Unknown removal scope", "detail": {}}
-    assert_text_free_of(response.text, [submitted])
 
 
 async def test_action_force_removal_interface_config_needs_no_interface_list(adapter_client):
@@ -233,14 +233,13 @@ async def test_action_force_removal_refuses_a_family_nothing_authorized(adapter_
         headers=AUTH,
     )
 
+    assert_text_free_of(response.text, [submitted])
     assert response.status_code == 400
     assert response.json()["error"] == {
         "code": "bad_request",
         "message": "Nothing is authorized for this removal scope on this device, so there is nothing to flush",
         "detail": {"reason": "no_authorized_section"},
     }
-    if submitted in response.text:
-        raise AssertionError("the response returned the submitted removal scope")
     async with session() as db:
         jobs = (await db.execute(select(Job).where(Job.device_id == device_id))).scalars().all()
         assert list(jobs) == [], "the refusal must leave no job behind"

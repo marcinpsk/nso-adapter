@@ -510,13 +510,11 @@ def test_snmp_rejects_a_malformed_vault_ref(bad_ref):
             _PLAIN,
         )
 
-    import traceback
-
     from tests._secret_discipline import assert_chain_free_of
 
+    # The chain walk IS the traceback check: it renders every reachable node and its notes,
+    # which is what a formatted traceback prints, without copying either into a failure.
     if bad_ref:
-        assert bad_ref not in str(caught.value)
-        assert bad_ref not in "".join(traceback.format_exception(caught.value))
         assert_chain_free_of(caught.value, [bad_ref])
 
 

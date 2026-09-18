@@ -46,10 +46,9 @@ def test_local_provider_missing_refuses_without_the_reference():
     with pytest.raises(SecretResolutionError) as caught:
         p.get("PLACEHOLDER_MISSING_REF")
 
+    assert_chain_free_of(caught.value, ["PLACEHOLDER_MISSING_REF"])
     assert caught.value.reason == "the referenced environment variable is not set"
     assert caught.value.slot is None, "only the caller knows the configuration slot"
-    assert "PLACEHOLDER_MISSING_REF" not in str(caught.value)
-    assert_chain_free_of(caught.value, ["PLACEHOLDER_MISSING_REF"])
 
 
 def test_resolve_secret_stamps_the_slot_on_the_local_refusal():
@@ -57,9 +56,8 @@ def test_resolve_secret_stamps_the_slot_on_the_local_refusal():
     with pytest.raises(SecretResolutionError) as caught:
         resolve_secret(LocalSecretsProvider(), "PLACEHOLDER_MISSING_REF", slot="netbox.api_token_ref")
 
-    assert str(caught.value) == "netbox.api_token_ref: the referenced environment variable is not set"
-    assert "PLACEHOLDER_MISSING_REF" not in str(caught.value)
     assert_chain_free_of(caught.value, ["PLACEHOLDER_MISSING_REF"])
+    assert str(caught.value) == "netbox.api_token_ref: the referenced environment variable is not set"
 
 
 def test_local_provider_satisfies_protocol():
@@ -80,9 +78,8 @@ def test_local_provider_classifies_an_unreadable_file_without_the_path(tmp_path,
     with pytest.raises(SecretResolutionError) as caught:
         LocalSecretsProvider().get("MY_TOKEN")
 
-    assert caught.value.reason == "the referenced file could not be read (IsADirectoryError)"
-    assert "secret-dir" not in str(caught.value)
     assert_chain_free_of(caught.value, ["secret-dir", str(tmp_path)])
+    assert caught.value.reason == "the referenced file could not be read (IsADirectoryError)"
 
 
 def test_local_provider_classifies_undecodable_file_bytes(tmp_path, monkeypatch):
@@ -95,8 +92,8 @@ def test_local_provider_classifies_undecodable_file_bytes(tmp_path, monkeypatch)
     with pytest.raises(SecretResolutionError) as caught:
         LocalSecretsProvider().get("MY_TOKEN")
 
-    assert caught.value.reason == "the referenced file could not be read (UnicodeDecodeError)"
     assert_chain_free_of(caught.value, ["binary-token", str(tmp_path), "secret-bytes"])
+    assert caught.value.reason == "the referenced file could not be read (UnicodeDecodeError)"
 
 
 def test_local_provider_does_not_use_the_process_default_file_encoding(tmp_path):
@@ -133,8 +130,8 @@ def test_local_provider_falls_through_when_the_referenced_file_is_gone(tmp_path,
     with pytest.raises(SecretResolutionError) as caught:
         LocalSecretsProvider().get("MY_TOKEN")
 
-    assert caught.value.reason == "the referenced environment variable is not set"
     assert_chain_free_of(caught.value, ["never-written", str(tmp_path)])
+    assert caught.value.reason == "the referenced environment variable is not set"
 
 
 def test_resolve_secret_stamps_the_slot_on_an_unreadable_file(tmp_path, monkeypatch):
@@ -146,5 +143,5 @@ def test_resolve_secret_stamps_the_slot_on_an_unreadable_file(tmp_path, monkeypa
     with pytest.raises(SecretResolutionError) as caught:
         resolve_secret(LocalSecretsProvider(), "NETBOX_TOKEN", slot="netbox.api_token_ref")
 
-    assert str(caught.value) == "netbox.api_token_ref: the referenced file could not be read (IsADirectoryError)"
     assert_chain_free_of(caught.value, ["token-dir", str(tmp_path)])
+    assert str(caught.value) == "netbox.api_token_ref: the referenced file could not be read (IsADirectoryError)"

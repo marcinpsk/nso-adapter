@@ -50,9 +50,9 @@ async def test_unregistered_instance_refusal_does_not_echo_the_persisted_name(ad
 
     resp = await adapter_client.post(f"/api/v1/devices/{device_id}/capability/refresh", headers=AUTH)
 
+    assert_text_free_of(resp.text, [instance])
     assert resp.status_code == 409
     assert resp.json()["error"] == {"code": "no_nso_client", "message": "No NSO client is registered", "detail": {}}
-    assert_text_free_of(resp.text, [instance])
 
 
 @pytest.mark.asyncio
