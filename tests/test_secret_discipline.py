@@ -37,6 +37,7 @@ _NON_DISCLOSURE_TESTS = (
     _TEST_ROOT / "nso" / "test_sse_subscriber.py",
     _TEST_ROOT / "secrets" / "test_local.py",
     _TEST_ROOT / "secrets" / "test_refs.py",
+    _TEST_ROOT / "test_main_lifespan.py",
     _TEST_ROOT / "test_secret_discipline.py",
     _TEST_ROOT / "test_vault_provider.py",
 )
@@ -46,6 +47,10 @@ _NON_DISCLOSURE_HELPERS = {"assert_chain_free_of", "assert_records_free_of", "as
 #: How this repository writes protected material into a test (see the placeholder convention). A
 #: body that names one is handling something protected, whether or not it calls a helper.
 _PROTECTED_LITERAL_PREFIX = "placeholder-"
+
+
+def test_main_lifespan_is_in_the_non_disclosure_registry() -> None:
+    assert _TEST_ROOT / "test_main_lifespan.py" in _NON_DISCLOSURE_TESTS
 
 
 def _reads_an_inspected_surface(node: ast.AST) -> bool:
