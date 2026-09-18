@@ -1276,7 +1276,7 @@ Return a fixed projection of the selected Vault state.
 ### `POST /api/v1/devices/{id}/secrets/harvest-community` → `200 | 400 | 401 | 404 | 409 | 422 | 501 | 502`
 
 Find one community by its read-mirror fingerprint and store it at a keyed Vault reference.
-The response contains only the adapter operation id, fingerprint, new Vault version, and
+The response contains only the adapter operation id, `secret_hash`, new Vault version, and
 the device-held non-secret access metadata.
 
 ```json
