@@ -375,6 +375,43 @@ rules:
       - patterns:
           - pattern: logger.$LEVEL(..., $KEY=$SINK, ...)
           - focus-metavariable: $SINK
+  - id: nso-raised-message-raw-identifier
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Raise fixed authored text. A raised message is published by str(exc), repr(exc) and any
+      formatted traceback, so no handler can take the caller's identifier back out of it.
+      Carry the identifier in a structured field instead.
+    mode: taint
+    pattern-sources:
+      - pattern: $D.nso_device_name
+        exact: true
+      - pattern: $D.ned_id
+        exact: true
+      - pattern: $D.sw_version
+        exact: true
+      - pattern: device_name
+        exact: true
+      - pattern: stream_url
+        exact: true
+    pattern-sanitizers:
+      # The adapter's own id is not caller text, and an HTTP status code is a closed integer.
+      # Both are narrower than sanitizing the object: $RESPONSE.text CAN echo the submitted
+      # name straight back, so a response reached through a device-named URL stays tainted.
+      - pattern: $D.id
+        exact: true
+      - pattern: $RESPONSE.status_code
+        exact: true
+    # The sink is the MESSAGE, not the raise: a structured detail= field is a different
+    # question, answered by whether its consumer renders it.
+    pattern-sinks:
+      - patterns:
+          - pattern-inside: raise $EXC(...)
+          - pattern-either:
+              - pattern: f"..."
+              - pattern: $TEMPLATE.format(...)
+              - pattern: $TEMPLATE % $VALUES
+              - pattern: $LEFT + $RIGHT
   - id: nso-api-error-raw-exception-renderer
     languages: [python]
     severity: ERROR
