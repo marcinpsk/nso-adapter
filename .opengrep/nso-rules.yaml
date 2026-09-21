@@ -475,4 +475,3 @@ rules:
         - review-patterns.py
     patterns:
       - pattern: int(...)
-

@@ -121,6 +121,28 @@ except IntegrityError as exc:
     assert len(scan_source(source)) == 1
 
 
+def test_a_MODULE_THAT_SHADOWS_IntegrityError_still_has_its_handlers_scanned() -> None:
+    """Dropping a rebound EXCEPTION name would stop the handler being recognised at all.
+
+    That fails open: one shadowing local anywhere in the file silently disables the guard
+    for every handler in it, which is the opposite of what the rebind check is for.
+    """
+    source = """
+from sqlalchemy.exc import IntegrityError
+
+def make(IntegrityError=IntegrityError):
+    return IntegrityError()
+
+async def write(db):
+    try:
+        await db.commit()
+    except IntegrityError:
+        return None
+"""
+
+    assert len(scan_source(source)) == 1
+
+
 def test_a_REBOUND_import_no_longer_counts_as_the_classification_helper() -> None:
     """A parameter shadowing the imported name makes the call something else entirely."""
     source = """

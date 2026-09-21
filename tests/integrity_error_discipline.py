@@ -35,7 +35,8 @@ def _rebound_names(tree: ast.AST) -> set[str]:
 
     An import binding is only trustworthy while the name still refers to it. A parameter, an
     assignment, a loop target or a walrus can rebind ``_violated_constraint``, and a call on
-    the rebound value is not the imported helper.
+    the rebound value is not the imported helper. Module-wide and scope-blind on purpose: the
+    only consumer drops a binding, which reports more rather than less.
     """
     names: set[str] = set()
     for node in ast.walk(tree):
@@ -70,8 +71,13 @@ def _import_bindings(tree: ast.AST) -> dict[str, str]:
             for alias in node.names:
                 if alias.name != "*":
                     bindings[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    # Only the classification helper is dropped when the module rebinds its name. Dropping a
+    # rebound exception name instead would stop _catches_integrity_error from recognising the
+    # handler at all, so one shadowing local anywhere in the file would silently disable the
+    # whole guard for it. Both remaining directions fail CLOSED: an unrecognised helper call
+    # and an over-recognised handler both report more, never less.
     rebound = _rebound_names(tree)
-    return {bound: target for bound, target in bindings.items() if bound not in rebound}
+    return {bound: target for bound, target in bindings.items() if target != _CONSTRAINT_HELPER or bound not in rebound}
 
 
 def _qualified_name(node: ast.AST | None, imports: dict[str, str]) -> str | None:
