@@ -1644,11 +1644,12 @@ def test_a_handler_sees_an_alias_from_an_earlier_try_body_prefix(handler: str) -
 def f():
     try:
         detail = exc
+        work()
         detail = "authored"
     {handler} ValueError:
         logger.warning("event", detail=detail)
 """
-    assert _raw_log_exception_renderers(source.format(handler=handler)) == [6]
+    assert _raw_log_exception_renderers(source.format(handler=handler)) == [7]
 
 
 def test_a_finally_block_sees_an_alias_from_an_earlier_try_body_prefix() -> None:
@@ -1656,11 +1657,12 @@ def test_a_finally_block_sees_an_alias_from_an_earlier_try_body_prefix() -> None
 def f():
     try:
         detail = exc
+        work()
         detail = "authored"
     finally:
         logger.warning("event", detail=detail)
 """
-    assert _raw_log_exception_renderers(source) == [6]
+    assert _raw_log_exception_renderers(source) == [7]
 
 
 def test_a_try_that_every_path_reassigns_leaves_no_alias_behind_it() -> None:

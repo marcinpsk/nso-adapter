@@ -136,9 +136,9 @@ def test_review_pattern_hook_resolves_its_interpreter_through_the_restricted_pat
     assert os.path.dirname(_SCAN_ARGV[0]) == "", "the interpreter must resolve through the supplied PATH"
 
 
-def test_subprocess_argv_literals_resolve_interpreters_through_path() -> None:
+def _assert_subprocess_argv_interpreters_resolve_through_path(root: Path) -> None:
     violations = []
-    for source_path in sorted((ROOT / "tests").rglob("*.py")):
+    for source_path in sorted((root / "tests").rglob("*.py")):
         tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
         argv_literals = {
             target.id: statement.value
@@ -153,7 +153,7 @@ def test_subprocess_argv_literals_resolve_interpreters_through_path() -> None:
                 and isinstance(call.func, ast.Attribute)
                 and isinstance(call.func.value, ast.Name)
                 and call.func.value.id == "subprocess"
-                and call.func.attr in {"Popen", "check_output", "run"}
+                and call.func.attr in {"Popen", "check_call", "check_output", "run"}
             ):
                 continue
             argv = (
@@ -177,9 +177,26 @@ def test_subprocess_argv_literals_resolve_interpreters_through_path() -> None:
                 and interpreter.value.startswith("/")
                 and Path(interpreter.value).name in _INTERPRETER_NAMES
             ):
-                violations.append(f"{source_path.relative_to(ROOT)}:{call.lineno}")
+                violations.append(f"{source_path.relative_to(root)}:{call.lineno}")
 
     assert not violations, "absolute interpreter argv literals:\n" + "\n".join(violations)
+
+
+def test_subprocess_argv_literals_resolve_interpreters_through_path() -> None:
+    _assert_subprocess_argv_interpreters_resolve_through_path(ROOT)
+
+
+@pytest.mark.parametrize("argv", ["_ARGV", "_ARGV + ['true']"], ids=["named", "concatenated"])
+@pytest.mark.parametrize("method", ["run", "check_call"])
+def test_subprocess_argv_audit_reads_module_level_constants(tmp_path: Path, argv: str, method: str) -> None:
+    test_dir = tmp_path / "tests"
+    test_dir.mkdir()
+    (test_dir / "test_named.py").write_text(
+        f'_ARGV = ["/usr/bin/bash"]\nsubprocess.{method}({argv})\n', encoding="utf-8"
+    )
+
+    with pytest.raises(AssertionError, match=r"tests/test_named.py:2"):
+        _assert_subprocess_argv_interpreters_resolve_through_path(tmp_path)
 
 
 def test_review_pattern_hook_explains_its_opengrep_prerequisite() -> None:
