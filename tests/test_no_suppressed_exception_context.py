@@ -44,12 +44,12 @@ _FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 
 
 def _as_invocation(decorator: ast.expr) -> ast.expr:
-    """``@name`` is ``name(fn)`` with the call left implicit; spell it as the call it is.
+    """``@name`` and ``@obj.name`` call their expressions with the function implicitly.
 
     ``@name(...)`` is already an ``ast.Call``, and any other decorator expression names no
     local helper, so both are returned unchanged.
     """
-    if not isinstance(decorator, ast.Name):
+    if not isinstance(decorator, (ast.Name, ast.Attribute)):
         return decorator
     return ast.copy_location(ast.Call(func=decorator, args=[], keywords=[]), decorator)
 
@@ -864,6 +864,29 @@ def test_flags_a_BARE_decorator_that_is_an_always_raising_helper() -> None:
     """``@refuse`` with no parentheses still CALLS ``refuse``, and the call runs in the handler."""
     assert isinstance(_runtime_context(_BARE_DECORATOR_IS_A_RAISING_HELPER), ValueError)
     assert scan_source(_BARE_DECORATOR_IS_A_RAISING_HELPER, "t.py") == ["t.py:7"]
+
+
+_BARE_ATTRIBUTE_DECORATOR_IS_A_RAISING_HELPER = (
+    "class Example:\n"
+    "    def _refuse(self, fn):\n"
+    "        raise Boom() from None\n"
+    "\n"
+    "    def run(self):\n"
+    "        try:\n"
+    "            trigger()\n"
+    "        except ValueError:\n"
+    "            @self._refuse\n"
+    "            def later():\n"
+    "                pass\n"
+    "\n"
+    "Example().run()\n"
+)
+
+
+def test_flags_a_BARE_ATTRIBUTE_decorator_that_is_an_always_raising_helper() -> None:
+    """``@self._refuse`` calls the method while the handler is active."""
+    assert isinstance(_runtime_context(_BARE_ATTRIBUTE_DECORATOR_IS_A_RAISING_HELPER), ValueError)
+    assert scan_source(_BARE_ATTRIBUTE_DECORATOR_IS_A_RAISING_HELPER, "t.py") == ["t.py:9"]
 
 
 def test_a_returning_helper_called_in_a_handler_stays_legal() -> None:

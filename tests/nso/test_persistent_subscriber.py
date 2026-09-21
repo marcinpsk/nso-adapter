@@ -147,7 +147,8 @@ async def test_persistent_subscriber_retries_after_transport_error(monkeypatch: 
     ) -> None:
         nonlocal attempts
         attempts += 1
-        assert stream_url == SECRET_STREAM_URL
+        if stream_url != SECRET_STREAM_URL:
+            raise AssertionError("subscriber did not receive the configured stream URL")
         assert duration == float("inf")
         # s3-13: the finite idle watchdog is threaded through to subscribe().
         assert idle_read_timeout_s == 90.0
