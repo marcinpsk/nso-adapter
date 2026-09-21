@@ -204,13 +204,18 @@ async def apply_switchport(
         )
         for interface in payload.interfaces
     )
+    refused = None
     try:
         prepared = await replace_switchport_snapshot(db, device_id, interfaces, deleted_roots=payload.deleted_roots)
     except DeviceProjectionGone:
-        raise api_error(404, "not_found", "Device not found")
+        # Built in the handler, raised after it: a raise inside attaches the caught exception.
+        refused = api_error(404, "not_found", "Device not found")
     except SwitchingRequestRefused as exc:
         await db.rollback()
-        raise api_error(422, "validation_error", str(exc)) from None
+        # Authored per reason: the answer names the refusal, never the roots the caller sent.
+        refused = api_error(422, "validation_error", exc.public_message, {"reason": exc.reason.value})
+    if refused is not None:
+        raise refused
     await db.commit()
     return {
         "status": prepared.status,

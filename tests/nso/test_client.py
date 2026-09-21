@@ -24,7 +24,7 @@ def _make_cfg(base_url="http://nso:8080/", ca_cert=None, host_header=None):
 
 class TestNsoClientInit:
     def test_strips_trailing_slash_from_base(self):
-        client = NsoClient(_make_cfg("http://nso:8080/"), "admin", "pass")
+        client = NsoClient(_make_cfg("http://nso:8080/"), "placeholder-user", "pass")
         assert client._base == "http://nso:8080"
 
     def test_stores_auth(self):

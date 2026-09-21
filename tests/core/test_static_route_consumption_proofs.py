@@ -21,6 +21,7 @@ import pytest
 
 from nso_adapter.core.static_route_reader import certified_static_route_section
 from nso_adapter.nso.client import DEVICE_INTENT_ROOT, ServiceInstanceState
+from tests._secret_discipline import assert_text_contains
 from tests.conftest import seed_device, session
 from tests.core.removal_helpers import seed_removal_job, seed_tomb
 from tests.core.static_route_harness import K as K_KEY
@@ -595,7 +596,7 @@ def _instance_client(entry: dict):
     """A real NsoClient over a fake RESTCONF transport that answers ONE instance."""
 
     def respond(request):
-        assert "device-intent:device-intent=sr-malformed" in str(request.url)
+        assert_text_contains(request.url, ["device-intent:device-intent=sr-malformed"])
         return httpx.Response(200, json={DEVICE_INTENT_ROOT: [entry]})
 
     return _client_with(httpx.MockTransport(respond))

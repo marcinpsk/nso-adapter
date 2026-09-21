@@ -375,7 +375,10 @@ Request:
   "netbox_device_id": 42 }
 ```
 → `201` device object (as above). `409 conflict` if the NetBox device or NSO
-device is already onboarded.
+device is already onboarded. An `error.detail.reason` of
+`netbox_device_claimed` means another mapping owns the requested NetBox device.
+An `error.detail.reason` of `onboarded_elsewhere` means the requested NSO
+device is linked to a different NetBox device.
 
 This onboard only creates the adapter **mapping row**; it assumes the device node
 already exists in NSO. To create the device *in NSO* and bring it up, use
@@ -552,7 +555,8 @@ Request (any subset):
 ```
 Changing `nso_device_name` or `nso_instance` re-keys the device: stored
 interface mappings and `interface_attr_state` are cleared and rebuilt on the
-next sync; `job` history is retained. → `200` device object.
+next sync; `job` history is retained. → `200` device object. A claimed target
+returns `409 conflict` with an `error.detail.reason` of `identity_claimed`.
 
 ### `DELETE /api/v1/devices/{id}` — offboard
 → `204`. Removes adapter state for the device. Does **not** modify NetBox.
@@ -1215,6 +1219,78 @@ sequence, so a snapshot taken before pk R existed can re-allocate R while the ad
 holds an unrelated row carrying `route_id = R` — and the deletion partition's first pass
 would bind that row as genuine and authorize removing it. Advancing the pk sequence past this
 value is what closes that. `null` on both means the adapter holds nothing, which is not `0`.
+
+## Secrets
+
+Vault references use `mount/path` for a path or `mount/path#key` for one field.
+The adapter never returns a reference, field name, or secret value. Every response the
+handler itself produces carries an adapter-generated `operation_id` that identifies its safe
+log record: a success returns it as a top-level field, and a refusal returns it in
+`error.detail.operation_id`. A `401` or a `422` is answered before the handler runs, so those
+two carry no id.
+
+### `POST /api/v1/secrets` → `200 | 400 | 401 | 422 | 501 | 502`
+
+Merge fields into a Vault KV v2 path. A keyed reference requires `values` to contain
+exactly that key.
+
+```json
+{
+  "vault_ref": "network/netbox/snmp/v3/placeholder-user",
+  "values": {"auth": "placeholder-secret", "priv": "placeholder-secret"}
+}
+```
+
+```json
+{"operation_id": "placeholder-operation", "version": 4}
+```
+
+### `POST /api/v1/secrets/verify` → `200 | 400 | 401 | 422 | 501 | 502`
+
+Return a fixed projection of the selected Vault state.
+
+```json
+{"vault_ref": "network/netbox/snmp/community/placeholder#community"}
+```
+
+```json
+{
+  "operation_id": "placeholder-operation",
+  "status": "present",
+  "fingerprint": "0123456789abcdef",
+  "has_auth": false,
+  "has_priv": false,
+  "version": 4
+}
+```
+
+`status` is one of `present`, `missing_path`, or `missing_field`:
+
+- A keyed reference returns `present` and its scalar `fingerprint` when the key exists.
+  Its `has_auth` and `has_priv` values are false.
+- A keyed reference to an existing path without that key returns `missing_field`.
+  It retains the path's current `version`.
+- An unkeyed reference to any readable path returns `present`, including an empty or
+  unversioned path. Its `fingerprint` is null. `has_auth` and `has_priv` state whether
+  the fixed `auth` and `priv` keys exist.
+- An absent path returns `missing_path`, a null `fingerprint`, false role flags, and a
+  null `version`.
+
+### `POST /api/v1/devices/{id}/secrets/harvest-community` → `200 | 400 | 401 | 404 | 409 | 422 | 501 | 502`
+
+Find one community by its read-mirror fingerprint and store it at a keyed Vault reference.
+The response contains only the adapter operation id, `secret_hash`, new Vault version, and
+the device-held non-secret access metadata.
+
+```json
+{
+  "operation_id": "placeholder-operation",
+  "secret_hash": "0123456789abcdef",
+  "version": 4,
+  "access": "RO",
+  "acl": null
+}
+```
 
 ## SNMP Configuration (M11)
 

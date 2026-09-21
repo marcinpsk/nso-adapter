@@ -11,11 +11,12 @@ import pytest
 from sqlalchemy import select
 
 from nso_adapter.core.vlan import (
+    parse_vlan_string,
     refresh_switchport_for_device,
     refresh_vlan_database_for_device,
 )
 from nso_adapter.nso.client import NsoExportUnavailableError
-from nso_adapter.store.models import Device, DeviceSwitchport, DeviceVlan
+from nso_adapter.store.models import Device, DeviceSwitchport, DeviceSwitchportTaggedVlan, DeviceVlan
 from tests.conftest import seed_device, session
 
 
@@ -45,6 +46,18 @@ def _serve_sections(nso: AsyncMock) -> dict:
 
     nso.get_device_state_section.side_effect = _get
     return sections
+
+
+@pytest.mark.parametrize("raw", [[], ["10", "20"], ("10", "20"), 10])
+def test_tagged_vlan_parser_rejects_non_wire_shapes(raw):
+    with pytest.raises(ValueError, match=rf"^tagged-vlans must be a string \(type {type(raw).__name__}\)$"):
+        parse_vlan_string(raw)
+
+
+@pytest.mark.parametrize("raw", ["10,,20", "10,20,"])
+def test_tagged_vlan_parser_rejects_empty_chunks(raw):
+    with pytest.raises(ValueError, match="^tagged-vlans contains an invalid VLAN range$"):
+        parse_vlan_string(raw)
 
 
 @pytest.mark.anyio
@@ -82,10 +95,117 @@ async def test_refresh_vlan_database_rejects_a_malformed_item_and_keeps_rows(ada
         await refresh_vlan_database_for_device(db, device, nso)
 
         sections["vlan-database"] = {"status": "ok", "vlan": [{"vlan-id": 10, "name": "MGMT"}, {"name": "NO-ID"}]}
-        with pytest.raises(ValueError, match="vlan-database item without a usable vlan id"):
+        with pytest.raises(ValueError, match="carries a vlan-id of type NoneType"):
             await refresh_vlan_database_for_device(db, device, nso)
         rows = (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device.id))).scalars().all()
         assert {r.vlan_id for r in rows} == {10, 20}, "a malformed item must never prune its siblings"
+
+
+@pytest.mark.anyio
+async def test_a_malformed_item_is_named_by_its_FIELD_and_never_repeated_verbatim(adapter_client):
+    """The refusal interpolated the whole wire item, which is device-derived server data.
+
+    A vlan-database entry carries whatever the export put in it. Repeating it verbatim
+    carries that content into every surface that records the refusal. The field name and
+    the received type say what is wrong and carry no payload.
+    """
+    from tests._secret_discipline import assert_chain_free_of, assert_text_free_of
+
+    device_id = await seed_device(nso_device_name="vsw-sink", netbox_device_id=1309)
+    async with _device_session(device_id) as (db, device):
+        nso = AsyncMock()
+        sections = _serve_sections(nso)
+        sections["vlan-database"] = {
+            "status": "ok",
+            "vlan": [{"name": "NO-ID", "description": "placeholder-server-text"}],
+        }
+        with pytest.raises(ValueError) as caught:
+            await refresh_vlan_database_for_device(db, device, nso)
+
+    message = str(caught.value)
+    assert_text_free_of(message, ["placeholder-server-text", "NO-ID"])
+    assert_chain_free_of(caught.value, ["placeholder-server-text"])
+    if "vlan-id" not in message:
+        raise AssertionError("the diagnostic must still name the field")
+    if "NoneType" not in message:
+        raise AssertionError("the diagnostic must still name the received type")
+
+
+#: What a NED can put in a switchport leaf the reader then converts.
+_UNTAGGED_TEXT = "placeholder-untagged-secret"
+_TAGGED_TEXT = "placeholder-tagged-secret"
+
+
+async def _switchport_surface_failure(device_id: int, interface: dict) -> tuple[BaseException, list]:
+    """Run the REAL switchport surface through the real fan-out; return (raised, records)."""
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.importer import _run_surfaces
+
+    async with _device_session(device_id) as (db, device):
+        nso = AsyncMock()
+        sections = _serve_sections(nso)
+        sections["vlan-database"] = {"status": "ok", "vlan": [{"vlan-id": 10, "name": "MGMT"}]}
+        await refresh_vlan_database_for_device(db, device, nso)
+
+        sections["switchport"] = {"status": "ok", "interface": [interface]}
+        with pytest.raises(Exception) as caught:  # noqa: B017, the raise IS what is under test
+            await refresh_switchport_for_device(db, device, nso)
+
+        with capture_logs() as logs:
+            failed = await _run_surfaces(db, device, nso, [("switchport", refresh_switchport_for_device)], "poll")
+    assert failed == ["switchport"], "the surface must still be reported as failed"
+    return caught.value, logs
+
+
+@pytest.mark.anyio
+async def test_a_malformed_UNTAGGED_VLAN_is_named_by_its_field_and_never_repeated(adapter_client):
+    """``int(untagged)`` put the device's own leaf into the ValueError, and the fan-out logs it.
+
+    ``sync.surface_refresh_failed`` records the exception repr, so whatever the NED emitted in
+    ``untagged-vlan`` reached the operator log through it.
+    """
+    from tests._secret_discipline import assert_chain_free_of, assert_records_free_of, assert_text_free_of
+
+    device_id = await seed_device(nso_device_name="vsw-untagged-sink", netbox_device_id=1311)
+    raised, logs = await _switchport_surface_failure(
+        device_id,
+        {"interface-name": "Gi0/1", "mode": "access", "untagged-vlan": _UNTAGGED_TEXT},
+    )
+
+    message = str(raised)
+    assert_text_free_of(message, [_UNTAGGED_TEXT])
+    assert_chain_free_of(raised, [_UNTAGGED_TEXT])
+    assert_records_free_of(logs, [_UNTAGGED_TEXT])
+    if "untagged-vlan" not in message:
+        raise AssertionError("the diagnostic must still name the field")
+    if "type str" not in message:
+        raise AssertionError("the diagnostic must still name the received type")
+    if not [record for record in logs if record["event"] == "sync.surface_refresh_failed"]:
+        raise AssertionError("the failed surface was not reported at all")
+
+
+@pytest.mark.anyio
+async def test_a_malformed_TAGGED_VLAN_entry_is_named_by_its_field_and_never_repeated(adapter_client):
+    """Reject a non-wire tagged shape without repeating its device-served entries."""
+    from tests._secret_discipline import assert_chain_free_of, assert_records_free_of, assert_text_free_of
+
+    device_id = await seed_device(nso_device_name="vsw-tagged-sink", netbox_device_id=1312)
+    raised, logs = await _switchport_surface_failure(
+        device_id,
+        {"interface-name": "Gi0/2", "mode": "trunk", "tagged-vlans": ["10", _TAGGED_TEXT]},
+    )
+
+    message = str(raised)
+    assert_text_free_of(message, [_TAGGED_TEXT])
+    assert_chain_free_of(raised, [_TAGGED_TEXT])
+    assert_records_free_of(logs, [_TAGGED_TEXT])
+    if "tagged-vlans" not in message:
+        raise AssertionError("the diagnostic must still name the field")
+    if "type list" not in message:
+        raise AssertionError("the diagnostic must still name the received type")
+    if not [record for record in logs if record["event"] == "sync.surface_refresh_failed"]:
+        raise AssertionError("the failed surface was not reported at all")
 
 
 @pytest.mark.anyio
@@ -101,14 +221,162 @@ async def test_refresh_switchport_links_vlans(adapter_client):
         await refresh_vlan_database_for_device(db, device, nso)
         sections["switchport"] = {
             "status": "ok",
-            "interface": [{"interface-name": "Gi0/1", "mode": "trunk", "untagged-vlan": 99, "tagged-vlans": "10,20"}],
+            "interface": [
+                {
+                    "interface-name": "Gi0/1",
+                    "mode": "trunk",
+                    "untagged-vlan": 99,
+                    "tagged-vlans": "10,10,20",
+                }
+            ],
         }
-        await refresh_switchport_for_device(db, device, nso)
+        assert await refresh_switchport_for_device(db, device, nso) is True
 
         sp = (await db.execute(select(DeviceSwitchport).where(DeviceSwitchport.device_id == device.id))).scalars().one()
         assert sp.mode == "trunk"
         uv = await db.get(DeviceVlan, sp.untagged_vlan_id)
         assert uv.vlan_id == 99
+        tagged = (
+            (
+                await db.execute(
+                    select(DeviceVlan.vlan_id)
+                    .join(DeviceSwitchportTaggedVlan, DeviceSwitchportTaggedVlan.vlan_id == DeviceVlan.id)
+                    .where(DeviceSwitchportTaggedVlan.switchport_id == sp.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert sorted(tagged) == [10, 20]
+
+
+@pytest.mark.anyio
+async def test_refresh_switchport_rejects_an_empty_tagged_vlan_list_without_clearing_rows(adapter_client):
+    """A malformed falsy wire value must fail before replacing the stored VLAN links."""
+    device_id = await seed_device(nso_device_name="vsw-empty-tagged", netbox_device_id=1313)
+    async with _device_session(device_id) as (db, device):
+        nso = AsyncMock()
+        sections = _serve_sections(nso)
+        sections["vlan-database"] = {
+            "status": "ok",
+            "vlan": [{"vlan-id": 10, "name": "A"}, {"vlan-id": 20, "name": "B"}],
+        }
+        await refresh_vlan_database_for_device(db, device, nso)
+        sections["switchport"] = {
+            "status": "ok",
+            "interface": [{"interface-name": "Gi0/1", "mode": "trunk", "tagged-vlans": "10,20"}],
+        }
+        await refresh_switchport_for_device(db, device, nso)
+
+        sections["switchport"] = {
+            "status": "ok",
+            "interface": [{"interface-name": "Gi0/1", "mode": "trunk", "tagged-vlans": []}],
+        }
+        with pytest.raises(ValueError, match=r"^tagged-vlans must be a string \(type list\)$"):
+            await refresh_switchport_for_device(db, device, nso)
+
+        tagged = (
+            (
+                await db.execute(
+                    select(DeviceVlan.vlan_id)
+                    .join(DeviceSwitchportTaggedVlan, DeviceSwitchportTaggedVlan.vlan_id == DeviceVlan.id)
+                    .join(DeviceSwitchport, DeviceSwitchport.id == DeviceSwitchportTaggedVlan.switchport_id)
+                    .where(DeviceSwitchport.device_id == device.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert sorted(tagged) == [10, 20], "the rejected refresh must preserve the last valid links"
+
+
+@pytest.mark.parametrize("wire", [{}, {"tagged-vlans": ""}], ids=["absent", "empty-string"])
+@pytest.mark.anyio
+async def test_refresh_switchport_treats_an_empty_tagged_vlans_leaf_as_none(adapter_client, wire):
+    """Empty is a VALUE, not malformed data, so the mirror clears rather than refusing the read.
+
+    `network-state-export.yang` types the leaf `string` and documents it as
+    "(empty = none / trunk-all)", and the producer omits it entirely when the list is empty
+    (`switchport.py`: `if tagged: entry["tagged-vlans"] = ...`). Refusing an empty value would
+    raise on every access port and roll the whole switchport materializer back.
+    """
+    device_id = await seed_device(nso_device_name=f"vsw-none-tagged-{len(wire)}", netbox_device_id=1316 + len(wire))
+    async with _device_session(device_id) as (db, device):
+        nso = AsyncMock()
+        sections = _serve_sections(nso)
+        sections["vlan-database"] = {
+            "status": "ok",
+            "vlan": [{"vlan-id": 10, "name": "A"}, {"vlan-id": 20, "name": "B"}],
+        }
+        await refresh_vlan_database_for_device(db, device, nso)
+        sections["switchport"] = {
+            "status": "ok",
+            "interface": [{"interface-name": "Gi0/1", "mode": "trunk", "tagged-vlans": "10,20"}],
+        }
+        await refresh_switchport_for_device(db, device, nso)
+
+        sections["switchport"] = {
+            "status": "ok",
+            "interface": [{"interface-name": "Gi0/1", "mode": "access", **wire}],
+        }
+        await refresh_switchport_for_device(db, device, nso)
+
+        tagged = (
+            (
+                await db.execute(
+                    select(DeviceVlan.vlan_id)
+                    .join(DeviceSwitchportTaggedVlan, DeviceSwitchportTaggedVlan.vlan_id == DeviceVlan.id)
+                    .join(DeviceSwitchport, DeviceSwitchport.id == DeviceSwitchportTaggedVlan.switchport_id)
+                    .where(DeviceSwitchport.device_id == device.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert tagged == [], "an empty tagged-vlans is 'none', so the mirror must follow the device"
+
+
+@pytest.mark.parametrize("tagged_vlans", ["not-a-vlan", "10,not-a-vlan"])
+@pytest.mark.anyio
+async def test_refresh_switchport_rejects_invalid_tagged_vlan_chunks_without_clearing_rows(
+    adapter_client, tagged_vlans
+):
+    """A malformed provider string must fail before replacing the stored VLAN links."""
+    device_id = await seed_device(nso_device_name="vsw-invalid-tagged", netbox_device_id=1314)
+    async with _device_session(device_id) as (db, device):
+        nso = AsyncMock()
+        sections = _serve_sections(nso)
+        sections["vlan-database"] = {
+            "status": "ok",
+            "vlan": [{"vlan-id": 10, "name": "A"}, {"vlan-id": 20, "name": "B"}],
+        }
+        await refresh_vlan_database_for_device(db, device, nso)
+        sections["switchport"] = {
+            "status": "ok",
+            "interface": [{"interface-name": "Gi0/1", "mode": "trunk", "tagged-vlans": "10,20"}],
+        }
+        await refresh_switchport_for_device(db, device, nso)
+
+        sections["switchport"] = {
+            "status": "ok",
+            "interface": [{"interface-name": "Gi0/1", "mode": "trunk", "tagged-vlans": tagged_vlans}],
+        }
+        with pytest.raises(ValueError, match="^tagged-vlans contains an invalid VLAN range$"):
+            await refresh_switchport_for_device(db, device, nso)
+
+        tagged = (
+            (
+                await db.execute(
+                    select(DeviceVlan.vlan_id)
+                    .join(DeviceSwitchportTaggedVlan, DeviceSwitchportTaggedVlan.vlan_id == DeviceVlan.id)
+                    .join(DeviceSwitchport, DeviceSwitchport.id == DeviceSwitchportTaggedVlan.switchport_id)
+                    .where(DeviceSwitchport.device_id == device.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert sorted(tagged) == [10, 20], "the rejected refresh must preserve the last valid links"
 
 
 @pytest.mark.anyio
@@ -191,3 +459,51 @@ async def test_refresh_switchport_keep_on_read_error(adapter_client):
             (await db.execute(select(DeviceSwitchport).where(DeviceSwitchport.device_id == device.id))).scalars().all()
         )
         assert [r.interface_name for r in rows] == ["Gi0/1"]  # kept
+
+
+@pytest.mark.anyio
+async def test_a_BOOLEAN_vlan_id_is_refused_and_never_bound_to_a_real_vlan(adapter_client):
+    """``bool`` is an ``int`` subclass, so ``int(True)`` used to mark VLAN 1 as seen.
+
+    The materializer prunes every VLAN it did not see, so a coerced ``true`` kept a row the
+    device never reported and dropped the rows it did.
+    """
+    device_id = await seed_device(nso_device_name="vsw-bool-vid", netbox_device_id=1315)
+    async with _device_session(device_id) as (db, device):
+        nso = AsyncMock()
+        sections = _serve_sections(nso)
+        sections["vlan-database"] = {"status": "ok", "vlan": [{"vlan-id": 10, "name": "MGMT"}]}
+        await refresh_vlan_database_for_device(db, device, nso)
+
+        sections["vlan-database"] = {"status": "ok", "vlan": [{"vlan-id": True, "name": "COERCED"}]}
+        with pytest.raises(ValueError) as caught:
+            await refresh_vlan_database_for_device(db, device, nso)
+
+    message = str(caught.value)
+    if "vlan-id" not in message or "bool" not in message:
+        raise AssertionError("the refusal must name the field and the received type")
+    async with _device_session(device_id) as (db, _device):
+        rows = (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device_id))).scalars().all()
+    # The harm the coercion caused: VLAN 1 counted as seen and the real rows were pruned.
+    assert [row.vlan_id for row in rows] == [10]
+
+
+@pytest.mark.anyio
+async def test_a_BOOLEAN_untagged_vlan_is_refused_and_never_bound_to_vlan_1(adapter_client):
+    """``int(True)`` bound the switchport to VLAN 1, a VLAN the device never named."""
+    device_id = await seed_device(nso_device_name="vsw-bool-untagged", netbox_device_id=1316)
+    raised, logs = await _switchport_surface_failure(
+        device_id,
+        {"interface-name": "Gi0/3", "mode": "access", "untagged-vlan": True},
+    )
+
+    message = str(raised)
+    if "untagged-vlan" not in message or "bool" not in message:
+        raise AssertionError("the refusal must name the field and the received type")
+    async with _device_session(device_id) as (db, _device):
+        rows = (
+            (await db.execute(select(DeviceSwitchport).where(DeviceSwitchport.device_id == device_id))).scalars().all()
+        )
+    assert rows == [], "the refused switchport must leave no row behind"
+    if not [record for record in logs if record["event"] == "sync.surface_refresh_failed"]:
+        raise AssertionError("the failed surface was not reported at all")

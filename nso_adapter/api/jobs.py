@@ -131,10 +131,14 @@ async def list_jobs(
     if device_id is not None:
         query = query.where(Job.device_id == device_id)
     if status is not None:
+        invalid = None
         try:
             js = JobStatus(status)
         except ValueError:
-            raise api_error(422, "validation_error", f"Invalid job status: {status!r}")
+            # Built in the handler, raised after it: a raise inside attaches the caught exception.
+            invalid = api_error(422, "validation_error", "Invalid job status")
+        if invalid is not None:
+            raise invalid
         query = query.where(Job.status == js)
     # An ascending page always walks from a cursor; absent, that cursor is the start of the
     # sequence. The predicate is also the visibility rule: `settle_seq > :cursor` is

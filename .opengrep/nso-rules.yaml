@@ -1,0 +1,338 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
+rules:
+  - id: nso-outcome-raw-exception-renderer
+    languages: [python]
+    severity: ERROR
+    message: Classify the outcome failure with failure_detail instead of rendering the exception.
+    paths:
+      include:
+        - nso_adapter/main.py
+        - nso_adapter/core/generation.py
+        - nso_adapter/core/importer.py
+        - nso_adapter/core/refresh_engine.py
+        - nso_adapter/core/redistribution.py
+        - nso_adapter/notifications/sse_subscriber.py
+        - nso_adapter/notifications/persistent_subscriber.py
+        - review-patterns.py
+    pattern-either:
+      - patterns:
+          - pattern: logger.$LEVEL(..., error=$ERROR, ...)
+          - pattern-not: logger.$LEVEL(..., error=failure_detail($EXCEPTION), ...)
+      - patterns:
+          - pattern-either:
+              - pattern: logger.$LEVEL(..., detail=$EXCEPTION, ...)
+              - pattern: logger.$LEVEL(..., detail=str($EXCEPTION), ...)
+              - pattern: logger.$LEVEL(..., detail=repr($EXCEPTION), ...)
+              - pattern: logger.$LEVEL(..., detail=f"...{$EXCEPTION}...", ...)
+              - pattern: logger.$LEVEL(..., detail=$FORMAT.format(..., $EXCEPTION, ...), ...)
+              - pattern: logger.$LEVEL(..., detail=$FORMAT % $EXCEPTION, ...)
+              - pattern: logger.$LEVEL(..., detail=$LEFT + $EXCEPTION, ...)
+              - pattern: logger.$LEVEL(..., detail=$EXCEPTION + $RIGHT, ...)
+              - pattern: logger.$LEVEL(..., detail=$LEFT + str($EXCEPTION), ...)
+              - pattern: logger.$LEVEL(..., detail=str($EXCEPTION) + $RIGHT, ...)
+              - pattern: logger.$LEVEL(..., detail=$LEFT + repr($EXCEPTION), ...)
+              - pattern: logger.$LEVEL(..., detail=repr($EXCEPTION) + $RIGHT, ...)
+              - pattern: logger.$LEVEL(..., detail=format($EXCEPTION), ...)
+          - metavariable-regex:
+              metavariable: $EXCEPTION
+              regex: ^(exc|exception|error)$
+      - pattern: logger.$LEVEL(..., exc_info=True, ...)
+      - pattern: logger.exception(...)
+  - id: nso-outcome-raw-exception-alias-renderer
+    languages: [python]
+    severity: ERROR
+    message: Classify an aliased outcome failure with failure_detail instead of rendering it.
+    mode: taint
+    paths:
+      include:
+        - nso_adapter/main.py
+        - nso_adapter/core/generation.py
+        - nso_adapter/core/importer.py
+        - nso_adapter/core/refresh_engine.py
+        - nso_adapter/core/redistribution.py
+        - nso_adapter/notifications/sse_subscriber.py
+        - nso_adapter/notifications/persistent_subscriber.py
+        - review-patterns.py
+    pattern-sources:
+      - patterns:
+          - pattern-inside: |
+              try:
+                ...
+              except $TYPE as $EXCEPTION:
+                ...
+          - pattern: $EXCEPTION
+    pattern-sanitizers:
+      - pattern: failure_detail(...)
+      - pattern: type(...).__name__
+      - pattern: http_status_of(...)
+    pattern-sinks:
+      - patterns:
+          - pattern: logger.$LEVEL(..., $FIELD=$DETAIL, ...)
+          - focus-metavariable: $DETAIL
+      - patterns:
+          - pattern: logger.$LEVEL(..., $DETAIL, ...)
+          - focus-metavariable: $DETAIL
+  - id: nso-api-validation-error-raw-exception-renderer
+    languages: [python]
+    severity: ERROR
+    message: Use an authored validation message instead of rendering request or exception data.
+    paths:
+      include:
+        - nso_adapter/api/devices.py
+        - nso_adapter/api/lag_config.py
+        - nso_adapter/api/vlan.py
+        - review-patterns.py
+    pattern-either:
+      - pattern: api_error(..., "validation_error", str($EXCEPTION), ...)
+      - pattern: api_error(..., "validation_error", repr($EXCEPTION), ...)
+      - pattern: api_error(..., "validation_error", f"...{$VALUE}...", ...)
+      - pattern: api_error(..., "validation_error", $FORMAT % $VALUE, ...)
+      - pattern: api_error(..., "validation_error", $FORMAT.format(...), ...)
+      - pattern: api_error(..., "validation_error", format($VALUE), ...)
+      - pattern: api_error(..., "validation_error", $LEFT + $RIGHT, ...)
+  - id: nso-api-validation-error-raw-data-alias
+    languages: [python]
+    severity: ERROR
+    message: Use an authored validation message instead of request or exception data.
+    mode: taint
+    paths:
+      include:
+        - nso_adapter/api/devices.py
+        - nso_adapter/api/lag_config.py
+        - nso_adapter/api/vlan.py
+        - review-patterns.py
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  def $FUNCTION(..., $REQUEST, ...):
+                    ...
+              - pattern-inside: |
+                  async def $FUNCTION(..., $REQUEST, ...):
+                    ...
+          - metavariable-regex:
+              metavariable: $REQUEST
+              regex: ^(body|payload)$
+          - pattern: $REQUEST.$FIELD
+      - patterns:
+          - pattern-inside: |
+              try:
+                ...
+              except $TYPE as $EXCEPTION:
+                ...
+          - pattern: $EXCEPTION
+    pattern-sanitizers:
+      - patterns:
+          - pattern-inside: |
+              try:
+                ...
+              except $TYPE as $EXCEPTION:
+                ...
+          - pattern: $EXCEPTION.public_message
+    pattern-sinks:
+      - patterns:
+          - pattern: api_error(..., "validation_error", $MESSAGE, ...)
+          - focus-metavariable: $MESSAGE
+  - id: nso-api-unknown-request-renderer
+    languages: [python]
+    severity: ERROR
+    message: Use an authored unknown-value response instead of rendering request data.
+    mode: taint
+    paths:
+      include:
+        - nso_adapter/api/actions.py
+        - review-patterns.py
+    pattern-sources:
+      - patterns:
+          - pattern-inside: |
+              async def action_force_removal(...):
+                ...
+          - pattern: body.scope
+    pattern-sinks:
+      - patterns:
+          - pattern: api_error(...)
+  - id: nso-api-conflict-handler-contract
+    languages: [python]
+    severity: ERROR
+    message: Use one approved authored LookupError conflict handler and its stable reason.
+    paths:
+      include:
+        - nso_adapter/api/devices.py
+        - review-patterns.py
+    patterns:
+      - pattern-either:
+          - pattern: |
+              try:
+                ...
+              except LookupError as $EXCEPTION:
+                $HANDLER
+          - pattern: |
+              try:
+                ...
+              except LookupError:
+                $HANDLER
+      - pattern-not: |
+          try:
+            ...
+          except LookupError:
+            refused = api_error(
+                409,
+                "conflict",
+                _NETBOX_DEVICE_CLAIMED_MESSAGE,
+                {"reason": "netbox_device_claimed"},
+            )
+      - pattern-not: |
+          try:
+            ...
+          except LookupError:
+            refused = api_error(
+                409,
+                "conflict",
+                _DEVICE_IDENTITY_CLAIMED_MESSAGE,
+                {"reason": "identity_claimed"},
+            )
+      - pattern-not: |
+          try:
+            ...
+          except LookupError as $EXCEPTION:
+            refused = api_error(
+                409,
+                "conflict",
+                _NETBOX_DEVICE_CLAIMED_MESSAGE,
+                {"reason": "netbox_device_claimed"},
+            )
+      - pattern-not: |
+          try:
+            ...
+          except LookupError as $EXCEPTION:
+            refused = api_error(
+                409,
+                "conflict",
+                _DEVICE_IDENTITY_CLAIMED_MESSAGE,
+                {"reason": "identity_claimed"},
+            )
+  - id: nso-failure-detail-raw-exception-renderer
+    languages: [python]
+    severity: ERROR
+    message: Return a closed classification instead of rendering exception text.
+    paths:
+      include:
+        - nso_adapter/nso/client.py
+        - review-patterns.py
+    patterns:
+      - pattern-inside: |
+          def $FUNCTION($EXCEPTION):
+            ...
+      - pattern-either:
+          - pattern: return str($EXCEPTION)
+          - pattern: return repr($EXCEPTION)
+          - pattern: return f"...{$EXCEPTION}..."
+          - pattern: return $FORMAT % $EXCEPTION
+          - pattern: return $FORMAT.format($EXCEPTION)
+          - pattern: return format($EXCEPTION)
+          - pattern: return str($EXCEPTION.$ATTRIBUTE)
+          - pattern: return repr($EXCEPTION.$ATTRIBUTE)
+  - id: nso-diagnostic-raw-identifier
+    languages: [python]
+    severity: ERROR
+    message: Log a stable internal identifier instead of a caller-provided device name or stream URL.
+    paths:
+      include:
+        - nso_adapter/main.py
+        - nso_adapter/api/capability.py
+        - nso_adapter/core/capability.py
+        - nso_adapter/core/importer.py
+        - nso_adapter/core/redistribution.py
+        - nso_adapter/core/refresh_engine.py
+        - nso_adapter/notifications/sse_subscriber.py
+        - nso_adapter/notifications/persistent_subscriber.py
+        - nso_adapter/nso/client.py
+        - review-patterns.py
+    pattern-either:
+      - pattern: logger.$LEVEL(..., device_name=$VALUE, ...)
+      - pattern: logger.$LEVEL(..., device=$VALUE, ...)
+      - pattern: logger.$LEVEL(..., stream=stream_url, ...)
+      - pattern: logger.$LEVEL(..., stream_url=stream_url, ...)
+      - pattern: logger.$LEVEL(..., url=stream_url, ...)
+  - id: nso-diagnostic-raw-identifier-alias
+    languages: [python]
+    severity: ERROR
+    message: Log a stable internal identifier instead of an aliased caller-provided identifier.
+    mode: taint
+    paths:
+      include:
+        - nso_adapter/main.py
+        - nso_adapter/api/capability.py
+        - nso_adapter/core/capability.py
+        - nso_adapter/core/importer.py
+        - nso_adapter/core/redistribution.py
+        - nso_adapter/core/refresh_engine.py
+        - nso_adapter/notifications/sse_subscriber.py
+        - nso_adapter/notifications/persistent_subscriber.py
+        - nso_adapter/nso/client.py
+        - review-patterns.py
+    pattern-sources:
+      - pattern: $D.nso_device_name
+        exact: true
+      - pattern: $D.ned_id
+        exact: true
+      - pattern: $D.sw_version
+        exact: true
+      - pattern: $B.nso_device_name
+        exact: true
+      - pattern: stream_url
+        exact: true
+    pattern-sanitizers:
+      - pattern: $D.id
+        exact: true
+      - pattern: capability.record_read_capability(...)
+        exact: true
+    pattern-sinks:
+      - patterns:
+          - pattern: logger.$LEVEL(..., $KEY=$SINK, ...)
+          - focus-metavariable: $SINK
+  - id: nso-store-legacy-query-api
+    languages: [python]
+    severity: ERROR
+    message: Query the store with select() and execute()/scalars(); Session.query is the legacy API.
+    pattern: $SESSION.query(...)
+  - id: nso-store-execute-raw-string
+    languages: [python]
+    severity: ERROR
+    message: Wrap plain SQL strings in text() or call exec_driver_sql(); Connection.execute rejects raw strings in SQLAlchemy 2.
+    patterns:
+      - pattern-either:
+          - pattern: $CONN.execute("...", ...)
+          - pattern: $CONN.execute(f"...", ...)
+          - pattern: $CONN.execute("..." + $VALUE, ...)
+          - pattern: $CONN.execute($VALUE + "...", ...)
+          - pattern: $CONN.execute("..." % $VALUE, ...)
+          - pattern: $CONN.execute($FORMAT.format(...), ...)
+      # Alembic's op.execute takes raw DDL by design.
+      - pattern-not: op.execute(...)
+  - id: nso-vault-payload-unvalidated
+    languages: [python]
+    severity: ERROR
+    message: Read a Vault KV v2 payload through _secret_data/_secret_version; hvac types the response Any, so an unguarded subscript sends an unvalidated shape to a typed mapping operation.
+    patterns:
+      - pattern-either:
+          - pattern: $SECRET["data"]["data"]
+          - pattern: $SECRET["data"].get("data", ...)
+          - pattern: $SECRET["data"]["metadata"]
+          - pattern: $SECRET["data"].get("metadata", ...)
+  - id: nso-wire-int-coercion
+    languages: [python]
+    severity: ERROR
+    message: Coerce a wire scalar with wire_int; bool is an int subclass, so int(value) reads a JSON true as 1 and binds a key the device never sent.
+    paths:
+      include:
+        - nso_adapter/core/vlan.py
+        - nso_adapter/secrets/vault.py
+        - review-patterns.py
+    patterns:
+      - pattern: int(...)
+      # wire_int IS the coercion; everything else in these modules goes through it.
+      - pattern-not-inside: |
+          def wire_int(...):
+              ...

@@ -76,7 +76,7 @@ def _client_for(sim: _NsoSim) -> NsoClient:
         username_ref="NSO_USERNAME",
         password_ref="NSO_PASSWORD",
     )
-    client = NsoClient(cfg, "admin", "admin")
+    client = NsoClient(cfg, "placeholder-user", "placeholder-password")
     client._client = lambda timeout=None: httpx.AsyncClient(
         transport=httpx.MockTransport(sim.handler), base_url="http://nso-dev:8080"
     )

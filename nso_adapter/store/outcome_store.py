@@ -60,6 +60,17 @@ def _decompose(outcome: ReadOutcome) -> tuple[str, str | None, str | None]:
     return "unavailable", outcome.reason.value, None
 
 
+def _read_failures(outcome: ReadOutcome) -> list[dict[str, str | int | None]] | None:
+    """Return the authored failure classifications for one persisted read attempt."""
+    if isinstance(outcome, Present):
+        failures = outcome.failures
+    elif isinstance(outcome, Unavailable) and outcome.failure is not None:
+        failures = (outcome.failure,)
+    else:
+        failures = ()
+    return [failure.persistence_fields() for failure in failures] or None
+
+
 async def record_read_outcome(
     db: AsyncSession,
     device_id: int,
@@ -87,6 +98,7 @@ async def record_read_outcome(
         read_outcome=read_outcome,
         read_reason=read_reason,
         freshness=freshness,
+        read_failures=_read_failures(outcome),
         source_epoch=source_epoch,
     )
     db.add(row)

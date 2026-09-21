@@ -8,6 +8,7 @@ vectors below in sync with its test suite so both repos agree on the grammar.
 import pytest
 
 from nso_adapter.secrets.refs import VaultRef, VaultRefError, parse_vault_ref
+from tests._secret_discipline import assert_text_free_of
 
 GOOD_VECTORS = [
     (
@@ -59,3 +60,26 @@ def test_require_key_modes():
 def test_non_string_rejected():
     with pytest.raises(VaultRefError):
         parse_vault_ref(None)  # type: ignore[arg-type]
+
+
+def test_rejected_reference_is_not_repeated_in_the_exception():
+    rejected = "placeholder-vault-reference"
+
+    with pytest.raises(VaultRefError) as caught:
+        parse_vault_ref(rejected)
+
+    assert_text_free_of(caught.value, [rejected])
+    assert str(caught.value) == "vault_ref must be '<mount>/<path...>'"
+
+
+def test_require_secret_fingerprint_owns_its_pattern_and_diagnostic():
+    from nso_adapter.secrets.refs import require_secret_fingerprint
+
+    rejected = "not-a-fingerprint"
+
+    assert require_secret_fingerprint("0123456789abcdef") == "0123456789abcdef"
+    with pytest.raises(ValueError) as caught:
+        require_secret_fingerprint(rejected)
+
+    assert_text_free_of(caught.value, [rejected])
+    assert str(caught.value) == "secret fingerprint must be 16 lowercase hexadecimal characters"

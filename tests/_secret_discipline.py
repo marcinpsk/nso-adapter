@@ -5,14 +5,19 @@
 ``raise ... from None`` only sets ``__suppress_context__``. The suppressed exception stays
 reachable as ``__context__`` and its repr can still hold the secret, so an assertion that
 reads those two flags passes while the material is one attribute away. Every check here
-walks both chains to the end and reads the nodes instead.
+walks the chains to the end and reads the nodes instead.
+
+"Reachable" is what a formatted traceback prints, which is more than the two chains: a note
+added with ``BaseException.add_note`` prints under the exception it is on, and an exception
+group prints its members, which hang off neither ``__cause__`` nor ``__context__``. Any task
+group raises one, so both are walked here.
 """
 
 from __future__ import annotations
 
 
 def exception_chain(exc: BaseException) -> list[BaseException]:
-    """Every exception reachable from *exc* through ``__cause__`` AND ``__context__``."""
+    """Every exception reachable from *exc*: ``__cause__``, ``__context__``, group members."""
     seen: set[int] = set()
     pending: list[BaseException | None] = [exc]
     chain: list[BaseException] = []
@@ -23,15 +28,53 @@ def exception_chain(exc: BaseException) -> list[BaseException]:
         seen.add(id(node))
         chain.append(node)
         pending += [node.__cause__, node.__context__]
+        if isinstance(node, BaseExceptionGroup):
+            pending += list(node.exceptions)
     return chain
 
 
 def assert_chain_free_of(exc: BaseException, secrets) -> None:
-    """Fail when any node of *exc*'s cause/context chain repeats one of *secrets*."""
+    """Fail when any node of *exc*'s chain, its notes included, repeats one of *secrets*."""
     for node in exception_chain(exc):
-        rendered = f"{node!r} {node}"
-        for secret in secrets:
-            assert secret not in rendered, f"{type(node).__name__} in the chain repeats secret material"
+        rendered = " ".join((repr(node), str(node), *getattr(node, "__notes__", ())))
+        for index, secret in enumerate(secrets):
+            if secret in rendered:
+                raise AssertionError(f"exception chain repeats secret material (secrets[{index}])")
+
+
+def assert_text_free_of(value, secrets) -> None:
+    """Fail without copying protected material or the inspected value into diagnostics."""
+    rendered = str(value)
+    for index, secret in enumerate(secrets):
+        if secret in rendered:
+            raise AssertionError(f"text repeats secret material (secrets[{index}])")
+
+
+def assert_text_contains(value, fragments) -> None:
+    """The presence half of :func:`assert_text_omits`, with the same non-disclosure property.
+
+    pytest rewrites ``assert "reconcile=" in str(url)`` and prints the whole URL on failure,
+    and the URL carries the device name. The fragment IS named; the surface never is.
+    """
+    rendered = str(value)
+    for fragment in fragments:
+        if fragment not in rendered:
+            raise AssertionError(f"text does not contain {fragment!r}")
+
+
+def assert_text_omits(value, fragments) -> None:
+    """Fail without copying the inspected value into diagnostics.
+
+    The sibling of :func:`assert_text_free_of` for an absence check over text that carries no
+    protected material of its own — a URL query parameter, a tool's own stderr. The property is
+    the same: pytest must not rewrite the assertion and print the whole surface, because the
+    surface can carry protected material even when the fragment does not. The fragment IS named,
+    because naming it discloses nothing and the test is unreadable without it.
+    """
+    rendered = str(value)
+    for fragment in fragments:
+        if fragment in rendered:
+            raise AssertionError(f"text contains {fragment!r}")
 
 
 class EchoingVault:
@@ -57,4 +100,5 @@ def assert_records_free_of(records, secrets) -> None:
     rendered = repr([dict(record) for record in records])
     for index, secret in enumerate(secrets):
         # The index, never the value: a failure prints this into pytest output and CI logs.
-        assert secret not in rendered, f"a log record repeats secret material (secrets[{index}])"
+        if secret in rendered:
+            raise AssertionError(f"a log record repeats secret material (secrets[{index}])")

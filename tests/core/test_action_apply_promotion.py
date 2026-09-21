@@ -17,6 +17,7 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from tests._secret_discipline import assert_text_free_of
 from tests.api.test_static_route_deleted_routes import deleted as deleted_route
 from tests.api.test_static_route_identity import entry as route_entry
 from tests.conftest import VALID_TOKEN, seed_device, session
@@ -82,6 +83,26 @@ async def _put_svis(client, device_id: int, vlan_ids: list[int], *, seq: int, qu
         },
         headers=AUTH | {"X-Push-Seq": str(seq)},
     )
+
+
+async def test_freeze_returns_the_fragment_on_the_success_path(adapter_client):
+    """A `return` inside the try exits `_freeze`; the trailing `raise` is unreachable on success.
+
+    A review read `raise unexecutable` (generation.py) as reachable after a successful return and
+    called it an UnboundLocalError on every call. It is reachable only when the except handler ran
+    and bound the name. This pins the real control flow so the claim cannot be re-argued.
+    """
+    from nso_adapter.core.generation import _freeze
+    from nso_adapter.core.projection import snapshot_stream
+    from nso_adapter.store.models import Device
+
+    device_id = await seed_device(nso_device_name="placeholder-freeze-success")
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        tables = await snapshot_stream(db, device_id, "static_route")
+        fragment = await _freeze(db, device, "static_route", tables)
+
+    assert isinstance(fragment, dict)
 
 
 async def _apply(client, device_id: int, selected: dict[str, int], *, attempt_id=None):
@@ -838,10 +859,14 @@ async def test_interface_config_generation_refuses_unresolvable_attribute_eligib
     assert await _jobs(device_id) == []
     assert (await _stream(device_id, "interface_config")).authorized_revision == 0
     warning = next(log for log in logs if log["event"] == "generation.interface_eligibility_unresolved")
+    non_device_fields = {key: value for key, value in warning.items() if key != "device_id"}
+    assert_text_free_of(non_device_fields, [str(iface_id), "description"])
     assert warning["device_id"] == device_id
-    assert f"interface {iface_id}" in warning["detail"]
-    assert "attribute 'description'" in warning["detail"]
-    assert warning["exc_info"] is True
+    assert warning["error"] == "InterfaceEligibilityUnresolved"
+    assert "detail" not in warning
+    assert "exc_info" not in warning
+    identifier_fields = {"interface_id", "interface_name", "netbox_interface_id", "nso_if_key"}
+    assert identifier_fields.isdisjoint(warning)
 
 
 async def test_unrelated_promotion_preserves_recorded_interface_eligibility(adapter_client):

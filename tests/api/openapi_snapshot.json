@@ -2746,12 +2746,12 @@
             ],
             "title": "Acl"
           },
-          "secret_hash": {
-            "title": "Secret Hash",
+          "operation_id": {
+            "title": "Operation Id",
             "type": "string"
           },
-          "vault_ref": {
-            "title": "Vault Ref",
+          "secret_hash": {
+            "title": "Secret Hash",
             "type": "string"
           },
           "version": {
@@ -2760,7 +2760,7 @@
           }
         },
         "required": [
-          "vault_ref",
+          "operation_id",
           "secret_hash",
           "version",
           "access",
@@ -2772,6 +2772,7 @@
       "HarvestCommunityRequest": {
         "properties": {
           "community_hash": {
+            "pattern": "^[0-9a-f]{16}$",
             "title": "Community Hash",
             "type": "string"
           },
@@ -7514,26 +7515,36 @@
       },
       "SecretVerifyOut": {
         "properties": {
-          "exists": {
-            "title": "Exists",
+          "fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fingerprint"
+          },
+          "has_auth": {
+            "title": "Has Auth",
             "type": "boolean"
           },
-          "fields": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Fields",
-            "type": "array"
+          "has_priv": {
+            "title": "Has Priv",
+            "type": "boolean"
           },
-          "hashes": {
-            "additionalProperties": {
-              "type": "string"
-            },
-            "title": "Hashes",
-            "type": "object"
+          "operation_id": {
+            "title": "Operation Id",
+            "type": "string"
           },
-          "vault_ref": {
-            "title": "Vault Ref",
+          "status": {
+            "enum": [
+              "present",
+              "missing_path",
+              "missing_field"
+            ],
+            "title": "Status",
             "type": "string"
           },
           "version": {
@@ -7549,10 +7560,11 @@
           }
         },
         "required": [
-          "vault_ref",
-          "exists",
-          "fields",
-          "hashes",
+          "operation_id",
+          "status",
+          "fingerprint",
+          "has_auth",
+          "has_priv",
           "version"
         ],
         "title": "SecretVerifyOut",
@@ -7573,15 +7585,8 @@
       },
       "SecretWriteOut": {
         "properties": {
-          "hashes": {
-            "additionalProperties": {
-              "type": "string"
-            },
-            "title": "Hashes",
-            "type": "object"
-          },
-          "vault_ref": {
-            "title": "Vault Ref",
+          "operation_id": {
+            "title": "Operation Id",
             "type": "string"
           },
           "version": {
@@ -7590,9 +7595,8 @@
           }
         },
         "required": [
-          "vault_ref",
-          "version",
-          "hashes"
+          "operation_id",
+          "version"
         ],
         "title": "SecretWriteOut",
         "type": "object"
@@ -15465,7 +15469,7 @@
     },
     "/api/v1/secrets": {
       "post": {
-        "description": "Merge-write secret fields at the ref's Vault path; return version + fingerprints.",
+        "description": "Merge-write secret fields at the ref's Vault path; return the operation_id and new KV v2 version.",
         "operationId": "set_secret_api_v1_secrets_post",
         "requestBody": {
           "content": {
@@ -15552,7 +15556,7 @@
     },
     "/api/v1/secrets/verify": {
       "post": {
-        "description": "Resolve a ref and return field names + fingerprints \u2014 never the values.",
+        "description": "Resolve a ref and return its fixed verification projection.",
         "operationId": "verify_secret_api_v1_secrets_verify_post",
         "requestBody": {
           "content": {

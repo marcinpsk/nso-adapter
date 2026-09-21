@@ -18,6 +18,7 @@ import pytest
 
 from nso_adapter.config import NsoInstanceConfig
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError, NsoReadContractError
+from tests._secret_discipline import assert_chain_free_of, assert_text_contains, assert_text_free_of
 
 
 def _make_client() -> NsoClient:
@@ -29,7 +30,7 @@ def _make_client() -> NsoClient:
         password_ref="NSO_PASSWORD",
         host_header=None,
     )
-    return NsoClient(cfg, "admin", "secret")
+    return NsoClient(cfg, "placeholder-user", "secret")
 
 
 class EnvelopeTransport(httpx.AsyncBaseTransport):
@@ -44,7 +45,7 @@ class EnvelopeTransport(httpx.AsyncBaseTransport):
         self,
         *,
         device_status: int = 200,
-        device_body: dict | None = None,
+        device_body: object | None = None,
         container_status: int = 200,
         action_status: int = 200,
         action_body: dict | None = None,
@@ -128,8 +129,10 @@ async def test_section_404_with_healthy_container_is_device_absent(patch_client)
 async def test_section_404_with_dead_container_raises_export_unavailable(patch_client):
     client = _make_client()
     with patch_client(client, EnvelopeTransport(device_status=404, container_status=404)):
-        with pytest.raises(NsoExportUnavailableError):
-            await client.get_device_state_section("sw01", "ospf-config")
+        with pytest.raises(NsoExportUnavailableError) as caught:
+            await client.get_device_state_section("placeholder-secret-device", "ospf-config")
+
+    assert_text_free_of(caught.value, ["placeholder-secret"])
 
 
 async def test_section_5xx_raises(patch_client):
@@ -168,8 +171,11 @@ async def test_doc_404_with_healthy_container_is_device_absent(patch_client):
 async def test_doc_404_with_dead_container_raises_export_unavailable(patch_client):
     client = _make_client()
     with patch_client(client, EnvelopeTransport(device_status=404, container_status=404)):
-        with pytest.raises(NsoExportUnavailableError):
-            await client.get_device_state_doc("sw01")
+        with pytest.raises(NsoExportUnavailableError) as caught:
+            await client.get_device_state_doc("placeholder-secret-device")
+
+    assert_chain_free_of(caught.value, ["placeholder-secret"])
+    assert caught.value.__context__ is None, "the malformed response must not stay attached"
 
 
 # ── run_device_state_read ────────────────────────────────────────────────────────────
@@ -194,7 +200,7 @@ async def test_action_posts_module_qualified_input_and_returns_output(patch_clie
     sent = json.loads(transport.requests[0].content)
     assert sent == {"network-state-export:input": {"device": "sw01", "family": ["ospf-config", "logging-config"]}}
     # The CANONICAL nested-action form (S2b contract): the action lives under /restconf/data.
-    assert "/restconf/data/network-state-export:device-state-read/run" in str(transport.requests[0].url)
+    assert_text_contains(transport.requests[0].url, ["/restconf/data/network-state-export:device-state-read/run"])
 
 
 async def test_action_error_raises_http_status_error(patch_client):
@@ -231,20 +237,45 @@ async def test_section_and_doc_run_on_the_blanket_timeout(patch_client):
     "body",
     [
         {},  # empty document
+        [],  # valid JSON, wrong top-level type
+        None,  # invalid empty JSON body
         {"network-state-export:device": []},  # empty device list
         {"wrong-namespace:device": [{"device-name": "sw01"}]},  # wrong namespace
         {"network-state-export:device": [{"device-name": "OTHER"}]},  # mismatched device
         {"network-state-export:device": [{"device-name": "sw01"}, {"device-name": "sw02"}]},  # multiple
     ],
-    ids=["empty-doc", "empty-list", "wrong-ns", "mismatch", "multiple"],
+    ids=["empty-doc", "top-level-list", "invalid-json", "empty-list", "wrong-ns", "mismatch", "multiple"],
 )
 async def test_doc_malformed_200_raises_never_absence(patch_client, body):
     """None is RESERVED for the confirmed-404 branch: a truncated/mangled 200 classified
     as device absence would clear every pop-policy family downstream."""
     client = _make_client()
     with patch_client(client, EnvelopeTransport(device_body=body)):
-        with pytest.raises(NsoExportUnavailableError):
+        with pytest.raises(NsoReadContractError) as caught:
+            await client.get_device_state_doc("placeholder-secret-device")
+
+    assert_text_free_of(caught.value, ["placeholder-secret"])
+
+
+async def test_doc_UNDECODABLE_200_refuses_without_keeping_the_decode_error_on_the_chain(patch_client):
+    """`resp.json()` can raise UnicodeDecodeError, whose message quotes the provider's bytes.
+
+    The refusal is raised AFTER the handler has exited, so the interpreter attaches nothing:
+    `raise ... from None` inside the handler would be a second way to say the same thing.
+    """
+    provider_bytes = b'{"leak": "placeholder-provider-body"}\xff'
+
+    def _respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=provider_bytes, headers={"content-type": "application/yang-data+json"})
+
+    client = _make_client()
+    with patch_client(client, httpx.MockTransport(_respond)):
+        with pytest.raises(NsoReadContractError) as caught:
             await client.get_device_state_doc("sw01")
+
+    assert caught.value.__context__ is None, "the decode error must not travel with the refusal"
+    assert caught.value.__cause__ is None
+    assert_chain_free_of(caught.value, ["placeholder-provider-body"])
 
 
 # ── READSEM 1328: run_device_state_read certifies the snapshot before any consumer walks it ──

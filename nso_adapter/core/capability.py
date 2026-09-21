@@ -223,15 +223,16 @@ async def refresh_device_capability(
     # platform stringifies to a truthy "None"); neither may become a bogus cache key.
     ned_id = _clean_capability_key(out.get("ned-id"))
     sw_version = _clean_capability_key(out.get("sw-version"))
+    log_identity = {"device_id": device.id} if device is not None else {}
     if not ned_id:
-        logger.debug("capability.refresh.no_ned", device=device_name)
+        logger.debug("capability.refresh.no_ned", **log_identity)
         return {}
     elements = out.get("element", []) or []
     count = await record_probe_capability(db, ned_id, sw_version, elements)
     if device is not None and (device.ned_id != ned_id or device.sw_version != sw_version):
         device.ned_id, device.sw_version = ned_id, sw_version
         await db.commit()
-    logger.info("capability.refresh.done", device=device_name, ned_id=ned_id, sw_version=sw_version, elements=count)
+    logger.info("capability.refresh.done", elements=count, **log_identity)
     return {"ned_id": ned_id, "sw_version": sw_version, "count": count}
 
 

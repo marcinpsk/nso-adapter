@@ -113,8 +113,11 @@ async def test_refresh_parses_and_stores_probe_output(adapter_client, monkeypatc
 @pytest.mark.asyncio
 async def test_refresh_persists_key_then_cache_only_resolve(adapter_client, monkeypatch):  # noqa: F811
     """A probe persists (ned_id, sw_version) on the device so a later read needs no probe."""
+    from structlog.testing import capture_logs
+
     from nso_adapter.core import capability
     from nso_adapter.store.models import Device
+    from tests._secret_discipline import assert_records_free_of
     from tests.conftest import seed_device
 
     device_id = await seed_device(nso_device_name="rg03")
@@ -138,9 +141,18 @@ async def test_refresh_persists_key_then_cache_only_resolve(adapter_client, monk
         assert probe_calls["n"] == 0
 
         # refresh=True probes once and persists the learned key onto the device row
-        info = await capability.resolve_capability_key(db, object(), device, refresh=True)
+        with capture_logs() as logs:
+            info = await capability.resolve_capability_key(db, object(), device, refresh=True)
         assert info["ned_id"] == _NED and info["sw_version"] == "17.15.4c"
         assert probe_calls["n"] == 1
+        record = next(record for record in logs if record["event"] == "capability.refresh.done")
+        assert_records_free_of([record], ["rg03", _NED, "17.15.4c"])
+        assert record == {
+            "event": "capability.refresh.done",
+            "log_level": "info",
+            "device_id": device_id,
+            "elements": 1,
+        }
         refreshed = await db.get(Device, device_id)
         assert (refreshed.ned_id, refreshed.sw_version) == (_NED, "17.15.4c")
 
@@ -309,8 +321,14 @@ def test_a_community_list_row_indexes_under_the_kind_its_list_carries():
 async def test_refresh_ned_id_literal_none_not_persisted(adapter_client, monkeypatch):  # noqa: F811
     """A probe reporting the literal string 'None' for ned-id (an unselected device_type.cli)
     must NOT become a capability key or be persisted onto the device (#13)."""
+    import logging
+
+    import structlog
+    from structlog.testing import capture_logs
+
     from nso_adapter.core import capability
     from nso_adapter.store.models import Device
+    from tests._secret_discipline import assert_records_free_of
     from tests.conftest import seed_device
 
     device_id = await seed_device(nso_device_name="rgX")
@@ -321,9 +339,22 @@ async def test_refresh_ned_id_literal_none_not_persisted(adapter_client, monkeyp
     monkeypatch.setattr(capability.actions, "capability_probe", fake_probe)
     async with session() as db:
         device = await db.get(Device, device_id)
-        res = await capability.refresh_device_capability(db, object(), "rgX", device)
+        prior_config = structlog.get_config().copy()
+        structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG))
+        try:
+            with capture_logs() as logs:
+                res = await capability.refresh_device_capability(db, object(), "rgX", device)
+        finally:
+            structlog.configure(**prior_config)
         assert res == {}  # 'None' ned-id → treated as no NED, nothing recorded
         assert device.ned_id != "None"  # never persisted as a bogus key
+        record = next(record for record in logs if record["event"] == "capability.refresh.no_ned")
+        assert_records_free_of([record], ["rgX", "None"])
+        assert record == {
+            "event": "capability.refresh.no_ned",
+            "log_level": "debug",
+            "device_id": device_id,
+        }
 
 
 @pytest.mark.asyncio

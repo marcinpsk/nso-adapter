@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
-"""Zizmor consumers must execute the locked uv dependency."""
+"""Local lint consumers must resolve their declared tools."""
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -13,6 +15,13 @@ import yaml
 ROOT = Path(__file__).parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 PRE_COMMIT = ROOT / ".pre-commit-config.yaml"
+REVIEW_PATTERNS = ROOT / "scripts" / "check-review-patterns"
+
+# Bare program name: subprocess resolves it through the PATH below, not the caller's.
+_SCAN_ARGV = ["bash", str(REVIEW_PATTERNS), "scan"]
+_RESTRICTED_PATH = "/usr/bin:/bin"
+# The PATH alone does not isolate the prerequisite: a host with /usr/bin/opengrep resolves it.
+_MISSING_OPENGREP = "opengrep-that-this-test-never-installs"
 
 _REMOTE_ZIZMOR_HOOK = "https://github.com/zizmorcore/zizmor-pre-commit"
 _ZIZMOR_UV_PREFIX = ["uv", "run", "--locked", "--native-tls", "--", "zizmor"]
@@ -68,3 +77,39 @@ def test_zizmor_consumers_share_locked_uv_dependency():
     assert ci_command[-1] == "."
     collections = {token.removeprefix("--collect=") for token in ci_command if token.startswith("--collect=")}
     assert collections == _ZIZMOR_COLLECTIONS
+
+
+def test_review_pattern_hook_resolves_its_interpreter_through_the_restricted_path() -> None:
+    """``/usr/bin/bash`` is absent on macOS, and an absolute program ignores the PATH below."""
+    assert os.path.dirname(_SCAN_ARGV[0]) == "", "the interpreter must resolve through the supplied PATH"
+
+
+def test_review_pattern_hook_explains_its_opengrep_prerequisite() -> None:
+    result = subprocess.run(
+        _SCAN_ARGV,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={"PATH": _RESTRICTED_PATH, "OPENGREP_BIN": _MISSING_OPENGREP},
+    )
+
+    assert result.returncode == 127
+    assert result.stderr.strip() == "OpenGrep is required. Install it or set OPENGREP_BIN. See README.md."
+
+
+def test_the_opengrep_prerequisite_holds_where_opengrep_is_on_the_path(tmp_path):
+    """The restricted PATH is this host's layout, not a guarantee: some carry /usr/bin/opengrep."""
+    planted = tmp_path / "opengrep"
+    planted.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    planted.chmod(0o755)
+
+    result = subprocess.run(
+        _SCAN_ARGV,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{tmp_path}:{_RESTRICTED_PATH}", "OPENGREP_BIN": _MISSING_OPENGREP},
+    )
+
+    assert result.returncode == 127
+    assert result.stderr.strip() == "OpenGrep is required. Install it or set OPENGREP_BIN. See README.md."

@@ -17,10 +17,16 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import select
 
-from nso_adapter.core.refresh_engine import run_family_refresh, run_family_refresh_from_section
+from nso_adapter.core.refresh_engine import (
+    run_family_refresh,
+    run_family_refresh_from_outcome,
+    run_family_refresh_from_section,
+)
 from nso_adapter.core.static_route import STATIC_ROUTE_SPEC
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
+from nso_adapter.nso.read_outcome import AbsentAuthoritative, Unavailable, UnavailableReason
 from nso_adapter.store.models import Device, DeviceStaticRoute, RefreshOutcome
+from tests._secret_discipline import assert_records_free_of
 from tests.conftest import seed_device, session
 
 ENV_SPEC = dataclasses.replace(STATIC_ROUTE_SPEC, wire_name="static-route")
@@ -151,6 +157,28 @@ async def test_error_keeps_rows_and_reports_degraded(adapter_client):
         assert await _routes(db, device_id) == ["10.0.0.0/8"]
 
 
+@pytest.mark.parametrize("section", [["not-a-section"], "not-a-section", 7])
+@pytest.mark.anyio
+async def test_non_mapping_section_is_classified_and_keeps_rows(adapter_client, section):
+    """A malformed served section is a read failure, not a refresh crash."""
+    from structlog.testing import capture_logs
+
+    device_id = await seed_device(nso_device_name="eng-env-malformed", netbox_device_id=9715)
+    await _seed_one_route(device_id)
+    async with _device_session(device_id) as (db, device):
+        with capture_logs() as logs:
+            ok = await run_family_refresh(db, device, _client(section=section), ENV_SPEC)
+
+        assert ok is False
+        assert await _routes(db, device_id) == ["10.0.0.0/8"]
+        outcome_row = await _latest_outcome(db, device_id)
+        assert (outcome_row.read_outcome, outcome_row.read_reason) == ("unavailable", "read_error")
+
+    record = next(record for record in logs if record["event"] == "static_route.refresh.unavailable")
+    assert record["read_operation"] == "section_classify"
+    assert record["failure_code"] == "section_malformed"
+
+
 # ── not-ready escalation (the record-warming path) ──────────────────────────────────
 
 
@@ -171,6 +199,42 @@ async def test_not_ready_escalates_to_the_action_and_uses_its_section(adapter_cl
         assert ok is True
         assert await _routes(db, device_id) == ["172.16.0.0/12"]
         client.run_device_state_read.assert_awaited_once_with("eng-env-notready", ["static-route"])
+
+
+@pytest.mark.anyio
+async def test_refresh_events_do_not_log_the_nso_device_name(adapter_client):
+    """Refresh diagnostics identify the stored row, not its caller-provided name."""
+    from structlog.testing import capture_logs
+
+    device_name = "placeholder-device-secret"
+    device_id = await seed_device(nso_device_name=device_name, netbox_device_id=9724)
+    async with _device_session(device_id) as (db, device):
+        with capture_logs() as logs:
+            client = _client(
+                section={"status": "not-ready"},
+                action_output={"atomic": True, "static-route": OK_SECTION},
+            )
+            assert await run_family_refresh(db, device, client, ENV_SPEC) is True
+            assert await run_family_refresh_from_outcome(db, device, ENV_SPEC, AbsentAuthoritative()) is True
+            assert (
+                await run_family_refresh_from_outcome(
+                    db,
+                    device,
+                    ENV_SPEC,
+                    Unavailable(UnavailableReason.not_authoritative),
+                )
+                is True
+            )
+
+    expected_events = {
+        "static_route.refresh.not_ready_escalating",
+        "static_route.refresh.done",
+        "static_route.refresh.cleared",
+        "static_route.refresh.not_authoritative",
+    }
+    records = [record for record in logs if record["event"] in expected_events]
+    assert {record["event"] for record in records} == expected_events
+    assert_records_free_of(records, [device_name])
 
 
 @pytest.mark.anyio
@@ -207,6 +271,51 @@ async def test_escalation_action_error_keeps_rows(adapter_client):
 
         assert ok is False
         assert await _routes(db, device_id) == ["10.0.0.0/8"]
+        outcome_row = await _latest_outcome(db, device_id)
+        assert outcome_row.read_failures == [
+            {
+                "read_operation": "device_state_read",
+                "component_family": "static-route",
+                "error_type": "RuntimeError",
+                "http_status": None,
+                "failure_code": "heal_action_failed",
+            }
+        ]
+
+
+@pytest.mark.anyio
+async def test_escalation_output_with_an_explicit_null_section_is_malformed(adapter_client):
+    """An action that ANSWERED the family with null sent something unusable, not nothing.
+
+    `output.get(wire)` returns None for an absent key and for a present null, and only the
+    absent key is the action's own omission contract failure.
+    """
+    device_id = await seed_device(nso_device_name="eng-env-nullsect", netbox_device_id=9711)
+    await _seed_one_route(device_id)
+    async with _device_session(device_id) as (db, device):
+        client = _client(section={"status": "not-ready"}, action_output={"atomic": True, "static-route": None})
+
+        ok = await run_family_refresh(db, device, client, ENV_SPEC)
+
+        assert ok is False
+        assert await _routes(db, device_id) == ["10.0.0.0/8"]
+        outcome_row = await _latest_outcome(db, device_id)
+        assert [f["failure_code"] for f in outcome_row.read_failures] == ["section_malformed"]
+
+
+@pytest.mark.anyio
+async def test_escalation_output_omitting_the_section_is_the_action_omission(adapter_client):
+    """The companion case: an omitted key stays `action_section_missing`, so the two pin each other."""
+    device_id = await seed_device(nso_device_name="eng-env-nokey", netbox_device_id=9712)
+    await _seed_one_route(device_id)
+    async with _device_session(device_id) as (db, device):
+        client = _client(section={"status": "not-ready"}, action_output={"atomic": True})
+
+        ok = await run_family_refresh(db, device, client, ENV_SPEC)
+
+        assert ok is False
+        outcome_row = await _latest_outcome(db, device_id)
+        assert [f["failure_code"] for f in outcome_row.read_failures] == ["action_section_missing"]
 
 
 @pytest.mark.anyio

@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import text
 
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import VALID_TOKEN, push_seq, seed_device, seed_switchport, seed_vlan_database, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -565,3 +566,23 @@ async def test_apply_switchport_requires_an_explicit_deletion_authority(adapter_
 
     assert response.status_code == 422
     assert await _switchport_stream_row(device_id) is None
+
+
+@pytest.mark.anyio
+async def test_apply_switchport_refusal_states_the_reason_and_not_the_root(adapter_client):
+    """The 422 forwarded str(exc), which interpolates the roots the request sent."""
+    device_id = await seed_device(nso_device_name="switchport-refusal-echo", netbox_device_id=None)
+    assert (await _post_switchport(adapter_client, device_id, _SWITCHPORT_A)).status_code == 200
+
+    response = await _post_switchport(
+        adapter_client,
+        device_id,
+        {"interfaces": [], "deleted_roots": ["placeholder-unauthorized-root"]},
+    )
+
+    assert_text_free_of(response.text, ["placeholder-unauthorized-root"])
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "validation_error"
+    assert error["message"] == "a deleted root is not authorized on this device"
+    assert error["detail"] == {"reason": "root_not_authorized"}

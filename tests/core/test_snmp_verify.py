@@ -74,6 +74,26 @@ def test_ONE_bad_ref_does_not_sink_the_GOOD_ones():
     assert sorted(out) == ["prod-ro"]
 
 
+def test_ONE_non_string_secret_does_not_sink_the_GOOD_ones():
+    malformed_path = ("network", "netbox/snmp/community/malformed")
+    provider = FakeVault(
+        {
+            _PATH: {"community": SNMP_COMMUNITY},
+            malformed_path: {"community": 42},
+        }
+    )
+
+    out = _fingerprints_blocking(
+        provider,
+        {
+            "prod-ro": SNMP_VAULT_REF,
+            "malformed": f"{malformed_path[0]}/{malformed_path[1]}#community",
+        },
+    )
+
+    assert out == {"prod-ro": community_export_name(SNMP_COMMUNITY)}
+
+
 def test_a_vault_OUTAGE_yields_nothing_and_never_raises():
     """Every ref fails, and the caller sees an empty map — which it must read as "unverifiable",
     never as "none of these are on the device".

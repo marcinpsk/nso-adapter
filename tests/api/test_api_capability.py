@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import pytest
 
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -40,6 +41,18 @@ def _fake_probe(monkeypatch, calls):
         return _PROBE_OUT
 
     monkeypatch.setattr(capability.actions, "capability_probe", fake_probe)
+
+
+@pytest.mark.asyncio
+async def test_unregistered_instance_refusal_does_not_echo_the_persisted_name(adapter_client):
+    instance = "placeholder-unregistered-instance"
+    device_id = await seed_device(nso_instance=instance, nso_device_name="placeholder-capability-device")
+
+    resp = await adapter_client.post(f"/api/v1/devices/{device_id}/capability/refresh", headers=AUTH)
+
+    assert_text_free_of(resp.text, [instance])
+    assert resp.status_code == 409
+    assert resp.json()["error"] == {"code": "no_nso_client", "message": "No NSO client is registered", "detail": {}}
 
 
 @pytest.mark.asyncio
@@ -224,21 +237,34 @@ async def _seed_device_with_key(name: str, ned: str = _NED, sw: str = "17.15.4c"
 async def test_read_capability_report_records_rows_under_the_device_key(adapter_client_with_nso):  # noqa: F811
     """The harness posts per-scope read states by NSO device name; the adapter resolves the
     (ned, sw) key from the device row and the rows come back via GET /capability."""
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
     device_id = await _seed_device_with_key("rg03")
 
-    resp = await adapter_client_with_nso.post(
-        "/api/v1/devices/read-capability/report",
-        headers=AUTH,
-        json={
-            "nso_device_name": "rg03",
-            "elements": [
-                {"scope": "bgp", "status": "native", "detail": "read 11 item(s) on rg03"},
-                {"scope": "isis", "status": "unknown", "detail": "reads empty on rg03"},
-            ],
-        },
-    )
+    with capture_logs() as logs:
+        resp = await adapter_client_with_nso.post(
+            "/api/v1/devices/read-capability/report",
+            headers=AUTH,
+            json={
+                "nso_device_name": "rg03",
+                "elements": [
+                    {"scope": "bgp", "status": "native", "detail": "read 11 item(s) on rg03"},
+                    {"scope": "isis", "status": "unknown", "detail": "reads empty on rg03"},
+                ],
+            },
+        )
     assert resp.status_code == 200
     assert resp.json() == {"ned_id": _NED, "sw_version": "17.15.4c", "count": 2}
+    record = next(record for record in logs if record["event"] == "capability.read_report")
+    assert_records_free_of([record], ["rg03", _NED, "17.15.4c"])
+    assert record == {
+        "event": "capability.read_report",
+        "log_level": "info",
+        "device_id": device_id,
+        "rows": 2,
+    }
 
     resp = await adapter_client_with_nso.get(f"/api/v1/devices/{device_id}/capability", headers=AUTH)
     body = resp.json()
@@ -257,6 +283,32 @@ async def test_read_capability_report_unknown_device_is_404(adapter_client_with_
         json={"nso_device_name": "no-such-device", "elements": [{"scope": "bgp", "status": "native"}]},
     )
     assert resp.status_code == 404
+    # The submitted name is caller-controlled; the closed code already distinguishes the case.
+    from tests._secret_discipline import assert_text_free_of
+
+    assert_text_free_of(resp.text, ["no-such-device"])
+
+
+@pytest.mark.asyncio
+async def test_read_capability_report_ambiguous_device_does_not_echo_the_name(adapter_client_with_nso):  # noqa: F811
+    """Two instances holding the same node name must not turn the submitted name into a response."""
+    from tests._secret_discipline import assert_text_free_of
+
+    name = "placeholder-ambiguous-node"
+    # Same node name under two instances: allowed by uq_device_nso_identity, ambiguous to a
+    # lookup that does not pass nso_instance.
+    await _seed_device_with_key(name)
+    await seed_device(nso_instance="nso-dev-2", nso_device_name=name, netbox_device_id=9931)
+
+    resp = await adapter_client_with_nso.post(
+        "/api/v1/devices/read-capability/report",
+        headers=AUTH,
+        json={"nso_device_name": name, "elements": [{"scope": "bgp", "status": "native"}]},
+    )
+
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "ambiguous_device"
+    assert_text_free_of(resp.text, [name])
 
 
 @pytest.mark.asyncio

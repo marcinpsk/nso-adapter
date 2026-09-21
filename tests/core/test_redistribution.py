@@ -7,6 +7,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from sqlalchemy import select
 
@@ -14,6 +15,7 @@ from nso_adapter.core.redistribution import refresh_redistribution_for_device, r
 from nso_adapter.nso.client import NsoExportUnavailableError
 from nso_adapter.nso.read_outcome import Freshness, Present, Unavailable, UnavailableReason
 from nso_adapter.store.models import Device, DeviceRedistribution
+from tests._secret_discipline import assert_records_free_of, assert_text_free_of
 from tests.conftest import seed_device, session
 
 
@@ -74,6 +76,97 @@ async def test_superseded_export_outage_does_not_degrade_newer_winner(adapter_cl
         )
 
     assert ok is True
+
+
+@pytest.mark.anyio
+async def test_redistribution_diagnostics_omit_the_nso_device_name(adapter_client):
+    """Every redistribution outcome uses the stored ID, not the submitted NSO name."""
+    from structlog.testing import capture_logs
+
+    device_name = "placeholder-redistribution-device"
+    device_id = await seed_device(nso_device_name=device_name, netbox_device_id=7698)
+    present = Present({}, Freshness.fresh)
+    async with _device_session(device_id) as (db, device):
+        with capture_logs() as logs:
+            await refresh_redistribution_from_outcomes(
+                db,
+                device,
+                {
+                    "ospf": Unavailable(UnavailableReason.export_down),
+                    "isis": present,
+                    "bgp": present,
+                },
+                refresh_source="test",
+                own_lock=False,
+            )
+            await refresh_redistribution_from_outcomes(
+                db,
+                device,
+                {protocol: present for protocol in ("ospf", "isis", "bgp")},
+                refresh_source="test",
+                own_lock=False,
+            )
+            await refresh_redistribution_from_outcomes(
+                db,
+                device,
+                {
+                    "ospf": present,
+                    "isis": Unavailable(UnavailableReason.unsupported),
+                    "bgp": Unavailable(UnavailableReason.read_error),
+                },
+                refresh_source="test",
+                own_lock=False,
+            )
+
+    expected_events = {
+        "redistribution.refresh.degraded",
+        "redistribution.refresh.done",
+        "redistribution.refresh.component_unsupported",
+        "redistribution.refresh.component_kept",
+    }
+    records = [record for record in logs if record["event"] in expected_events]
+    assert {record["event"] for record in records} == expected_events
+    assert all(record["device_id"] == device_id for record in records)
+    assert_records_free_of(records, [device_name])
+
+
+@pytest.mark.anyio
+async def test_component_kept_carries_the_failure_classification(adapter_client):
+    """`reason` alone cannot tell an auth refusal from a malformed body; the classification can."""
+    from structlog.testing import capture_logs
+
+    from nso_adapter.nso.read_outcome import ReadFailure, ReadFailureCode, ReadOperation
+
+    device_name = "rd-kept-classified"
+    device_id = await seed_device(nso_device_name=device_name, netbox_device_id=7799)
+    failure = ReadFailure(
+        operation=ReadOperation.device_state_read,
+        device=device_name,
+        family="bgp",
+        error_type="HTTPStatusError",
+        http_status=503,
+        code=ReadFailureCode.heal_action_failed,
+    )
+    async with _device_session(device_id) as (db, device):
+        with capture_logs() as logs:
+            await refresh_redistribution_from_outcomes(
+                db,
+                device,
+                {
+                    "ospf": Unavailable(UnavailableReason.unsupported),
+                    "isis": Unavailable(UnavailableReason.unsupported),
+                    "bgp": Unavailable(UnavailableReason.read_error, failure=failure),
+                },
+                refresh_source="test",
+                own_lock=False,
+            )
+
+    record = next(record for record in logs if record["event"] == "redistribution.refresh.component_kept")
+    assert record["read_operation"] == "device_state_read"
+    assert record["error_type"] == "HTTPStatusError"
+    assert record["http_status"] == 503
+    assert record["failure_code"] == "heal_action_failed"
+    assert_records_free_of([record], [device_name])
 
 
 @pytest.mark.anyio
@@ -594,7 +687,9 @@ async def _latest_outcome(device_id: int):
 
 @pytest.mark.anyio
 async def test_mixed_replaced_and_error_retained_is_degraded_present(adapter_client):
-    """D7: >=1 component replaced + >=1 retained-by-ERROR -> the composite records
+    """D7: one component replaces while two failures retain their partitions.
+
+    The composite records
     (present, stale, replaced, succeeded=True) — the payload IS mirror truth including
     the retained partition — while the fn still returns False (device stays partial).
 
@@ -608,6 +703,13 @@ async def test_mixed_replaced_and_error_retained_is_degraded_present(adapter_cli
             bgp={},
         )
         client._sections["ospf-config"] = {"status": "error", "reason": "boom"}
+        request = httpx.Request("GET", "https://placeholder.invalid/bgp?token=placeholder-secret")
+        response = httpx.Response(503, request=request)
+        client._sections["bgp-config"] = httpx.HTTPStatusError(
+            "placeholder-secret-reason",
+            request=request,
+            response=response,
+        )
 
         ok = await refresh_redistribution_for_device(db, device, client, refresh_source="test")
 
@@ -626,6 +728,23 @@ async def test_mixed_replaced_and_error_retained_is_degraded_present(adapter_cli
         "replaced",
         True,
     ), "mixed replaced+error-retained is degraded-success on the wire, not unavailable"
+    assert_text_free_of(outcome.read_failures, ["placeholder-secret"])
+    assert outcome.read_failures == [
+        {
+            "read_operation": "section_classify",
+            "component_family": "ospf-config",
+            "error_type": None,
+            "http_status": None,
+            "failure_code": "section_status_error",
+        },
+        {
+            "read_operation": "section_get",
+            "component_family": "bgp-config",
+            "error_type": "HTTPStatusError",
+            "http_status": 503,
+            "failure_code": None,
+        },
+    ]
 
 
 @pytest.mark.anyio
@@ -744,3 +863,103 @@ async def test_all_components_device_absent_keeps_and_succeeds(adapter_client):
         "kept",
         True,
     )
+
+
+# ── the merged composite keeps each failing component's classification ──
+
+
+def _read_failure(family: str):
+    from nso_adapter.nso.read_outcome import ReadFailure, ReadOperation
+
+    return ReadFailure(
+        operation=ReadOperation.section_get,
+        device="rd-failure-carry",
+        family=family,
+        error_type="HTTPStatusError",
+        http_status=503,
+    )
+
+
+def _export_down_failure(family: str):
+    """The outage shape: the container 404 raises, so there is no status to carry."""
+    from nso_adapter.nso.client import NsoExportUnavailableError
+    from nso_adapter.nso.read_outcome import ReadFailure, ReadOperation
+
+    return ReadFailure(
+        operation=ReadOperation.section_get,
+        device="rd-outage-carry",
+        family=family,
+        error_type=NsoExportUnavailableError.__name__,
+    )
+
+
+@pytest.mark.anyio
+async def test_the_export_down_composite_carries_the_outage_classification(adapter_client, monkeypatch):
+    """The tier-1 abort built a bare Unavailable, dropping what the failing read classified.
+
+    ``failure`` is compare=False, so an equality assertion on the outcome cannot see the
+    loss: the operator's record simply stopped naming the read, the type and the status.
+    """
+    from nso_adapter.core import redistribution
+
+    device_id = await seed_device(nso_device_name="rd-outage-carry", netbox_device_id=7710)
+    recorded = []
+
+    async def _record(db, device, outcome, refresh_source, **kwargs):
+        recorded.append(outcome)
+        return
+
+    monkeypatch.setattr(redistribution, "_record_composite", _record)
+    failure = _export_down_failure("redistribution.ospf")
+
+    async with _device_session(device_id) as (db, device):
+        await refresh_redistribution_from_outcomes(
+            db,
+            device,
+            {
+                "ospf": Unavailable(UnavailableReason.export_down, failure=failure),
+                "isis": Unavailable(UnavailableReason.unsupported),
+                "bgp": Unavailable(UnavailableReason.unsupported),
+            },
+            refresh_source="test",
+            own_lock=False,
+        )
+
+    assert recorded, "the composite was never recorded"
+    assert recorded[0].reason is UnavailableReason.export_down
+    assert recorded[0].failure is failure, "the composite dropped the outage classification"
+
+
+@pytest.mark.anyio
+async def test_the_merged_outcome_carries_the_worst_components_failure(adapter_client, monkeypatch):
+    """Nothing replaced, one real failure: the merge kept the reason and dropped the failure."""
+    from nso_adapter.store import outcome_store
+
+    device_id = await seed_device(nso_device_name="rd-merge-carry", netbox_device_id=7711)
+    real_record = outcome_store.record_read_outcome
+    merged = []
+
+    async def _spy(db, device_id_, family, outcome, **kwargs):
+        merged.append(outcome)
+        return await real_record(db, device_id_, family, outcome, **kwargs)
+
+    monkeypatch.setattr(outcome_store, "record_read_outcome", _spy)
+    failure = _read_failure("redistribution.bgp")
+
+    async with _device_session(device_id) as (db, device):
+        ok = await refresh_redistribution_from_outcomes(
+            db,
+            device,
+            {
+                "ospf": Unavailable(UnavailableReason.unsupported),
+                "isis": Unavailable(UnavailableReason.unsupported),
+                "bgp": Unavailable(UnavailableReason.read_error, failure=failure),
+            },
+            refresh_source="test",
+            own_lock=False,
+        )
+
+    assert ok is False, "a real failure with nothing replaced is not a success"
+    assert merged, "phase 1 never recorded the merged outcome"
+    assert merged[0].reason is UnavailableReason.read_error, "the worst reason must still win"
+    assert merged[0].failure is failure, "the merge dropped the failing component's classification"
