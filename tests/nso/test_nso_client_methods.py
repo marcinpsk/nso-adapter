@@ -24,7 +24,7 @@ from nso_adapter.nso.client import (
     failure_detail,
 )
 from nso_adapter.nso.read_outcome import Unavailable, UnavailableReason
-from tests._secret_discipline import assert_text_free_of
+from tests._secret_discipline import assert_text_contains, assert_text_free_of
 
 
 def _make_cfg(base_url: str = "http://nso:8080", ca_cert=None, host_header=None):
@@ -453,7 +453,7 @@ async def test_set_address_patches_only_address():
     assert len(captured) == 1
     req = captured[0]
     assert req.method == "PATCH"
-    assert "device=rtr" in str(req.url)
+    assert_text_contains(req.url, ["device=rtr"])
     body = json.loads(req.content)
     entry = body["tailf-ncs:device"][0]
     assert entry == {"name": "rtr", "address": "192.0.2.5"}  # no port key when unset

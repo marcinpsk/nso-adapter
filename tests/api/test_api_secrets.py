@@ -24,7 +24,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from nso_adapter.main import create_app
-from tests._secret_discipline import assert_text_free_of
+from tests._secret_discipline import assert_text_contains, assert_text_free_of
 from tests.conftest import VALID_TOKEN, seed_device, session
 from tests.test_vault_provider import _FakeClient, _FakeForbidden, _FakeInvalidPath, _FakeKvV2
 
@@ -507,7 +507,7 @@ async def test_harvest_community_ios_happy_path(vault_client):
     assert_text_free_of(resp.text, [ref, "s3cr3t-comm"])
     assert store[f"netbox/snmp/community/{target_hash}"] == {"community": "s3cr3t-comm"}
     # the GET was the targeted per-NED community subtree, not the full device config
-    assert "snmp-server/community" in str(transport.requests[0].url)
+    assert_text_contains(transport.requests[0].url, ["snmp-server/community"])
 
 
 @pytest.mark.anyio

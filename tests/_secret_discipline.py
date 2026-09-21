@@ -50,6 +50,18 @@ def assert_text_free_of(value, secrets) -> None:
             raise AssertionError(f"text repeats secret material (secrets[{index}])")
 
 
+def assert_text_contains(value, fragments) -> None:
+    """The presence half of :func:`assert_text_omits`, with the same non-disclosure property.
+
+    pytest rewrites ``assert "reconcile=" in str(url)`` and prints the whole URL on failure,
+    and the URL carries the device name. The fragment IS named; the surface never is.
+    """
+    rendered = str(value)
+    for fragment in fragments:
+        if fragment not in rendered:
+            raise AssertionError(f"text does not contain {fragment!r}")
+
+
 def assert_text_omits(value, fragments) -> None:
     """Fail without copying the inspected value into diagnostics.
 

@@ -457,14 +457,17 @@ async def test_start_sse_streams_enabled_spawns_one_task_per_instance(monkeypatc
         try:
             assert len(tasks) == 1
             await asyncio.sleep(0)  # let the subscriber coroutine start
-            assert seen and seen[0][0] == expected_stream_url
+            # Compared without printing: expected_stream_url embeds the stream credential.
+            if not seen or seen[0][0] != expected_stream_url:
+                raise AssertionError("the subscriber did not receive the derived stream URL")
         finally:
             stop.set()
             for t in tasks:
                 await asyncio.wait_for(t, timeout=1.0)
 
-    record = next(record for record in logs if record["event"] == "sse.stream.started")
-    assert_records_free_of([record], ["placeholder-stream-secret"])
+    assert_records_free_of(logs, ["placeholder-stream-secret"])
+    if not any(record["event"] == "sse.stream.started" for record in logs):
+        raise AssertionError("the stream start was not reported")
 
 
 # --------------------------------------------------------------------------- #

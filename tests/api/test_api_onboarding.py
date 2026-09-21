@@ -98,7 +98,7 @@ async def test_onboard_conflict_log_uses_adapter_ids_not_caller_names(adapter_cl
             headers=AUTH,
         )
 
-    assert_text_free_of(resp.text, ["46231"])
+    assert_text_free_of(resp.text, ["46231", "placeholder-linked-node"])
     assert resp.status_code == 409, resp.text
     error = resp.json()["error"]
     assert error["code"] == "conflict"

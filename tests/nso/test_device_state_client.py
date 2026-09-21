@@ -18,7 +18,7 @@ import pytest
 
 from nso_adapter.config import NsoInstanceConfig
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError, NsoReadContractError
-from tests._secret_discipline import assert_chain_free_of, assert_text_free_of
+from tests._secret_discipline import assert_chain_free_of, assert_text_contains, assert_text_free_of
 
 
 def _make_client() -> NsoClient:
@@ -200,7 +200,7 @@ async def test_action_posts_module_qualified_input_and_returns_output(patch_clie
     sent = json.loads(transport.requests[0].content)
     assert sent == {"network-state-export:input": {"device": "sw01", "family": ["ospf-config", "logging-config"]}}
     # The CANONICAL nested-action form (S2b contract): the action lives under /restconf/data.
-    assert "/restconf/data/network-state-export:device-state-read/run" in str(transport.requests[0].url)
+    assert_text_contains(transport.requests[0].url, ["/restconf/data/network-state-export:device-state-read/run"])
 
 
 async def test_action_error_raises_http_status_error(patch_client):

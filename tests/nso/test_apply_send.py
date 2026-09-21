@@ -41,7 +41,7 @@ from nso_adapter.nso.apply import (
 from nso_adapter.nso.client import DEVICE_INTENT_ROOT, NsoClient
 from nso_adapter.nso.nso_json import NSO_LEX_CHUNK, straddling_bare_tokens
 from nso_adapter.store.models import OspfInstanceIntent, OspfInterfaceIntent, RedistributionIntent
-from tests._secret_discipline import assert_text_omits
+from tests._secret_discipline import assert_text_contains, assert_text_omits
 
 _EMPTY_DRYRUN = {"dry-run-result": {"native": {}}}
 
@@ -118,7 +118,7 @@ async def test_native_dry_run_returns_device_delta():
     delta = await native_dry_run(client, "http://nso/restconf/data/x:y", '{"a": 1}', "sw03")
 
     assert delta == "router isis\n"
-    assert "dry-run=native" in str(transport.requests[0].url)
+    assert_text_contains(transport.requests[0].url, ["dry-run=native"])
     assert transport.requests[0].content == b'{"a": 1}'
 
 
@@ -150,7 +150,7 @@ async def test_the_sender_puts_the_keyed_instance_then_verifies_clean():
     assert json.loads(put_req.content) == {
         DEVICE_INTENT_ROOT: [{"device": "sw03", "vlan": {"vlan": [{"vlan-id": 10}]}}]
     }
-    assert "reconcile=" in str(put_req.url)
+    assert_text_contains(put_req.url, ["reconcile="])
     # a verify dry-run followed the apply, and it re-issues the SAME method
     assert any("dry-run=native" in str(r.url) and r.method == "PUT" for r in transport.requests[1:])
 
@@ -213,7 +213,7 @@ async def test_no_networking_reaches_the_wire_as_a_commit_param():
 
     await apply_device_intent(client, "sw03", {"snmp": {}}, no_networking=True)
 
-    assert "no-networking" in str(transport.requests[0].url)
+    assert_text_contains(transport.requests[0].url, ["no-networking"])
 
 
 async def test_no_networking_also_reaches_the_post_commit_verification():
@@ -224,8 +224,10 @@ async def test_no_networking_also_reaches_the_post_commit_verification():
     await apply_device_intent(client, "sw03", {"snmp": {}}, no_networking=True)
 
     verify = [r for r in transport.requests[1:] if "dry-run=native" in str(r.url)]
-    assert verify, [str(r.url) for r in transport.requests]
-    assert all("no-networking" in str(r.url) for r in verify), [str(r.url) for r in verify]
+    if not verify:
+        raise AssertionError("the commit was not followed by a dry-run verification")
+    for request in verify:
+        assert_text_contains(request.url, ["no-networking"])
 
 
 # ── _verify_native_or_raise ────────────────────────────────────────────────────
@@ -723,7 +725,8 @@ async def test_a_real_ospf_commit_puts_then_verifies():
     put_req = transport.requests[0]
     assert put_req.method == "PUT"
     assert_text_omits(put_req.url, ["dry-run=native"])  # the URL carries the device name
-    assert "reconcile=" in str(put_req.url)
+    if "reconcile=" not in str(put_req.url):
+        raise AssertionError("the commit URL carries no reconcile mode")
     assert _sent(transport, "ospf")["process-config"][0]["enabled"] is False
     # a verify dry-run followed the commit
     assert any("dry-run=native" in str(r.url) for r in transport.requests[1:])

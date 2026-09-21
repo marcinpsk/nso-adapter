@@ -45,6 +45,7 @@ _NON_DISCLOSURE_TESTS = (
 _INSPECTED_ATTRIBUTES = {"json", "read_failures", "text", "value"}
 _INSPECTED_CALLS = {"repr", "str"}
 _NON_DISCLOSURE_HELPERS = {"assert_chain_free_of", "assert_records_free_of", "assert_text_free_of"}
+
 #: How this repository writes protected material into a test (see the placeholder convention). A
 #: body that names one is handling something protected, whether or not it calls a helper.
 _PROTECTED_LITERAL_PREFIX = "placeholder-"
@@ -146,20 +147,72 @@ def _assertion_comparisons(test: ast.expr) -> list[ast.Compare]:
     return comparisons
 
 
+def _is_rewritten_check(node: ast.Assert) -> bool:
+    """True when pytest would rewrite *node* into a print of an inspected surface.
+
+    BOTH operands are read: ``assert resp.text not in allowed`` renders the response on the
+    left, and pytest prints the whole comparison either way.
+    """
+    return any(
+        any(isinstance(operator, ast.NotIn) for operator in comparison.ops)
+        and any(_reads_an_inspected_surface(value) for value in (comparison.left, *comparison.comparators))
+        for comparison in _assertion_comparisons(node.test)
+    )
+
+
 def test_non_disclosure_checks_do_not_use_rewritten_assertions() -> None:
     violations = []
     for path in _NON_DISCLOSURE_TESTS:
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Assert):
-                continue
-            if any(
-                any(isinstance(operator, ast.NotIn) for operator in comparison.ops)
-                and any(_reads_an_inspected_surface(value) for value in comparison.comparators)
-                for comparison in _assertion_comparisons(node.test)
-            ):
+            if isinstance(node, ast.Assert) and _is_rewritten_check(node):
                 violations.append(f"{path.relative_to(_TEST_ROOT.parent)}:{node.lineno}")
     assert violations == []
+
+
+def _reads_a_url_surface(node: ast.AST) -> bool:
+    return any(isinstance(part, ast.Attribute) and part.attr == "url" for part in ast.walk(node))
+
+
+def _url_membership_lines(source: str) -> list[int]:
+    """Assertions that let pytest print a request URL, which carries the device name."""
+    return [
+        node.lineno
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Assert)
+        and (
+            any(
+                any(isinstance(operator, ast.In | ast.NotIn) for operator in comparison.ops)
+                and any(_reads_a_url_surface(value) for value in (comparison.left, *comparison.comparators))
+                for comparison in _assertion_comparisons(node.test)
+            )
+            or (node.msg is not None and _reads_a_url_surface(node.msg))
+        )
+    ]
+
+
+def test_url_membership_checks_go_through_a_non_disclosure_helper() -> None:
+    """``assert "reconcile=" in str(req.url)`` prints the whole URL, device name included."""
+    violations = []
+    for path in _NON_DISCLOSURE_TESTS:
+        for lineno in _url_membership_lines(path.read_text(encoding="utf-8")):
+            violations.append(f"{path.relative_to(_TEST_ROOT.parent)}:{lineno}")
+    assert violations == []
+
+
+def test_the_url_membership_rule_reads_the_assertion_and_not_its_filters() -> None:
+    """A comprehension filter renders a count, and the helper call is not an assertion at all."""
+    membership = 'assert "reconcile=" in str(put_req.url)'
+    absence = 'assert "dry-run=native" not in str(request.url)'
+    message = "assert verify, [str(r.url) for r in requests]"
+    comprehension_filter = 'assert len([r for r in requests if "dry-run" not in str(r.url)]) == 1'
+    helper = 'assert_text_contains(put_req.url, ["reconcile="])'
+
+    assert _url_membership_lines(membership) == [1]
+    assert _url_membership_lines(absence) == [1]
+    assert _url_membership_lines(message) == [1]
+    assert _url_membership_lines(comprehension_filter) == []
+    assert _url_membership_lines(helper) == []
 
 
 def _protected_roots(call: ast.Call) -> set[str]:
@@ -405,12 +458,7 @@ def _rewritten_check_lines(source: str) -> list[int]:
     return [
         node.lineno
         for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Assert)
-        and any(
-            any(isinstance(operator, ast.NotIn) for operator in comparison.ops)
-            and any(_reads_an_inspected_surface(value) for value in comparison.comparators)
-            for comparison in _assertion_comparisons(node.test)
-        )
+        if isinstance(node, ast.Assert) and _is_rewritten_check(node)
     ]
 
 
@@ -421,8 +469,10 @@ def test_the_rewritten_assertion_rule_reads_the_assertion_and_not_its_filters() 
     rendered_call = "assert secret not in repr(record)"
     comprehension_filter = 'assert len([r for r in requests if "dry-run" not in str(r.url)]) == 1'
     key_membership = 'assert "device_id" not in record'
+    reverse_operand = "assert resp.text not in allowed"
 
     assert _rewritten_check_lines(named_value) == [1]
+    assert _rewritten_check_lines(reverse_operand) == [1], "pytest prints the left operand too"
     assert _rewritten_check_lines(marker_in_a_surface) == [1], "the URL carries the device name"
     assert _rewritten_check_lines(rendered_call) == [1]
     assert _rewritten_check_lines(comprehension_filter) == []

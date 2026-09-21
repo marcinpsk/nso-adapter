@@ -726,8 +726,10 @@ async def test_a_failed_device_state_read_preserves_only_the_http_status():
     assert (status, entries) == ("error", {})
     failed = [record for record in logs if record["event"] == "static_route.device_state_read_failed"]
     assert len(failed) == 1
-    assert failed[0]["error"] == "HTTPStatusError (HTTP 503)"
+    # The scan runs first: `error` is the field a diagnostic regression would taint, so an
+    # equality failure here would print provider text before anything had cleared it.
     assert_records_free_of(logs, [*request_urls, "Placeholder Device State Failure", "placeholder device-state body"])
+    assert failed[0]["error"] == "HTTPStatusError (HTTP 503)"
 
 
 # ── a failed host-key fetch: the action's own info text reaches no sink ──
@@ -1002,6 +1004,6 @@ async def test_a_FAILED_pre_apply_sync_from_records_the_STATUS_and_not_the_devic
 
     reported = [record for record in logs if record["event"] == "apply.sync_from.failed"]
     assert reported, "the failed sync-from was not reported at all"
+    assert_records_free_of(logs, _SYNC_FROM_LEAKS)
     assert reported[0]["error"] == "HTTPStatusError (HTTP 502)", "the status is what tells the failures apart"
     assert reported[0]["device_id"] == device_id, "the record stays addressable by the adapter id"
-    assert_records_free_of(logs, _SYNC_FROM_LEAKS)
