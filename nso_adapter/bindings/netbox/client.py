@@ -25,12 +25,10 @@ def rejection_detail(body: object) -> str:
     """Classify a NetBox rejection body for a log record.
 
     NetBox repeats the submitted value in its validation messages, and a bulk row carries
-    an interface name, so no message text may travel. Only the field NAMES stay: they are
-    our own schema, and they are what tells an operator which column to fix.
+    an interface name. The response keys can also come from NetBox, so only counts travel.
     """
     if isinstance(body, dict):
-        names = sorted(str(key) for key in body)
-        return f"fields: {', '.join(names)}" if names else "fields: none"
+        return f"fields: {len(body)}" if body else "fields: none"
     if isinstance(body, list):
         return f"errors: {len(body)}"
     return "unparsed"

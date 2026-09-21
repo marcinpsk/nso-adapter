@@ -1092,7 +1092,7 @@ async def test_the_PROVISIONED_record_carries_step_names_and_statuses_but_no_ste
 
     from nso_adapter.core.onboarding import provision_nso_device
     from nso_adapter.nso.client import NsoClient
-    from tests._secret_discipline import assert_records_free_of
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
     submitted_name = "placeholder-caller-provisioned-device"
     submitted_admin_state = "placeholder-caller-admin-state"
@@ -1128,6 +1128,7 @@ async def test_the_PROVISIONED_record_carries_step_names_and_statuses_but_no_ste
     # module pre-date the stack on main and belong to the diagnostic-identity migration, which
     # needs the keyed reference to name a device that has no adapter row yet.
     assert_records_free_of(provisioned, [submitted_name, submitted_admin_state, "device-type=", "198.51.100.20"])
+    assert_keys_absent(provisioned[0], ["instance"])
     assert provisioned[0]["device_id"] is not None, "the record must stay correlatable"
     # The response keeps what the sink drops.
     assert {"step": "admin_state", "status": "ok", "detail": submitted_admin_state} in result["steps"]
@@ -1172,7 +1173,7 @@ async def test_an_UNLINKED_provision_is_still_correlatable_without_a_device_id(a
     assert result["ok"] is True
     assert result["device_id"] is None  # no NetBox link, so no adapter row
     record = next(r for r in logs if r["event"] == "device.provisioned")
-    assert_keys_absent(record, ["device_id"])
+    assert_keys_absent(record, ["device_id", "instance"])
     assert re.fullmatch(DEVICE_REF_PATTERN, record["device_ref"]), "the keyed reference carries it"
     assert record["job_id"] == 4242, "and the job correlates the record to what produced it"
     assert_records_free_of([record], [submitted_name])

@@ -1398,8 +1398,7 @@ _APPROVED_REJECTION_DETAIL = '''\
 def rejection_detail(body: object) -> str:
     """Approved formatter contract."""
     if isinstance(body, dict):
-        names = sorted(str(key) for key in body)
-        return f"fields: {', '.join(names)}" if names else "fields: none"
+        return f"fields: {len(body)}" if body else "fields: none"
     if isinstance(body, list):
         return f"errors: {len(body)}"
     return "unparsed"
@@ -1414,8 +1413,8 @@ def test_failure_detail_reads_only_closed_exception_properties() -> None:
     assert actual == _APPROVED_FAILURE_DETAIL_AST
 
 
-def test_rejection_detail_keeps_only_the_field_names_of_a_rejection_body() -> None:
-    """The NetBox rejection classifier is pinned: its messages carry the submitted values."""
+def test_rejection_detail_keeps_only_the_shape_of_a_rejection_body() -> None:
+    """The NetBox rejection classifier is pinned: response keys can carry submitted values."""
     actual = _formatter_definition_ast(_NETBOX_CLIENT.read_text(encoding="utf-8"), "rejection_detail")
 
     assert actual == _APPROVED_REJECTION_DETAIL_AST
@@ -1426,6 +1425,7 @@ def test_rejection_detail_keeps_only_the_field_names_of_a_rejection_body() -> No
     [
         "    return str(body)\n",
         '    return f"{body}"\n',
+        '    if isinstance(body, dict):\n        return f"fields: {\', \'.join(body)}"\n    return "unparsed"\n',
         '    if isinstance(body, dict):\n        return ", ".join(f"{k}={v}" for k, v in body.items())\n    return "unparsed"\n',
     ],
 )

@@ -262,7 +262,8 @@ async def test_bulk_create_rejection_keeps_absolute_position_after_chunking(clie
 @pytest.mark.parametrize(
     ("body", "expected"),
     [
-        ({"mtu": ["too big"], "name": ["'placeholder-x' is taken"]}, "fields: mtu, name"),
+        ({"mtu": ["too big"], "name": ["'placeholder-x' is taken"]}, "fields: 2"),
+        ({"placeholder-secret": ["invalid"]}, "fields: 1"),
         ({}, "fields: none"),
         # A 400 whose positional list flags nothing reaches the single-row path as a list.
         ([{}], "errors: 1"),
@@ -272,7 +273,8 @@ async def test_bulk_create_rejection_keeps_absolute_position_after_chunking(clie
 )
 def test_rejection_detail_keeps_only_the_shape_of_a_rejection_body(body, expected):
     """The classifier is total: an unrecognized body degrades to a fixed string, never a value."""
-    assert rejection_detail(body) == expected
+    if rejection_detail(body) != expected:
+        raise AssertionError("the rejection body was not classified by shape")
 
 
 @respx.mock
@@ -289,7 +291,24 @@ async def test_bulk_create_rejection_keeps_a_reflected_name_out_of_the_record(cl
     assert result == []
     record = next(record for record in logs if record["event"] == "netbox.bulk_create.row_rejected")
     assert record["payload_index"] == 0
-    assert record["error"] == "fields: name"
+    if record["error"] != "fields: 1":
+        raise AssertionError("the rejected row was not classified by shape")
+    assert_records_free_of([record], [name])
+
+
+@respx.mock
+async def test_bulk_create_rejection_keeps_a_reflected_error_key_out_of_the_record(client):
+    """A response key can reflect the submitted name, so it must not reach the log."""
+    name = "placeholder-reflected-error-key"
+    respx.post(f"{BASE}/api/dcim/interfaces/").mock(return_value=httpx.Response(400, json=[{name: ["invalid"]}]))
+
+    with capture_logs() as logs:
+        result = await client.bulk_create_interfaces([{"name": name}], netbox_device_id=45)
+
+    assert result == []
+    record = next(record for record in logs if record["event"] == "netbox.bulk_create.row_rejected")
+    if record["error"] != "fields: 1":
+        raise AssertionError("the rejection record included a provider-controlled key")
     assert_records_free_of([record], [name])
 
 
@@ -307,7 +326,8 @@ async def test_bulk_patch_non_positional_rejection_keeps_a_reflected_name_out_of
     assert result == []
     record = next(record for record in logs if record["event"] == "netbox.bulk_patch.row_rejected")
     assert record["netbox_interface_id"] == 7
-    assert record["error"] == "fields: mtu, name"
+    if record["error"] != "fields: 2":
+        raise AssertionError("the rejected row was not classified by shape")
     assert_records_free_of([record], [name])
 
 

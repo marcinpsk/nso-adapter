@@ -781,7 +781,6 @@ async def provision_nso_device(
         "device.provisioned",
         **identity_fields,
         job_id=job_id,
-        instance=nso_instance,
         steps=_step_classifications(steps),
     )
     return _result(True, device_id)
