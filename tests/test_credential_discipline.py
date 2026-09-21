@@ -28,17 +28,13 @@ def test_repository_has_no_forbidden_credentials():
     )
 
 
-def test_baseline_update_argument_is_rejected_without_writing(monkeypatch, capsys):
-    wrote = False
-
-    def record_write(*args, **kwargs):
-        nonlocal wrote
-        wrote = True
-
-    monkeypatch.setattr(credential_discipline, "save_baseline", record_write, raising=False)
+def test_baseline_update_argument_is_rejected_without_writing(monkeypatch, capsys, tmp_path):
+    """Guard the path, not a guessed writer name: any writer at all would create this file."""
+    baseline = tmp_path / "credential_discipline_baseline.txt"
+    monkeypatch.setattr(credential_discipline, "_OBSOLETE_BASELINE_PATH", baseline)
 
     assert credential_discipline._main(["--update-baseline"]) == 2
-    assert wrote is False
+    assert not baseline.exists()
     assert "usage:" in capsys.readouterr().err
 
 
@@ -84,6 +80,18 @@ def test_flags_new_credential_literals(statement):
     assert len(hits) == 1
     assert hits[0].path == "t.py"
     assert hits[0].lineno == 1
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        'client(*("admin", "placeholder"))',
+        'username, password = "u", *("admin",)',
+    ],
+)
+def test_flags_credential_literals_behind_a_STAR(statement):
+    """``ast.Starred`` wraps the value, so an unwrapped scan walked straight past it."""
+    assert len(scan_source(statement, "t.py")) == 1
 
 
 @pytest.mark.parametrize(

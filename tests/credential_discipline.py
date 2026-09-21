@@ -175,7 +175,9 @@ class _Scanner(ast.NodeVisitor):
     def _check_value(self, value: ast.AST, statement: ast.AST) -> None:
         if self._is_marked(statement):
             return
-        if isinstance(value, (ast.Tuple, ast.List)):
+        if isinstance(value, ast.Starred):
+            self._check_value(value.value, statement)
+        elif isinstance(value, (ast.Tuple, ast.List)):
             for item in value.elts:
                 self._check_value(item, statement)
         elif (literal := _constant_string(value)) is not None and literal.casefold() == "admin":

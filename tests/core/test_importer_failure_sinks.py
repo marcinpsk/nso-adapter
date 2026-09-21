@@ -176,6 +176,29 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
             self.visit(statement)
         self.aliases |= body_aliases
 
+    def visit_Try(self, node: ast.Try) -> None:  # noqa: N802 - ast visitor API
+        # generic_visit walks body, handlers, orelse and finalbody in source order, so an
+        # alias a handler taints was discarded by an `else` assignment before `finally` ran.
+        incoming = self.aliases.copy()
+        for statement in node.body:
+            self.visit(statement)
+        body_aliases = self.aliases
+
+        reaching: set[str] = set()
+        for handler in node.handlers:
+            self.aliases = body_aliases.copy()
+            self.visit(handler)
+            reaching |= self.aliases
+
+        self.aliases = body_aliases.copy()
+        for statement in node.orelse:
+            self.visit(statement)
+        reaching |= self.aliases
+
+        self.aliases = reaching | incoming
+        for statement in node.finalbody:
+            self.visit(statement)
+
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:  # noqa: N802 - ast visitor API
         handler_name = node.name
         if handler_name is not None:
@@ -817,3 +840,20 @@ async def test_a_malformed_record_document_is_a_read_error_not_an_export_outage(
     assert outcome.reason is UnavailableReason.read_error
     assert outcome.failure.error_type == "NsoReadContractError"
     assert outcome.failure.operation is ReadOperation.doc_get
+
+
+def test_an_alias_a_handler_taints_still_reaches_the_finally_block() -> None:
+    """The handler path reaches `finally` too, so an `else` assignment cannot clear the alias."""
+    source = """\
+def f():
+    try:
+        detail = "authored"
+    except ValueError as exc:
+        detail = exc
+    else:
+        detail = "authored"
+    finally:
+        logger.warning("event", detail=detail)
+"""
+
+    assert _raw_log_exception_renderers(source) == [9]
