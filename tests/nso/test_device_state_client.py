@@ -257,6 +257,27 @@ async def test_doc_malformed_200_raises_never_absence(patch_client, body):
     assert_text_free_of(caught.value, ["placeholder-secret"])
 
 
+async def test_doc_UNDECODABLE_200_refuses_without_keeping_the_decode_error_on_the_chain(patch_client):
+    """`resp.json()` can raise UnicodeDecodeError, whose message quotes the provider's bytes.
+
+    The refusal is raised AFTER the handler has exited, so the interpreter attaches nothing:
+    `raise ... from None` inside the handler would be a second way to say the same thing.
+    """
+    provider_bytes = b'{"leak": "placeholder-provider-body"}\xff'
+
+    def _respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=provider_bytes, headers={"content-type": "application/yang-data+json"})
+
+    client = _make_client()
+    with patch_client(client, httpx.MockTransport(_respond)):
+        with pytest.raises(NsoReadContractError) as caught:
+            await client.get_device_state_doc("sw01")
+
+    assert caught.value.__context__ is None, "the decode error must not travel with the refusal"
+    assert caught.value.__cause__ is None
+    assert_chain_free_of(caught.value, ["placeholder-provider-body"])
+
+
 # ── READSEM 1328: run_device_state_read certifies the snapshot before any consumer walks it ──
 
 
