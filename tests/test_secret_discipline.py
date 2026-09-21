@@ -308,7 +308,9 @@ def _record_non_disclosure_assertions(assertions: list[ast.Assert], aliases: set
     for node in assertions:
         if any(
             any(isinstance(operator, ast.NotIn) for operator in comparison.ops)
-            and any(_reads_an_inspected_surface(value, aliases) for value in comparison.comparators)
+            # BOTH operands: ``assert resp.text not in allowed`` renders the response on the
+            # left, and pytest prints the whole comparison either way.
+            and any(_reads_an_inspected_surface(value, aliases) for value in (comparison.left, *comparison.comparators))
             for comparison in _assertion_comparisons(node.test)
         ):
             violations.append(node.lineno)
@@ -601,20 +603,6 @@ def _assertion_comparisons(test: ast.expr) -> list[ast.Compare]:
         stack.extend(ast.iter_child_nodes(node))
     return comparisons
 
-
-def _is_rewritten_check(node: ast.Assert, aliases: set[str] | None = None) -> bool:
-    """True when pytest would rewrite *node* into a print of an inspected surface.
-
-    BOTH operands are read: ``assert resp.text not in allowed`` renders the response on the
-    left, and pytest prints the whole comparison either way.
-    """
-    return any(
-        any(isinstance(operator, ast.NotIn) for operator in comparison.ops)
-        and any(
-            _reads_an_inspected_surface(value, aliases) for value in (comparison.left, *comparison.comparators)
-        )
-        for comparison in _assertion_comparisons(node.test)
-    )
 
 def test_the_guarded_membership_is_derived_from_what_a_module_handles() -> None:
     """A module that starts holding protected material joins both rules with no edit here."""
@@ -969,12 +957,12 @@ def test_secret_equality_guard_reads_rendered_operands() -> None:
 
 
 def _rewritten_check_lines(source: str) -> list[int]:
-    """Run the SAME rule ``test_non_disclosure_checks_do_not_use_rewritten_assertions`` runs."""
-    return [
-        node.lineno
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Assert) and _is_rewritten_check(node)
-    ]
+    """Run the SAME rule ``test_non_disclosure_checks_do_not_use_rewritten_assertions`` runs.
+
+    Delegated, not re-walked: a second walk has no alias resolution, so the snippets would
+    exercise a rule the suite does not ship.
+    """
+    return _non_disclosure_assertion_lines(source)
 
 
 def test_the_rewritten_assertion_rule_reads_the_assertion_and_not_its_filters() -> None:

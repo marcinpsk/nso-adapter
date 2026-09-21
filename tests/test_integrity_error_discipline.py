@@ -103,3 +103,38 @@ except IntegrityError as exc:
 """
 
     assert len(scan_source(source)) == 1
+
+
+def test_a_bare_raise_a_context_manager_can_SUPPRESS_is_not_a_reraise() -> None:
+    """``contextlib.suppress`` exits the handler normally, so the conversion still runs."""
+    source = """
+import contextlib
+from sqlalchemy.exc import IntegrityError
+try:
+    write()
+except IntegrityError as exc:
+    with contextlib.suppress(Exception):
+        raise
+    convert()
+"""
+
+    assert len(scan_source(source)) == 1
+
+
+def test_a_REBOUND_import_no_longer_counts_as_the_classification_helper() -> None:
+    """A parameter shadowing the imported name makes the call something else entirely."""
+    source = """
+from sqlalchemy.exc import IntegrityError
+from nso_adapter.store.db import _violated_constraint
+
+def handle(_violated_constraint):
+    try:
+        write()
+    except IntegrityError as exc:
+        if _violated_constraint(exc) == "expected":
+            convert()
+        else:
+            raise
+"""
+
+    assert len(scan_source(source)) == 1

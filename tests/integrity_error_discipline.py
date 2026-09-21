@@ -30,8 +30,36 @@ class Violation:
         )
 
 
+def _rebound_names(tree: ast.AST) -> set[str]:
+    """Every name the module binds outside its import statements.
+
+    An import binding is only trustworthy while the name still refers to it. A parameter, an
+    assignment, a loop target or a walrus can rebind ``_violated_constraint``, and a call on
+    the rebound value is not the imported helper.
+    """
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            names.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.ExceptHandler) and node.name is not None:
+            names.add(node.name)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None:
+            names.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+            names.add(node.rest)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            names.update(node.names)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            arguments = node.args
+            names.update(argument.arg for argument in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs))
+            names.update(argument.arg for argument in (arguments.vararg, arguments.kwarg) if argument is not None)
+    return names
+
+
 def _import_bindings(tree: ast.AST) -> dict[str, str]:
-    """Map imported names to their fully qualified targets."""
+    """Map imported names to their fully qualified targets, dropping any the module rebinds."""
     bindings: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -42,7 +70,8 @@ def _import_bindings(tree: ast.AST) -> dict[str, str]:
             for alias in node.names:
                 if alias.name != "*":
                     bindings[alias.asname or alias.name] = f"{node.module}.{alias.name}"
-    return bindings
+    rebound = _rebound_names(tree)
+    return {bound: target for bound, target in bindings.items() if bound not in rebound}
 
 
 def _qualified_name(node: ast.AST | None, imports: dict[str, str]) -> str | None:
@@ -104,9 +133,15 @@ def _flow_statements(
     states: set[bool],
     imports: dict[str, str],
     exception_name: str,
-) -> tuple[set[bool], bool]:
-    """Return fall-through classification states and whether an unsafe exit exists."""
+) -> tuple[set[bool], bool, set[bool]]:
+    """Return fall-through states, whether an unsafe exit exists, and the states live at a raise.
+
+    The third value is what a SUPPRESSING context manager resumes with:
+    ``with contextlib.suppress(Exception): raise`` exits the handler normally, so a raise
+    inside a ``with`` is not an unconditional re-raise.
+    """
     unsafe_exit = False
+    raised: set[bool] = set()
     for statement in body:
         if not states:
             break
@@ -117,13 +152,19 @@ def _flow_statements(
         if isinstance(statement, ast.If):
             if _expression_classifies(statement.test, imports, exception_name):
                 states = {True}
-            body_states, body_unsafe = _flow_statements(statement.body, states.copy(), imports, exception_name)
-            else_states, else_unsafe = _flow_statements(statement.orelse, states.copy(), imports, exception_name)
+            body_states, body_unsafe, body_raised = _flow_statements(
+                statement.body, states.copy(), imports, exception_name
+            )
+            else_states, else_unsafe, else_raised = _flow_statements(
+                statement.orelse, states.copy(), imports, exception_name
+            )
             states = body_states | else_states
             unsafe_exit = unsafe_exit or body_unsafe or else_unsafe
+            raised |= body_raised | else_raised
         elif isinstance(statement, ast.Raise):
             if statement.exc is not None and False in states:
                 unsafe_exit = True
+            raised |= states
             states = set()
         elif isinstance(statement, (ast.Break, ast.Continue, ast.Return)):
             if False in states:
@@ -132,9 +173,11 @@ def _flow_statements(
         elif isinstance(statement, (ast.With, ast.AsyncWith)):
             if any(_expression_classifies(item.context_expr, imports, exception_name) for item in statement.items):
                 states = {True}
-            states, nested_unsafe = _flow_statements(statement.body, states, imports, exception_name)
+            body_states, nested_unsafe, body_raised = _flow_statements(statement.body, states, imports, exception_name)
+            states = body_states | body_raised
             unsafe_exit = unsafe_exit or nested_unsafe
-    return states, unsafe_exit
+            raised |= body_raised
+    return states, unsafe_exit, raised
 
 
 def _handler_is_safe(
@@ -142,7 +185,8 @@ def _handler_is_safe(
     imports: dict[str, str],
     exception_name: str,
 ) -> bool:
-    states, unsafe_exit = _flow_statements(body, {False}, imports, exception_name)
+    # A raise at handler level really does exit, so the raise-time states are dropped here.
+    states, unsafe_exit, _raised = _flow_statements(body, {False}, imports, exception_name)
     return not unsafe_exit and False not in states
 
 

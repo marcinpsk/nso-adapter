@@ -184,6 +184,29 @@ def test_review_pattern_hook_explains_its_opengrep_prerequisite() -> None:
     assert result.stderr.strip() == "OpenGrep is required. Install it or set OPENGREP_BIN. See README.md."
 
 
+def test_review_pattern_test_mode_explains_its_pyyaml_prerequisite(tmp_path) -> None:
+    """`language: system` means the PATH python3, which need not be the project environment."""
+    planted = tmp_path / "opengrep"
+    planted.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    planted.chmod(0o755)
+    without_yaml = tmp_path / "python3"
+    without_yaml.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    without_yaml.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", str(REVIEW_PATTERNS), "test"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{tmp_path}:{_RESTRICTED_PATH}"},
+    )
+
+    assert result.returncode == 127
+    assert result.stderr.strip() == (
+        "PyYAML is required for 'test' mode. Install it into the python3 on PATH. See README.md."
+    )
+
+
 def test_the_opengrep_prerequisite_holds_where_opengrep_is_on_the_path(tmp_path):
     """The restricted PATH is this host's layout, not a guarantee: some carry /usr/bin/opengrep."""
     planted = tmp_path / "opengrep"
