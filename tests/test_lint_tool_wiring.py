@@ -140,6 +140,13 @@ def test_subprocess_argv_literals_resolve_interpreters_through_path() -> None:
     violations = []
     for source_path in sorted((ROOT / "tests").rglob("*.py")):
         tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+        argv_literals = {
+            target.id: statement.value
+            for statement in tree.body
+            if isinstance(statement, ast.Assign) and isinstance(statement.value, (ast.List, ast.Tuple))
+            for target in statement.targets
+            if isinstance(target, ast.Name)
+        }
         for call in ast.walk(tree):
             if not (
                 isinstance(call, ast.Call)
@@ -157,6 +164,10 @@ def test_subprocess_argv_literals_resolve_interpreters_through_path() -> None:
                     None,
                 )
             )
+            if isinstance(argv, ast.BinOp) and isinstance(argv.op, ast.Add):
+                argv = argv.left
+            if isinstance(argv, ast.Name):
+                argv = argv_literals.get(argv.id)
             if not isinstance(argv, (ast.List, ast.Tuple)) or not argv.elts:
                 continue
             interpreter = argv.elts[0]
