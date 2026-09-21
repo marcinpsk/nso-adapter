@@ -344,6 +344,26 @@ def _renders_root_whole(node: ast.AST, root: str) -> bool:
     )
 
 
+def _direct_secret_equality_lines(source: str) -> list[int]:
+    """Find pytest equality checks that would print a named secret on failure."""
+    lines = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Assert) or not isinstance(node.test, ast.Compare):
+            continue
+        if not any(isinstance(op, ast.Eq | ast.NotEq) for op in node.test.ops):
+            continue
+        operands = (node.test.left, *node.test.comparators)
+        roots = {
+            part.id
+            for operand in operands
+            for part in ast.walk(operand)
+            if isinstance(part, ast.Name) and "secret" in part.id.casefold()
+        }
+        if any(_renders_root_whole(operand, root) for root in roots for operand in operands):
+            lines.append(node.lineno)
+    return lines
+
+
 def _discloses_protected_value(node: ast.Assert, root: str) -> bool:
     """True when a FAILURE of *node* prints the protected surface whole.
 
@@ -453,6 +473,26 @@ def test_non_disclosure_checks_run_before_the_diagnostics() -> None:
             for lineno, root in _ordering_violations_in(scope):
                 violations.append(f"{path.relative_to(_TEST_ROOT.parent)}:{lineno} discloses {root!r}")
     assert violations == []
+
+
+def test_secret_constants_are_not_compared_with_rewritten_assertions() -> None:
+    violations = [
+        f"{path.relative_to(_TEST_ROOT.parent)}:{line}"
+        for path in sorted(_TEST_ROOT.rglob("test_*.py"))
+        for line in _direct_secret_equality_lines(path.read_text(encoding="utf-8"))
+    ]
+    assert violations == []
+
+
+def test_secret_equality_guard_reads_rendered_operands() -> None:
+    assert _direct_secret_equality_lines("assert received == SECRET_STREAM_URL") == [1]
+    assert _direct_secret_equality_lines("assert len(received) == len(SECRET_STREAM_URL)") == []
+    assert (
+        _direct_secret_equality_lines(
+            'if received != SECRET_STREAM_URL:\n    raise AssertionError("stream URL differed")'
+        )
+        == []
+    )
 
 
 def _rewritten_check_lines(source: str) -> list[int]:

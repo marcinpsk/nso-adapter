@@ -180,13 +180,15 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
         # generic_visit walks body, handlers, orelse and finalbody in source order, so an
         # alias a handler taints was discarded by an `else` assignment before `finally` ran.
         incoming = self.aliases.copy()
+        raising = incoming.copy()
         for statement in node.body:
             self.visit(statement)
+            raising |= self.aliases
         body_aliases = self.aliases
 
         reaching: set[str] = set()
         for handler in node.handlers:
-            self.aliases = body_aliases.copy()
+            self.aliases = raising.copy()
             self.visit(handler)
             reaching |= self.aliases
 
@@ -195,10 +197,9 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
             self.visit(statement)
         reaching |= self.aliases
 
-        # `finally` also runs while an exception raised inside the try is still propagating,
-        # so it is visited with the incoming state as well. Only the paths that FALL OUT of
-        # the try reach the statements after it, so the incoming state is not carried past it.
-        entry = reaching | incoming
+        # `finally` also runs when an earlier try-body statement raises, before a later
+        # assignment can clear an alias. Only paths that fall out of the try continue after it.
+        entry = reaching | raising
         self.aliases = entry.copy()
         for statement in node.finalbody:
             self.visit(statement)
@@ -870,6 +871,31 @@ def f():
 def test_an_alias_a_handler_taints_still_reaches_the_finally_block(handler: str) -> None:
     """The handler path reaches `finally` too, so an `else` assignment cannot clear the alias."""
     assert _raw_log_exception_renderers(_TRY_ELSE_FINALLY.format(handler=handler)) == [9]
+
+
+@pytest.mark.parametrize("handler", ["except", "except*"], ids=["try", "try-star"])
+def test_a_handler_sees_an_alias_from_an_earlier_try_body_prefix(handler: str) -> None:
+    source = """\
+def f():
+    try:
+        detail = exc
+        detail = "authored"
+    {handler} ValueError:
+        logger.warning("event", detail=detail)
+"""
+    assert _raw_log_exception_renderers(source.format(handler=handler)) == [6]
+
+
+def test_a_finally_block_sees_an_alias_from_an_earlier_try_body_prefix() -> None:
+    source = """\
+def f():
+    try:
+        detail = exc
+        detail = "authored"
+    finally:
+        logger.warning("event", detail=detail)
+"""
+    assert _raw_log_exception_renderers(source) == [6]
 
 
 def test_a_try_that_every_path_reassigns_leaves_no_alias_behind_it() -> None:
