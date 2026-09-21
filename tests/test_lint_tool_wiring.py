@@ -439,3 +439,27 @@ def test_the_scan_fails_when_opengrep_drops_a_malformed_rule(tmp_path: Path):
 
     assert result.returncode == 1, "a dropped rule must fail the scan, not pass it"
     assert "Rule parse error" in result.stderr
+
+
+def test_no_module_defines_a_TOP_LEVEL_name_twice() -> None:
+    """A shadowed definition binds the later one, so edits to the earlier have no effect.
+
+    ruff's F811 cannot see this: it reports a redefinition of an UNUSED name, and a helper
+    that the module calls between the two definitions is used. test_secret_discipline.py
+    carried two `_assertion_comparisons`, and the security rule ran the copy nobody edited.
+    """
+    duplicates = []
+    for path in sorted((*ROOT.glob("tests/**/*.py"), *ROOT.glob("nso_adapter/**/*.py"))):
+        defined: dict[str, int] = {}
+        for node in ast.parse(path.read_text(encoding="utf-8")).body:
+            names = []
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names = [node.name]
+            elif isinstance(node, ast.Assign):
+                names = [target.id for target in node.targets if isinstance(target, ast.Name)]
+            for name in names:
+                if name in defined:
+                    duplicates.append(f"{path.relative_to(ROOT)}:{node.lineno} redefines {name!r}")
+                defined[name] = node.lineno
+
+    assert duplicates == []

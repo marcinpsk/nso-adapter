@@ -496,7 +496,7 @@ async def test_c4_7_a_fully_superseded_removal_issues_no_http_at_all(adapter_cli
     """C4.7 — consumption by supersession, not by failure: no PUT, no read, job succeeds."""
     from structlog.testing import capture_logs
 
-    from tests._secret_discipline import assert_records_free_of
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
     device_id = await seed_device(nso_device_name="sr-c47", netbox_device_id=7407)
     await seed_rows(device_id, [{"triple": A, "route_id": 2}])
@@ -516,7 +516,7 @@ async def test_c4_7_a_fully_superseded_removal_issues_no_http_at_all(adapter_cli
     record = next(record for record in logs if record["event"] == "static_route.removal_superseded")
     assert record["device_id"] == device_id
     assert record["job_id"] == job_id
-    assert "reclaimed" not in record
+    assert_keys_absent(record, ["reclaimed"])
     assert_records_free_of([record], A[1:])
 
 
@@ -543,7 +543,7 @@ async def test_c4_9_residue_found_fails_the_job_and_the_next_sweep_reissues(adap
     from structlog.testing import capture_logs
 
     from nso_adapter.core.tombstone_sweep import sweep_tombstones
-    from tests._secret_discipline import assert_records_free_of
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
     device_id = await seed_device(nso_device_name="sr-c49", netbox_device_id=7409)
     await seed_owned(device_id, [B])
@@ -572,7 +572,7 @@ async def test_c4_9_residue_found_fails_the_job_and_the_next_sweep_reissues(adap
     record = next(record for record in logs if record["event"] == "removal.residue_found")
     assert record["device_id"] == device_id
     assert record["scope"] == "static_route"
-    assert "residue" not in record
+    assert_keys_absent(record, ["residue"])
     assert_records_free_of([record], A[1:])
 
 

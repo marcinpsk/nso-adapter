@@ -36,7 +36,7 @@ async def test_onboard_creates_device(adapter_client_with_nso):
 
     from nso_adapter.core.onboarding import onboard_device
     from nso_adapter.store.models import MappingStatus
-    from tests._secret_discipline import assert_records_free_of
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
     async with session() as db:
         with capture_logs() as logs:
@@ -48,7 +48,7 @@ async def test_onboard_creates_device(adapter_client_with_nso):
         assert device.mapping_status == MappingStatus.mapped
     record = next(record for record in logs if record["event"] == "device.onboarded")
     assert record["device_id"] == device.id
-    assert "nso_device" not in record
+    assert_keys_absent(record, ["nso_device"])
     assert_records_free_of([record], ["core-rtr-01"])
 
 
@@ -71,7 +71,7 @@ async def test_claim_timeout_does_not_repeat_the_nso_device_name(adapter_client_
     from nso_adapter.config import get_config
     from nso_adapter.core.claim import ClaimRegistration, ClaimUnavailableError, acquire_claim, release_claim
     from nso_adapter.core.onboarding import onboard_device
-    from tests._secret_discipline import assert_chain_free_of, assert_records_free_of
+    from tests._secret_discipline import assert_chain_free_of, assert_keys_absent, assert_records_free_of
     from tests.conftest import seed_device
 
     device_name = "placeholder-claimed-device"
@@ -90,7 +90,7 @@ async def test_claim_timeout_does_not_repeat_the_nso_device_name(adapter_client_
     assert_chain_free_of(caught.value, [device_name])
     record = next(record for record in logs if record["event"] == "device.mapping_claim_timeout")
     assert record["device_id"] == device_id
-    assert "nso_device" not in record
+    assert_keys_absent(record, ["nso_device"])
     assert_records_free_of([record], [device_name])
 
 
@@ -180,7 +180,7 @@ async def test_onboard_adopts_unlinked_existing_device(adapter_client_with_nso):
 
     from nso_adapter.core.onboarding import onboard_device
     from nso_adapter.store.models import MappingStatus
-    from tests._secret_discipline import assert_records_free_of
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
     from tests.conftest import seed_device
 
     existing_id = await seed_device(nso_instance="nso-dev", nso_device_name="preprovisioned", netbox_device_id=None)
@@ -195,7 +195,7 @@ async def test_onboard_adopts_unlinked_existing_device(adapter_client_with_nso):
     record = next(record for record in logs if record["event"] == "device.adopted")
     assert record["device_id"] == existing_id
     assert record["netbox_device_id"] == 77
-    assert "nso_device" not in record
+    assert_keys_absent(record, ["nso_device"])
     assert_records_free_of([record], ["preprovisioned"])
 
     # Exactly one row for that NSO node — adoption must not create a duplicate.
@@ -514,7 +514,7 @@ async def test_rekey_changes_device_name(adapter_client_with_nso):
     from structlog.testing import capture_logs
 
     from nso_adapter.core.onboarding import rekey_device
-    from tests._secret_discipline import assert_records_free_of
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
     from tests.conftest import seed_device
 
     device_id = await seed_device(nso_instance="nso-dev", nso_device_name="old-name", netbox_device_id=300)
@@ -535,7 +535,7 @@ async def test_rekey_changes_device_name(adapter_client_with_nso):
         assert updated.source_epoch == 2
     record = next(record for record in logs if record["event"] == "device.rekeyed")
     assert record["device_id"] == device_id
-    assert "nso_device" not in record
+    assert_keys_absent(record, ["nso_device"])
     assert_records_free_of([record], ["new-name"])
 
 
@@ -1148,7 +1148,7 @@ async def test_an_UNLINKED_provision_is_still_correlatable_without_a_device_id(a
     from nso_adapter.core.onboarding import provision_nso_device
     from nso_adapter.domain.diagnostics import DEVICE_REF_PATTERN
     from nso_adapter.nso.client import NsoClient
-    from tests._secret_discipline import assert_records_free_of
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
     submitted_name = "placeholder-caller-unlinked-provision"
     client = AsyncMock(spec=NsoClient)
@@ -1172,7 +1172,7 @@ async def test_an_UNLINKED_provision_is_still_correlatable_without_a_device_id(a
     assert result["ok"] is True
     assert result["device_id"] is None  # no NetBox link, so no adapter row
     record = next(r for r in logs if r["event"] == "device.provisioned")
-    assert "device_id" not in record
+    assert_keys_absent(record, ["device_id"])
     assert re.fullmatch(DEVICE_REF_PATTERN, record["device_ref"]), "the keyed reference carries it"
     assert record["job_id"] == 4242, "and the job correlates the record to what produced it"
     assert_records_free_of([record], [submitted_name])

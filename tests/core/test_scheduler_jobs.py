@@ -428,11 +428,11 @@ async def test_intent_reconcile_replaces_intent_and_skips_unknown_interface(adap
     async with session() as db:
         rows = (await db.execute(select(InterfaceIntent))).scalars().all()
     assert [(r.attribute, r.intent_value) for r in rows] == [("description", "uplink")]
-    from tests._secret_discipline import assert_records_free_of
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
     skipped = next(log for log in debug_logs if log["event"] == "scheduler.intent_reconcile.unknown_interface")
     assert skipped["device_id"] == ids["sw01"]
-    assert "interface" not in skipped
+    assert_keys_absent(skipped, ["interface"])
     assert_records_free_of([skipped], ["GigabitEthernet9/9"])
 
 

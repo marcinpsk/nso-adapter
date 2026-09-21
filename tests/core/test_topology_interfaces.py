@@ -168,15 +168,15 @@ async def test_unions_and_filters_sources(adapter_client, debug_logs):
     assert "lag67:0" not in names  # decision 3: colon-form unbound shell skipped
     assert "lag-4" not in names  # decision 2: empty + unreferenced LAG skipped
 
-    from tests._secret_discipline import assert_records_free_of
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
     ensured = next(record for record in debug_logs if record["event"] == "topology_interfaces.ensured")
     skipped = next(record for record in debug_logs if record["event"] == "topology_interfaces.skipped_unbound")
     assert ensured["device_id"] == device_id
     assert ensured["total"] == len(names)
-    assert "nso_device_name" not in ensured
+    assert_keys_absent(ensured, ["nso_device_name"])
     assert skipped["device_id"] == device_id
-    assert "names" not in skipped
+    assert_keys_absent(skipped, ["names"])
     assert_records_free_of([ensured, skipped], ["topo-nokia", "lag67:0"])
 
 

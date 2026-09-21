@@ -481,7 +481,7 @@ async def test_provision_admission_retries_when_the_winner_finishes(adapter_clie
     from nso_adapter.core import jobs as jobs_mod
     from nso_adapter.domain.diagnostics import device_ref
     from nso_adapter.store.models import Job, JobStatus
-    from tests._secret_discipline import assert_records_free_of
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
     async with session() as db:
@@ -509,7 +509,7 @@ async def test_provision_admission_retries_when_the_winner_finishes(adapter_clie
     assert created is True and second.id != first.id
     record = next(record for record in debug_logs if record["event"] == "job.provision_admission.winner_finished")
     assert record["device_ref"] == device_ref(_PROVISION["nso_instance"], _PROVISION["device_name"])
-    assert "device_name" not in record
+    assert_keys_absent(record, ["device_name"])
     assert_records_free_of([record], [_PROVISION["device_name"]])
 
 
@@ -518,7 +518,7 @@ async def test_provision_admission_exhaustion_does_not_repeat_the_device_name(ad
 
     from nso_adapter.core import jobs as jobs_mod
     from nso_adapter.domain.diagnostics import device_ref
-    from tests._secret_discipline import assert_chain_free_of, assert_records_free_of
+    from tests._secret_discipline import assert_chain_free_of, assert_keys_absent, assert_records_free_of
 
     device_name = "placeholder-provision-admission-device"
     params = {**_PROVISION, "device_name": device_name, "address": "198.18.0.1"}
@@ -546,7 +546,7 @@ async def test_provision_admission_exhaustion_does_not_repeat_the_device_name(ad
     )
     assert response.status_code == 200
     assert record["device_ref"] == response.json()["device_ref"] == device_ref(params["nso_instance"], device_name)
-    assert "device_name" not in record
+    assert_keys_absent(record, ["device_name"])
     assert_records_free_of([record], [device_name])
 
 

@@ -18,7 +18,7 @@ import nso_adapter.core.failover as failover
 from nso_adapter.config import SchedulerConfig
 from nso_adapter.core.failover import FlipBudget, _next_due, run_failover_tick, step_failback, step_failover
 from nso_adapter.store.models import ActiveAddress, Device, DeviceFailover
-from tests._secret_discipline import assert_records_free_of
+from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
 _BASE = datetime(2026, 6, 18, 12, 0, 0, tzinfo=UTC)
 
@@ -904,5 +904,5 @@ async def test_revert_failure_diagnostic_omits_an_unknown_role():
 
     record = next(record for record in logs if record["event"] == "failover.revert_failed")
     assert record["device_id"] == 17
-    assert "role" not in record
+    assert_keys_absent(record, ["role"])
     assert_records_free_of([record], ["placeholder-device", "198.18.0.10"])

@@ -11,7 +11,7 @@ from structlog.testing import capture_logs
 from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.bindings.netbox.mapper import _guess_netbox_type, resolve_or_create_interface
 from nso_adapter.domain.models import Interface as DomainInterface
-from tests._secret_discipline import assert_records_free_of
+from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
 # ---------------------------------------------------------------------------
 # _guess_netbox_type — pure function tests
@@ -180,10 +180,7 @@ async def test_resolve_creates_missing_interface(debug_logs):
     assert record["netbox_interface_id"] == 55
     assert record["netbox_parent_id"] is None
     assert record["type"] == "other"
-    assert "device_id" not in record
-    assert "netbox_id" not in record
-    assert "name" not in record
-    assert "parent" not in record
+    assert_keys_absent(record, ["device_id", "netbox_id", "name", "parent"])
     assert_records_free_of([record], [interface_name])
 
 
@@ -200,9 +197,7 @@ async def test_resolve_returns_none_on_create_failure():
     assert result is None
     record = next(record for record in logs if record["event"] == "netbox.interface.create_failed")
     assert record["netbox_device_id"] == 42
-    assert "device_id" not in record
-    assert "netbox_interface_id" not in record
-    assert "name" not in record
+    assert_keys_absent(record, ["device_id", "netbox_interface_id", "name"])
     assert_records_free_of([record], [interface_name])
 
 
@@ -276,10 +271,7 @@ async def test_existing_flat_unit_gets_reparented(debug_logs):
     assert record["netbox_device_id"] == 42
     assert record["netbox_interface_id"] == 11
     assert record["netbox_parent_id"] == 10
-    assert "device_id" not in record
-    assert "netbox_id" not in record
-    assert "name" not in record
-    assert "parent" not in record
+    assert_keys_absent(record, ["device_id", "netbox_id", "name", "parent"])
     assert_records_free_of([record], [base_name, interface_name])
 
 
@@ -342,8 +334,7 @@ async def test_existing_flat_unit_reparent_failure_is_swallowed():
     record = next(record for record in logs if record["event"] == "netbox.interface.reparent_failed")
     assert record["netbox_device_id"] == 42
     assert record["netbox_interface_id"] == 11
-    assert "device_id" not in record
-    assert "name" not in record
+    assert_keys_absent(record, ["device_id", "name"])
     assert_records_free_of([record], [base_name, interface_name])
 
 
@@ -373,9 +364,7 @@ async def test_base_creation_failure_creates_unit_parentless():
     assert "parent" not in unit_payload  # created without a parent rather than lost
     record = next(record for record in logs if record["event"] == "netbox.interface.base_unresolved")
     assert record["netbox_device_id"] == 42
-    assert "device_id" not in record
-    assert "unit" not in record
-    assert "base" not in record
+    assert_keys_absent(record, ["device_id", "unit", "base"])
     assert_records_free_of([record], [base_name, interface_name])
 
 
@@ -434,9 +423,7 @@ async def test_bulk_ensure_parent_unresolved_uses_device_and_payload_position():
     record = next(record for record in logs if record["event"] == "netbox.bulk_ensure.parent_unresolved")
     assert record["netbox_device_id"] == 42
     assert record["payload_index"] == 0
-    assert "device_id" not in record
-    assert "child" not in record
-    assert "parent" not in record
+    assert_keys_absent(record, ["device_id", "child", "parent"])
     assert_records_free_of([record], [child_name, parent_name])
     assert all(call.kwargs == {"netbox_device_id": 42} for call in client.bulk_create_interfaces.await_args_list)
 

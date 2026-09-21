@@ -822,7 +822,7 @@ async def test_isis_removal_blocked_on_orphaned_service_rows(adapter_client):
     orphan; the job must BLOCK, name the orphan rows, and commit NOTHING."""
     from structlog.testing import capture_logs
 
-    from tests._secret_discipline import assert_records_free_of
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
     device_id = await _seed_device(nso_device_name="ra1-guard")
     await _seed_isis_intent(device_id, ("system", "ipv4"))
@@ -854,7 +854,7 @@ async def test_isis_removal_blocked_on_orphaned_service_rows(adapter_client):
     assert record["device_id"] == device_id
     assert record["job_id"] == job_id
     assert record["scope"] == "isis"
-    assert "orphans" not in record
+    assert_keys_absent(record, ["orphans"])
     assert_records_free_of([record], ["lo0"])
 
 
@@ -1361,7 +1361,7 @@ async def test_run_removal_reports_residue_when_removed_key_survives(adapter_cli
     """The sw03 Vlan987 case: removal succeeds but the device tree still has the key."""
     from structlog.testing import capture_logs
 
-    from tests._secret_discipline import assert_records_free_of
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
     device_id = await _seed_device(nso_device_name="sw3")
     job_id = await _seed_removal_job(device_id, "svi", {"removed": {"interface": [["Vlan987"]]}})
@@ -1378,7 +1378,7 @@ async def test_run_removal_reports_residue_when_removed_key_survives(adapter_cli
     assert record["device_id"] == device_id
     assert record["job_id"] == job_id
     assert record["scope"] == "svi"
-    assert "residue" not in record
+    assert_keys_absent(record, ["residue"])
     assert_records_free_of([record], ["Vlan987"])
 
 

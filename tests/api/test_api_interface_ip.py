@@ -400,7 +400,7 @@ async def test_put_ip_intent_greenfield_routed_creates_interface(adapter_client)
     from structlog.testing import capture_logs
 
     from nso_adapter.store.models import DbInterface, InterfaceIpIntent
-    from tests._secret_discipline import assert_records_free_of
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
     device_id = await seed_device(nso_device_name="ip-intent-gf", netbox_device_id=910)
     interface_name = "LAG99:99"
@@ -427,8 +427,7 @@ async def test_put_ip_intent_greenfield_routed_creates_interface(adapter_client)
     record = next(record for record in logs if record["event"] == "ip_intent.put.greenfield_interface")
     assert record["device_id"] == device_id
     assert record["encap_tag"] == "99"
-    assert "interface" not in record
-    assert "parent_binding" not in record
+    assert_keys_absent(record, ["interface", "parent_binding"])
     assert_records_free_of([record], [interface_name, parent_binding])
 
     async with session() as db:
@@ -454,7 +453,7 @@ async def test_put_ip_intent_unknown_interface_record_uses_device_id(adapter_cli
 
     from nso_adapter.api.interface_ip import IpAddressEntry, put_ip_intent
     from nso_adapter.core.receipt import IntentDelivery, PushIdentity
-    from tests._secret_discipline import assert_records_free_of
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
     staged = IpAddressEntry(interface="placeholder-staged", address="198.18.249.162/31", family="ipv4")
     missing = IpAddressEntry(interface="placeholder-missing", address="198.18.249.164/31", family="ipv4")
@@ -485,7 +484,7 @@ async def test_put_ip_intent_unknown_interface_record_uses_device_id(adapter_cli
     assert result["address_count"] == 0
     record = next(record for record in logs if record["event"] == "ip_intent.put.unknown_interface")
     assert record["device_id"] == device_id
-    assert "interface" not in record
+    assert_keys_absent(record, ["interface"])
     assert_records_free_of([record], [missing.interface])
 
 

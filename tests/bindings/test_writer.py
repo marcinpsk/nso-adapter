@@ -12,7 +12,7 @@ from structlog.testing import capture_logs
 from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.bindings.netbox.writer import WriteResult, write_interfaces
 from nso_adapter.domain.models import Interface, InterfaceAttr
-from tests._secret_discipline import assert_records_free_of
+from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
 
 def _make_nb_client():
@@ -114,8 +114,7 @@ async def test_write_counts_skipped_on_patch_error():
     record = next(record for record in logs if record["event"] == "netbox.write_failed")
     assert record["netbox_device_id"] == 42
     assert record["netbox_interface_id"] == 5
-    assert "device_id" not in record
-    assert "interface" not in record
+    assert_keys_absent(record, ["device_id", "interface"])
     assert_records_free_of([record], [interface_name])
 
 

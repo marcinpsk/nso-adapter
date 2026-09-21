@@ -740,31 +740,6 @@ def test_a_CLEAN_chain_passes() -> None:
     assert_chain_free_of(caught, [_SECRET])
 
 
-_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
-
-
-def _assertion_comparisons(test: ast.expr) -> list[ast.Compare]:
-    """The assertion's own comparisons, skipping any inside a comprehension.
-
-    A `not in` used as a comprehension filter is a per-element test. The assertion renders the
-    comprehension's RESULT - a count, a list - never the element, so it discloses nothing.
-    """
-    comparisons: list[ast.Compare] = []
-    stack: list[ast.AST] = [test]
-    while stack:
-        node = stack.pop()
-        if isinstance(node, _COMPREHENSIONS):
-            continue
-        if isinstance(node, ast.Compare):
-            comparisons.append(node)
-        stack.extend(ast.iter_child_nodes(node))
-    return comparisons
-
-
-def test_the_guarded_membership_is_derived_from_what_a_module_handles() -> None:
-    """A module that starts holding protected material joins both rules with no edit here."""
-
-
 def test_non_disclosure_checks_do_not_use_rewritten_assertions() -> None:
     violations = []
     for path in _NON_DISCLOSURE_TESTS:
@@ -978,11 +953,12 @@ def _discloses_protected_value(node: ast.Assert, root: str) -> bool:
 
     The two operator kinds read their operands differently, so they are judged differently. A
     membership operand is the HAYSTACK being searched for the protected value, so narrowing it
-    still renders text that came from the protected value: it is judged on the whole chain.
-    Every other operator compares a value against an authored one, so narrowing produces a
-    different, smaller value: it is judged on the operand's outermost expression. That is why
-    ``"device_id" not in record`` renders a boolean while ``record == expected`` renders the
-    record, and why ``resp.json()["error"]["code"] == "vault_error"`` renders neither.
+    still renders text that came from the protected value: it is judged on the whole chain. A
+    BARE container operand is rendered too, because pytest prints both operands of a membership
+    test: ``assert "nso_device" not in record`` fails as ``assert 'nso_device' not in {'nso_device':
+    'placeholder-secret'}``. Every other operator compares a value against an authored one, so
+    narrowing produces a different, smaller value and is judged on the operand's outermost
+    expression, which is why ``resp.json()["error"]["code"] == "vault_error"`` renders neither.
     """
     if node.msg is not None and _renders_root(node.msg, root):
         return True
@@ -990,10 +966,10 @@ def _discloses_protected_value(node: ast.Assert, root: str) -> bool:
         if not isinstance(part, ast.Compare):
             continue
         operands = (part.left, *part.comparators)
-        if any(isinstance(operator, ast.In | ast.NotIn) for operator in part.ops):
-            if any(_renders_root_through_a_surface(operand, root) for operand in operands):
-                return True
-            continue
+        if any(isinstance(operator, ast.In | ast.NotIn) for operator in part.ops) and any(
+            _renders_root_through_a_surface(operand, root) for operand in operands
+        ):
+            return True
         if any(_renders_root_whole(operand, root) for operand in operands):
             return True
     return False
@@ -1132,7 +1108,7 @@ def _ordering_violations(source: str) -> list[int]:
 
 
 def test_the_ordering_rule_reads_the_shapes_that_disclose_and_no_others() -> None:
-    """A failure message and a bare operand render the value; a key test renders a boolean."""
+    """A failure message, a bare operand and a membership container all render the value."""
     message = """\
 def t():
     assert resp.status_code == 422, resp.text
@@ -1148,6 +1124,11 @@ def t():
     assert "device_id" not in record
     assert_records_free_of([record], [protected])
 """
+    cleared_key_membership = """\
+def t():
+    assert_records_free_of([record], [protected])
+    assert "device_id" not in record
+"""
     narrowed_operand = """\
 def t():
     assert record["error"] == "ReadTimeout"
@@ -1162,7 +1143,9 @@ def t():
     assert _ordering_violations(message) == [2]
     assert _ordering_violations(bare_operand) == [2]
     assert _ordering_violations(rendered_membership) == [2]
-    assert _ordering_violations(key_membership) == []
+    # pytest prints BOTH operands of a membership test, so the container is rendered whole.
+    assert _ordering_violations(key_membership) == [2]
+    assert _ordering_violations(cleared_key_membership) == []
     assert _ordering_violations(narrowed_operand) == []
 
 

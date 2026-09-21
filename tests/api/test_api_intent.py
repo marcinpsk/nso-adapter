@@ -107,7 +107,7 @@ async def test_put_intent_unknown_interface_lands(adapter_client):
 
     from structlog.testing import capture_logs
 
-    from tests._secret_discipline import assert_records_free_of
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
     interface_name = "ae99.999"
     with capture_logs() as logs:
@@ -129,7 +129,7 @@ async def test_put_intent_unknown_interface_lands(adapter_client):
 
     record = next(record for record in logs if record["event"] == "intent.put.greenfield_interface")
     assert record["device_id"] == device_id
-    assert "interface" not in record
+    assert_keys_absent(record, ["interface"])
     assert_records_free_of([record], [interface_name])
 
     # the materialised interface carries an accepted attr_state (apply-eligible, not inert)

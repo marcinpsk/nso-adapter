@@ -10,7 +10,7 @@ import respx
 from structlog.testing import capture_logs
 
 from nso_adapter.bindings.netbox.client import NetboxClient, rejection_detail
-from tests._secret_discipline import assert_records_free_of
+from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
 BASE = "http://netbox.local"
 TOKEN = "nb-test-token"
@@ -255,8 +255,7 @@ async def test_bulk_create_rejection_keeps_absolute_position_after_chunking(clie
     record = next(record for record in logs if record["event"] == "netbox.bulk_create.row_rejected")
     assert record["payload_index"] == chunk + 1
     assert record["netbox_device_id"] == 43
-    assert "device_id" not in record
-    assert "netbox_interface_id" not in record
+    assert_keys_absent(record, ["device_id", "netbox_interface_id"])
     assert_records_free_of([record], names)
 
 
@@ -408,7 +407,7 @@ async def test_bulk_patch_400_non_positional_body_bisects_to_isolate_bad_row(cli
     assert record["payload_index"] == 2
     assert record["netbox_device_id"] == 44
     assert record["netbox_interface_id"] == bad_id
-    assert "device_id" not in record
+    assert_keys_absent(record, ["device_id"])
     assert_records_free_of([record], names)
 
 

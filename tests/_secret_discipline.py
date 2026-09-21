@@ -50,6 +50,18 @@ def assert_text_free_of(value, secrets) -> None:
             raise AssertionError(f"text repeats secret material (secrets[{index}])")
 
 
+def assert_keys_absent(container, keys) -> None:
+    """Assert that *container* holds none of *keys*, without rendering it.
+
+    pytest prints BOTH operands of a membership test, so ``assert "nso_device" not in record``
+    fails as ``assert 'nso_device' not in {'nso_device': 'placeholder-secret'}``. The key names
+    are authored and are named; the container never is.
+    """
+    present = sorted(key for key in keys if key in container)
+    if present:
+        raise AssertionError(f"the value carries {present!r}")
+
+
 def assert_text_contains(value, fragments) -> None:
     """The presence half of :func:`assert_text_omits`, with the same non-disclosure property.
 

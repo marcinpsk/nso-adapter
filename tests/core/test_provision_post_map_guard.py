@@ -134,7 +134,7 @@ async def test_post_map_refresh_runs_under_the_claim(adapter_client_with_nso, mo
 
     from nso_adapter.core.onboarding import offboard_device
     from nso_adapter.store.models import Device, MappingStatus
-    from tests._secret_discipline import assert_records_free_of
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
     monkeypatch.setattr(get_config(), "intent_claim_wait_seconds", 0.3)
     name = f"pg-{branch}"
@@ -183,8 +183,7 @@ async def test_post_map_refresh_runs_under_the_claim(adapter_client_with_nso, mo
     assert claim.job_id == job_id, "a revoked claim with no job recorded cannot re-disposition it"
     provisioned = next(record for record in logs if record["event"] == "device.provisioned")
     assert provisioned["device_id"] == reg.device_id
-    assert "device_ref" not in provisioned
-    assert "nso_device" not in provisioned
+    assert_keys_absent(provisioned, ["device_ref", "nso_device"])
     if branch == "fresh":
         mapped = next(record for record in logs if record["event"] == "device.onboarded")
         assert mapped["claimed"] is True
@@ -195,7 +194,7 @@ async def test_post_map_refresh_runs_under_the_claim(adapter_client_with_nso, mo
         mapped = None
     if mapped is not None:
         assert mapped["device_id"] == reg.device_id
-        assert "nso_device" not in mapped
+        assert_keys_absent(mapped, ["nso_device"])
     assert_records_free_of([provisioned, *([mapped] if mapped is not None else [])], [name])
 
 
@@ -490,7 +489,7 @@ async def test_a_taken_netbox_id_is_refused_and_leaks_no_claim(adapter_client_wi
 
     from nso_adapter.domain.diagnostics import device_ref
     from nso_adapter.store.models import DeviceClaim
-    from tests._secret_discipline import assert_records_free_of
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
     await seed_device(nso_device_name="pg-holder", netbox_device_id=7240, attributes=[])
 
@@ -514,8 +513,7 @@ async def test_a_taken_netbox_id_is_refused_and_leaks_no_claim(adapter_client_wi
         assert (await db.execute(sa.select(DeviceClaim))).first() is None
     record = next(record for record in logs if record["event"] == "device.provisioned")
     assert record["device_ref"] == device_ref(_INSTANCE, "pg-taken")
-    assert "device_id" not in record
-    assert "nso_device" not in record
+    assert_keys_absent(record, ["device_id", "nso_device"])
     assert_records_free_of([record], ["pg-taken"])
 
 
@@ -579,7 +577,7 @@ async def test_a_pair_mapped_elsewhere_is_reported_and_leaks_no_claim(adapter_cl
 
     from nso_adapter.domain.diagnostics import device_ref
     from nso_adapter.store.models import DeviceClaim
-    from tests._secret_discipline import assert_records_free_of
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
     await seed_device(nso_device_name="pg-elsewhere", netbox_device_id=7250, attributes=[])
 
@@ -607,8 +605,7 @@ async def test_a_pair_mapped_elsewhere_is_reported_and_leaks_no_claim(adapter_cl
     assert record["reason"] == "onboarded_elsewhere"
     provisioned = next(record for record in logs if record["event"] == "device.provisioned")
     assert provisioned["device_ref"] == device_ref(_INSTANCE, "pg-elsewhere")
-    assert "device_id" not in provisioned
-    assert "nso_device" not in provisioned
+    assert_keys_absent(provisioned, ["device_id", "nso_device"])
     assert_records_free_of([provisioned], ["pg-elsewhere"])
     assert not reg.registered
     async with session() as db:
@@ -825,7 +822,7 @@ async def test_the_mapping_endpoint_takes_no_claim(adapter_client_with_nso):
 
     from nso_adapter.domain.diagnostics import device_ref
     from nso_adapter.store.models import DeviceClaim, Job
-    from tests._secret_discipline import assert_records_free_of
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
     reg = ClaimRegistration()
     job_id = await _seed_provision_job()
@@ -843,8 +840,7 @@ async def test_the_mapping_endpoint_takes_no_claim(adapter_client_with_nso):
     assert refresh.calls == 0
     provisioned = next(record for record in logs if record["event"] == "device.provisioned")
     assert provisioned["device_ref"] == device_ref(_INSTANCE, "pg-patha")
-    assert "device_id" not in provisioned
-    assert "nso_device" not in provisioned
+    assert_keys_absent(provisioned, ["device_id", "nso_device"])
     assert_records_free_of([provisioned], ["pg-patha"])
 
     async with session() as db:

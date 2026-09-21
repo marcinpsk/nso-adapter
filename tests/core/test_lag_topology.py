@@ -138,7 +138,7 @@ async def test_lag_without_lag_id_is_skipped_not_fatal(adapter_client):
     async with _device_session(device_id) as (db, device):
         from structlog.testing import capture_logs
 
-        from tests._secret_discipline import assert_records_free_of
+        from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
         client = AsyncMock()
         client.get_device_state_section.return_value = {
@@ -158,7 +158,7 @@ async def test_lag_without_lag_id_is_skipped_not_fatal(adapter_client):
         record = next(record for record in logs if record["event"] == "lag_topology.entry_skipped")
         assert record["device_id"] == device_id
         assert record["reason"] == "no lag-id"
-        assert "lag_name" not in record
+        assert_keys_absent(record, ["lag_name"])
         assert_records_free_of([record], ["lag-aa"])
 
 
