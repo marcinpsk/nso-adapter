@@ -176,7 +176,7 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
             self.visit(statement)
         self.aliases |= body_aliases
 
-    def visit_Try(self, node: ast.Try) -> None:  # noqa: N802 - ast visitor API
+    def _visit_try(self, node: ast.Try | ast.TryStar) -> None:
         # generic_visit walks body, handlers, orelse and finalbody in source order, so an
         # alias a handler taints was discarded by an `else` assignment before `finally` ran.
         incoming = self.aliases.copy()
@@ -195,9 +195,20 @@ class _RawLogExceptionVisitor(ast.NodeVisitor):
             self.visit(statement)
         reaching |= self.aliases
 
-        self.aliases = reaching | incoming
+        # `finally` also runs while an exception raised inside the try is still propagating,
+        # so it is visited with the incoming state as well. Only the paths that FALL OUT of
+        # the try reach the statements after it, so the incoming state is not carried past it.
+        entry = reaching | incoming
+        self.aliases = entry.copy()
         for statement in node.finalbody:
             self.visit(statement)
+        self.aliases = (reaching | (self.aliases - entry)) - (entry - self.aliases)
+
+    def visit_Try(self, node: ast.Try) -> None:  # noqa: N802 - ast visitor API
+        self._visit_try(node)
+
+    def visit_TryStar(self, node: ast.TryStar) -> None:  # noqa: N802 - ast visitor API
+        self._visit_try(node)
 
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:  # noqa: N802 - ast visitor API
         handler_name = node.name
@@ -842,13 +853,11 @@ async def test_a_malformed_record_document_is_a_read_error_not_an_export_outage(
     assert outcome.failure.operation is ReadOperation.doc_get
 
 
-def test_an_alias_a_handler_taints_still_reaches_the_finally_block() -> None:
-    """The handler path reaches `finally` too, so an `else` assignment cannot clear the alias."""
-    source = """\
+_TRY_ELSE_FINALLY = """\
 def f():
     try:
         detail = "authored"
-    except ValueError as exc:
+    {handler} ValueError as exc:
         detail = exc
     else:
         detail = "authored"
@@ -856,4 +865,44 @@ def f():
         logger.warning("event", detail=detail)
 """
 
-    assert _raw_log_exception_renderers(source) == [9]
+
+@pytest.mark.parametrize("handler", ["except", "except*"], ids=["try", "try-star"])
+def test_an_alias_a_handler_taints_still_reaches_the_finally_block(handler: str) -> None:
+    """The handler path reaches `finally` too, so an `else` assignment cannot clear the alias."""
+    assert _raw_log_exception_renderers(_TRY_ELSE_FINALLY.format(handler=handler)) == [9]
+
+
+def test_a_try_that_every_path_reassigns_leaves_no_alias_behind_it() -> None:
+    """`finally` sees the incoming state; the statements AFTER the try only see the exits."""
+    every_path_clean = """\
+def f():
+    detail = exc
+    try:
+        detail = "authored"
+    except ValueError:
+        detail = "authored"
+    logger.warning("event", detail=detail)
+"""
+    empty_finally = """\
+def f():
+    detail = exc
+    try:
+        detail = "authored"
+    finally:
+        pass
+    logger.warning("event", detail=detail)
+"""
+    tainted_by_finally = """\
+def f():
+    try:
+        detail = "authored"
+    except ValueError as exc:
+        pass
+    finally:
+        detail = exc
+    logger.warning("event", detail=detail)
+"""
+
+    assert _raw_log_exception_renderers(every_path_clean) == []
+    assert _raw_log_exception_renderers(empty_finally) == []
+    assert _raw_log_exception_renderers(tainted_by_finally) == [8]

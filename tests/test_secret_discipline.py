@@ -194,7 +194,9 @@ def _url_membership_lines(source: str) -> list[int]:
 def test_url_membership_checks_go_through_a_non_disclosure_helper() -> None:
     """``assert "reconcile=" in str(req.url)`` prints the whole URL, device name included."""
     violations = []
-    for path in _NON_DISCLOSURE_TESTS:
+    # Every module, not the curated registry: the URL surface IS the protected material here,
+    # so a module that holds nothing of its own still discloses the device name through it.
+    for path in sorted(_TEST_ROOT.rglob("test_*.py")):
         for lineno in _url_membership_lines(path.read_text(encoding="utf-8")):
             violations.append(f"{path.relative_to(_TEST_ROOT.parent)}:{lineno}")
     assert violations == []

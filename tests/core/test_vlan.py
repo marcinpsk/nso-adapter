@@ -482,6 +482,10 @@ async def test_a_BOOLEAN_vlan_id_is_refused_and_never_bound_to_a_real_vlan(adapt
     message = str(caught.value)
     if "vlan-id" not in message or "bool" not in message:
         raise AssertionError("the refusal must name the field and the received type")
+    async with _device_session(device_id) as (db, _device):
+        rows = (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device_id))).scalars().all()
+    # The harm the coercion caused: VLAN 1 counted as seen and the real rows were pruned.
+    assert [row.vlan_id for row in rows] == [10]
 
 
 @pytest.mark.anyio
@@ -501,4 +505,5 @@ async def test_a_BOOLEAN_untagged_vlan_is_refused_and_never_bound_to_vlan_1(adap
             (await db.execute(select(DeviceSwitchport).where(DeviceSwitchport.device_id == device_id))).scalars().all()
         )
     assert rows == [], "the refused switchport must leave no row behind"
-    assert logs, "the failed surface was not reported at all"
+    if not [record for record in logs if record["event"] == "sync.surface_refresh_failed"]:
+        raise AssertionError("the failed surface was not reported at all")
