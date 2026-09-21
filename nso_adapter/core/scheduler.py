@@ -461,7 +461,6 @@ async def _refresh_all_devices(refresh_fn, label: str) -> None:
                     f"scheduler.{label}.skipped",
                     device_id=device.id,
                     reason="no_nso_client",
-                    instance=device.nso_instance,
                 )
                 continue
             await refresh_fn(db, device, nso_client, refresh_source="poll")
