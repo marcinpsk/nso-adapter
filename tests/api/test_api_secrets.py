@@ -12,6 +12,7 @@ transport serving real-shape NED payloads) — the real ``NsoClient`` runs.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import threading
 import types
@@ -23,6 +24,7 @@ import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from nso_adapter.api import secrets as secrets_module
 from nso_adapter.main import create_app
 from tests._secret_discipline import assert_text_contains, assert_text_free_of
 from tests.conftest import VALID_TOKEN, seed_device, session
@@ -637,7 +639,7 @@ async def test_a_vault_failure_puts_no_reference_or_provider_text_in_the_502(vau
     # The same failure through the real helper: `from None` would leave the provider's
     # exception on __context__, where a formatted traceback still prints it.
     with pytest.raises(ApiError) as caught:
-        await _vault_op(boom)
+        await _vault_op(boom, "placeholder-operation")
     assert_chain_free_of(caught.value, leaked)
 
 
@@ -860,7 +862,7 @@ async def test_a_MALFORMED_ref_is_answered_with_the_broken_RULE_not_the_input(va
     # The same input through the real helper: `from exc` kept the parser exception, whose
     # own text repeats the reference verbatim.
     with pytest.raises(ApiError) as caught:
-        _parse_ref(malformed)
+        _parse_ref(malformed, "placeholder-operation")
     assert_chain_free_of(caught.value, [malformed, "placeholder-path", "placeholder-secret"])
     assert exception_chain(caught.value) == [caught.value], "the parser exception must not stay attached"
 
@@ -902,3 +904,69 @@ async def test_an_UNREGISTERED_instance_answers_502_with_nothing_attached(vault_
     assert built, "the refusal never went through api_error"
     refusal = built[-1]
     assert exception_chain(refusal) == [refusal], "the registry exception must not stay attached to the 502"
+
+
+# ── every handler-owned refusal is joinable to its own record ─────────────────
+
+
+@pytest.mark.anyio
+async def test_a_MALFORMED_ref_refusal_is_joinable_to_its_own_record(vault_client):
+    """A 400 raised before the handler minted an id could be joined to nothing."""
+    from structlog.testing import capture_logs
+
+    client, _store, _ = vault_client
+    with capture_logs() as logs:
+        resp = await client.post("/api/v1/secrets", json={"vault_ref": "no-slash", "values": {"a": "b"}}, headers=AUTH)
+
+    assert resp.status_code == 400
+    operation_id = resp.json()["error"]["detail"]["operation_id"]
+    rejected = [record for record in logs if record["event"] == "secrets.ref_rejected"]
+    assert [record["operation_id"] for record in rejected] == [operation_id]
+
+
+@pytest.mark.anyio
+async def test_a_VAULT_FAILURE_refusal_is_joinable_to_its_own_record(vault_client, monkeypatch):
+    """The 502 logged nothing at all, so the operator had a failure and no record of it."""
+    from structlog.testing import capture_logs
+
+    client, _store, kv = vault_client
+
+    def boom(**_kwargs):
+        raise RuntimeError("vault: read failed")
+
+    monkeypatch.setattr(kv, "read_secret_version", boom)
+    with capture_logs() as logs:
+        resp = await client.post("/api/v1/secrets/verify", json={"vault_ref": "network/placeholder-path"}, headers=AUTH)
+
+    assert resp.status_code == 502
+    operation_id = resp.json()["error"]["detail"]["operation_id"]
+    failed = [record for record in logs if record["event"] == "secrets.vault_failed"]
+    assert [(record["operation_id"], record["failure"]) for record in failed] == [(operation_id, "RuntimeError")]
+
+
+def test_every_refusal_in_the_secrets_module_carries_the_operation_id() -> None:
+    """A refusal with no id could be joined to no record, which is the module's whole contract.
+
+    The code stays a literal at every call site (test_call_site_codes_are_subset_of_error_codes
+    forbids a computed one), so the detail is checked here rather than behind a builder.
+    """
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path(inspect.getfile(secrets_module)).read_text(encoding="utf-8"))
+    missing = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "api_error"):
+            continue
+        detail = (
+            node.args[3]
+            if len(node.args) > 3
+            else next((keyword.value for keyword in node.keywords if keyword.arg == "detail"), None)
+        )
+        keys = (
+            [key.value for key in detail.keys if isinstance(key, ast.Constant)] if isinstance(detail, ast.Dict) else []
+        )
+        if "operation_id" not in keys:
+            missing.append(node.lineno)
+
+    assert missing == [], "every refusal must answer with {'operation_id': ...} in its detail"

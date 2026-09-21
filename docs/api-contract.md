@@ -1223,8 +1223,10 @@ value is what closes that. `null` on both means the adapter holds nothing, which
 ## Secrets
 
 Vault references use `mount/path` for a path or `mount/path#key` for one field.
-The adapter never returns a reference, field name, or secret value. Each successful
-operation returns an adapter-generated `operation_id` that identifies its safe log record.
+The adapter never returns a reference, field name, or secret value. Every response,
+successful or not, carries an adapter-generated `operation_id` that identifies its safe log
+record: a success returns it as a top-level field, and a refusal returns it in
+`error.detail.operation_id`.
 
 ### `POST /api/v1/secrets` → `200 | 400 | 401 | 422 | 501 | 502`
 

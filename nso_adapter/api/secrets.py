@@ -105,7 +105,7 @@ def _operation_id() -> str:
     return uuid4().hex
 
 
-def _vault_provider(request: Request):
+def _vault_provider(request: Request, operation_id: str):
     """Return the app's secrets provider, or 501 if it cannot write Vault."""
     provider = getattr(request.app.state, "secrets", None)
     if provider is None or not hasattr(provider, "write_path"):
@@ -113,11 +113,12 @@ def _vault_provider(request: Request):
             501,
             "secrets_write_unsupported",
             "The configured secrets provider cannot write Vault (secrets.provider must be 'vault')",
+            {"operation_id": operation_id},
         )
     return provider
 
 
-def _parse_ref(reference: str) -> VaultRef:
+def _parse_ref(reference: str, operation_id: str) -> VaultRef:
     """Parse a caller-supplied ref, answering 400 with the broken rule and not the input.
 
     The caller learns which part of the grammar it broke. It is never sent its own text
@@ -130,10 +131,11 @@ def _parse_ref(reference: str) -> VaultRef:
         reason = exc.reason
     # Raised outside the handler: `from exc` (and `from None`) both keep the parser
     # exception on the chain, and its text repeats the reference.
-    raise api_error(400, "invalid_vault_ref", reason)
+    logger.warning("secrets.ref_rejected", operation_id=operation_id, reason=reason)
+    raise api_error(400, "invalid_vault_ref", reason, {"operation_id": operation_id})
 
 
-async def _vault_op(operation):
+async def _vault_op(operation, operation_id: str):
     """Run a provider read/write OFF the event loop, mapping Vault failures to a 502.
 
     hvac is blocking (``requests`` — real sockets), so calling it straight from an
@@ -153,7 +155,8 @@ async def _vault_op(operation):
         failure = type(exc).__name__
     # Raised outside the handler: `from None` would still leave the provider's exception
     # reachable on __context__, and a formatted traceback prints it.
-    raise api_error(502, "vault_error", f"The Vault operation failed ({failure})")
+    logger.warning("secrets.vault_failed", operation_id=operation_id, failure=failure)
+    raise api_error(502, "vault_error", f"The Vault operation failed ({failure})", {"operation_id": operation_id})
 
 
 @router.post(
@@ -163,8 +166,9 @@ async def _vault_op(operation):
 )
 async def set_secret(body: SecretWriteRequest, request: Request) -> SecretWriteOut:
     """Merge-write secret fields at the ref's Vault path; return the operation_id and new KV v2 version."""
-    provider = _vault_provider(request)
-    ref = _parse_ref(body.vault_ref)
+    operation_id = _operation_id()
+    provider = _vault_provider(request, operation_id)
+    ref = _parse_ref(body.vault_ref, operation_id)
     if ref.key is not None and set(body.values) != {ref.key}:
         # Both halves of the mismatch are the caller's own strings, so the refusal states the
         # rule. The caller holds the ref and the field names it sent and needs neither back.
@@ -172,11 +176,11 @@ async def set_secret(body: SecretWriteRequest, request: Request) -> SecretWriteO
             400,
             "invalid_vault_ref",
             "a vault_ref ending in '#<key>' requires values to carry exactly that one field",
+            {"operation_id": operation_id},
         )
 
     plain = {field: value.get_secret_value() for field, value in body.values.items()}
-    version = await _vault_op(lambda: provider.write_path(ref.mount, ref.path, plain))
-    operation_id = _operation_id()
+    version = await _vault_op(lambda: provider.write_path(ref.mount, ref.path, plain), operation_id)
     logger.info("secrets.set", operation_id=operation_id, version=version)
     return SecretWriteOut(operation_id=operation_id, version=version)
 
@@ -188,8 +192,9 @@ async def set_secret(body: SecretWriteRequest, request: Request) -> SecretWriteO
 )
 async def verify_secret(body: SecretVerifyRequest, request: Request) -> SecretVerifyOut:
     """Resolve a ref and return its fixed verification projection."""
-    provider = _vault_provider(request)
-    ref = _parse_ref(body.vault_ref)
+    operation_id = _operation_id()
+    provider = _vault_provider(request, operation_id)
+    ref = _parse_ref(body.vault_ref, operation_id)
 
     def _read_for_verification() -> tuple[tuple[dict[str, object], int | None] | None, str | None]:
         result = provider.read_path_meta(ref.mount, ref.path)
@@ -199,7 +204,7 @@ async def verify_secret(body: SecretVerifyRequest, request: Request) -> SecretVe
             selected = selected_secret_value(data, ref.key)
         return result, selected
 
-    result, selected = await _vault_op(_read_for_verification)
+    result, selected = await _vault_op(_read_for_verification, operation_id)
     fingerprint = None
     has_auth = False
     has_priv = False
@@ -217,7 +222,6 @@ async def verify_secret(body: SecretVerifyRequest, request: Request) -> SecretVe
             fingerprint = secret_fingerprint(selected)
         else:
             status = "missing_field"
-    operation_id = _operation_id()
     logger.info("secrets.verify", operation_id=operation_id, status=status, version=version)
     return SecretVerifyOut(
         operation_id=operation_id,
@@ -255,14 +259,17 @@ async def harvest_community(
     v3 secrets are never harvestable (engine-ID-localized); timos is excluded
     (SR OS stores communities hash2-obfuscated — live-confirmed).
     """
-    provider = _vault_provider(request)
-    ref = _parse_ref(body.vault_ref)
+    operation_id = _operation_id()
+    provider = _vault_provider(request, operation_id)
+    ref = _parse_ref(body.vault_ref, operation_id)
     if ref.key is None:
-        raise api_error(400, "invalid_vault_ref", "harvest target ref must name a '#key'")
+        raise api_error(
+            400, "invalid_vault_ref", "harvest target ref must name a '#key'", {"operation_id": operation_id}
+        )
 
     device = await db.get(Device, device_id)
     if device is None:
-        raise api_error(404, "not_found", f"device {device_id} not found")
+        raise api_error(404, "not_found", f"device {device_id} not found", {"operation_id": operation_id})
 
     ned_id = device.ned_id or ""
     subpath = snmp_harvest.harvest_subpath(ned_id)
@@ -272,6 +279,7 @@ async def harvest_community(
             "harvest_unsupported_ned",
             "This device's NED is not harvest-capable (SR OS stores communities "
             "hash2-obfuscated — live-confirmed; v3 secrets are never harvestable)",
+            {"operation_id": operation_id},
         )
 
     unavailable = None
@@ -280,7 +288,7 @@ async def harvest_community(
     except RuntimeError:
         # Adapter-authored, like the same refusal in api/capability.py. The caught text is
         # not repeated and not chained: a raise inside the handler attaches it either way.
-        unavailable = api_error(502, "nso_unavailable", "No NSO client is registered")
+        unavailable = api_error(502, "nso_unavailable", "No NSO client is registered", {"operation_id": operation_id})
     if unavailable is not None:
         raise unavailable
     payload = await client.get_device_config_subtree(device.nso_device_name, subpath)
@@ -293,10 +301,10 @@ async def harvest_community(
             "community_not_found",
             f"no community with the requested fingerprint in the config mirror of device {device.id}. "
             "If the device changed out-of-band, run sync-from and refresh first",
+            {"operation_id": operation_id},
         )
 
-    version = await _vault_op(lambda: provider.write_path(ref.mount, ref.path, {ref.key: found.secret}))
-    operation_id = _operation_id()
+    version = await _vault_op(lambda: provider.write_path(ref.mount, ref.path, {ref.key: found.secret}), operation_id)
     # The device is the adapter's own id and the hash is a fingerprint; no part of the ref.
     logger.info(
         "secrets.harvest_community",
