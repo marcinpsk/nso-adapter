@@ -466,6 +466,23 @@ def test_a_NON_MAPPING_METADATA_envelope_is_REFUSED_not_read_as_unversioned(fake
         _provider().read_path_meta("network", "netbox/snmp/community/prod-ro")
 
 
+@pytest.mark.parametrize("version", [True, 1.9, "2", 0, -1])
+def test_a_MALFORMED_VERSION_is_REFUSED_and_never_coerced(fake_hvac, version):
+    """``int()`` read ``True`` as 1 and truncated ``1.9`` to 1, reporting a version Vault never wrote."""
+    _, store, kv = fake_hvac
+    store["netbox/snmp/community/prod-ro"] = {"community": "placeholder-community"}
+    original = kv.read_secret_version
+
+    def _with_bad_version(**kwargs):
+        secret = original(**kwargs)
+        return {"data": {**secret["data"], "metadata": {"version": version}}}
+
+    kv.read_secret_version = _with_bad_version
+
+    with pytest.raises(ValueError, match="invalid version"):
+        _provider().read_path_meta("network", "netbox/snmp/community/prod-ro")
+
+
 def test_an_ABSENT_metadata_block_still_reads_as_an_UNVERSIONED_path(fake_hvac):
     """The other half: absence keeps its own meaning, so the refusal above is not over-broad."""
     _, store, kv = fake_hvac

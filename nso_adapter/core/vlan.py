@@ -35,6 +35,17 @@ def _now():
     return datetime.now(UTC)
 
 
+def wire_int(value: object) -> int:
+    """Coerce a wire scalar to ``int``, refusing a JSON boolean.
+
+    ``bool`` is an ``int`` subclass, so a bare ``int(value)`` turns ``true`` into 1 and
+    ``false`` into 0 and binds a real VLAN to a value the device never sent.
+    """
+    if isinstance(value, bool):
+        raise TypeError("a wire integer must not be a boolean")
+    return int(value)  # type: ignore[call-overload]
+
+
 def parse_vlan_string(raw: str | None) -> list[int]:
     """Expand the NSO ``tagged-vlans`` range string into a sorted VLAN ID list."""
     if raw is None or raw == "":
@@ -50,9 +61,9 @@ def parse_vlan_string(raw: str | None) -> list[int]:
         unusable = None
         try:
             if "-" in chunk:
-                start, end = (int(x) for x in chunk.split("-", 1))
+                start, end = (wire_int(x) for x in chunk.split("-", 1))
             else:
-                start = end = int(chunk)
+                start = end = wire_int(chunk)
         except ValueError:
             unusable = ValueError(_INVALID_TAGGED_VLAN_RANGE)
         # Raise after the handler so the provider value is not retained as exception context.
@@ -88,7 +99,7 @@ async def _upsert_vlans(
         raw_vlan_id = item.get("vlan-id", item.get("vlan_id"))
         unusable = None
         try:
-            vid = int(raw_vlan_id)  # type: ignore[arg-type]
+            vid = wire_int(raw_vlan_id)
         except (TypeError, ValueError):
             # A skipped item would vanish from `seen` and the prune below would delete its
             # existing row — reject the whole refresh instead (the engine's savepoint keeps
@@ -177,7 +188,7 @@ async def _upsert_switchports(
         if untagged is not None:
             unusable = None
             try:
-                untagged_vid = int(untagged)
+                untagged_vid = wire_int(untagged)
             except (TypeError, ValueError):
                 # The value is the device's own; name the field and what arrived, not the leaf.
                 unusable = ValueError(

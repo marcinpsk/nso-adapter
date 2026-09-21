@@ -321,3 +321,18 @@ rules:
           - pattern: $SECRET["data"].get("data", ...)
           - pattern: $SECRET["data"]["metadata"]
           - pattern: $SECRET["data"].get("metadata", ...)
+  - id: nso-wire-int-coercion
+    languages: [python]
+    severity: ERROR
+    message: Coerce a wire scalar with wire_int; bool is an int subclass, so int(value) reads a JSON true as 1 and binds a key the device never sent.
+    paths:
+      include:
+        - nso_adapter/core/vlan.py
+        - nso_adapter/secrets/vault.py
+        - review-patterns.py
+    patterns:
+      - pattern: int(...)
+      # wire_int IS the coercion; everything else in these modules goes through it.
+      - pattern-not-inside: |
+          def wire_int(...):
+              ...

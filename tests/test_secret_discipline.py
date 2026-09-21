@@ -30,6 +30,7 @@ _NON_DISCLOSURE_TESTS = (
     _TEST_ROOT / "core" / "test_onboarding.py",
     _TEST_ROOT / "core" / "test_redistribution.py",
     _TEST_ROOT / "core" / "test_refresh_engine_envelope.py",
+    _TEST_ROOT / "core" / "test_vlan.py",
     _TEST_ROOT / "nso" / "test_apply_send.py",
     _TEST_ROOT / "nso" / "test_device_state_client.py",
     _TEST_ROOT / "nso" / "test_nso_client_methods.py",

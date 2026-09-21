@@ -448,8 +448,22 @@ def vault_payload(client, mount, path, _secret_data, _secret_version):
     fields = secret["data"]["data"]
     # ruleid: nso-vault-payload-unvalidated
     version = secret["data"].get("metadata", {}).get("version")
+    # ruleid: nso-vault-payload-unvalidated
+    fields = secret["data"].get("data", {})
+    # ruleid: nso-vault-payload-unvalidated
+    metadata = secret["data"]["metadata"]
     # ok: nso-vault-payload-unvalidated
     fields = _secret_data(secret)
     # ok: nso-vault-payload-unvalidated
     version = _secret_version(secret)
-    return fields, version
+    return fields, version, metadata
+
+
+def wire_int_coercion(item, wire_int):
+    # ruleid: nso-wire-int-coercion
+    vid = int(item["vlan-id"])
+    # ruleid: nso-wire-int-coercion
+    mtu = int(item.get("mtu"))
+    # ok: nso-wire-int-coercion
+    untagged = wire_int(item.get("untagged-vlan"))
+    return vid, mtu, untagged

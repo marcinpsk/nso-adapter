@@ -52,7 +52,18 @@ def _secret_version(secret: object) -> int | None:
     if not isinstance(metadata, Mapping):
         raise ValueError("the Vault payload is not a mapping")
     version = metadata.get("version")
-    return int(version) if version is not None else None
+    return _require_version(version) if version is not None else None
+
+
+def _require_version(value: object) -> int:
+    """Return a KV v2 version, refusing anything that is not a positive integer.
+
+    ``int()`` would read ``True`` as 1 and truncate ``1.9`` to 1, so a malformed payload
+    would report a version Vault never wrote and a verification would pass on it.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("the Vault payload has an invalid version")
+    return value
 
 
 class VaultSecretsProvider:
@@ -218,7 +229,7 @@ class VaultSecretsProvider:
                 path=path,
                 secret=payload,
             )
-            return int(resp["data"]["version"])
+            return _require_version(_secret_envelope(resp).get("version"))
 
         version = self._with_reauth(_write)
         if mount == self._mount:
