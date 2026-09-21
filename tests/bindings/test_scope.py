@@ -191,3 +191,15 @@ async def test_fetch_all_scope_parses_failover_ips():
     by_id = {r.netbox_device_id: r for r in records}
     assert (by_id[10].primary_ip, by_id[10].oob_ip) == ("10.0.0.1", "192.0.2.5")
     assert (by_id[20].primary_ip, by_id[20].oob_ip) == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_a_BOOLEAN_device_fk_is_skipped_and_never_keyed_to_device_1():
+    """``bool`` is an ``int`` subclass, so ``int(True)`` used to key the row to NetBox device 1."""
+    data = {"count": 2, "next": None, "results": [{"device": True}, {"device": {"id": 20}}]}
+    client = _make_nb_client()
+    client._client.return_value = _mock_http_ctx(_httpx_response(data))
+
+    records = await fetch_all_scope(client)
+
+    assert records == [PluginScopeRecord(netbox_device_id=20, attributes=[], primary_ip=None, oob_ip=None)]

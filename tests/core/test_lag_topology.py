@@ -150,3 +150,18 @@ async def test_lag_without_lag_id_is_skipped_not_fatal(adapter_client):
         assert ok is True
         rows = (await db.execute(select(LagInterface).where(LagInterface.device_id == device.id))).scalars().all()
         assert [(r.name, r.lag_id) for r in rows] == [("lag-1", 1)]
+
+
+@pytest.mark.anyio
+async def test_a_BOOLEAN_lag_id_is_refused(adapter_client):
+    """``int(True)`` stored LAG 1, a bundle id the device never reported."""
+    device_id = await seed_device(nso_device_name="sw-bool-lag", netbox_device_id=1408)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "device-name": "sw-bool-lag",
+            "lag": [{"name": "Port-channel1", "lag-id": True, "member": []}],
+        }
+        with pytest.raises(TypeError):
+            await refresh_lag_topology_for_device(db, device, nso_client, refresh_source="poll")

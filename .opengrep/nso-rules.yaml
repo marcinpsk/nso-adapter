@@ -467,11 +467,12 @@ rules:
     paths:
       include:
         - nso_adapter/core/vlan.py
+        - nso_adapter/core/subinterface.py
+        - nso_adapter/core/lag_topology.py
+        - nso_adapter/core/interface_mtu.py
+        - nso_adapter/bindings/netbox/scope.py
         - nso_adapter/secrets/vault.py
         - review-patterns.py
     patterns:
       - pattern: int(...)
-      # wire_int IS the coercion; everything else in these modules goes through it.
-      - pattern-not-inside: |
-          def wire_int(...):
-              ...
+
