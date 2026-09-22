@@ -69,8 +69,19 @@ def test_the_log_surface_sees_what_logrecord_repr_hides(caplog):
     weak = repr(caplog.records)
     surface = _log_surface(caplog)
     for secret in ("ARGS-ONLY-SECRET", "EXC-ONLY-SECRET"):
-        assert secret not in weak, "LogRecord.__repr__ renders only msg"
+        assert_text_free_of(weak, [secret])  # LogRecord.__repr__ renders only msg
         assert secret in surface, "the surface must expose args and exc_text"
+
+
+def test_collateral_refusal_exceptions_do_not_echo_live_orphan_keys():
+    from nso_adapter.core.removal import RemovalBlockedError
+
+    orphan = "placeholder-live-orphan"
+    blocked = RemovalBlockedError({"snmp/community": [[orphan]]})
+    wrapped = NsoApplyError("removal_blocked_collateral", str(blocked), detail={"orphans": blocked.orphans})
+
+    assert_chain_free_of(blocked, [orphan])
+    assert_chain_free_of(wrapped, [orphan])
 
 
 def _assert_safe(exc, job, row_error, logs, secrets):
@@ -86,8 +97,7 @@ def _assert_safe(exc, job, row_error, logs, secrets):
         _log_surface(logs),
     ]
     for surface in surfaces:
-        for secret in secrets:
-            assert secret not in surface
+        assert_text_free_of(surface, secrets)
     assert_chain_free_of(exc, secrets)
 
 

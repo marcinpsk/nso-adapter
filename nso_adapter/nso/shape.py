@@ -18,6 +18,17 @@ from __future__ import annotations
 from typing import Any
 
 
+def wire_int(value: object) -> int:
+    """Coerce a wire scalar to ``int``, refusing a JSON boolean.
+
+    ``bool`` is an ``int`` subclass, so a bare ``int(value)`` turns ``true`` into 1 and
+    ``false`` into 0 and binds a real key to a value the device never sent.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise TypeError("a wire integer must be an integer or string")
+    return int(value)  # type: ignore[call-overload]
+
+
 def as_list(value: Any) -> list:
     """Normalize an NSO child-list value to a Python list.
 

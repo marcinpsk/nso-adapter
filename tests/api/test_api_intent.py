@@ -230,6 +230,9 @@ async def test_put_intent_requires_auth(adapter_client):
 
 async def test_put_intent_unmanaged_attribute_returns_422(adapter_client):
     """PUT intent with an attribute not in the device's managed scope → 422."""
+    from tests._secret_discipline import assert_text_free_of
+
+    submitted = "placeholder-unmanaged-attribute"
     device_id = await seed_device(
         nso_instance="nso-dev",
         nso_device_name="scope-check-device",
@@ -238,12 +241,12 @@ async def test_put_intent_unmanaged_attribute_returns_422(adapter_client):
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/intent",
-        json={"attributes": [{"interface": "Gi0/0", "attribute": "vlan", "intent_value": "100"}]},
+        json={"attributes": [{"interface": "Gi0/0", "attribute": submitted, "intent_value": "100"}]},
         headers=AUTH | push_seq(),
     )
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "validation_error"
-    assert "vlan" in resp.json()["error"]["message"]
+    assert_text_free_of(resp.text, [submitted])
 
 
 # ── GET /api/v1/devices/{id}/intent ─────────────────────────────────────────

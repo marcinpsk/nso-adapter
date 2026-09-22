@@ -78,7 +78,7 @@ def resolve_device_type(ned_id: str, requested: str | None = None) -> str:
     if derived is None:
         return requested or "cli"
     if requested is not None and requested != derived:
-        raise ValueError(f"ned_type {requested!r} contradicts NED id {ned_id!r} (transport={derived!r})")
+        raise ValueError("requested ned_type contradicts the NED transport")
     return derived
 
 

@@ -82,7 +82,13 @@ async def test_refresh_vlan_database_upserts_and_prunes(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_refresh_vlan_database_rejects_a_malformed_item_and_keeps_rows(adapter_client):
+@pytest.mark.parametrize(
+    ("invalid_entry", "received_type"),
+    [({"name": "NO-ID"}, "NoneType"), ({"vlan-id": 10.5, "name": "FRACTIONAL"}, "float")],
+)
+async def test_refresh_vlan_database_rejects_a_malformed_item_and_keeps_rows(
+    adapter_client, invalid_entry, received_type
+):
     """An item without a usable vlan id must reject the refresh, never prune the unseen rows."""
     device_id = await seed_device(nso_device_name="vsw-malformed", netbox_device_id=1304)
     async with _device_session(device_id) as (db, device):
@@ -94,8 +100,8 @@ async def test_refresh_vlan_database_rejects_a_malformed_item_and_keeps_rows(ada
         }
         await refresh_vlan_database_for_device(db, device, nso)
 
-        sections["vlan-database"] = {"status": "ok", "vlan": [{"vlan-id": 10, "name": "MGMT"}, {"name": "NO-ID"}]}
-        with pytest.raises(ValueError, match="carries a vlan-id of type NoneType"):
+        sections["vlan-database"] = {"status": "ok", "vlan": [{"vlan-id": 10, "name": "MGMT"}, invalid_entry]}
+        with pytest.raises(ValueError, match=f"carries a vlan-id of type {received_type}"):
             await refresh_vlan_database_for_device(db, device, nso)
         rows = (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device.id))).scalars().all()
         assert {r.vlan_id for r in rows} == {10, 20}, "a malformed item must never prune its siblings"

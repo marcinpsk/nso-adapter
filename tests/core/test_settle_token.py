@@ -451,6 +451,30 @@ async def test_a_successor_inserted_mid_decision_lands_superseded(adapter_client
         assert generation.status is GenerationStatus.abandoned, "the absorbed requeue left its generation blocking"
 
 
+async def test_requeue_reraises_an_unrelated_integrity_failure(adapter_client):
+    """Only the queued-job dedupe index can convert a requeue into superseded."""
+    from sqlalchemy.exc import IntegrityError
+
+    from nso_adapter.core.claim import terminalize_running
+    from nso_adapter.store.models import JobStatus, JobType
+
+    device_id = await seed_device(nso_device_name="s1-other-constraint", netbox_device_id=9912)
+    job_id = await _queue(device_id, JobType.sync)
+    _jid, _dev, _jt, reg = await _start_run(device_id, job_id)
+
+    async with session() as db:
+        await db.execute(sa.text("ALTER TABLE jobs ADD CONSTRAINT ck_job_test_not_queued CHECK (status <> 'queued')"))
+        await db.commit()
+
+        with pytest.raises(IntegrityError, match="ck_job_test_not_queued"):
+            await terminalize_running(
+                db,
+                job_id,
+                status=JobStatus.queued,
+                expected_attempt=reg.run_attempt,
+            )
+
+
 # ── S1.5 / S1.7: the writers with no execution, and the device_id sentinel ───
 
 

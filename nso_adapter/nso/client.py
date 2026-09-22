@@ -126,13 +126,9 @@ def _certify_device_state_output(output: object, device_name: str, wire_families
     that would be actively misleading if walked.
     """
     if not isinstance(output, dict) or output.get("atomic") is not True:
-        raise NsoReadContractError(f"device-state-read for {device_name!r} did not certify an atomic snapshot")
+        raise NsoReadContractError("device-state-read did not certify an atomic snapshot")
     if output.get("device-name") != device_name:
-        # The echo is the server's own value: name the device we asked for, never the one it sent.
-        raise NsoReadContractError(
-            f"device-state-read echoed a different device than {device_name!r}; refusing a "
-            "version-skewed / wrong-device snapshot"
-        )
+        raise NsoReadContractError("device-state-read echoed a different device")
     for wire in wire_families:
         section = output.get(wire)
         if section is None:

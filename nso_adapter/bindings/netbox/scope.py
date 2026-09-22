@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import structlog
 
 from nso_adapter.bindings.netbox.client import NetboxClient
+from nso_adapter.nso.shape import wire_int
 
 logger = structlog.get_logger(__name__)
 
@@ -45,14 +46,20 @@ def _parse_scope_item(item: object) -> PluginScopeRecord | None:
         nb_id = device_field.get("id") or item.get("netbox_device_id")
     elif isinstance(device_field, (int, str)):
         # NetBox returns the FK as a bare integer when no full serializer depth
-        nb_id = int(device_field)
+        nb_id = device_field
     else:
         nb_id = item.get("netbox_device_id")
     if nb_id is None:
         return None
+    try:
+        netbox_device_id = wire_int(nb_id)
+    except (TypeError, ValueError):
+        # The id is what every later row is keyed by; a coerced one would key the wrong device.
+        logger.warning("netbox.scope.unusable_device_id", received_type=type(nb_id).__name__)
+        return None
     attrs = item.get("managed_attributes") or item.get("attributes", [])
     return PluginScopeRecord(
-        netbox_device_id=int(nb_id),
+        netbox_device_id=netbox_device_id,
         attributes=list(attrs),
         primary_ip=item.get("primary_ip"),
         oob_ip=item.get("oob_ip"),
