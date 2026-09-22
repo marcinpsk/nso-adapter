@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
 
@@ -312,6 +313,12 @@ def _record_non_disclosure_assertions(assertions: list[ast.Assert], aliases: set
             violations.append(node.lineno)
 
 
+@dataclass
+class _ObservedStates:
+    exceptions: list[set[str]] = field(default_factory=list)
+    returns: list[set[str]] = field(default_factory=list)
+
+
 def _resolve_class_node(
     node: ast.AST,
     aliases: set[str],
@@ -335,7 +342,7 @@ def _resolve_class_if(
     aliases: set[str],
     enclosing_aliases: set[str],
     violations: list[int] | None,
-    observed_states: list[set[str]] | None,
+    observed_states: _ObservedStates | None,
     inherit_current: bool,
 ) -> set[str]:
     aliases = _resolve_class_node(statement.test, aliases, enclosing_aliases, violations, inherit_current)
@@ -353,51 +360,65 @@ def _resolve_class_try(
     aliases: set[str],
     enclosing_aliases: set[str],
     violations: list[int] | None,
-    observed_states: list[set[str]] | None,
+    observed_states: _ObservedStates | None,
     inherit_current: bool,
 ) -> set[str]:
     incoming = aliases.copy()
-    body_states: list[set[str]] = []
+    body_states = _ObservedStates()
     body_aliases = _resolve_class_statements(
         statement.body, incoming.copy(), enclosing_aliases, violations, body_states, inherit_current
     )
-    else_states: list[set[str]] = []
+    else_states = _ObservedStates()
     normal_aliases = _resolve_class_statements(
         statement.orelse, body_aliases.copy(), enclosing_aliases, violations, else_states, inherit_current
     )
-    handler_input = set().union(incoming, *body_states)
+    handler_input = set().union(*body_states.exceptions)
     handler_aliases = []
     handler_exception_states: list[set[str]] = []
-    for handler in statement.handlers:
+    handler_return_states: list[set[str]] = []
+    for handler in statement.handlers if body_states.exceptions else ():
         state = handler_input.copy()
         if handler.type is not None:
             state = _resolve_class_node(handler.type, state, enclosing_aliases, violations, inherit_current)
         if handler.name is not None:
             state.discard(handler.name)
-        handler_states: list[set[str]] = []
+        handler_states = _ObservedStates()
         state = _resolve_class_statements(
             handler.body, state, enclosing_aliases, violations, handler_states, inherit_current
         )
         if handler.name is not None:
             state.discard(handler.name)
-            for handler_state in handler_states:
+            for handler_state in (*handler_states.exceptions, *handler_states.returns):
                 handler_state.discard(handler.name)
-        handler_exception_states.extend(handler_states)
+        handler_exception_states.extend(handler_states.exceptions)
+        handler_return_states.extend(handler_states.returns)
         handler_aliases.append(state)
     aliases = normal_aliases | set().union(*handler_aliases, set())
     normal_aliases = _resolve_class_statements(
         statement.finalbody, aliases, enclosing_aliases, violations, observed_states, inherit_current
     )
-    exceptional_states = else_states + handler_exception_states
+    exceptional_states = else_states.exceptions + handler_exception_states
     if not any(handler.type is None for handler in statement.handlers):
-        exceptional_states += body_states
+        exceptional_states += body_states.exceptions
     exceptional_aliases = set().union(*exceptional_states, set())
     if exceptional_aliases:
         propagated_aliases = _resolve_class_statements(
             statement.finalbody, exceptional_aliases, enclosing_aliases, violations, observed_states, inherit_current
         )
         if observed_states is not None:
-            observed_states.append(propagated_aliases)
+            observed_states.exceptions.append(propagated_aliases)
+    returning_states = body_states.returns + else_states.returns + handler_return_states
+    if returning_states:
+        returned_aliases = _resolve_class_statements(
+            statement.finalbody,
+            set().union(*returning_states),
+            enclosing_aliases,
+            violations,
+            observed_states,
+            inherit_current,
+        )
+        if observed_states is not None:
+            observed_states.returns.append(returned_aliases)
     return normal_aliases
 
 
@@ -406,7 +427,7 @@ def _resolve_class_for(
     aliases: set[str],
     enclosing_aliases: set[str],
     violations: list[int] | None,
-    observed_states: list[set[str]] | None,
+    observed_states: _ObservedStates | None,
     inherit_current: bool,
 ) -> set[str]:
     incoming = _resolve_class_node(statement.iter, aliases, enclosing_aliases, violations, inherit_current)
@@ -432,7 +453,7 @@ def _resolve_class_while(
     aliases: set[str],
     enclosing_aliases: set[str],
     violations: list[int] | None,
-    observed_states: list[set[str]] | None,
+    observed_states: _ObservedStates | None,
     inherit_current: bool,
 ) -> set[str]:
     initial = aliases.copy()
@@ -457,7 +478,7 @@ def _resolve_class_with(
     aliases: set[str],
     enclosing_aliases: set[str],
     violations: list[int] | None,
-    observed_states: list[set[str]] | None,
+    observed_states: _ObservedStates | None,
     inherit_current: bool,
 ) -> set[str]:
     incoming = aliases.copy()
@@ -466,11 +487,16 @@ def _resolve_class_with(
         if item.optional_vars is not None:
             target_aliases = _binding_aliases(_target_value_bindings(item.optional_vars, item.context_expr), incoming)
             incoming = incoming - _target_names(item.optional_vars) | target_aliases
+    body_states = _ObservedStates() if observed_states is not None else None
     aliases = _resolve_class_statements(
-        statement.body, incoming, enclosing_aliases, violations, observed_states, inherit_current
+        statement.body, incoming, enclosing_aliases, violations, body_states, inherit_current
     )
     if observed_states is not None:
-        observed_states.append(aliases.copy())
+        assert body_states is not None
+        observed_states.exceptions.extend(body_states.exceptions)
+        observed_states.exceptions.extend(body_states.returns)
+        observed_states.returns.extend(body_states.returns)
+        observed_states.exceptions.append(aliases.copy())
     return aliases
 
 
@@ -479,12 +505,12 @@ def _resolve_class_statements(
     aliases: set[str],
     enclosing_aliases: set[str],
     violations: list[int] | None,
-    observed_states: list[set[str]] | None = None,
+    observed_states: _ObservedStates | None = None,
     inherit_current: bool = False,
 ) -> set[str]:
     for statement in statements:
         if observed_states is not None and statement_may_raise(statement):
-            observed_states.append(aliases.copy())
+            observed_states.exceptions.append(aliases.copy())
         if isinstance(statement, ast.If):
             aliases = _resolve_class_if(
                 statement, aliases, enclosing_aliases, violations, observed_states, inherit_current
@@ -508,6 +534,8 @@ def _resolve_class_statements(
         else:
             aliases = _resolve_class_node(statement, aliases, enclosing_aliases, violations, inherit_current)
             if isinstance(statement, ast.Return | ast.Raise):
+                if observed_states is not None and isinstance(statement, ast.Return):
+                    observed_states.returns.append(aliases.copy())
                 return set()
     return aliases
 
@@ -527,7 +555,12 @@ def _resolve_scope(scope: ast.AST, enclosing_aliases: set[str], violations: list
         else enclosing_aliases
     )
     if isinstance(scope, ast.Module | ast.FunctionDef | ast.AsyncFunctionDef):
-        return _resolve_class_statements(scope.body, aliases, aliases, violations, inherit_current=True)
+        aliases = _resolve_class_statements(scope.body, aliases, aliases, violations, inherit_current=True)
+        if violations is not None:
+            # A child can run after later bindings change an enclosing name.
+            for child in facts.children:
+                _resolve_scope(child, aliases, violations)
+        return aliases
     return aliases | _binding_aliases(facts.bindings, aliases)
 
 
@@ -1265,6 +1298,62 @@ def test_non_disclosure_aliases_follow_module_and_function_control_flow() -> Non
     ):
         assert _non_disclosure_assertion_lines(source) == [], source
     assert _non_disclosure_assertion_lines(return_through_finally) == [6]
+
+
+def test_deferred_scopes_see_aliases_bound_before_they_run() -> None:
+    module_function = "def check():\n    assert protected not in captured\ncaptured = response.text\ncheck()\n"
+    class_method = (
+        "class Check:\n"
+        "    def check(self):\n"
+        "        assert protected not in captured\n"
+        "captured = response.text\n"
+        "Check().check()\n"
+    )
+    function_closure = (
+        "def outer():\n"
+        "    def check():\n"
+        "        assert protected not in captured\n"
+        "    captured = response.text\n"
+        "    check()\n"
+    )
+
+    assert _non_disclosure_assertion_lines(module_function) == [2]
+    assert _non_disclosure_assertion_lines(class_method) == [3]
+    assert _non_disclosure_assertion_lines(function_closure) == [3]
+
+
+def test_bare_return_does_not_enter_an_exception_handler() -> None:
+    no_exception = (
+        "def check():\n"
+        "    try:\n"
+        "        captured = response.text\n"
+        "        return\n"
+        "    except Exception:\n"
+        "        assert protected not in captured\n"
+    )
+    possible_exception = no_exception.replace("return", "return might_raise()")
+    no_exception_with_incoming_alias = (
+        "def check():\n"
+        "    captured = response.text\n"
+        "    try:\n"
+        "        return\n"
+        "    except Exception:\n"
+        "        assert protected not in captured\n"
+    )
+    context_exit_can_raise = (
+        "def check():\n"
+        "    try:\n"
+        "        with context():\n"
+        "            captured = response.text\n"
+        "            return\n"
+        "    except Exception:\n"
+        "        assert protected not in captured\n"
+    )
+
+    assert _non_disclosure_assertion_lines(no_exception) == []
+    assert _non_disclosure_assertion_lines(possible_exception) == [6]
+    assert _non_disclosure_assertion_lines(no_exception_with_incoming_alias) == []
+    assert _non_disclosure_assertion_lines(context_exit_can_raise) == [7]
 
 
 def test_an_immediately_invoked_lambda_is_part_of_the_disclosure_surface() -> None:

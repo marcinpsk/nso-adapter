@@ -105,7 +105,9 @@ def scope_bound_names(nodes: list[ast.AST]) -> set[str]:
 
 def statement_may_raise(statement: ast.stmt) -> bool:
     """Return whether a statement needs an exceptional input state."""
-    if isinstance(statement, (ast.Pass, ast.Break, ast.Continue)):
+    if isinstance(statement, (ast.Pass, ast.Break, ast.Continue)) or (
+        isinstance(statement, ast.Return) and statement.value is None
+    ):
         return False
     if isinstance(statement, (ast.Try, ast.TryStar)):
         return False
