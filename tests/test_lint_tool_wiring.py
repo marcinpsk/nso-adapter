@@ -131,6 +131,28 @@ def test_zizmor_consumers_share_locked_uv_dependency():
     assert collections == _ZIZMOR_COLLECTIONS
 
 
+def test_outcome_exception_alias_guard_runs_before_commit() -> None:
+    config = yaml.safe_load(PRE_COMMIT.read_text(encoding="utf-8"))
+    hooks = [
+        hook
+        for repository in config["repos"]
+        if repository["repo"] == "local"
+        for hook in repository["hooks"]
+        if hook["id"] == "outcome-exception-alias-guard"
+    ]
+    assert len(hooks) == 1
+    hook = hooks[0]
+    command = shlex.split(hook["entry"])
+    assert command[:5] == ["uv", "run", "--locked", "--native-tls", "--"]
+    assert command[5] == "pytest"
+    assert "tests/core/test_importer_failure_sinks.py::test_guarded_modules_never_log_raw_exception_text" in command
+    assert "tests/core/test_importer_failure_sinks.py::test_importer_never_logs_raw_exception_text" in command
+    assert hook["pass_filenames"] is False
+    hook_files = re.compile(hook["files"])
+    assert hook_files.search("nso_adapter/core/removal.py")
+    assert hook_files.search("tests/core/test_importer_failure_sinks.py")
+
+
 def test_review_pattern_hook_resolves_its_interpreter_through_the_restricted_path() -> None:
     """``/usr/bin/bash`` is absent on macOS, and an absolute program ignores the PATH below."""
     assert os.path.dirname(_SCAN_ARGV[0]) == "", "the interpreter must resolve through the supplied PATH"

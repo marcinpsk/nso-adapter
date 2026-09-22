@@ -44,6 +44,9 @@ values in every positional or structured log field. It covers `nso_adapter/main.
 so an HTTP exception cannot repeat a request URL or server text. The behavioral
 and AST regressions in `tests/core/test_importer_failure_sinks.py` remain
 authoritative for the classification contract and complete Python syntax.
+The pre-commit AST guard scans guarded modules for exception aliases after
+context-manager exits. Its control-flow model tracks conditional and later
+assignments that OpenGrep cannot classify reliably.
 
 `nso-diagnostic-raw-identifier` rejects `device_name` and `device` fields in the
 guarded importer, redistribution, client, refresh, capability, startup, and

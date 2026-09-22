@@ -24,7 +24,6 @@ OPENGREP = shutil.which(os.environ.get("OPENGREP_BIN") or "opengrep")
 OPENGREP_RULES = ROOT / ".opengrep" / "nso-rules.yaml"
 OPENGREP_EXCEPTION_RULES = {
     "nso-outcome-raw-exception-alias-renderer",
-    "nso-outcome-with-exit-raw-exception-alias-renderer",
 }
 
 
@@ -457,6 +456,10 @@ OPENGREP_XFAILS = {
         False,
     ): "OpenGrep retains taint after a catch-all handler overwrites exceptional state",
     (
+        "control-with-exit-post-body-state",
+        True,
+    ): "OpenGrep does not track the exception alias through context-manager exit; the AST guard does",
+    (
         "control-nested-try-exception-propagation-at-function-scope",
         False,
     ): "OpenGrep retains taint after a nested catch-all handler overwrites exceptional state",
@@ -520,8 +523,8 @@ def _scanner_case_parameters() -> list[object]:
                 marks = []
                 source = case.tainted if tainted else case.clean
                 if not scanner.expression_sink and "EXPRESSION_SINK" in source:
-                    marks.append(pytest.mark.skip(reason=f"{scanner.name} has no expression sink"))
-                elif reason := (case.gaps or {}).get((scanner.name, tainted)):
+                    continue
+                if reason := (case.gaps or {}).get((scanner.name, tainted)):
                     marks.append(pytest.mark.xfail(reason=reason, strict=True))
                 parameters.append(
                     pytest.param(
@@ -535,13 +538,21 @@ def _scanner_case_parameters() -> list[object]:
     return parameters
 
 
-def test_scanner_conformance_skips_missing_expression_sink() -> None:
-    for parameter in _scanner_case_parameters():
+def test_scanner_conformance_omits_missing_expression_sink() -> None:
+    parameters = _scanner_case_parameters()
+    expected_ids = {
+        f"{case.name}-{scanner.name}-{'tainted' if tainted else 'clean'}"
+        for scanner in SCANNERS
+        for case in CASES
+        for tainted in (True, False)
+        if scanner.expression_sink or "EXPRESSION_SINK" not in (case.tainted if tainted else case.clean)
+    }
+    assert {parameter.id for parameter in parameters} == expected_ids
+    for parameter in parameters:
         scanner, case, tainted = parameter.values
         source = case.tainted if tainted else case.clean
-        if scanner.expression_sink or "EXPRESSION_SINK" not in source:
-            continue
-        assert {mark.name for mark in parameter.marks} == {"skip"}, parameter.id
+        assert scanner.expression_sink or "EXPRESSION_SINK" not in source, parameter.id
+        assert all(mark.name != "skip" for mark in parameter.marks), parameter.id
 
 
 @pytest.fixture(scope="module")

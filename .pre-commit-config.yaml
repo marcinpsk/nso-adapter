@@ -76,6 +76,12 @@ repos:
         language: system
         pass_filenames: false
         files: ^(\.opengrep/|scripts/check-review-patterns$)
+      - id: outcome-exception-alias-guard
+        name: outcome exception alias guard (AST)
+        entry: uv run --locked --native-tls -- pytest -q -n 8 --no-cov tests/core/test_importer_failure_sinks.py::test_importer_never_logs_raw_exception_text tests/core/test_importer_failure_sinks.py::test_guarded_modules_never_log_raw_exception_text
+        language: system
+        pass_filenames: false
+        files: ^(nso_adapter/.*\.py|tests/(core/test_importer_failure_sinks|_ast_scanner_support)\.py|\.pre-commit-config\.yaml)$
 
   # Type-check nso_adapter and fail only on errors absent from mypy-baseline.txt.
   # Runs on pre-push (not every commit). CI runs the same script in the lint job,

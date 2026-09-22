@@ -1134,6 +1134,41 @@ logger.warning("event", detail=alias)
     assert _raw_log_exception_renderers(source) == [9]
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        """\
+alias = "authored detail"
+try:
+    with context():
+        alias = exc
+        if condition:
+            alias = "authored detail"
+except Exception:
+    pass
+else:
+    alias = "authored detail"
+logger.warning("event", detail=alias)
+""",
+        """\
+alias = "authored detail"
+try:
+    with context():
+        alias = exc
+        alias = "authored detail"
+        alias = exc
+except Exception:
+    pass
+else:
+    alias = "authored detail"
+logger.warning("event", detail=alias)
+""",
+    ],
+)
+def test_raw_exception_log_guard_preserves_taint_after_unsafe_context_overwrites(source: str) -> None:
+    assert _raw_log_exception_renderers(source) == [11]
+
+
 def test_raw_exception_log_guard_does_not_leak_aliases_between_functions() -> None:
     source = """\
 def first():
