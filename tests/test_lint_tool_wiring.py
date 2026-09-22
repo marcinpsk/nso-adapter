@@ -459,6 +459,10 @@ def _redefined_top_level_lines(source: str) -> list[int]:
             if _is_overload(node):  # typing.overload declares the same name on purpose
                 continue
             names = [node.name]
+        elif isinstance(node, ast.Import):
+            names = [alias.asname or alias.name.split(".", maxsplit=1)[0] for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.module != "__future__":
+            names = [alias.asname or alias.name for alias in node.names if alias.name != "*"]
         elif isinstance(node, ast.Assign):
             names = [target.id for target in node.targets if isinstance(target, ast.Name)]
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
@@ -502,3 +506,31 @@ def test_the_redefinition_rule_reads_every_binding_form_and_spares_an_overload()
     assert _redefined_top_level_lines(annotated_constant) == [4]
     assert _redefined_top_level_lines(overload) == []
     assert _redefined_top_level_lines(nested) == [], "a local rebinding is not a shadowed module name"
+
+
+def test_the_redefinition_rule_tracks_import_bindings() -> None:
+    direct_import = "import pkg.module\npkg = 1\n"
+    aliased_import = "import pkg.module as alias\nalias = 1\n"
+    from_import = "from pkg import name\nname = 1\n"
+    aliased_from_import = "from pkg import name as alias\nalias = 1\n"
+    future_import = "from __future__ import annotations\nannotations = 1\n"
+    wildcard_import = "from pkg import *\nstar = 1\n"
+
+    assert _redefined_top_level_lines(direct_import) == [2]
+    assert _redefined_top_level_lines(aliased_import) == [2]
+    assert _redefined_top_level_lines(from_import) == [2]
+    assert _redefined_top_level_lines(aliased_from_import) == [2]
+    assert _redefined_top_level_lines(future_import) == []
+    assert _redefined_top_level_lines(wildcard_import) == []
+
+
+def test_diagnostic_identifier_rule_coverage_is_documented() -> None:
+    rules = yaml.safe_load((ROOT / ".opengrep" / "nso-rules.yaml").read_text(encoding="utf-8"))["rules"]
+    rule = next(rule for rule in rules if rule["id"] == "nso-diagnostic-raw-identifier")
+    readme = (ROOT / ".opengrep" / "README.md").read_text(encoding="utf-8")
+    coverage = readme.split("`nso-diagnostic-raw-identifier` rejects", 1)[1].split("\n\n", 1)[0]
+
+    for path in rule["paths"]["include"]:
+        assert f"`{path}`" in coverage, f"missing documented path: {path}"
+    for field in ("device_name", "device", "nso_device", "lag_name", "stream", "stream_url", "url"):
+        assert f"`{field}`" in coverage, f"missing documented field: {field}"

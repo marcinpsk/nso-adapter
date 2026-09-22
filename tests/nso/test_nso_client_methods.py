@@ -24,7 +24,7 @@ from nso_adapter.nso.client import (
     failure_detail,
 )
 from nso_adapter.nso.read_outcome import Unavailable, UnavailableReason
-from tests._secret_discipline import assert_text_contains, assert_text_free_of
+from tests._secret_discipline import assert_keys_absent, assert_text_contains, assert_text_free_of
 
 
 def _make_cfg(base_url: str = "http://nso:8080", ca_cert=None, host_header=None):
@@ -585,7 +585,7 @@ async def test_a_MISMATCHED_device_echo_never_reaches_the_refusal_record(patch_c
     assert (state.status, state.entry) == ("inconclusive", None), "a wrong-device echo is never a read"
     refused = [record for record in logs if record["event"] == "nso.service_instance_inconclusive"]
     assert refused, "the refusal was not reported at all"
-    assert "device" not in refused[0]
+    assert_keys_absent(refused[0], ["device"])
     assert refused[0]["reason"] == "the instance echoes a different device"
     assert_records_free_of(logs, [requested, echoed])
 

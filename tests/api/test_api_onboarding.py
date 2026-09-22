@@ -7,7 +7,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from tests._secret_discipline import assert_records_free_of, assert_text_free_of
+from tests._secret_discipline import assert_keys_absent, assert_records_free_of, assert_text_free_of
 from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -109,9 +109,7 @@ async def test_onboard_conflict_log_uses_adapter_ids_not_caller_names(adapter_cl
     assert refused, "the operator was told nothing"
     assert refused[0]["device_id"] == existing_id
     assert refused[0]["linked_netbox_device_id"] == 46231, "the operator must still see the link"
-    assert "nso_instance" not in refused[0]
-    assert "nso_device" not in refused[0]
-    assert "nso_device_name" not in refused[0]
+    assert_keys_absent(refused[0], ["nso_instance", "nso_device", "nso_device_name"])
 
 
 async def test_rekey_conflict_log_uses_adapter_ids_not_caller_names(adapter_client_with_nso):
@@ -144,9 +142,7 @@ async def test_rekey_conflict_log_uses_adapter_ids_not_caller_names(adapter_clie
     assert refused, "the operator was told nothing"
     assert refused[0]["device_id"] == device_id
     assert refused[0]["conflicting_device_id"] == conflicting_id
-    assert "nso_instance" not in refused[0]
-    assert "nso_device" not in refused[0]
-    assert "nso_device_name" not in refused[0]
+    assert_keys_absent(refused[0], ["nso_instance", "nso_device", "nso_device_name"])
 
 
 async def test_onboard_unknown_instance_returns_422(adapter_client):

@@ -1364,6 +1364,34 @@ assert protected not in body
     assert _ordering_violations(whole_json) == [2]
 
 
+def _unsafe_identifier_key_checks(source: str) -> list[int]:
+    protected_keys = {"device", "nso_device", "nso_device_name", "nso_instance", "lag_name"}
+    return [
+        node.lineno
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Assert)
+        for comparison in _assertion_comparisons(node.test)
+        if isinstance(comparison.left, ast.Constant)
+        and comparison.left.value in protected_keys
+        and any(isinstance(operator, ast.NotIn) for operator in comparison.ops)
+    ]
+
+
+def test_identifier_key_checks_do_not_render_records_on_failure() -> None:
+    """A failed pytest membership check can print the complete protected record."""
+    unsafe = 'assert "device" not in record'
+    safe = 'assert_keys_absent(record, ["device"])'
+    assert _unsafe_identifier_key_checks(unsafe) == [1]
+    assert _unsafe_identifier_key_checks(safe) == []
+
+    violations = [
+        f"{path.relative_to(_TEST_ROOT.parent)}:{line}"
+        for path in _NON_DISCLOSURE_TESTS
+        for line in _unsafe_identifier_key_checks(path.read_text(encoding="utf-8"))
+    ]
+    assert violations == []
+
+
 def test_membership_guard_covers_complete_decoded_surfaces() -> None:
     source = """\
 assert protected not in response.json()

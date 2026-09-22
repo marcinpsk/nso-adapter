@@ -76,8 +76,7 @@ async def _upsert_lags(
         except (TypeError, ValueError):
             logger.warning(
                 "lag_topology.entry_skipped",
-                device_id=device.id,
-                lag_name=lag.get("name"),
+                **device_fields(device_id=device.id),
                 reason="invalid lag-id",
             )
             continue

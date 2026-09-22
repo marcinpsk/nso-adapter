@@ -59,9 +59,22 @@ submitted value in its validation messages, so only the field names travel. The
 remaining modules named in `test_guarded_modules_never_log_raw_exception_text` are
 tracked by the universal-guard card; this list is still an allowlist, not the tree.
 
-`nso-diagnostic-raw-identifier` rejects `device_name` and `device` fields in the
-guarded importer, redistribution, client, refresh, capability, startup, and
-subscriber diagnostics. It also rejects raw SSE stream URL fields. It matches the
+`nso-diagnostic-raw-identifier` rejects `device_name`, `device`, `nso_device`, and
+`lag_name` fields, plus raw SSE `stream`, `stream_url`, and `url` fields. Its
+allowlist covers `nso_adapter/main.py`, `nso_adapter/api/capability.py`,
+`nso_adapter/api/intent.py`, `nso_adapter/api/interface_ip.py`,
+`nso_adapter/bindings/netbox/client.py`, `nso_adapter/bindings/netbox/mapper.py`,
+`nso_adapter/bindings/netbox/writer.py`, `nso_adapter/core/apply.py`,
+`nso_adapter/core/capability.py`, `nso_adapter/core/failover.py`,
+`nso_adapter/core/importer.py`, `nso_adapter/core/jobs.py`,
+`nso_adapter/core/lag_topology.py`, `nso_adapter/core/onboarding.py`,
+`nso_adapter/core/redistribution.py`, `nso_adapter/core/refresh_engine.py`,
+`nso_adapter/core/removal.py`, `nso_adapter/core/route_policy.py`,
+`nso_adapter/core/scheduler.py`, `nso_adapter/core/static_route_reader.py`,
+`nso_adapter/core/topology_interfaces.py`,
+`nso_adapter/notifications/sse_subscriber.py`,
+`nso_adapter/notifications/persistent_subscriber.py`, `nso_adapter/nso/apply.py`,
+`nso_adapter/nso/client.py`, and the `review-patterns.py` fixture. It matches the
 keyword name, so it sees only a value written directly into the field.
 
 It does **not** reject the NSO instance name, under either spelling. The instance

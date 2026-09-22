@@ -16,6 +16,7 @@ from sqlalchemy import select
 from nso_adapter.core import scheduler as sched
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.models import ActiveAddress, Device, DeviceFailover, FailoverConfig
+from tests._secret_discipline import assert_keys_absent
 from tests.conftest import session
 
 
@@ -606,7 +607,7 @@ async def test_upsert_retains_active_oob_and_accepts_distinct_primary(adapter_cl
         assert changed is True  # the surfaced stuck state is a change
         conflict_log = next(log for log in logs if log["event"] == "failover.active_oob_change_refused")
         assert conflict_log["device_id"] == dev.id
-        assert "device" not in conflict_log
+        assert_keys_absent(conflict_log, ["device"])
         fo = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == dev.id))).scalar_one()
         assert fo.oob_ip == "192.0.2.5", "the address the device lives on must be retained"
         assert fo.failback_blocked_reason == "active_oob_address_conflict"

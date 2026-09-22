@@ -164,6 +164,10 @@ async def test_lag_without_lag_id_is_skipped_not_fatal(adapter_client):
 
 @pytest.mark.anyio
 async def test_lag_with_malformed_id_does_not_block_valid_topology(adapter_client):
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
+
     device_id = await seed_device(nso_device_name="sw-malformed-lag", netbox_device_id=9821)
     async with _device_session(device_id) as (db, device):
         client = AsyncMock()
@@ -175,9 +179,14 @@ async def test_lag_with_malformed_id_does_not_block_valid_topology(adapter_clien
             ],
         }
 
-        assert await refresh_lag_topology_for_device(db, device, client) is True
+        with capture_logs() as logs:
+            assert await refresh_lag_topology_for_device(db, device, client) is True
         rows = (await db.execute(select(LagInterface).where(LagInterface.device_id == device.id))).scalars().all()
         assert [(row.name, row.lag_id) for row in rows] == [("lag-2", 2)]
+        skipped = [record for record in logs if record["event"] == "lag_topology.entry_skipped"]
+        assert len(skipped) == 1
+        assert_keys_absent(skipped[0], ["lag_name"])
+        assert_records_free_of(skipped, ["lag-invalid"])
 
 
 @pytest.mark.anyio
