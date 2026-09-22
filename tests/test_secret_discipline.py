@@ -562,12 +562,16 @@ def _resolve_scope(scope: ast.AST, enclosing_aliases: set[str], violations: list
             for child in facts.children:
                 child_aliases = aliases
                 if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                    prior_statements = [statement for statement in scope.body if statement.lineno < child.lineno]
+                    prior_aliases = _resolve_class_statements(
+                        prior_statements, initial_aliases.copy(), initial_aliases, None
+                    )
                     later_bindings = [
                         binding
                         for binding in facts.bindings
                         if any(getattr(value, "lineno", -1) >= child.lineno for value in binding[1])
                     ]
-                    child_aliases = aliases | _binding_aliases(later_bindings, initial_aliases)
+                    child_aliases = aliases | _binding_aliases(later_bindings, prior_aliases)
                 _resolve_scope(child, child_aliases, violations)
         return aliases
     return aliases | _binding_aliases(facts.bindings, aliases)
@@ -1358,10 +1362,19 @@ def test_deferred_children_keep_later_aliases_across_returns_and_callbacks() -> 
         "    run(check)\n"
         "    captured = 'authored'\n"
     )
+    alias_crosses_child_definition = (
+        "def factory():\n"
+        "    base = response.text\n"
+        "    def check():\n"
+        "        assert protected not in captured\n"
+        "    captured = base\n"
+        "    return check\n"
+    )
 
     assert _non_disclosure_assertion_lines(returned) == [3]
     assert _non_disclosure_assertion_lines(aliased_call) == [3]
     assert _non_disclosure_assertion_lines(callback) == [5]
+    assert _non_disclosure_assertion_lines(alias_crosses_child_definition) == [4]
 
 
 def test_bare_return_does_not_enter_an_exception_handler() -> None:
