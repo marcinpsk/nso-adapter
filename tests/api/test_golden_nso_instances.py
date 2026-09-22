@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from nso_adapter.domain.diagnostics import device_ref
 from nso_adapter.nso.client import NsoClient
 from tests.conftest import VALID_TOKEN
 
@@ -53,6 +54,7 @@ async def test_list_instance_devices_golden(adapter_client_with_nso):
     assert body == [
         {
             "name": "aaa-switch-03",
+            "device_ref": device_ref("nso-dev", "aaa-switch-03"),
             "address": None,
             "ned_id": None,
             "platform": None,
@@ -64,6 +66,7 @@ async def test_list_instance_devices_golden(adapter_client_with_nso):
         },
         {
             "name": "core-rtr-01",
+            "device_ref": device_ref("nso-dev", "core-rtr-01"),
             "address": "10.0.0.1",
             "ned_id": "cisco-ios-cli-6.95",
             "platform": "ios",

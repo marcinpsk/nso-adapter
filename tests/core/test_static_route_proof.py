@@ -24,8 +24,10 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 from sqlalchemy import select, text
+from structlog.testing import capture_logs
 
 from nso_adapter.store.models import Job, JobStatus, JobType
+from tests._secret_discipline import assert_records_free_of
 from tests.conftest import push_seq, seed_device, session
 from tests.core.test_static_route_put import (
     A,
@@ -257,7 +259,8 @@ async def test_c3_3_a_surviving_predecessor_fails_the_scope_and_keeps_the_key_op
         section=dev_state(wire(A), wire(B)),  # B landed, A survived the replace
     )
 
-    job = await run_the_apply(device_id, client)
+    with capture_logs() as logs:
+        job = await run_the_apply(device_id, client)
 
     assert job.status == JobStatus.failed
     assert await deployed_keys(device_id) == {B: list(A)}, "the replacement stays OPEN"
@@ -265,6 +268,9 @@ async def test_c3_3_a_surviving_predecessor_fails_the_scope_and_keeps_the_key_op
     item = next(i for i in job.error["detail"]["items"] if i["type"] == "static_route")
     assert item["code"] == "static_route_residue_found"
     assert item["error"].startswith("static_route: the replaced route(s)")
+    record = next(record for record in logs if record["event"] == "static_route.residue_found")
+    assert record["device_id"] == device_id
+    assert_records_free_of([record], ["sr-proof", A[1], A[2]])
 
 
 # ── C3.4 — every decided inconclusive signal: no consumption, job SUCCEEDS ───

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass, field
-from functools import cache
 from pathlib import Path
 
 import pytest
@@ -21,55 +20,21 @@ from tests._secret_discipline import assert_chain_free_of, exception_chain
 
 _SECRET = "placeholder-vault-secret"
 _TEST_ROOT = Path(__file__).resolve().parent
+#: Every test module. A fixed allowlist lets a new module's assertion escape the guard, and
+#: three review rounds found exactly that escape before this list was retired.
+_NON_DISCLOSURE_TESTS = tuple(sorted(_TEST_ROOT.rglob("test_*.py")))
+#: These attributes and calls return complete values that pytest prints in assertion failures.
+_RENDERED_SURFACE_ATTRIBUTES = {"json", "read_failures", "text", "value"}
+_INSPECTED_CALLS = {"repr", "str"}
+_NON_DISCLOSURE_HELPERS = {"assert_chain_free_of", "assert_records_free_of", "assert_text_free_of"}
 #: How this repository writes protected material into a test (see the placeholder convention). A
 #: body that names one is handling something protected, whether or not it calls a helper.
 _PROTECTED_LITERAL_PREFIX = "placeholder-"
-_NON_DISCLOSURE_HELPERS = {"assert_chain_free_of", "assert_records_free_of", "assert_text_free_of"}
-
-
-def _handles_protected_material(tree: ast.AST) -> bool:
-    """True when a module holds something protected, by either way this repository says so."""
-    return any(
-        (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _NON_DISCLOSURE_HELPERS)
-        or (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and node.value.startswith(_PROTECTED_LITERAL_PREFIX)
-        )
-        for node in ast.walk(tree)
-    )
-
-
-@cache
-def _guarded_modules() -> tuple[Path, ...]:
-    """The modules both rules below read, DERIVED from what each one handles.
-
-    A hand-kept list omits a module the moment it starts handling protected material, and both
-    rules then skip it in silence: that is how ``core/test_capability.py`` reached review with
-    neither rule covering it. Deriving the membership removes the omission rather than the
-    symptom.
-
-    The signal is what a module HOLDS, by the two ways this repository says so. A module that
-    writes a non-disclosure check while holding neither is not selected until it calls a helper,
-    which is what ``api/test_error_codes.py`` now does. Selecting on the check itself instead
-    needs the narrower rendered-TEXT surface set, because over a parsed container
-    ``"local_as" not in peer`` asks whether a KEY is absent and would report ~20 assertions that
-    disclose nothing.
-    """
-    return tuple(
-        path
-        for path in sorted(_TEST_ROOT.rglob("test_*.py"))
-        if _handles_protected_material(ast.parse(path.read_text(encoding="utf-8")))
-    )
-
-
-_INSPECTED_ATTRIBUTES = {"json", "read_failures", "text", "value"}
-_INSPECTED_CALLS = {"repr", "str"}
 
 
 def test_main_lifespan_is_in_the_non_disclosure_registry() -> None:
-    """It calls the helpers, so the derivation has to pick it up without anyone listing it."""
-    assert _TEST_ROOT / "test_main_lifespan.py" in _guarded_modules()
+    """The blanket sweep covers this module without anyone listing it."""
+    assert _TEST_ROOT / "test_main_lifespan.py" in _NON_DISCLOSURE_TESTS
 
 
 class _InspectedSurfaceReader(ast.NodeVisitor):
@@ -85,13 +50,31 @@ class _InspectedSurfaceReader(ast.NodeVisitor):
         super().visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:  # noqa: N802 - ast visitor API
-        if node.attr in _INSPECTED_ATTRIBUTES:
+        if node.attr in _RENDERED_SURFACE_ATTRIBUTES:
             self.found = True
-            return
-        self.generic_visit(node)
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:  # noqa: N802 - ast visitor API
+        # A subscript narrows a decoded container to one member.
+        return
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:  # noqa: N802 - ast visitor API
+        self.visit(node.elt)
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:  # noqa: N802 - ast visitor API
+        self.visit(node.elt)
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:  # noqa: N802 - ast visitor API
+        self.visit(node.elt)
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:  # noqa: N802 - ast visitor API
+        self.visit(node.key)
+        self.visit(node.value)
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 - ast visitor API
         if isinstance(node.func, ast.Name) and node.func.id in _INSPECTED_CALLS:
+            self.found = True
+            return
+        if isinstance(node.func, ast.Attribute) and node.func.attr in _RENDERED_SURFACE_ATTRIBUTES:
             self.found = True
             return
         if isinstance(node.func, ast.Lambda):
@@ -299,6 +282,23 @@ def _binding_aliases(bindings: list[tuple[str, list[ast.AST]]], aliases: set[str
                 resolved.add(name)
                 changed = True
     return resolved
+
+
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
+
+
+def _assertion_comparisons(test: ast.expr) -> list[ast.Compare]:
+    """Return assertion comparisons outside comprehension filters."""
+    comparisons: list[ast.Compare] = []
+    stack: list[ast.AST] = [test]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, _COMPREHENSIONS):
+            continue
+        if isinstance(node, ast.Compare):
+            comparisons.append(node)
+        stack.extend(ast.iter_child_nodes(node))
+    return comparisons
 
 
 def _record_non_disclosure_assertions(assertions: list[ast.Assert], aliases: set[str], violations: list[int]) -> None:
@@ -773,47 +773,9 @@ def test_a_CLEAN_chain_passes() -> None:
     assert_chain_free_of(caught, [_SECRET])
 
 
-_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
-
-
-def _assertion_comparisons(test: ast.expr) -> list[ast.Compare]:
-    """The assertion's own comparisons, skipping any inside a comprehension.
-
-    A `not in` used as a comprehension filter is a per-element test. The assertion renders the
-    comprehension's RESULT - a count, a list - never the element, so it discloses nothing.
-    """
-    comparisons: list[ast.Compare] = []
-    stack: list[ast.AST] = [test]
-    while stack:
-        node = stack.pop()
-        if isinstance(node, _COMPREHENSIONS):
-            continue
-        if isinstance(node, ast.Compare):
-            comparisons.append(node)
-        stack.extend(ast.iter_child_nodes(node))
-    return comparisons
-
-
-def test_the_guarded_membership_is_derived_from_what_a_module_handles() -> None:
-    """A module that starts holding protected material joins both rules with no edit here."""
-    helper_call = "def t():\n    assert_text_free_of(resp.text, [protected])\n"
-    placeholder_literal = 'def t():\n    secret = "placeholder-token"\n'
-    neither = "def t():\n    assert resp.status_code == 200\n"
-
-    assert _handles_protected_material(ast.parse(helper_call))
-    assert _handles_protected_material(ast.parse(placeholder_literal))
-    assert not _handles_protected_material(ast.parse(neither))
-
-    every_module = set(_TEST_ROOT.rglob("test_*.py"))
-    guarded = set(_guarded_modules())
-    assert Path(__file__).resolve() in guarded, "this module holds material and must guard itself"
-    assert guarded < every_module, "a derivation of what is held, not a blanket sweep"
-    assert len(guarded) > 40, "the derivation must reach the modules that hold material"
-
-
 def test_non_disclosure_checks_do_not_use_rewritten_assertions() -> None:
     violations = []
-    for path in _guarded_modules():
+    for path in _NON_DISCLOSURE_TESTS:
         violations.extend(
             f"{path.relative_to(_TEST_ROOT.parent)}:{line}"
             for line in _non_disclosure_assertion_lines(path.read_text(encoding="utf-8"))
@@ -942,7 +904,7 @@ def _renders_root(node: ast.AST, root: str) -> bool:
     for part in ast.walk(node):
         if isinstance(part, ast.Name) and part.id == root:
             return True
-        if isinstance(part, ast.Attribute) and part.attr in _INSPECTED_ATTRIBUTES:
+        if isinstance(part, ast.Attribute) and part.attr in _RENDERED_SURFACE_ATTRIBUTES:
             if any(isinstance(inner, ast.Name) and inner.id == root for inner in ast.walk(part)):
                 return True
     return False
@@ -951,7 +913,7 @@ def _renders_root(node: ast.AST, root: str) -> bool:
 def _renders_root_through_a_surface(node: ast.AST, root: str) -> bool:
     """True when *root* is rendered through a text surface or an explicit str/repr, never bare."""
     for part in ast.walk(node):
-        reads_surface = (isinstance(part, ast.Attribute) and part.attr in _INSPECTED_ATTRIBUTES) or (
+        reads_surface = (isinstance(part, ast.Attribute) and part.attr in _RENDERED_SURFACE_ATTRIBUTES) or (
             isinstance(part, ast.Call) and isinstance(part.func, ast.Name) and part.func.id in _INSPECTED_CALLS
         )
         if reads_surface and any(isinstance(inner, ast.Name) and inner.id == root for inner in ast.walk(part)):
@@ -967,10 +929,10 @@ def _rendered_surfaces(node: ast.AST) -> list[ast.AST]:
     ``caught.value.response.status_code`` renders an int and ``resp.json()["error"]["code"]``
     renders one authored string: neither reads a surface off anything.
     """
-    if isinstance(node, ast.Attribute) and node.attr in _INSPECTED_ATTRIBUTES:
+    if isinstance(node, ast.Attribute) and node.attr in _RENDERED_SURFACE_ATTRIBUTES:
         return [node.value]
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-        if node.func.attr in _INSPECTED_ATTRIBUTES:
+        if node.func.attr in _RENDERED_SURFACE_ATTRIBUTES:
             return [node.func.value]
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _INSPECTED_CALLS:
         return list(node.args)
@@ -1024,11 +986,12 @@ def _discloses_protected_value(node: ast.Assert, root: str) -> bool:
 
     The two operator kinds read their operands differently, so they are judged differently. A
     membership operand is the HAYSTACK being searched for the protected value, so narrowing it
-    still renders text that came from the protected value: it is judged on the whole chain.
-    Every other operator compares a value against an authored one, so narrowing produces a
-    different, smaller value: it is judged on the operand's outermost expression. That is why
-    ``"device_id" not in record`` renders a boolean while ``record == expected`` renders the
-    record, and why ``resp.json()["error"]["code"] == "vault_error"`` renders neither.
+    still renders text that came from the protected value: it is judged on the whole chain. A
+    BARE container operand is rendered too, because pytest prints both operands of a membership
+    test: ``assert "nso_device" not in record`` fails as ``assert 'nso_device' not in {'nso_device':
+    'placeholder-secret'}``. Every other operator compares a value against an authored one, so
+    narrowing produces a different, smaller value and is judged on the operand's outermost
+    expression, which is why ``resp.json()["error"]["code"] == "vault_error"`` renders neither.
     """
     if node.msg is not None and _renders_root(node.msg, root):
         return True
@@ -1036,10 +999,10 @@ def _discloses_protected_value(node: ast.Assert, root: str) -> bool:
         if not isinstance(part, ast.Compare):
             continue
         operands = (part.left, *part.comparators)
-        if any(isinstance(operator, ast.In | ast.NotIn) for operator in part.ops):
-            if any(_renders_root_through_a_surface(operand, root) for operand in operands):
-                return True
-            continue
+        if any(isinstance(operator, ast.In | ast.NotIn) for operator in part.ops) and any(
+            _renders_root_through_a_surface(operand, root) for operand in operands
+        ):
+            return True
         if any(_renders_root_whole(operand, root) for operand in operands):
             return True
     return False
@@ -1116,7 +1079,7 @@ def _ordering_violations_in(scope: ast.AST) -> list[tuple[int, str]]:
 def test_non_disclosure_checks_run_before_the_diagnostics() -> None:
     """pytest prints a failing assertion's operands, so the helper has to clear the value first."""
     violations = []
-    for path in _guarded_modules():
+    for path in _NON_DISCLOSURE_TESTS:
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for scope in ast.walk(tree):
             if not isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef):
@@ -1178,7 +1141,7 @@ def _ordering_violations(source: str) -> list[int]:
 
 
 def test_the_ordering_rule_reads_the_shapes_that_disclose_and_no_others() -> None:
-    """A failure message and a bare operand render the value; a key test renders a boolean."""
+    """A failure message, a bare operand and a membership container all render the value."""
     message = """\
 def t():
     assert resp.status_code == 422, resp.text
@@ -1194,6 +1157,11 @@ def t():
     assert "device_id" not in record
     assert_records_free_of([record], [protected])
 """
+    cleared_key_membership = """\
+def t():
+    assert_records_free_of([record], [protected])
+    assert "device_id" not in record
+"""
     narrowed_operand = """\
 def t():
     assert record["error"] == "ReadTimeout"
@@ -1208,7 +1176,9 @@ def t():
     assert _ordering_violations(message) == [2]
     assert _ordering_violations(bare_operand) == [2]
     assert _ordering_violations(rendered_membership) == [2]
-    assert _ordering_violations(key_membership) == []
+    # pytest prints BOTH operands of a membership test, so the container is rendered whole.
+    assert _ordering_violations(key_membership) == [2]
+    assert _ordering_violations(cleared_key_membership) == []
     assert _ordering_violations(narrowed_operand) == []
 
 
@@ -1367,6 +1337,63 @@ def t():
 """
 
     assert _ordering_violations(nested_clear) == [4]
+
+
+def test_membership_and_rendered_surface_rules_answer_separate_questions() -> None:
+    """`"local_as" not in peer` asks whether a KEY is absent. `assert_text_free_of` cannot express
+    that. It substring-matches the rendered mapping and would pass or fail for an unrelated
+    reason. Whole-object equality prints the complete decoded response instead.
+    """
+    container = """\
+body = response.json()
+peer = body["peers"][0]
+assert "local_as" not in peer
+"""
+    whole_json = """\
+def t():
+    assert response.json() == expected
+    assert_text_free_of(response.text, [protected])
+"""
+    text = """\
+body = response.text
+assert protected not in body
+"""
+
+    assert _non_disclosure_assertion_lines(container) == []
+    assert _non_disclosure_assertion_lines(text) == [2]
+    assert _ordering_violations(whole_json) == [2]
+
+
+def test_membership_guard_covers_complete_decoded_surfaces() -> None:
+    source = """\
+assert protected not in response.json()
+assert protected not in caught.value
+assert protected not in result.read_failures()
+assert "device_id" not in response.json()["record"]
+assert queued not in [record["id"] for record in response.json()]
+"""
+
+    assert _non_disclosure_assertion_lines(source) == [1, 2, 3]
+
+
+def test_a_NOT_IN_used_as_a_comprehension_filter_is_not_a_disclosure_check() -> None:
+    """The assertion renders the comprehension's RESULT — a count — never the element."""
+    filtered = """\
+assert len([item for item in requests if "dry-run" not in str(item.url)]) == 1
+"""
+    rendered = """\
+assert protected not in str(request.url)
+"""
+
+    assert _non_disclosure_assertion_lines(filtered) == []
+    assert _non_disclosure_assertion_lines(rendered) == [1]
+
+
+def test_the_guard_reads_EVERY_test_module() -> None:
+    """The allowlist is gone and must stay gone: three review rounds found assertions escaping
+    through modules nobody had added to it."""
+    assert set(_NON_DISCLOSURE_TESTS) == set(_TEST_ROOT.rglob("test_*.py"))
+    assert len(_NON_DISCLOSURE_TESTS) > 200, "the sweep should see the whole suite"
 
 
 def test_non_disclosure_aliases_follow_bindings_without_cross_scope_contamination() -> None:

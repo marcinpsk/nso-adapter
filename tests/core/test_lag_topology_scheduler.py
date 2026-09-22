@@ -359,6 +359,25 @@ async def test_poll_job_skips_device_without_nso_client(adapter_client, monkeypa
 
 
 @pytest.mark.anyio
+async def test_shared_poll_skip_record_uses_device_id_without_raw_instance(adapter_client, monkeypatch, debug_logs):
+    from tests._secret_discipline import assert_keys_absent
+
+    async with session() as db:
+        db.add(Device(nso_instance="ghost", nso_device_name="d1", netbox_device_id=4001))
+        await db.commit()
+
+    def _raise(*_):
+        raise RuntimeError("NSO client not registered")
+
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", _raise)
+    await scheduler_module._scheduled_vlan_refresh()
+
+    record = next(item for item in debug_logs if item.get("reason") == "no_nso_client")
+    assert isinstance(record["device_id"], int)
+    assert_keys_absent(record, ["instance"])
+
+
+@pytest.mark.anyio
 async def test_scheduled_lag_topology_refresh_refreshes_all_devices(adapter_client, monkeypatch):
     async with session() as db:
         db.add_all(

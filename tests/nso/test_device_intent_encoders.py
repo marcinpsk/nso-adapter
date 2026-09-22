@@ -159,7 +159,8 @@ def test_the_registry_containers_are_the_aggregate_yang_containers():
             if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
                 for target in node.targets:
                     if isinstance(target, ast.Name) and target.id.endswith("_CONTAINER"):
-                        assert node.value.value not in containers, f"{module.__name__}.{target.id} repeats a container"
+                        if node.value.value in containers:
+                            pytest.fail(f"{module.__name__}.{target.id} repeats a container")
 
 
 def test_every_section_declares_a_capability_scope_and_a_result_counter():

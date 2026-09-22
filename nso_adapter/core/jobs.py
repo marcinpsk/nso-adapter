@@ -30,6 +30,7 @@ from nso_adapter.core.claim import (
     lock_claim,
     terminalize,
 )
+from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
 
 logger = structlog.get_logger(__name__)
@@ -324,9 +325,21 @@ async def enqueue_provision_job(params: dict, db: AsyncSession) -> tuple[Job, bo
         active = await get_active_provision_job(params["nso_instance"], params["device_name"], db)
         if active is not None:
             return active, False
-        logger.debug("job.provision_admission.winner_finished", device_name=params.get("device_name"))
+        logger.debug(
+            "job.provision_admission.winner_finished",
+            **device_fields(
+                nso_instance=params["nso_instance"],
+                nso_device_name=params["device_name"],
+            ),
+        )
 
-    logger.warning("job.provision_admission.retries_exhausted", device_name=params.get("device_name"))
+    logger.warning(
+        "job.provision_admission.retries_exhausted",
+        **device_fields(
+            nso_instance=params["nso_instance"],
+            nso_device_name=params["device_name"],
+        ),
+    )
     raise RuntimeError("could not admit a provision job")
 
 

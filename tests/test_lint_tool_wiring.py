@@ -14,6 +14,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests._secret_discipline import assert_text_omits
+
 ROOT = Path(__file__).parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 PRE_COMMIT = ROOT / ".pre-commit-config.yaml"
@@ -311,7 +313,7 @@ def test_review_pattern_scan_rejects_partial_parse_drift(
     assert heading in result.stderr
     assert changed_path in result.stderr
     for unchanged_path in _EXPECTED_PARTIAL_PATHS & partial_paths:
-        assert unchanged_path not in result.stderr
+        assert_text_omits(result.stderr, [unchanged_path])
 
 
 def test_review_pattern_scan_accepts_the_pinned_partial_paths(tmp_path: Path) -> None:
@@ -437,3 +439,66 @@ def test_the_scan_fails_when_opengrep_drops_a_malformed_rule(tmp_path: Path):
 
     assert result.returncode == 1, "a dropped rule must fail the scan, not pass it"
     assert "Rule parse error" in result.stderr
+
+
+def _is_overload(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> bool:
+    return any(
+        (isinstance(decorator, ast.Name) and decorator.id == "overload")
+        or (isinstance(decorator, ast.Attribute) and decorator.attr == "overload")
+        for decorator in node.decorator_list
+    )
+
+
+def _redefined_top_level_lines(source: str) -> list[int]:
+    """The lines that bind a top-level name the module already bound."""
+    redefined: list[int] = []
+    defined: dict[str, int] = {}
+    for node in ast.parse(source).body:
+        names: list[str] = []
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if _is_overload(node):  # typing.overload declares the same name on purpose
+                continue
+            names = [node.name]
+        elif isinstance(node, ast.Assign):
+            names = [target.id for target in node.targets if isinstance(target, ast.Name)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names = [node.target.id]
+        for name in names:
+            if name in defined:
+                redefined.append(node.lineno)
+            defined[name] = node.lineno
+    return redefined
+
+
+def test_no_module_defines_a_TOP_LEVEL_name_twice() -> None:
+    """A shadowed definition binds the later one, so edits to the earlier have no effect.
+
+    ruff's F811 cannot see this: it reports a redefinition of an UNUSED name, and a helper
+    that the module calls between the two definitions is used. test_secret_discipline.py
+    carried two `_assertion_comparisons`, and the security rule ran the copy nobody edited.
+    """
+    duplicates = [
+        f"{path.relative_to(ROOT)}:{lineno}"
+        for path in sorted((*ROOT.glob("tests/**/*.py"), *ROOT.glob("nso_adapter/**/*.py")))
+        for lineno in _redefined_top_level_lines(path.read_text(encoding="utf-8"))
+    ]
+
+    assert duplicates == []
+
+
+def test_the_redefinition_rule_reads_every_binding_form_and_spares_an_overload() -> None:
+    """An annotated constant shadows exactly like a plain one; an overload does not shadow."""
+    function = "def f():\n    pass\n\n\ndef f():\n    pass\n"
+    plain_constant = "X = 1\nX = 2\n"
+    annotated_constant = "from typing import Final\n\nX: Final = 1\nX: Final = 2\n"
+    overload = (
+        "from typing import overload\n\n\n@overload\ndef f(x: int) -> int: ...\n\n\n"
+        "@overload\ndef f(x: str) -> str: ...\n\n\ndef f(x):\n    return x\n"
+    )
+    nested = "def outer():\n    def g():\n        pass\n\n    def g():\n        pass\n"
+
+    assert _redefined_top_level_lines(function) == [5]
+    assert _redefined_top_level_lines(plain_constant) == [2]
+    assert _redefined_top_level_lines(annotated_constant) == [4]
+    assert _redefined_top_level_lines(overload) == []
+    assert _redefined_top_level_lines(nested) == [], "a local rebinding is not a shadowed module name"

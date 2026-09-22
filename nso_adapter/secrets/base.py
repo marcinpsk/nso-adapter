@@ -49,15 +49,27 @@ def selected_secret_value(fields: Mapping[str, object], key: str) -> str | None:
     return value
 
 
+def require_nonblank_secret(value: str, *, slot: str) -> str:
+    """Reject a blank secret. The value is never trimmed; only the blank case is refused."""
+    if not value.strip():
+        raise SecretResolutionError("the configured secret is blank", slot=slot)
+    return value
+
+
 def resolve_secret(provider: SecretsProvider, reference: str, *, slot: str) -> str:
     """Resolve one CONFIGURED reference, naming the config slot when it fails.
 
     The provider refuses without the reference, so this is where the failure gets an
     address an operator can act on. Nothing of the provider's own exception is attached:
     hvac repeats the request URL, and the URL carries the path.
+
+    A blank answer is refused here. Both providers serve a blank as a SET value on purpose, so
+    nothing below this rejects one, and every configured reference names a credential or a key -
+    a blank one is guessed on the first attempt. Refusing at the single boundary they all cross
+    means a slot added later cannot forget the check.
     """
     try:
-        return provider.get(reference)
+        return require_nonblank_secret(provider.get(reference), slot=slot)
     except SecretResolutionError as exc:
         failure = SecretResolutionError(exc.reason, slot=slot)
     except Exception as exc:  # noqa: BLE001, every provider failure is one classified refusal

@@ -820,6 +820,10 @@ async def _seed_isis_intent(device_id: int, *ifaces: tuple[str, str]):
 async def test_isis_removal_blocked_on_orphaned_service_rows(adapter_client):
     """A live interface row the document does not re-assert and nobody just removed is an
     orphan; the job must BLOCK, name the orphan rows, and commit NOTHING."""
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
+
     device_id = await _seed_device(nso_device_name="ra1-guard")
     await _seed_isis_intent(device_id, ("system", "ipv4"))
     client = _guard_client(
@@ -835,7 +839,8 @@ async def test_isis_removal_blocked_on_orphaned_service_rows(adapter_client):
     )
     job_id = await _seed_removal_job(device_id, scope="isis")
     sender = _sender()
-    await _run_removal_with(device_id, job_id, client, sender)
+    with capture_logs() as logs:
+        await _run_removal_with(device_id, job_id, client, sender)
     async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
@@ -845,6 +850,12 @@ async def test_isis_removal_blocked_on_orphaned_service_rows(adapter_client):
         assert job.error["detail"]["orphans"] == {"isis/interface-config": [["lo0", "ipv4"]]}
         assert "preview" not in job.error["detail"], "a native delta may not be persisted"
     assert _commits(sender) == [], "a blocked write commits nothing"
+    record = next(record for record in logs if record["event"] == "removal.blocked_collateral")
+    assert record["device_id"] == device_id
+    assert record["job_id"] == job_id
+    assert record["scope"] == "isis"
+    assert_keys_absent(record, ["orphans"])
+    assert_records_free_of([record], ["lo0"])
 
 
 async def test_isis_removal_orphaned_process_blocks(adapter_client):
@@ -974,7 +985,16 @@ def _guard_client(instance=None):
 def _sender():
     """Record every ``apply_device_intent`` call and answer a dry-run with a native delta."""
 
-    async def _impl(_client, _device_name, _containers, *, dry_run=False, no_networking=False, strict=False):
+    async def _impl(
+        _client,
+        _device_name,
+        _containers,
+        *,
+        device_id,
+        dry_run=False,
+        no_networking=False,
+        strict=False,
+    ):
         return "native delta" if dry_run else "conclusive"
 
     return AsyncMock(side_effect=_impl)
@@ -1339,16 +1359,27 @@ async def _job_after(job_id: int) -> Job:
 
 async def test_run_removal_reports_residue_when_removed_key_survives(adapter_client):
     """The sw03 Vlan987 case: removal succeeds but the device tree still has the key."""
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
+
     device_id = await _seed_device(nso_device_name="sw3")
     job_id = await _seed_removal_job(device_id, "svi", {"removed": {"interface": [["Vlan987"]]}})
     client = _ReaderClient(svi={"interface": [{"interface-name": "Vlan987", "vlan-id": 987}]})
 
-    await _run(job_id, device_id, client)
+    with capture_logs() as logs:
+        await _run(job_id, device_id, client)
 
     job = await _job_after(job_id)
     assert job.status == JobStatus.succeeded
     assert job.result["residue_check"] == "found"
     assert job.result["residue"] == {"interface": [["Vlan987"]]}
+    record = next(record for record in logs if record["event"] == "removal.residue_found")
+    assert record["device_id"] == device_id
+    assert record["job_id"] == job_id
+    assert record["scope"] == "svi"
+    assert_keys_absent(record, ["residue"])
+    assert_records_free_of([record], ["Vlan987"])
 
 
 async def test_run_removal_residue_clean_when_key_gone(adapter_client):
@@ -2182,7 +2213,13 @@ async def test_detach_commits_with_no_networking(adapter_client):
         def _client(self, timeout=None):
             return httpx.AsyncClient(transport=_Transport())
 
-    await nso_apply.apply_device_intent(_Client(), "sw-detach", {"vlan": {"vlan": []}}, no_networking=True)
+    await nso_apply.apply_device_intent(
+        _Client(),
+        "sw-detach",
+        {"vlan": {"vlan": []}},
+        device_id=1,
+        no_networking=True,
+    )
 
     assert "no-networking" in recorded[0]
     assert "device-intent:device-intent=sw-detach" in recorded[0]
