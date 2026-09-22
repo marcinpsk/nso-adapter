@@ -1196,6 +1196,21 @@ def test_guarded_modules_never_log_raw_exception_text() -> None:
         if _raw_log_exception_renderers(path.read_text(encoding="utf-8"))
     }
     assert violations == {}
+    assert _formatter_definition_ast(_NETBOX_CLIENT.read_text(encoding="utf-8"), "rejection_detail") == (
+        _APPROVED_REJECTION_DETAIL_AST
+    )
+    unapproved_refs = {}
+    for path in (_IMPORTER, *_GUARDED_LOG_SINKS):
+        if path == _NETBOX_CLIENT:
+            continue
+        lines = [
+            node.lineno
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+            if isinstance(node, ast.Name) and node.id == "rejection_detail"
+        ]
+        if lines:
+            unapproved_refs[path.relative_to(_RULES.parents[1]).as_posix()] = lines
+    assert unapproved_refs == {}
 
 
 def test_the_action_section_code_is_derived_in_exactly_one_place() -> None:
@@ -1285,7 +1300,10 @@ def test_review_guards_cover_each_authored_error_boundary() -> None:
         "nso_adapter/bindings/netbox/client.py",
         "nso_adapter/bindings/netbox/writer.py",
     } <= outcome_paths
-    assert {path.name for path in _GUARDED_LOG_SINKS} <= {path.rsplit("/", maxsplit=1)[-1] for path in outcome_paths}
+    assert outcome_paths == {
+        *(path.relative_to(_RULES.parents[1]).as_posix() for path in (_IMPORTER, *_GUARDED_LOG_SINKS)),
+        "review-patterns.py",
+    }
     identifier_paths = set(rules["nso-diagnostic-raw-identifier"]["paths"]["include"])
     assert {
         "nso_adapter/core/importer.py",
@@ -1362,6 +1380,12 @@ def _binds_formatter_name(node: ast.AST, name: str = "failure_detail") -> bool:
         return node.name == name
     if isinstance(node, ast.Name):
         return node.id == name and isinstance(node.ctx, (ast.Store, ast.Del))
+    if isinstance(node, ast.arg):
+        return node.arg == name
+    if isinstance(node, ast.ExceptHandler | ast.MatchAs | ast.MatchStar):
+        return node.name == name
+    if isinstance(node, ast.MatchMapping):
+        return node.rest == name
     if isinstance(node, ast.alias):
         imported_name = node.asname or node.name.split(".", maxsplit=1)[0]
         return imported_name == name or node.name == "*"
@@ -1440,6 +1464,19 @@ def test_rejection_detail_guard_rejects_an_alternate_binding() -> None:
 
     with pytest.raises(ValueError, match="one direct module function binding"):
         _formatter_definition_ast(_APPROVED_REJECTION_DETAIL + rebind, "rejection_detail")
+
+
+@pytest.mark.parametrize(
+    "shadow",
+    [
+        "def other(rejection_detail):\n    return rejection_detail\n",
+        "try:\n    work()\nexcept Exception as rejection_detail:\n    pass\n",
+        "match value:\n    case rejection_detail:\n        pass\n",
+    ],
+)
+def test_rejection_detail_guard_rejects_nested_shadow_bindings(shadow: str) -> None:
+    with pytest.raises(ValueError, match="one direct module function binding"):
+        _formatter_definition_ast(_APPROVED_REJECTION_DETAIL + shadow, "rejection_detail")
 
 
 @pytest.mark.parametrize(

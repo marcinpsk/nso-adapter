@@ -23,9 +23,7 @@ _TEST_ROOT = Path(__file__).resolve().parent
 #: Every test module. A fixed allowlist lets a new module's assertion escape the guard, and
 #: three review rounds found exactly that escape before this list was retired.
 _NON_DISCLOSURE_TESTS = tuple(sorted(_TEST_ROOT.rglob("test_*.py")))
-#: Only rendered text makes `protected not in surface` a substring disclosure check.
-_MEMBERSHIP_SURFACE_ATTRIBUTES = {"text"}
-#: These attributes and calls return the complete value that pytest prints in equality failures.
+#: These attributes and calls return complete values that pytest prints in assertion failures.
 _RENDERED_SURFACE_ATTRIBUTES = {"json", "read_failures", "text", "value"}
 _INSPECTED_CALLS = {"repr", "str"}
 _NON_DISCLOSURE_HELPERS = {"assert_chain_free_of", "assert_records_free_of", "assert_text_free_of"}
@@ -52,13 +50,31 @@ class _InspectedSurfaceReader(ast.NodeVisitor):
         super().visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:  # noqa: N802 - ast visitor API
-        if node.attr in _MEMBERSHIP_SURFACE_ATTRIBUTES:
+        if node.attr in _RENDERED_SURFACE_ATTRIBUTES:
             self.found = True
-            return
-        self.generic_visit(node)
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:  # noqa: N802 - ast visitor API
+        # A subscript narrows a decoded container to one member.
+        return
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:  # noqa: N802 - ast visitor API
+        self.visit(node.elt)
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:  # noqa: N802 - ast visitor API
+        self.visit(node.elt)
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:  # noqa: N802 - ast visitor API
+        self.visit(node.elt)
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:  # noqa: N802 - ast visitor API
+        self.visit(node.key)
+        self.visit(node.value)
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 - ast visitor API
         if isinstance(node.func, ast.Name) and node.func.id in _INSPECTED_CALLS:
+            self.found = True
+            return
+        if isinstance(node.func, ast.Attribute) and node.func.attr in _RENDERED_SURFACE_ATTRIBUTES:
             self.found = True
             return
         if isinstance(node.func, ast.Lambda):
@@ -888,7 +904,7 @@ def _renders_root(node: ast.AST, root: str) -> bool:
     for part in ast.walk(node):
         if isinstance(part, ast.Name) and part.id == root:
             return True
-        if isinstance(part, ast.Attribute) and part.attr in _MEMBERSHIP_SURFACE_ATTRIBUTES:
+        if isinstance(part, ast.Attribute) and part.attr in _RENDERED_SURFACE_ATTRIBUTES:
             if any(isinstance(inner, ast.Name) and inner.id == root for inner in ast.walk(part)):
                 return True
     return False
@@ -897,7 +913,7 @@ def _renders_root(node: ast.AST, root: str) -> bool:
 def _renders_root_through_a_surface(node: ast.AST, root: str) -> bool:
     """True when *root* is rendered through a text surface or an explicit str/repr, never bare."""
     for part in ast.walk(node):
-        reads_surface = (isinstance(part, ast.Attribute) and part.attr in _MEMBERSHIP_SURFACE_ATTRIBUTES) or (
+        reads_surface = (isinstance(part, ast.Attribute) and part.attr in _RENDERED_SURFACE_ATTRIBUTES) or (
             isinstance(part, ast.Call) and isinstance(part.func, ast.Name) and part.func.id in _INSPECTED_CALLS
         )
         if reads_surface and any(isinstance(inner, ast.Name) and inner.id == root for inner in ast.walk(part)):
@@ -1346,6 +1362,18 @@ assert protected not in body
     assert _non_disclosure_assertion_lines(container) == []
     assert _non_disclosure_assertion_lines(text) == [2]
     assert _ordering_violations(whole_json) == [2]
+
+
+def test_membership_guard_covers_complete_decoded_surfaces() -> None:
+    source = """\
+assert protected not in response.json()
+assert protected not in caught.value
+assert protected not in result.read_failures()
+assert "device_id" not in response.json()["record"]
+assert queued not in [record["id"] for record in response.json()]
+"""
+
+    assert _non_disclosure_assertion_lines(source) == [1, 2, 3]
 
 
 def test_a_NOT_IN_used_as_a_comprehension_filter_is_not_a_disclosure_check() -> None:
