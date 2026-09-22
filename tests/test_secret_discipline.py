@@ -555,11 +555,20 @@ def _resolve_scope(scope: ast.AST, enclosing_aliases: set[str], violations: list
         else enclosing_aliases
     )
     if isinstance(scope, ast.Module | ast.FunctionDef | ast.AsyncFunctionDef):
+        initial_aliases = aliases.copy()
         aliases = _resolve_class_statements(scope.body, aliases, aliases, violations, inherit_current=True)
         if violations is not None:
             # A child can run after later bindings change an enclosing name.
             for child in facts.children:
-                _resolve_scope(child, aliases, violations)
+                child_aliases = aliases
+                if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                    later_bindings = [
+                        binding
+                        for binding in facts.bindings
+                        if any(getattr(value, "lineno", -1) >= child.lineno for value in binding[1])
+                    ]
+                    child_aliases = aliases | _binding_aliases(later_bindings, initial_aliases)
+                _resolve_scope(child, child_aliases, violations)
         return aliases
     return aliases | _binding_aliases(facts.bindings, aliases)
 
@@ -1320,6 +1329,39 @@ def test_deferred_scopes_see_aliases_bound_before_they_run() -> None:
     assert _non_disclosure_assertion_lines(module_function) == [2]
     assert _non_disclosure_assertion_lines(class_method) == [3]
     assert _non_disclosure_assertion_lines(function_closure) == [3]
+
+
+def test_deferred_children_keep_later_aliases_across_returns_and_callbacks() -> None:
+    returned = (
+        "def factory():\n"
+        "    def check():\n"
+        "        assert protected not in captured\n"
+        "    captured = response.text\n"
+        "    return check\n"
+    )
+    aliased_call = (
+        "def outer():\n"
+        "    def check():\n"
+        "        assert protected not in captured\n"
+        "    saved = check\n"
+        "    captured = response.text\n"
+        "    saved()\n"
+        "    captured = 'authored'\n"
+    )
+    callback = (
+        "def run(callback):\n"
+        "    callback()\n"
+        "def outer():\n"
+        "    def check():\n"
+        "        assert protected not in captured\n"
+        "    captured = response.text\n"
+        "    run(check)\n"
+        "    captured = 'authored'\n"
+    )
+
+    assert _non_disclosure_assertion_lines(returned) == [3]
+    assert _non_disclosure_assertion_lines(aliased_call) == [3]
+    assert _non_disclosure_assertion_lines(callback) == [5]
 
 
 def test_bare_return_does_not_enter_an_exception_handler() -> None:
