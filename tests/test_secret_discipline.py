@@ -333,7 +333,8 @@ def _resolve_class_node(
     if violations is not None:
         _record_non_disclosure_assertions(facts.assertions, aliases, violations)
         for child in facts.children:
-            _resolve_scope(child, aliases if inherit_current else enclosing_aliases, violations)
+            if not (inherit_current and isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)):
+                _resolve_scope(child, aliases if inherit_current else enclosing_aliases, violations)
     return aliases
 
 
@@ -544,6 +545,123 @@ def _resolve_class_scope(scope: ast.ClassDef, enclosing_aliases: set[str], viola
     return _resolve_class_statements(scope.body, enclosing_aliases.copy(), enclosing_aliases, violations)
 
 
+class _ChildCallProof:
+    """Keep each branch's aliases with the names bound to one nested function."""
+
+    def __init__(self, child: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        self.child = child
+
+    @staticmethod
+    def _references(node: ast.AST, bound_names: set[str]) -> bool:
+        return any(
+            isinstance(part, ast.Name) and isinstance(part.ctx, ast.Load) and part.id in bound_names
+            for part in ast.walk(node)
+        )
+
+    def _if(
+        self, statement: ast.If, aliases: set[str], bound_names: set[str]
+    ) -> list[tuple[set[str], set[str]]] | None:
+        if self._references(statement.test, bound_names):
+            return None
+        tested = _resolve_class_node(statement.test, aliases, aliases, None, True)
+        body = self.walk(statement.body, [(tested.copy(), bound_names.copy())])
+        other = self.walk(statement.orelse, [(tested.copy(), bound_names.copy())])
+        return None if body is None or other is None else body + other
+
+    def _definition(
+        self, statement: ast.FunctionDef | ast.AsyncFunctionDef, aliases: set[str], bound_names: set[str]
+    ) -> list[tuple[set[str], set[str]]] | None:
+        if statement is not self.child and any(
+            isinstance(part, ast.Name) and isinstance(part.ctx, ast.Load) for part in ast.walk(statement)
+        ):
+            return None
+        updated = bound_names - {statement.name}
+        if statement is self.child:
+            updated.add(statement.name)
+        return [(aliases - {statement.name}, updated)]
+
+    def _assignment(
+        self, statement: ast.Assign, aliases: set[str], bound_names: set[str]
+    ) -> list[tuple[set[str], set[str]]] | None:
+        if not all(isinstance(target, ast.Name) for target in statement.targets):
+            return None
+        if self._references(statement.value, bound_names) and not isinstance(statement.value, ast.Name):
+            return None
+        updated = bound_names.copy()
+        for target in statement.targets:
+            if isinstance(statement.value, ast.Name) and statement.value.id in bound_names:
+                updated.add(target.id)
+            else:
+                updated.discard(target.id)
+        return [(_resolve_class_node(statement, aliases, aliases, None, True), updated)]
+
+    def _call(
+        self, statement: ast.Expr, aliases: set[str], bound_names: set[str]
+    ) -> list[tuple[set[str], set[str]]] | None:
+        call = statement.value
+        assert isinstance(call, ast.Call)
+        if isinstance(call.func, ast.Name) and call.func.id in {"locals", "vars", "eval", "exec"}:
+            return None
+        if isinstance(call.func, ast.Name) and call.func.id in bound_names:
+            if call.args or call.keywords:
+                return None
+            violations: list[int] = []
+            _resolve_scope(self.child, aliases, violations)
+            if violations:
+                return None
+        elif self._references(call, bound_names):
+            return None
+        return [(_resolve_class_node(statement, aliases, aliases, None, True), bound_names)]
+
+    def _step(
+        self, statement: ast.stmt, aliases: set[str], bound_names: set[str]
+    ) -> list[tuple[set[str], set[str]]] | None:
+        if isinstance(statement, ast.If):
+            return self._if(statement, aliases, bound_names)
+        if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef):
+            return self._definition(statement, aliases, bound_names)
+        if isinstance(statement, ast.Assign):
+            return self._assignment(statement, aliases, bound_names)
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+            return self._call(statement, aliases, bound_names)
+        if isinstance(statement, ast.Return | ast.Raise):
+            return None if self._references(statement, bound_names) else []
+        if isinstance(statement, ast.Pass):
+            return [(aliases, bound_names)]
+        return None
+
+    def walk(
+        self, statements: list[ast.stmt], paths: list[tuple[set[str], set[str]]]
+    ) -> list[tuple[set[str], set[str]]] | None:
+        for statement in statements:
+            next_paths: list[tuple[set[str], set[str]]] = []
+            for aliases, bound_names in paths:
+                stepped = self._step(statement, aliases, bound_names)
+                if stepped is None:
+                    return None
+                next_paths.extend(stepped)
+            paths = next_paths
+            if len(paths) > 64:
+                return None
+        return paths
+
+
+def _child_calls_are_safe(
+    scope: ast.FunctionDef | ast.AsyncFunctionDef,
+    child: ast.FunctionDef | ast.AsyncFunctionDef,
+    initial_aliases: set[str],
+) -> bool:
+    """Prove direct child calls safe; keep the conservative verdict when proof is incomplete."""
+    if (
+        child.decorator_list
+        or child.args.defaults
+        or any(default is not None for default in child.args.kw_defaults)
+        or any(isinstance(node, ast.NamedExpr | ast.Nonlocal | ast.Global) for node in ast.walk(scope))
+    ):
+        return False
+    return _ChildCallProof(child).walk(scope.body, [(initial_aliases.copy(), set())]) is not None
+
+
 def _resolve_scope(scope: ast.AST, enclosing_aliases: set[str], violations: list[int] | None = None) -> set[str]:
     if isinstance(scope, ast.ClassDef):
         return _resolve_class_scope(scope, enclosing_aliases, violations)
@@ -562,6 +680,12 @@ def _resolve_scope(scope: ast.AST, enclosing_aliases: set[str], violations: list
             for child in facts.children:
                 child_aliases = aliases
                 if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                    if (
+                        isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef)
+                        and isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)
+                        and _child_calls_are_safe(scope, child, initial_aliases)
+                    ):
+                        continue
                     prior_statements = [statement for statement in scope.body if statement.lineno < child.lineno]
                     prior_aliases = _resolve_class_statements(
                         prior_statements, initial_aliases.copy(), initial_aliases, None
@@ -571,7 +695,7 @@ def _resolve_scope(scope: ast.AST, enclosing_aliases: set[str], violations: list
                         for binding in facts.bindings
                         if any(getattr(value, "lineno", -1) >= child.lineno for value in binding[1])
                     ]
-                    child_aliases = aliases | _binding_aliases(later_bindings, prior_aliases)
+                    child_aliases = aliases | prior_aliases | _binding_aliases(later_bindings, prior_aliases)
                 _resolve_scope(child, child_aliases, violations)
         return aliases
     return aliases | _binding_aliases(facts.bindings, aliases)
@@ -1375,6 +1499,63 @@ def test_deferred_children_keep_later_aliases_across_returns_and_callbacks() -> 
     assert _non_disclosure_assertion_lines(aliased_call) == [3]
     assert _non_disclosure_assertion_lines(callback) == [5]
     assert _non_disclosure_assertion_lines(alias_crosses_child_definition) == [4]
+
+
+def test_nested_function_calls_follow_the_bound_function_on_each_path() -> None:
+    cleared_before_call = (
+        "def outer():\n"
+        "    captured = response.text\n"
+        "    def check():\n"
+        "        assert protected not in captured\n"
+        "    captured = 'authored'\n"
+        "    check()\n"
+    )
+    correlated_binding = (
+        "def outer(flag):\n"
+        "    captured = response.text\n"
+        "    def check():\n"
+        "        assert protected not in captured\n"
+        "    def harmless():\n"
+        "        return None\n"
+        "    if flag:\n"
+        "        bound = harmless\n"
+        "    else:\n"
+        "        captured = 'authored'\n"
+        "        bound = check\n"
+        "    bound()\n"
+    )
+    leaking_binding = correlated_binding.replace("bound = harmless", "bound = check")
+    indirect_call = (
+        "def outer():\n"
+        "    def run():\n"
+        "        check()\n"
+        "    captured = response.text\n"
+        "    def check():\n"
+        "        assert protected not in captured\n"
+        "    run()\n"
+        "    captured = 'authored'\n"
+    )
+    default_taints_before_call = (
+        "def outer():\n"
+        "    captured = 'authored'\n"
+        "    def check(value=(captured := response.text)):\n"
+        "        assert protected not in captured\n"
+        "    check()\n"
+    )
+    argument_taints_before_call = (
+        "def outer():\n"
+        "    captured = 'authored'\n"
+        "    def check(value):\n"
+        "        assert protected not in captured\n"
+        "    check(captured := response.text)\n"
+    )
+
+    assert _non_disclosure_assertion_lines(cleared_before_call) == []
+    assert _non_disclosure_assertion_lines(correlated_binding) == []
+    assert _non_disclosure_assertion_lines(leaking_binding) == [4]
+    assert _non_disclosure_assertion_lines(indirect_call) == [6]
+    assert _non_disclosure_assertion_lines(default_taints_before_call) == [4]
+    assert _non_disclosure_assertion_lines(argument_taints_before_call) == [4]
 
 
 def test_bare_return_does_not_enter_an_exception_handler() -> None:
