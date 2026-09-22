@@ -2,6 +2,32 @@
 
 <!-- version list -->
 
+## v1.5.0 (2026-09-22)
+
+### Bug Fixes
+
+- **guards**: Carry aliases across child definitions
+  ([`7bb4150`](https://github.com/marcinpsk/nso-adapter/commit/7bb4150fd1f35686c8f8be65b242d7c892eb0d8d))
+
+- **guards**: Close scanner and raised-message review gaps
+  ([`b77ddbf`](https://github.com/marcinpsk/nso-adapter/commit/b77ddbf0944d9835e750e40d1b8c6bb044c413cb))
+
+- **guards**: Preserve deferred and terminal alias states
+  ([`77c5b02`](https://github.com/marcinpsk/nso-adapter/commit/77c5b024c7bba0008284e850397f50b3b1558340))
+
+- **guards**: Prove nested calls safe on simple paths
+  ([`fa72a65`](https://github.com/marcinpsk/nso-adapter/commit/fa72a650cf39b7b7581a21416868afe8c173951b))
+
+- **guards**: Retain later aliases for deferred children
+  ([`a963c93`](https://github.com/marcinpsk/nso-adapter/commit/a963c935215b04b9c779127fa0b711423c58e380))
+
+- **guards**: Track outcome aliases across context exits
+  ([`47541b7`](https://github.com/marcinpsk/nso-adapter/commit/47541b7c188842cea0cd0fe7b69e0d0b448dbc90))
+
+- **review**: Keep valid LAG rows and resolve disclosure aliases by path
+  ([`1e79fe9`](https://github.com/marcinpsk/nso-adapter/commit/1e79fe9aaf58791d0a6d4fc570fe93cb09ad6f28))
+
+
 ## v1.4.2 (2026-09-21)
 
 ### Bug Fixes
