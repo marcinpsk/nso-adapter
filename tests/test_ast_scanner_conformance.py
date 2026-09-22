@@ -235,27 +235,11 @@ CASES = (
         "scope-comprehension-inward",
         "value = SOURCE\n[EXPRESSION_SINK for _ in items]",
         "value = CLEAN\n[EXPRESSION_SINK for _ in items]",
-        {
-            (
-                "non-disclosure",
-                True,
-            ): "the scanner checks assert statements, which comprehensions cannot contain",
-            (
-                "non-disclosure",
-                False,
-            ): "the scanner checks assert statements, which comprehensions cannot contain",
-        },
     ),
     ConformanceCase(
         "scope-comprehension-outward",
         "[EXPRESSION_SINK for value in [SOURCE]]",
         "[value for value in [SOURCE]]\nvalue = CLEAN\nSINK",
-        {
-            (
-                "non-disclosure",
-                True,
-            ): "the scanner checks assert statements, which comprehensions cannot contain",
-        },
     ),
     ConformanceCase(
         "control-try-except",
@@ -534,7 +518,10 @@ def _scanner_case_parameters() -> list[object]:
         for case in CASES:
             for tainted in (True, False):
                 marks = []
-                if reason := (case.gaps or {}).get((scanner.name, tainted)):
+                source = case.tainted if tainted else case.clean
+                if not scanner.expression_sink and "EXPRESSION_SINK" in source:
+                    marks.append(pytest.mark.skip(reason=f"{scanner.name} has no expression sink"))
+                elif reason := (case.gaps or {}).get((scanner.name, tainted)):
                     marks.append(pytest.mark.xfail(reason=reason, strict=True))
                 parameters.append(
                     pytest.param(
@@ -546,6 +533,15 @@ def _scanner_case_parameters() -> list[object]:
                     )
                 )
     return parameters
+
+
+def test_scanner_conformance_skips_missing_expression_sink() -> None:
+    for parameter in _scanner_case_parameters():
+        scanner, case, tainted = parameter.values
+        source = case.tainted if tainted else case.clean
+        if scanner.expression_sink or "EXPRESSION_SINK" not in source:
+            continue
+        assert {mark.name for mark in parameter.marks} == {"skip"}, parameter.id
 
 
 @pytest.fixture(scope="module")

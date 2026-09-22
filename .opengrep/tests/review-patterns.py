@@ -617,6 +617,16 @@ def raised_message_via_attribute(device):
     raise NsoReadContractError(f"echoed a different device than {device.nso_device_name!r}")
 
 
+def raised_message_from_bare_attribute(device):
+    # ruleid: nso-raised-message-raw-identifier
+    raise NsoReadContractError(device.nso_device_name)
+
+
+def structured_orphans_do_not_become_the_message(device):
+    # ok: nso-raised-message-raw-identifier
+    raise RemovalBlockedError({"snmp/community": [[device.nso_device_name]]})
+
+
 def raised_message_after_a_code(device_name, code):
     # ruleid: nso-raised-message-raw-identifier
     raise NsoApplyError(code, f"dry-run for {device_name!r} rejected")

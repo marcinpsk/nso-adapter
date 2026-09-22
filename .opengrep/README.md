@@ -69,7 +69,8 @@ message. Both identifier rules above sink on `logger.*`, so neither sees a name
 interpolated into an exception, which `str(exc)`, `repr(exc)` and any formatted
 traceback then publish with no handler able to take it back out. The rule carries the
 same identifier vocabulary into the message expression of a `raise`, through
-f-strings, `format`, `%` and concatenation, and through a local alias.
+f-strings, `format`, `%` and concatenation, a local alias, or a bare first argument.
+`RemovalBlockedError` stores its argument in `orphans` and sets a fixed message.
 
 It sinks on the MESSAGE, not on the `raise`: a `detail=` field is a different
 question, answered by whether its consumer renders it. It is the only guard here with

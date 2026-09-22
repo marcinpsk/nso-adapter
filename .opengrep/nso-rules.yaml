@@ -412,6 +412,10 @@ rules:
               - pattern: $TEMPLATE.format(...)
               - pattern: $TEMPLATE % $VALUES
               - pattern: $LEFT + $RIGHT
+      - patterns:
+          - pattern-inside: raise $EXC($MESSAGE, ...)
+          - pattern-not-inside: raise RemovalBlockedError(...)
+          - focus-metavariable: $MESSAGE
   - id: nso-api-error-raw-exception-renderer
     languages: [python]
     severity: ERROR
