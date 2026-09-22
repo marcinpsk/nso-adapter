@@ -304,6 +304,7 @@ async def test_read_capability_report_ambiguous_device_does_not_echo_its_name(ad
     )
 
     assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "ambiguous_device"
     assert_text_free_of(resp.text, [submitted])
 
 

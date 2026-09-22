@@ -334,23 +334,11 @@ CASES = (
         "control-return-exits-branch",
         "def nested():\n    value = CLEAN\n    if condition:\n        value = SOURCE\n    SINK",
         "def nested():\n    value = CLEAN\n    if condition:\n        value = SOURCE\n        return\n    SINK",
-        {
-            (
-                "non-disclosure",
-                False,
-            ): "the scanner unions a scope's bindings and does not model control flow",
-        },
     ),
     ConformanceCase(
         "control-raise-exits-branch",
         "value = CLEAN\nif condition:\n    value = SOURCE\nSINK",
         "value = CLEAN\nif condition:\n    value = SOURCE\n    raise RuntimeError\nSINK",
-        {
-            (
-                "non-disclosure",
-                False,
-            ): "the scanner unions a scope's bindings and does not model control flow",
-        },
     ),
     ConformanceCase(
         "control-if-body",

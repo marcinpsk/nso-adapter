@@ -71,10 +71,20 @@ async def _upsert_lags(
                 reason="no lag-id",
             )
             continue
+        try:
+            lag_id = wire_int(lag["lag-id"])
+        except (TypeError, ValueError):
+            logger.warning(
+                "lag_topology.entry_skipped",
+                device_id=device.id,
+                lag_name=lag.get("name"),
+                reason="invalid lag-id",
+            )
+            continue
         li = LagInterface(
             device_id=device.id,
             name=lag["name"],
-            lag_id=wire_int(lag["lag-id"]),
+            lag_id=lag_id,
             last_refreshed_at=now,
             refresh_source=refresh_source,
         )

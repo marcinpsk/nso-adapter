@@ -300,10 +300,6 @@ def _binding_aliases(bindings: list[tuple[str, list[ast.AST]]], aliases: set[str
     return resolved
 
 
-def _resolve_bindings(bindings: list[tuple[str, list[ast.AST]]], aliases: set[str]) -> set[str]:
-    return aliases | _binding_aliases(bindings, aliases)
-
-
 def _record_non_disclosure_assertions(assertions: list[ast.Assert], aliases: set[str], violations: list[int]) -> None:
     for node in assertions:
         if any(
@@ -321,6 +317,7 @@ def _resolve_class_node(
     aliases: set[str],
     enclosing_aliases: set[str],
     violations: list[int] | None,
+    inherit_current: bool,
 ) -> set[str]:
     facts = _ScopeFacts()
     facts.visit(node)
@@ -329,7 +326,7 @@ def _resolve_class_node(
     if violations is not None:
         _record_non_disclosure_assertions(facts.assertions, aliases, violations)
         for child in facts.children:
-            _resolve_scope(child, enclosing_aliases, violations)
+            _resolve_scope(child, aliases if inherit_current else enclosing_aliases, violations)
     return aliases
 
 
@@ -339,13 +336,14 @@ def _resolve_class_if(
     enclosing_aliases: set[str],
     violations: list[int] | None,
     observed_states: list[set[str]] | None,
+    inherit_current: bool,
 ) -> set[str]:
-    aliases = _resolve_class_node(statement.test, aliases, enclosing_aliases, violations)
+    aliases = _resolve_class_node(statement.test, aliases, enclosing_aliases, violations, inherit_current)
     body_aliases = _resolve_class_statements(
-        statement.body, aliases.copy(), enclosing_aliases, violations, observed_states
+        statement.body, aliases.copy(), enclosing_aliases, violations, observed_states, inherit_current
     )
     else_aliases = _resolve_class_statements(
-        statement.orelse, aliases.copy(), enclosing_aliases, violations, observed_states
+        statement.orelse, aliases.copy(), enclosing_aliases, violations, observed_states, inherit_current
     )
     return body_aliases | else_aliases
 
@@ -356,15 +354,16 @@ def _resolve_class_try(
     enclosing_aliases: set[str],
     violations: list[int] | None,
     observed_states: list[set[str]] | None,
+    inherit_current: bool,
 ) -> set[str]:
     incoming = aliases.copy()
     body_states: list[set[str]] = []
     body_aliases = _resolve_class_statements(
-        statement.body, incoming.copy(), enclosing_aliases, violations, body_states
+        statement.body, incoming.copy(), enclosing_aliases, violations, body_states, inherit_current
     )
     else_states: list[set[str]] = []
     normal_aliases = _resolve_class_statements(
-        statement.orelse, body_aliases.copy(), enclosing_aliases, violations, else_states
+        statement.orelse, body_aliases.copy(), enclosing_aliases, violations, else_states, inherit_current
     )
     handler_input = set().union(incoming, *body_states)
     handler_aliases = []
@@ -372,11 +371,13 @@ def _resolve_class_try(
     for handler in statement.handlers:
         state = handler_input.copy()
         if handler.type is not None:
-            state = _resolve_class_node(handler.type, state, enclosing_aliases, violations)
+            state = _resolve_class_node(handler.type, state, enclosing_aliases, violations, inherit_current)
         if handler.name is not None:
             state.discard(handler.name)
         handler_states: list[set[str]] = []
-        state = _resolve_class_statements(handler.body, state, enclosing_aliases, violations, handler_states)
+        state = _resolve_class_statements(
+            handler.body, state, enclosing_aliases, violations, handler_states, inherit_current
+        )
         if handler.name is not None:
             state.discard(handler.name)
             for handler_state in handler_states:
@@ -385,7 +386,7 @@ def _resolve_class_try(
         handler_aliases.append(state)
     aliases = normal_aliases | set().union(*handler_aliases, set())
     normal_aliases = _resolve_class_statements(
-        statement.finalbody, aliases, enclosing_aliases, violations, observed_states
+        statement.finalbody, aliases, enclosing_aliases, violations, observed_states, inherit_current
     )
     exceptional_states = else_states + handler_exception_states
     if not any(handler.type is None for handler in statement.handlers):
@@ -393,7 +394,7 @@ def _resolve_class_try(
     exceptional_aliases = set().union(*exceptional_states, set())
     if exceptional_aliases:
         propagated_aliases = _resolve_class_statements(
-            statement.finalbody, exceptional_aliases, enclosing_aliases, violations, observed_states
+            statement.finalbody, exceptional_aliases, enclosing_aliases, violations, observed_states, inherit_current
         )
         if observed_states is not None:
             observed_states.append(propagated_aliases)
@@ -406,21 +407,22 @@ def _resolve_class_for(
     enclosing_aliases: set[str],
     violations: list[int] | None,
     observed_states: list[set[str]] | None,
+    inherit_current: bool,
 ) -> set[str]:
-    incoming = _resolve_class_node(statement.iter, aliases, enclosing_aliases, violations)
+    incoming = _resolve_class_node(statement.iter, aliases, enclosing_aliases, violations, inherit_current)
     loop_entry = incoming.copy()
     while True:
         target_aliases = _binding_aliases(_target_value_bindings(statement.target, statement.iter), loop_entry)
         iteration_aliases = loop_entry - _target_names(statement.target) | target_aliases
         body_aliases = _resolve_class_statements(
-            statement.body, iteration_aliases, enclosing_aliases, violations, observed_states
+            statement.body, iteration_aliases, enclosing_aliases, violations, observed_states, inherit_current
         )
         expanded_entry = loop_entry | body_aliases
         if expanded_entry == loop_entry:
             break
         loop_entry = expanded_entry
     else_aliases = _resolve_class_statements(
-        statement.orelse, loop_entry, enclosing_aliases, violations, observed_states
+        statement.orelse, loop_entry, enclosing_aliases, violations, observed_states, inherit_current
     )
     return loop_entry | else_aliases
 
@@ -431,20 +433,21 @@ def _resolve_class_while(
     enclosing_aliases: set[str],
     violations: list[int] | None,
     observed_states: list[set[str]] | None,
+    inherit_current: bool,
 ) -> set[str]:
     initial = aliases.copy()
     loop_entry = initial.copy()
     while True:
-        tested_aliases = _resolve_class_node(statement.test, loop_entry, enclosing_aliases, violations)
+        tested_aliases = _resolve_class_node(statement.test, loop_entry, enclosing_aliases, violations, inherit_current)
         body_aliases = _resolve_class_statements(
-            statement.body, tested_aliases, enclosing_aliases, violations, observed_states
+            statement.body, tested_aliases, enclosing_aliases, violations, observed_states, inherit_current
         )
         expanded_entry = loop_entry | body_aliases
         if expanded_entry == loop_entry:
             break
         loop_entry = expanded_entry
     else_aliases = _resolve_class_statements(
-        statement.orelse, initial | loop_entry, enclosing_aliases, violations, observed_states
+        statement.orelse, initial | loop_entry, enclosing_aliases, violations, observed_states, inherit_current
     )
     return initial | loop_entry | else_aliases
 
@@ -455,14 +458,17 @@ def _resolve_class_with(
     enclosing_aliases: set[str],
     violations: list[int] | None,
     observed_states: list[set[str]] | None,
+    inherit_current: bool,
 ) -> set[str]:
     incoming = aliases.copy()
     for item in statement.items:
-        incoming = _resolve_class_node(item.context_expr, incoming, enclosing_aliases, violations)
+        incoming = _resolve_class_node(item.context_expr, incoming, enclosing_aliases, violations, inherit_current)
         if item.optional_vars is not None:
             target_aliases = _binding_aliases(_target_value_bindings(item.optional_vars, item.context_expr), incoming)
             incoming = incoming - _target_names(item.optional_vars) | target_aliases
-    aliases = _resolve_class_statements(statement.body, incoming, enclosing_aliases, violations, observed_states)
+    aliases = _resolve_class_statements(
+        statement.body, incoming, enclosing_aliases, violations, observed_states, inherit_current
+    )
     if observed_states is not None:
         observed_states.append(aliases.copy())
     return aliases
@@ -474,22 +480,35 @@ def _resolve_class_statements(
     enclosing_aliases: set[str],
     violations: list[int] | None,
     observed_states: list[set[str]] | None = None,
+    inherit_current: bool = False,
 ) -> set[str]:
     for statement in statements:
         if observed_states is not None and statement_may_raise(statement):
             observed_states.append(aliases.copy())
         if isinstance(statement, ast.If):
-            aliases = _resolve_class_if(statement, aliases, enclosing_aliases, violations, observed_states)
+            aliases = _resolve_class_if(
+                statement, aliases, enclosing_aliases, violations, observed_states, inherit_current
+            )
         elif isinstance(statement, (ast.Try, ast.TryStar)):
-            aliases = _resolve_class_try(statement, aliases, enclosing_aliases, violations, observed_states)
+            aliases = _resolve_class_try(
+                statement, aliases, enclosing_aliases, violations, observed_states, inherit_current
+            )
         elif isinstance(statement, (ast.For, ast.AsyncFor)):
-            aliases = _resolve_class_for(statement, aliases, enclosing_aliases, violations, observed_states)
+            aliases = _resolve_class_for(
+                statement, aliases, enclosing_aliases, violations, observed_states, inherit_current
+            )
         elif isinstance(statement, ast.While):
-            aliases = _resolve_class_while(statement, aliases, enclosing_aliases, violations, observed_states)
+            aliases = _resolve_class_while(
+                statement, aliases, enclosing_aliases, violations, observed_states, inherit_current
+            )
         elif isinstance(statement, (ast.With, ast.AsyncWith)):
-            aliases = _resolve_class_with(statement, aliases, enclosing_aliases, violations, observed_states)
+            aliases = _resolve_class_with(
+                statement, aliases, enclosing_aliases, violations, observed_states, inherit_current
+            )
         else:
-            aliases = _resolve_class_node(statement, aliases, enclosing_aliases, violations)
+            aliases = _resolve_class_node(statement, aliases, enclosing_aliases, violations, inherit_current)
+            if isinstance(statement, ast.Return | ast.Raise):
+                return set()
     return aliases
 
 
@@ -502,13 +521,14 @@ def _resolve_scope(scope: ast.AST, enclosing_aliases: set[str], violations: list
         return _resolve_class_scope(scope, enclosing_aliases, violations)
 
     facts = _scope_facts(scope)
-    aliases = _resolve_bindings(facts.bindings, enclosing_aliases - facts.local_names)
-
-    if violations is not None:
-        _record_non_disclosure_assertions(facts.assertions, aliases, violations)
-        for child in facts.children:
-            _resolve_scope(child, aliases, violations)
-    return aliases
+    aliases = (
+        enclosing_aliases - facts.local_names
+        if isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef)
+        else enclosing_aliases
+    )
+    if isinstance(scope, ast.Module | ast.FunctionDef | ast.AsyncFunctionDef):
+        return _resolve_class_statements(scope.body, aliases, aliases, violations, inherit_current=True)
+    return aliases | _binding_aliases(facts.bindings, aliases)
 
 
 def _inspected_surface_aliases(tree: ast.AST) -> set[str]:
@@ -1179,10 +1199,10 @@ def t():
     assert _ordering_violations(nested_clear) == [4]
 
 
-def test_non_disclosure_aliases_converge_without_cross_scope_contamination() -> None:
-    reversed_order = """\
-leaked = captured
+def test_non_disclosure_aliases_follow_bindings_without_cross_scope_contamination() -> None:
+    copied_alias = """\
 captured = response.text
+leaked = captured
 assert protected not in leaked
 """
     cross_scope = """\
@@ -1192,8 +1212,59 @@ def nested():
 assert protected not in captured
 """
 
-    assert _non_disclosure_assertion_lines(reversed_order) == [3]
+    assert _non_disclosure_assertion_lines(copied_alias) == [3]
     assert _non_disclosure_assertion_lines(cross_scope) == []
+
+
+def test_non_disclosure_aliases_follow_module_and_function_control_flow() -> None:
+    module_overwrite = "captured = response.text\ncaptured = 'authored'\nassert protected not in captured\n"
+    function_overwrite = (
+        "def check(flag):\n"
+        "    captured = response.text\n"
+        "    if flag:\n"
+        "        return\n"
+        "    captured = 'authored'\n"
+        "    assert protected not in captured\n"
+    )
+    exceptional_finally = (
+        "def check():\n"
+        "    try:\n"
+        "        captured = response.text\n"
+        "        captured = 'authored'\n"
+        "    finally:\n"
+        "        assert protected not in captured\n"
+    )
+    module_child = (
+        "captured = response.text\ncaptured = 'authored'\ndef check():\n    assert protected not in captured\n"
+    )
+    terminal_return = (
+        "def check(flag):\n"
+        "    captured = 'authored'\n"
+        "    if flag:\n"
+        "        captured = response.text\n"
+        "        return\n"
+        "    assert protected not in captured\n"
+    )
+    terminal_raise = terminal_return.replace("return", "raise RuntimeError()")
+    return_through_finally = (
+        "def check():\n"
+        "    try:\n"
+        "        captured = response.text\n"
+        "        return\n"
+        "    finally:\n"
+        "        assert protected not in captured\n"
+    )
+
+    for source in (
+        module_overwrite,
+        function_overwrite,
+        exceptional_finally,
+        module_child,
+        terminal_return,
+        terminal_raise,
+    ):
+        assert _non_disclosure_assertion_lines(source) == [], source
+    assert _non_disclosure_assertion_lines(return_through_finally) == [6]
 
 
 def test_an_immediately_invoked_lambda_is_part_of_the_disclosure_surface() -> None:
