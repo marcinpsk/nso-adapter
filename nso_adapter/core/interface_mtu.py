@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.shape import as_list
+from nso_adapter.nso.shape import as_list, wire_int
 from nso_adapter.store.models import Device, DeviceInterfaceMtu
 
 logger = structlog.get_logger(__name__)
@@ -27,7 +27,7 @@ def _int_or_none(value) -> int | None:
     if value is None:
         return None
     try:
-        return int(value)
+        return wire_int(value)
     except (TypeError, ValueError):
         return None
 

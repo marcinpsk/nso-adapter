@@ -15,7 +15,8 @@ import uuid as uuid_mod
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select, text
+from sqlalchemy.exc import IntegrityError
 
 from nso_adapter.store import meta as store_meta
 from nso_adapter.store.models import StoreMeta
@@ -47,6 +48,23 @@ async def test_ensure_store_meta_idempotent(adapter_client):
     async with session() as db:
         row = (await db.execute(select(StoreMeta))).scalar_one()
         assert (row.incarnation, row.born) == first
+
+
+@pytest.mark.anyio
+async def test_ensure_store_meta_reraises_an_unrelated_integrity_failure(adapter_client):
+    """Only the singleton primary key can decide the concurrent mint outcome."""
+    async with session() as db:
+        await db.execute(delete(StoreMeta))
+        await db.execute(
+            text(
+                "ALTER TABLE store_meta ADD CONSTRAINT ck_store_meta_test_incarnation "
+                "CHECK (incarnation = 'permitted-test-incarnation')"
+            )
+        )
+        await db.commit()
+
+    with pytest.raises(IntegrityError, match="ck_store_meta_test_incarnation"):
+        await store_meta.ensure_store_meta()
 
 
 @pytest.mark.anyio

@@ -95,3 +95,18 @@ async def test_refresh_authoritative_empty_clears(adapter_client):
         nso_client.get_device_state_section.return_value = {"status": "ok"}
         await refresh_subinterface_for_device(db, device, nso_client, refresh_source="test")
         assert await _rows(db, device_id) == {}
+
+
+@pytest.mark.anyio
+async def test_a_BOOLEAN_dot1q_vlan_is_refused(adapter_client):
+    """``int(True)`` stored dot1q VLAN 1 for a subinterface the device tagged with nothing."""
+    device_id = await seed_device(nso_device_name="subif-bool", netbox_device_id=974)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "device-name": "subif-bool",
+            "interface": [{"interface-name": "Gi0/1.100", "dot1q-vlan": True}],
+        }
+        with pytest.raises(TypeError):
+            await refresh_subinterface_for_device(db, device, nso_client, refresh_source="test")

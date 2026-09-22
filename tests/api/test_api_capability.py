@@ -277,38 +277,35 @@ async def test_read_capability_report_records_rows_under_the_device_key(adapter_
 
 @pytest.mark.asyncio
 async def test_read_capability_report_unknown_device_is_404(adapter_client_with_nso):  # noqa: F811
+    from tests._secret_discipline import assert_text_free_of
+
+    submitted = "placeholder-unknown-capability-device"
     resp = await adapter_client_with_nso.post(
         "/api/v1/devices/read-capability/report",
         headers=AUTH,
-        json={"nso_device_name": "no-such-device", "elements": [{"scope": "bgp", "status": "native"}]},
+        json={"nso_device_name": submitted, "elements": [{"scope": "bgp", "status": "native"}]},
     )
     assert resp.status_code == 404
-    # The submitted name is caller-controlled; the closed code already distinguishes the case.
-    from tests._secret_discipline import assert_text_free_of
-
-    assert_text_free_of(resp.text, ["no-such-device"])
+    assert_text_free_of(resp.text, [submitted])
 
 
 @pytest.mark.asyncio
-async def test_read_capability_report_ambiguous_device_does_not_echo_the_name(adapter_client_with_nso):  # noqa: F811
-    """Two instances holding the same node name must not turn the submitted name into a response."""
+async def test_read_capability_report_ambiguous_device_does_not_echo_its_name(adapter_client_with_nso):  # noqa: F811
     from tests._secret_discipline import assert_text_free_of
 
-    name = "placeholder-ambiguous-node"
-    # Same node name under two instances: allowed by uq_device_nso_identity, ambiguous to a
-    # lookup that does not pass nso_instance.
-    await _seed_device_with_key(name)
-    await seed_device(nso_instance="nso-dev-2", nso_device_name=name, netbox_device_id=9931)
+    submitted = "placeholder-ambiguous-capability-device"
+    await seed_device(nso_instance="configured-primary", nso_device_name=submitted, netbox_device_id=8401)
+    await seed_device(nso_instance="configured-secondary", nso_device_name=submitted, netbox_device_id=8402)
 
     resp = await adapter_client_with_nso.post(
         "/api/v1/devices/read-capability/report",
         headers=AUTH,
-        json={"nso_device_name": name, "elements": [{"scope": "bgp", "status": "native"}]},
+        json={"nso_device_name": submitted, "elements": [{"scope": "bgp", "status": "native"}]},
     )
 
     assert resp.status_code == 409
     assert resp.json()["error"]["code"] == "ambiguous_device"
-    assert_text_free_of(resp.text, [name])
+    assert_text_free_of(resp.text, [submitted])
 
 
 @pytest.mark.asyncio

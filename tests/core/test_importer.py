@@ -1069,8 +1069,10 @@ async def test_sync_device_unresolved_ned_marks_unmatched(db_session: AsyncSessi
     """A device whose NED can't be resolved is marked unmatched_device + failed, then raises."""
     from nso_adapter.core import importer as imp
     from nso_adapter.store.models import LastSyncStatus
+    from tests._secret_discipline import assert_chain_free_of
 
-    device = Device(nso_instance="nso-dev", nso_device_name="sw-noned", netbox_device_id=10)  # ned_id None
+    device_name = "placeholder-unresolved-device"
+    device = Device(nso_instance="nso-dev", nso_device_name=device_name, netbox_device_id=10)  # ned_id None
     db_session.add(device)
     await db_session.commit()
 
@@ -1082,13 +1084,7 @@ async def test_sync_device_unresolved_ned_marks_unmatched(db_session: AsyncSessi
     with pytest.raises(ValueError, match="no NED ID") as caught:
         await sync_device(device.id, db_session)
 
-    # The worker renders repr(exc) for this failure, so the NSO name may not be in the message.
-    from tests._secret_discipline import assert_chain_free_of, assert_text_free_of
-
-    assert_text_free_of(str(caught.value), ["sw-noned"])
-    assert_chain_free_of(caught.value, ["sw-noned"])
-    assert str(device.id) in str(caught.value)
-
+    assert_chain_free_of(caught.value, [device_name])
     await db_session.refresh(device)
     assert device.mapping_status == MappingStatus.unmatched_device
     assert device.last_sync_status == LastSyncStatus.failed

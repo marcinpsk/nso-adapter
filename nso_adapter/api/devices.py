@@ -532,7 +532,7 @@ async def get_device_by_nso(instance: str, name: str, db: AsyncSession = Depends
     result = await db.execute(select(Device).where(Device.nso_instance == instance, Device.nso_device_name == name))
     device = result.scalar_one_or_none()
     if not device:
-        raise api_error(404, "not_found", f"No device for instance='{instance}' name='{name}'")
+        raise api_error(404, "not_found", "Device not found")
 
     scope_result = await db.execute(select(ManagedScope).where(ManagedScope.device_id == device.id))
     scope_attrs = [s.attribute for s in scope_result.scalars().all()]

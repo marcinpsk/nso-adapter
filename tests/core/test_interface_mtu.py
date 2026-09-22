@@ -87,3 +87,20 @@ async def test_refresh_authoritative_empty_clears(adapter_client):
         nso_client.get_device_state_section.return_value = {"status": "ok"}
         await refresh_interface_mtu_for_device(db, device, nso_client, refresh_source="test")
         assert await _rows(db, device_id) == {}
+
+
+@pytest.mark.anyio
+async def test_a_BOOLEAN_mtu_is_dropped_and_never_stored_as_1(adapter_client):
+    """``int(True)`` stored an MTU of 1 byte; the refused value is stored as absent instead."""
+    device_id = await seed_device(nso_device_name="mtu-bool", netbox_device_id=984)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "device-name": "mtu-bool",
+            "interface": [{"interface-name": "Gi0/1", "mtu": True, "ip-mtu": 9000}],
+        }
+        await refresh_interface_mtu_for_device(db, device, nso_client, refresh_source="test")
+        rows = await _rows(db, device_id)
+        assert rows["Gi0/1"].mtu is None
+        assert rows["Gi0/1"].ip_mtu == 9000

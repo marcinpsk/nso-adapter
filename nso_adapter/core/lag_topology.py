@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.shape import as_list
+from nso_adapter.nso.shape import as_list, wire_int
 from nso_adapter.store.models import Device, LagInterface, LagMember
 
 logger = structlog.get_logger(__name__)
@@ -71,10 +71,20 @@ async def _upsert_lags(
                 reason="no lag-id",
             )
             continue
+        try:
+            lag_id = wire_int(lag["lag-id"])
+        except (TypeError, ValueError):
+            logger.warning(
+                "lag_topology.entry_skipped",
+                device_id=device.id,
+                lag_name=lag.get("name"),
+                reason="invalid lag-id",
+            )
+            continue
         li = LagInterface(
             device_id=device.id,
             name=lag["name"],
-            lag_id=int(lag["lag-id"]),
+            lag_id=lag_id,
             last_refreshed_at=now,
             refresh_source=refresh_source,
         )

@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.shape import as_list
+from nso_adapter.nso.shape import as_list, wire_int
 from nso_adapter.store.models import Device, DeviceSubinterface
 
 logger = structlog.get_logger(__name__)
@@ -37,7 +37,7 @@ async def _upsert_subinterface(db: AsyncSession, device: Device, interfaces: lis
                 device_id=device.id,
                 interface_name=name,
                 parent_interface=item.get("parent-interface") or None,
-                dot1q_vlan=int(dot1q) if dot1q is not None else None,
+                dot1q_vlan=wire_int(dot1q) if dot1q is not None else None,
                 sub_type=item.get("type") or "subinterface",
                 vrf=item.get("vrf") or None,
                 last_refreshed_at=now,

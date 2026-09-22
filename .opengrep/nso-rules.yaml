@@ -5,11 +5,12 @@ rules:
     languages: [python]
     severity: ERROR
     message: Classify the outcome failure with failure_detail instead of rendering the exception.
-    paths:
+    paths: &outcome_log_paths
       include:
         - nso_adapter/main.py
         - nso_adapter/core/generation.py
         - nso_adapter/core/importer.py
+        - nso_adapter/core/removal.py
         - nso_adapter/core/refresh_engine.py
         - nso_adapter/core/redistribution.py
         - nso_adapter/notifications/sse_subscriber.py
@@ -44,16 +45,7 @@ rules:
     severity: ERROR
     message: Classify an aliased outcome failure with failure_detail instead of rendering it.
     mode: taint
-    paths:
-      include:
-        - nso_adapter/main.py
-        - nso_adapter/core/generation.py
-        - nso_adapter/core/importer.py
-        - nso_adapter/core/refresh_engine.py
-        - nso_adapter/core/redistribution.py
-        - nso_adapter/notifications/sse_subscriber.py
-        - nso_adapter/notifications/persistent_subscriber.py
-        - review-patterns.py
+    paths: *outcome_log_paths
     pattern-sources:
       - patterns:
           - pattern-inside: |
@@ -292,6 +284,66 @@ rules:
       - patterns:
           - pattern: logger.$LEVEL(..., $KEY=$SINK, ...)
           - focus-metavariable: $SINK
+  - id: nso-raised-message-raw-identifier
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Raise fixed authored text. A raised message is published by str(exc), repr(exc) and any
+      formatted traceback, so no handler can take the caller's identifier back out of it.
+      Carry the identifier in a structured field instead.
+    mode: taint
+    pattern-sources:
+      - pattern: $D.nso_device_name
+        exact: true
+      - pattern: $D.ned_id
+        exact: true
+      - pattern: $D.sw_version
+        exact: true
+      - pattern: device_name
+        exact: true
+      - pattern: stream_url
+        exact: true
+    pattern-sanitizers:
+      # The adapter's own id is not caller text, and an HTTP status code is a closed integer.
+      # Both are narrower than sanitizing the object: $RESPONSE.text CAN echo the submitted
+      # name straight back, so a response reached through a device-named URL stays tainted.
+      - pattern: $D.id
+        exact: true
+      - pattern: $RESPONSE.status_code
+        exact: true
+    # The sink is the MESSAGE, not the raise: a structured detail= field is a different
+    # question, answered by whether its consumer renders it.
+    pattern-sinks:
+      - patterns:
+          - pattern-inside: raise $EXC(...)
+          - pattern-either:
+              - pattern: f"..."
+              - pattern: $TEMPLATE.format(...)
+              - pattern: $TEMPLATE % $VALUES
+              - pattern: $LEFT + $RIGHT
+      - patterns:
+          - pattern-inside: raise $EXC($MESSAGE, ...)
+          - pattern-not-inside: raise RemovalBlockedError(...)
+          - focus-metavariable: $MESSAGE
+  - id: nso-api-error-raw-exception-renderer
+    languages: [python]
+    severity: ERROR
+    message: Answer with authored text or failure_detail; str()/repr() on an exception repeats the server's own message and the request URL into the response body.
+    patterns:
+      - pattern-either:
+          - pattern: api_error(..., str($EXC), ...)
+          - pattern: api_error(..., repr($EXC), ...)
+      # Only a BROADLY caught exception. A named application error carries authored text by
+      # construction, so rendering it is the intended answer; a bare Exception is whatever
+      # the transport, the server or a decoder raised.
+      - pattern-inside: |
+          try:
+            ...
+          except $BROAD as $EXC:
+            ...
+      - metavariable-regex:
+          metavariable: $BROAD
+          regex: ^(Exception|BaseException)$
   - id: nso-store-legacy-query-api
     languages: [python]
     severity: ERROR
@@ -328,11 +380,11 @@ rules:
     paths:
       include:
         - nso_adapter/core/vlan.py
+        - nso_adapter/core/subinterface.py
+        - nso_adapter/core/lag_topology.py
+        - nso_adapter/core/interface_mtu.py
+        - nso_adapter/bindings/netbox/scope.py
         - nso_adapter/secrets/vault.py
         - review-patterns.py
     patterns:
       - pattern: int(...)
-      # wire_int IS the coercion; everything else in these modules goes through it.
-      - pattern-not-inside: |
-          def wire_int(...):
-              ...

@@ -327,7 +327,7 @@ async def enqueue_provision_job(params: dict, db: AsyncSession) -> tuple[Job, bo
         logger.debug("job.provision_admission.winner_finished", device_name=params.get("device_name"))
 
     logger.warning("job.provision_admission.retries_exhausted", device_name=params.get("device_name"))
-    raise RuntimeError(f"could not admit a provision job for {params.get('device_name')!r}")
+    raise RuntimeError("could not admit a provision job")
 
 
 # ── Job runners ───────────────────────────────────────────────────────────────

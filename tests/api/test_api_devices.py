@@ -102,13 +102,18 @@ async def test_get_by_nso_hit_returns_device_object(adapter_client):
 
 async def test_get_by_nso_miss_returns_404(adapter_client):
     """by-nso with no matching row → 404 with not_found code."""
+    from tests._secret_discipline import assert_text_free_of
+
+    instance = "placeholder-submitted-instance"
+    name = "placeholder-submitted-device"
     resp = await adapter_client.get(
         "/api/v1/devices/by-nso",
-        params={"instance": "nso-dev", "name": "does-not-exist"},
+        params={"instance": instance, "name": name},
         headers=AUTH,
     )
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "not_found"
+    assert_text_free_of(resp.text, [instance, name])
 
 
 async def test_get_by_nso_missing_instance_param_returns_422(adapter_client):
