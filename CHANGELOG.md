@@ -2,6 +2,231 @@
 
 <!-- version list -->
 
+## v1.4.2 (2026-09-21)
+
+### Bug Fixes
+
+- Address remaining review findings
+  ([`cdfb7d7`](https://github.com/marcinpsk/nso-adapter/commit/cdfb7d76b78ea1c4ce37e811196bf556d8d7d884))
+
+- Address review findings
+  ([`45eef5c`](https://github.com/marcinpsk/nso-adapter/commit/45eef5c5631fd83f7c158d0a94bcfa0d87819bf3))
+
+- Track try-body aliases and guard secret assertions
+  ([`a077451`](https://github.com/marcinpsk/nso-adapter/commit/a077451d9750f2e978da8db877a287ffae41a867))
+
+- Update vlan.py
+  ([`973cfeb`](https://github.com/marcinpsk/nso-adapter/commit/973cfeb64e8563d895ac56f9927ce6362a16ab6f))
+
+- **api**: Redact the caller's own selection key from the 422 location
+  ([`116781d`](https://github.com/marcinpsk/nso-adapter/commit/116781d9701a94b938bb9946fe5bf5edddafc154))
+
+- **diagnostics**: Classify the exception text the apply logs render
+  ([`79a89a8`](https://github.com/marcinpsk/nso-adapter/commit/79a89a89331995611938b5385be474d64826acf8))
+
+- **diagnostics**: Close the section-code class and three caller-text leaks
+  ([`61c9e84`](https://github.com/marcinpsk/nso-adapter/commit/61c9e84ade3338f7fb2532d5ae2c11259e227c32))
+
+- **diagnostics**: Keep NED identifiers and device names out of capability records
+  ([`3ab4c1e`](https://github.com/marcinpsk/nso-adapter/commit/3ab4c1e6b479b98ab2c77bd4033bcb1d4e12ec0d))
+
+- **diagnostics**: Name the apply device by its adapter id where one is in scope
+  ([`7ee9230`](https://github.com/marcinpsk/nso-adapter/commit/7ee92305206d9eebc643a1fe371aca27afe7f97c))
+
+- **diagnostics**: Omit stream URLs and device names
+  ([`51a23f8`](https://github.com/marcinpsk/nso-adapter/commit/51a23f8e5037cff3677c2bb9be8b7dd62228ded1))
+
+- **diagnostics**: Remove remaining raw identifiers
+  ([`ecb0584`](https://github.com/marcinpsk/nso-adapter/commit/ecb05847aed139a3b3557019b171fd566ecd7b3b))
+
+- **guards**: Correct the try-flow states and widen the URL rule scope
+  ([`d4f93be`](https://github.com/marcinpsk/nso-adapter/commit/d4f93be790424c6242148b14230c808a8e0485bf))
+
+- **importer,onboarding**: Close three read and rekey race defects
+  ([`aeaaf14`](https://github.com/marcinpsk/nso-adapter/commit/aeaaf146465bf0bc9297654aba9df48f88149e45))
+
+- **onboarding**: Classify integrity failures before treating them as races
+  ([`8c4fa72`](https://github.com/marcinpsk/nso-adapter/commit/8c4fa72bcedce60222366f9c5b19e62203e3ea70))
+
+- **onboarding**: Keep the classified failure in the provisioning record
+  ([`1ecd8ff`](https://github.com/marcinpsk/nso-adapter/commit/1ecd8ff454439e7af2a7f0278d84bf089a2545c3))
+
+- **onboarding**: Log step classifications, not the step payload
+  ([`aea1ad8`](https://github.com/marcinpsk/nso-adapter/commit/aea1ad807b4104ad56fc6975aad9b6fcbf1f058c))
+
+- **onboarding**: Name the provisioned device by adapter id, not by NSO name
+  ([`e28225f`](https://github.com/marcinpsk/nso-adapter/commit/e28225f736aaa2767517b7797e47cfa583f4337f))
+
+- **opengrep**: Stop banning the operator-authored NSO instance name
+  ([`05df0d7`](https://github.com/marcinpsk/nso-adapter/commit/05df0d758df55eab5913651f96362954416d646e))
+
+- **read-outcome**: Keep the caller's device name out of the generated repr
+  ([`690c2e7`](https://github.com/marcinpsk/nso-adapter/commit/690c2e73d5399b73b35f6ad96c825e5fb8ca7dcb))
+
+- **read-outcome**: Refuse a read classification no reader can produce
+  ([`b808958`](https://github.com/marcinpsk/nso-adapter/commit/b808958c8a551fc9de4ace1b7b2be5eb3961303b))
+
+- **read-outcome**: Validate where every failure code can come from
+  ([`8e57b16`](https://github.com/marcinpsk/nso-adapter/commit/8e57b16ed5a5ee8e8245a8e08c22a477a3b9932b))
+
+- **review**: Address latest adapter findings
+  ([`5ded00d`](https://github.com/marcinpsk/nso-adapter/commit/5ded00de04899f82a362d578bb74d0cdd3e0f48c))
+
+- **review**: Centralize Vault value selection
+  ([`045789e`](https://github.com/marcinpsk/nso-adapter/commit/045789e702347ba9e017647f285aa966ee938065))
+
+- **review**: Close adapter guard gaps
+  ([`99df323`](https://github.com/marcinpsk/nso-adapter/commit/99df323977715091b7e462003af6d664112ba828))
+
+- **review**: Close adapter validation gaps
+  ([`d3d8dd9`](https://github.com/marcinpsk/nso-adapter/commit/d3d8dd96937093ac595761f189bf19ba03b59b8e))
+
+- **review**: Close diagnostic guard gaps
+  ([`9c62196`](https://github.com/marcinpsk/nso-adapter/commit/9c62196f6c0854c3f70c8b63ee4fe9eb109230fb))
+
+- **review**: Close remaining adapter findings
+  ([`76d9f6b`](https://github.com/marcinpsk/nso-adapter/commit/76d9f6b6af791064b5818868d75f9bb885e3f075))
+
+- **review**: Close remaining safety gaps
+  ([`cae1bc5`](https://github.com/marcinpsk/nso-adapter/commit/cae1bc58003dd3b8e61ba9cec910fe11e5281f53))
+
+- **review**: Close structured logging guard gaps
+  ([`a24f2ce`](https://github.com/marcinpsk/nso-adapter/commit/a24f2ce5a83f4e50ac17c9e24ac11a084270085a))
+
+- **review**: Cover raw exception renderers
+  ([`c89bc1f`](https://github.com/marcinpsk/nso-adapter/commit/c89bc1fe397e64050d838a59561dd24c79795fd2))
+
+- **review**: Harden input boundary contracts
+  ([`a978cba`](https://github.com/marcinpsk/nso-adapter/commit/a978cba61e4085b198b9a83515dc442f4a7b612b))
+
+- **review**: Narrow Vault value validation
+  ([`6691a95`](https://github.com/marcinpsk/nso-adapter/commit/6691a950e4bd7a94aad97013ebefb5156b2e8336))
+
+- **review**: Remove credential baseline bypass
+  ([`1dfc18e`](https://github.com/marcinpsk/nso-adapter/commit/1dfc18e78aeb67572801cac20e0748c5e625e548))
+
+- **secret-discipline**: Credit only unconditional non-disclosure clears
+  ([`eb9bec0`](https://github.com/marcinpsk/nso-adapter/commit/eb9bec0709240f9fa134793c9593fad6b91a81ff))
+
+- **secret-discipline**: Read a surface off an inspected method call
+  ([`3c80ef9`](https://github.com/marcinpsk/nso-adapter/commit/3c80ef98abaf756ebb36eab58f428c9814d22c44))
+
+- **secrets**: Mint the operation id before any handler-owned failure
+  ([`0b62e47`](https://github.com/marcinpsk/nso-adapter/commit/0b62e474e4076ea457576fbbfa8ccd4eed950827))
+
+- **secrets**: Refuse a Vault payload that is not a mapping
+  ([`80d7a96`](https://github.com/marcinpsk/nso-adapter/commit/80d7a96513f3484ef4541be983ed651199640c18))
+
+- **vlan**: Refuse a boolean where a wire integer is expected
+  ([`e9a47b5`](https://github.com/marcinpsk/nso-adapter/commit/e9a47b579c00a64368afa73dc7ce2ba2ce0a5e53))
+
+- **vlan**: Reject malformed tagged-VLAN chunks instead of dropping them
+  ([`64f8548`](https://github.com/marcinpsk/nso-adapter/commit/64f85485eb65311a6067ca8a8ea788b57b3922d0))
+
+### Chores
+
+- **ci**: Bump astral-sh/setup-uv in the actions group
+  ([`01e695b`](https://github.com/marcinpsk/nso-adapter/commit/01e695bd2db92c5f5ea60da1c89d7389ab87e776))
+
+- **deps**: Bump anyio from 4.13.0 to 4.14.2
+  ([`420f61b`](https://github.com/marcinpsk/nso-adapter/commit/420f61ba2c1e2f7726f5d15803d1039303f77e33))
+
+- **deps**: Bump the python-minor-patch group with 4 updates
+  ([`3f91ae9`](https://github.com/marcinpsk/nso-adapter/commit/3f91ae96193e30bf90bd38ea614e6e73d785995c))
+
+- **docs**: Keep internal notes local
+  ([`26e7dcf`](https://github.com/marcinpsk/nso-adapter/commit/26e7dcf9c5dc98c3ddc0c33f26ab90e814d11e3d))
+
+- **opengrep**: Cover raw string expressions
+  ([`af95b9c`](https://github.com/marcinpsk/nso-adapter/commit/af95b9c43f44b1a6b99c70c31025b04831aa7e43))
+
+- **opengrep**: Gate the store API shapes
+  ([`efe7754`](https://github.com/marcinpsk/nso-adapter/commit/efe7754a11ba2e3b92909fc4a45391ebc2440b0a))
+
+- **opengrep**: Track aliased identifiers into diagnostic sinks
+  ([`f67e2ff`](https://github.com/marcinpsk/nso-adapter/commit/f67e2ff09ece178b72458ba39a5a245fb352fd42))
+
+### Documentation
+
+- **api-contract**: Name the harvest response key secret_hash
+  ([`e1cc6a1`](https://github.com/marcinpsk/nso-adapter/commit/e1cc6a15e647caf8e846c9f83c45892dba75709f))
+
+- **review**: Use semantic test references
+  ([`fe81dad`](https://github.com/marcinpsk/nso-adapter/commit/fe81dad04a702a9cd6a3224b6f6a3d93f5fea1cb))
+
+- **store**: State the fingerprint contract on SnmpCommunity
+  ([`63a4732`](https://github.com/marcinpsk/nso-adapter/commit/63a47323fa7bd3c0b0e174a4eb92edb555e834ca))
+
+### Testing
+
+- Detect bare attribute decorators in exception-context guard and redact stream URL assertion
+  failures
+  ([`ab76f71`](https://github.com/marcinpsk/nso-adapter/commit/ab76f7189e50d7c51d0ec39e7d6fd8a7e7d1c77f))
+
+- Preserve exception aliases across branches
+  ([`5cb2d8e`](https://github.com/marcinpsk/nso-adapter/commit/5cb2d8e497243ad0f4f3b917995aae520f1143b9))
+
+- **apply-promotion**: Clear the record before the assertions that print it
+  ([`55452ca`](https://github.com/marcinpsk/nso-adapter/commit/55452cad48b8c13791517c61d5bf88cf515821f4))
+
+- **device-state**: Pin the clean chain on an undecodable device-state body
+  ([`407d741`](https://github.com/marcinpsk/nso-adapter/commit/407d741527684adbcb90b87ba8b02799d0bc8848))
+
+- **guards**: Assert the conflict rule ignores a typed refusal
+  ([`51e003b`](https://github.com/marcinpsk/nso-adapter/commit/51e003b2055ed8f1f62ce75d228f74a38dafaf2f))
+
+- **guards**: Close three holes the AST scanners walked past
+  ([`fb97af8`](https://github.com/marcinpsk/nso-adapter/commit/fb97af88f564b70b960b114642aef4bdc5208f30))
+
+- **guards**: Pin the identifier policy as a set, not a text search
+  ([`1f21e55`](https://github.com/marcinpsk/nso-adapter/commit/1f21e5549be1d21a4d1cfd411c0b924639aa0311))
+
+- **importer-sinks**: Bind structured assignment targets in the exception-alias scan
+  ([`c1777cb`](https://github.com/marcinpsk/nso-adapter/commit/c1777cba6c84fa89c8199915eb20279fc8b36bbe))
+
+- **lint**: Isolate the OpenGrep prerequisite from the host's PATH
+  ([`20380b8`](https://github.com/marcinpsk/nso-adapter/commit/20380b83aca55be98d05dd0b8d6e3a44a4e0328b))
+
+- **lint**: Resolve bash through the restricted PATH
+  ([`e8b7d8a`](https://github.com/marcinpsk/nso-adapter/commit/e8b7d8a3b94ce6cd76da34d2bc820079f571f0df))
+
+- **readsem**: Pin the two contracts a review round asked us to break
+  ([`a4b2376`](https://github.com/marcinpsk/nso-adapter/commit/a4b2376ecf24a2b73fa708884c1e19dba8379c37))
+
+- **secret-discipline**: Cover test_main_lifespan in the non-disclosure registry
+  ([`d979024`](https://github.com/marcinpsk/nso-adapter/commit/d9790246f0e618f02c0d40a0cfb3edcf0dc78b71))
+
+- **secret-discipline**: Route envelope and refresh checks through the helpers
+  ([`41eb14b`](https://github.com/marcinpsk/nso-adapter/commit/41eb14b961438d6662d05c83eb352f76d51c6f6d))
+
+- **secret-discipline**: Route the API non-disclosure assertions through the helpers
+  ([`d07732c`](https://github.com/marcinpsk/nso-adapter/commit/d07732ca48e4497518098a917c40eac745e9143e))
+
+- **secrets**: Capture the fingerprint rejection before matching its diagnostic
+  ([`97f4272`](https://github.com/marcinpsk/nso-adapter/commit/97f427220d55c88a67739c8e64616d812c8d1b72))
+
+- **secrets**: Clear the protected value before the assertion that prints it
+  ([`f7760b4`](https://github.com/marcinpsk/nso-adapter/commit/f7760b41ec79c367773266765854db8c5a92e425))
+
+- **secrets**: Clear the protected value before the diagnostics that render it
+  ([`a92ecf2`](https://github.com/marcinpsk/nso-adapter/commit/a92ecf29968ca0c303f922ed6a30baa0b1457433))
+
+- **secrets**: Judge a body that holds protected material, helper call or not
+  ([`0964b87`](https://github.com/marcinpsk/nso-adapter/commit/0964b87731a5999bb14f199420b30fd060796355))
+
+- **secrets**: Keep request URLs and protected text out of assertion output
+  ([`cf2b151`](https://github.com/marcinpsk/nso-adapter/commit/cf2b151fff4432c3173f435d681d78a3f7a9319a))
+
+- **secrets**: Name the absence check that must not print its surface
+  ([`ec68b8a`](https://github.com/marcinpsk/nso-adapter/commit/ec68b8a783515b1920f46131238d278b33d1d14d))
+
+- **secrets**: Run every non-disclosure check before pytest can render it
+  ([`6895de0`](https://github.com/marcinpsk/nso-adapter/commit/6895de01a648b83345ef15ae1f08fba57457f2d7))
+
+- **snmp**: Align FakeVault with the production field type
+  ([`623a02d`](https://github.com/marcinpsk/nso-adapter/commit/623a02d4f10c38bdd9f575f3194cc4ea39451dd8))
+
+
 ## v1.4.1 (2026-09-14)
 
 ### Bug Fixes
