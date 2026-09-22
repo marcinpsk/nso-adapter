@@ -268,6 +268,23 @@ def _binding_aliases(bindings: list[tuple[str, list[ast.AST]]], aliases: set[str
     return resolved
 
 
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
+
+
+def _assertion_comparisons(test: ast.expr) -> list[ast.Compare]:
+    """Return assertion comparisons outside comprehension filters."""
+    comparisons: list[ast.Compare] = []
+    stack: list[ast.AST] = [test]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, _COMPREHENSIONS):
+            continue
+        if isinstance(node, ast.Compare):
+            comparisons.append(node)
+        stack.extend(ast.iter_child_nodes(node))
+    return comparisons
+
+
 def _record_non_disclosure_assertions(assertions: list[ast.Assert], aliases: set[str], violations: list[int]) -> None:
     for node in assertions:
         if any(
