@@ -1386,7 +1386,17 @@ assert protected not in body
 
 
 def _unsafe_identifier_key_checks(source: str) -> list[int]:
-    protected_keys = {"device", "nso_device", "nso_device_name", "nso_instance", "lag_name", "keys"}
+    protected_keys = {
+        "device",
+        "device_id",
+        "device_name",
+        "interface",
+        "keys",
+        "lag_name",
+        "nso_device",
+        "nso_device_name",
+        "nso_instance",
+    }
     return [
         node.lineno
         for node in ast.walk(ast.parse(source))
@@ -1404,6 +1414,9 @@ def test_identifier_key_checks_do_not_render_records_on_failure() -> None:
     safe = 'assert_keys_absent(record, ["device"])'
     assert _unsafe_identifier_key_checks(unsafe) == [1]
     assert _unsafe_identifier_key_checks('assert "keys" not in warnings[0]') == [1]
+    assert _unsafe_identifier_key_checks('assert "interface" not in record') == [1]
+    assert _unsafe_identifier_key_checks('assert "device_id" not in record') == [1]
+    assert _unsafe_identifier_key_checks('assert "device_name" not in record') == [1]
     assert _unsafe_identifier_key_checks(safe) == []
 
     violations = [

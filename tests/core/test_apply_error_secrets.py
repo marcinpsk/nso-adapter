@@ -20,6 +20,7 @@ from nso_adapter.nso.client import DEVICE_INTENT_ROOT
 from nso_adapter.store.models import BgpRouterIntent, Job, JobStatus, OspfInterfaceIntent, SnmpCommunityIntent
 from tests._secret_discipline import (
     assert_chain_free_of,
+    assert_keys_absent,
     assert_records_free_of,
     assert_text_free_of,
     assert_text_omits,
@@ -862,8 +863,8 @@ async def test_an_auth_refusal_and_an_outage_do_not_classify_the_same(adapter_cl
         assert record["error_type"] == "HTTPStatusError"
         assert record["family"] == "static-route"
         assert record["failure_code"] is None, "an HTTP answer is not a contract refusal"
-    assert "device_name" not in denied
-    assert "device_name" not in outage
+    assert_keys_absent(denied, ["device_name"])
+    assert_keys_absent(outage, ["device_name"])
     assert_records_free_of(await _outcome_rows(denied_id), _HTTP_SECRETS)
     assert_records_free_of(await _outcome_rows(outage_id), _HTTP_SECRETS)
 

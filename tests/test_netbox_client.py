@@ -182,7 +182,7 @@ async def test_bulk_patch_one_failed_batch_does_not_abandon_rest(client):
     assert len(result) == 2 * client_mod._BULK_PATCH_CHUNK
     record = next(record for record in logs if record["event"] == "netbox.bulk_patch.batch_failed")
     assert record["netbox_device_id"] == 42
-    assert "device_id" not in record
+    assert_keys_absent(record, ["device_id"])
 
 
 @respx.mock
