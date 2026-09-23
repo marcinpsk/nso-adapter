@@ -27,6 +27,7 @@ from nso_adapter.core.jobs import (
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import session
 
 
@@ -284,7 +285,7 @@ async def test_run_with_db_failure(adapter_client):
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.error["code"] == "internal"
-        assert "sekrit-credential" not in json.dumps(job.error), "exception text reached the persisted error"
+        assert_text_free_of(json.dumps(job.error), ["sekrit-credential"])
         assert "RuntimeError" in job.error["message"]
 
 

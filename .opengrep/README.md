@@ -55,7 +55,8 @@ transport error repeats it and the handler logged it raw. `mapper.py` is the nar
 case: its PATCH URL carries the NetBox interface id and its POST payload carries the
 interface name. `rejection_detail` is
 the second approved classifier, for a NetBox rejection body: NetBox repeats the
-submitted value in its validation messages, so only the field names travel. The
+submitted value in its validation messages, and a response key can repeat it too.
+Only the body's shape and counts travel. The
 remaining modules named in `test_guarded_modules_never_log_raw_exception_text` are
 tracked by the universal-guard card; this list is still an allowlist, not the tree.
 

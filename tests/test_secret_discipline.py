@@ -25,7 +25,7 @@ _TEST_ROOT = Path(__file__).resolve().parent
 _NON_DISCLOSURE_TESTS = tuple(sorted(_TEST_ROOT.rglob("test_*.py")))
 #: These attributes and calls return complete values that pytest prints in assertion failures.
 _RENDERED_SURFACE_ATTRIBUTES = {"json", "read_failures", "text", "value"}
-_INSPECTED_CALLS = {"repr", "str"}
+_INSPECTED_CALLS = {"repr", "str", "_log_surface"}
 _NON_DISCLOSURE_HELPERS = {"assert_chain_free_of", "assert_records_free_of", "assert_text_free_of"}
 #: How this repository writes protected material into a test (see the placeholder convention). A
 #: body that names one is handling something protected, whether or not it calls a helper.
@@ -56,8 +56,9 @@ class _InspectedSurfaceReader(ast.NodeVisitor):
         self.visit(node.value)
 
     def visit_Subscript(self, node: ast.Subscript) -> None:  # noqa: N802 - ast visitor API
-        # A subscript narrows a decoded container to one member.
-        return
+        # A key or index narrows a decoded container to one member. A slice keeps the surface.
+        if isinstance(node.slice, ast.Slice):
+            self.visit(node.value)
 
     def visit_ListComp(self, node: ast.ListComp) -> None:  # noqa: N802 - ast visitor API
         self.visit(node.elt)
@@ -74,6 +75,14 @@ class _InspectedSurfaceReader(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 - ast visitor API
         if isinstance(node.func, ast.Name) and node.func.id in _INSPECTED_CALLS:
+            self.found = True
+            return
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "dumps"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "json"
+        ):
             self.found = True
             return
         if isinstance(node.func, ast.Attribute) and node.func.attr in _RENDERED_SURFACE_ATTRIBUTES:
@@ -1409,6 +1418,26 @@ assert queued not in [record["id"] for record in response.json()]
     alias_source = "captured = response.text\nassert protected not in captured.upper\n"
     assert _non_disclosure_assertion_lines(source) == [1, 2, 3, 4]
     assert _non_disclosure_assertion_lines(alias_source) == [2]
+
+
+def test_membership_guard_covers_serialized_surfaces() -> None:
+    direct = "assert protected not in json.dumps(job.error)\n"
+    alias = "surface = json.dumps(job.error)\nassert protected not in surface\n"
+    logged = "assert protected not in _log_surface(recorded_logs)\n"
+
+    assert _non_disclosure_assertion_lines(direct) == [1]
+    assert _non_disclosure_assertion_lines(alias) == [2]
+    assert _non_disclosure_assertion_lines(logged) == [1]
+
+
+def test_membership_guard_covers_text_slices() -> None:
+    direct = "assert protected not in response.text[:500]\n"
+    alias = "body = response.text\nassert protected not in body[1:]\n"
+    narrowed = 'assert "device_id" not in response.json()["record"]\n'
+
+    assert _non_disclosure_assertion_lines(direct) == [1]
+    assert _non_disclosure_assertion_lines(alias) == [2]
+    assert _non_disclosure_assertion_lines(narrowed) == []
 
 
 def test_a_NOT_IN_used_as_a_comprehension_filter_is_not_a_disclosure_check() -> None:

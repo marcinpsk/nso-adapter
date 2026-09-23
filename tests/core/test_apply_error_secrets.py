@@ -18,7 +18,12 @@ from nso_adapter.core.community_dialect import community_dialect_for
 from nso_adapter.nso.apply import NsoApplyError, SectionExecution, apply_device_intent, encode_snmp
 from nso_adapter.nso.client import DEVICE_INTENT_ROOT
 from nso_adapter.store.models import BgpRouterIntent, Job, JobStatus, OspfInterfaceIntent, SnmpCommunityIntent
-from tests._secret_discipline import assert_chain_free_of, assert_records_free_of, assert_text_free_of
+from tests._secret_discipline import (
+    assert_chain_free_of,
+    assert_records_free_of,
+    assert_text_free_of,
+    assert_text_omits,
+)
 from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 from tests.core.test_static_route_put import seed_apply_job
 from tests.nso.test_apply_send import _client_with
@@ -215,10 +220,10 @@ async def test_unexpected_commit_exception_keeps_secret_out_of_logs_and_errors(a
     async with session() as db:
         stored = await db.get(SnmpCommunityIntent, row.id)
 
+    for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error)):
+        assert_text_free_of(surface, [_SECRET])
     assert stored.last_apply_error["code"] == "internal"
     assert stored.last_apply_error["message"] == "apply error (internal); see the server log"
-    for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error)):
-        assert _SECRET not in surface
     internal = next(record for record in logs if record["event"] == "apply.commit_internal_error")
     failed = next(record for record in logs if record["event"] == "apply.atomic_failed")
     assert internal["device_id"] == device_id
@@ -240,13 +245,13 @@ async def test_typed_commit_failure_keeps_its_message_out_of_logs_and_errors(
     async with session() as db:
         stored = await db.get(SnmpCommunityIntent, row.id)
 
+    for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error), _log_surface(recorded_logs)):
+        assert_text_free_of(surface, [_SECRET])
     assert stored.last_apply_error == {
         "code": "nso_error",
         "message": "apply error (nso_error); see the server log",
         "detail": {"stage": "commit"},
     }
-    for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error), _log_surface(recorded_logs)):
-        assert _SECRET not in surface
 
 
 async def test_typed_build_failure_keeps_its_message_out_of_logs_and_errors(adapter_client, monkeypatch, recorded_logs):
@@ -271,13 +276,13 @@ async def test_typed_build_failure_keeps_its_message_out_of_logs_and_errors(adap
             (await db.execute(select(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id))).scalars().one()
         )
 
+    for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error), _log_surface(recorded_logs)):
+        assert_text_free_of(surface, [invalid_asn])
     assert stored.last_apply_error == {
         "code": "invalid_asn",
         "message": "apply error (invalid_asn); see the server log",
         "detail": {},
     }
-    for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error), _log_surface(recorded_logs)):
-        assert invalid_asn not in surface
     assert not any(request.method == "PUT" for request in requests)
 
 
@@ -369,11 +374,11 @@ async def test_a_blocked_apply_keeps_the_device_delta_out_of_the_job_and_row_err
     job = await _run(device_id, client, monkeypatch)
     async with session() as db:
         stored = await db.get(SnmpCommunityIntent, row.id)
+    for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error), _log_surface(recorded_logs)):
+        assert_text_free_of(surface, [_SECRET])
     assert job.status == JobStatus.failed
     assert stored.last_apply_error["code"] == "removal_blocked_collateral"
     assert stored.last_apply_error["detail"]["orphans"] == {"snmp/community": [["legacy"]]}
-    for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error), _log_surface(recorded_logs)):
-        assert _SECRET not in surface
 
 
 async def test_a_blocked_removal_keeps_the_device_delta_out_of_the_job_error(adapter_client, recorded_logs):
@@ -390,11 +395,11 @@ async def test_a_blocked_removal_keeps_the_device_delta_out_of_the_job_error(ada
         await removal_mod.run_removal(job_id, device_id)
     async with session() as db:
         job = await db.get(Job, job_id)
+    assert_text_free_of(json.dumps(job.error), [_SECRET])
+    assert_text_free_of(_log_surface(recorded_logs), [_SECRET])
     assert job.status == JobStatus.failed
     assert job.error["code"] == "removal_blocked_collateral"
     assert job.error["detail"]["orphans"] == {"snmp/community": [["legacy"]]}
-    assert _SECRET not in json.dumps(job.error)
-    assert _SECRET not in _log_surface(recorded_logs)
 
 
 # ── a device rejection: the construct is attributed, the device text is not kept ──
@@ -468,6 +473,15 @@ async def test_a_device_rejection_attributes_its_construct_and_keeps_no_device_t
     async with session() as db:
         recorded = {(r.scope, r.name): r for r in await get_device_capability(db, _NED, _SW) if r.source == "apply"}
         stored = await db.get(SnmpCommunityIntent, row.id)
+    surfaces = [
+        json.dumps(job.error),
+        json.dumps(stored.last_apply_error),
+        _log_surface(recorded_logs),
+        *(f"{r.detail} {r.name}" for r in recorded.values()),
+    ]
+    for surface in surfaces:
+        assert_text_free_of(surface, [_SECRET])
+        assert_text_omits(surface, ["snmp-server"])
     assert job.status == JobStatus.failed
     if condemned is not None:
         verdict = preflight(list(recorded.values()), community_members=[condemned])
@@ -476,15 +490,6 @@ async def test_a_device_rejection_attributes_its_construct_and_keeps_no_device_t
         verdict = preflight(list(recorded.values()), community_members=[cleared])
         assert verdict["fully_supported"] is True, f"preflight condemns {cleared!r}, which the device never refused"
     assert construct in recorded, f"the construct was not attributed: {sorted(recorded)}"
-    surfaces = [
-        json.dumps(job.error),
-        json.dumps(stored.last_apply_error),
-        _log_surface(recorded_logs),
-        *(f"{r.detail} {r.name}" for r in recorded.values()),
-    ]
-    for surface in surfaces:
-        assert _SECRET not in surface
-        assert "snmp-server" not in surface, "opaque device text left the redaction boundary"
 
 
 # ── a failed device-state read: the server's own reason reaches no sink ──

@@ -314,7 +314,7 @@ async def test_bulk_create_rejection_keeps_a_reflected_error_key_out_of_the_reco
 
 @respx.mock
 async def test_bulk_patch_non_positional_rejection_keeps_a_reflected_name_out_of_the_record(client):
-    """The single-row non-positional path parses a dict body; only its field names may travel."""
+    """The single-row non-positional path parses a dict body; only its shape and counts may travel."""
     name = "placeholder-reflected-patch"
     respx.patch(f"{BASE}/api/dcim/interfaces/").mock(
         return_value=httpx.Response(400, json={"name": [f"'{name}' is already taken."], "mtu": ["too big"]})
