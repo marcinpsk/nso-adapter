@@ -449,6 +449,16 @@ def _is_overload(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) ->
     )
 
 
+def _assigned_names(target: ast.expr) -> list[str]:
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, ast.Starred):
+        return _assigned_names(target.value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [name for element in target.elts for name in _assigned_names(element)]
+    return []
+
+
 def _redefined_top_level_lines(source: str) -> list[int]:
     """The lines that bind a top-level name the module already bound."""
     redefined: list[int] = []
@@ -464,7 +474,7 @@ def _redefined_top_level_lines(source: str) -> list[int]:
         elif isinstance(node, ast.ImportFrom) and node.module != "__future__":
             names = [alias.asname or alias.name for alias in node.names if alias.name != "*"]
         elif isinstance(node, ast.Assign):
-            names = [target.id for target in node.targets if isinstance(target, ast.Name)]
+            names = [name for target in node.targets for name in _assigned_names(target)]
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             names = [node.target.id]
         for name in names:
@@ -522,6 +532,16 @@ def test_the_redefinition_rule_tracks_import_bindings() -> None:
     assert _redefined_top_level_lines(aliased_from_import) == [2]
     assert _redefined_top_level_lines(future_import) == []
     assert _redefined_top_level_lines(wildcard_import) == []
+
+
+def test_the_redefinition_rule_tracks_destructured_bindings() -> None:
+    source = "first, [second, *rest] = values\nfirst = other\nsecond = other\nrest = other\n"
+    assert _redefined_top_level_lines(source) == [2, 3, 4]
+
+
+def test_the_redefinition_rule_ignores_bindings_inside_subscript_targets() -> None:
+    source = "first = 1\nitems = {}\nvalues = [2]\nitems[tuple(first for first in values)] = 3\n"
+    assert _redefined_top_level_lines(source) == []
 
 
 def test_diagnostic_identifier_rule_coverage_is_documented() -> None:

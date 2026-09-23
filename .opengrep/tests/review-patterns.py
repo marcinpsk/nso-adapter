@@ -469,6 +469,20 @@ def aliased_raw_diagnostic_identifiers(logger, device, body, stream_url):
     logger.info("family.refresh.done", device_id=device.id)
 
 
+async def aliased_raw_identifiers_through_receivers(logger, rows, get_device, repo, device_id):
+    # ruleid: nso-diagnostic-raw-identifier-alias
+    logger.info("family.refresh.done", context=rows[0].nso_device_name)
+    # ruleid: nso-diagnostic-raw-identifier-alias
+    logger.info("family.refresh.done", context=get_device().nso_device_name)
+    # ruleid: nso-diagnostic-raw-identifier-alias
+    logger.info("family.refresh.done", context=(await repo.get(device_id)).nso_device_name)
+
+
+def raw_route_policy_name(logger, name):
+    # ruleid: nso-route-policy-raw-name
+    logger.warning("route_policy.refresh.duplicate_name_skipped", name=name)
+
+
 def raised_messages_naming_the_caller(device, device_name, stream_url, wire, code, client, containers):
     # ruleid: nso-raised-message-raw-identifier
     raise NsoReadContractError(f"device-state-read for {device_name!r} did not certify")

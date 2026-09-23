@@ -86,7 +86,7 @@ async def test_duplicate_object_names_are_deduped_not_crashing(adapter_client): 
 
     from nso_adapter.core.route_policy import _upsert_route_policy_data
     from nso_adapter.store.models import Device, DeviceRoutePolicyASPath, DeviceRoutePolicyPrefixList
-    from tests._secret_discipline import assert_records_free_of
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
     nso_data = {
         "prefix-list": [
@@ -124,11 +124,10 @@ async def test_duplicate_object_names_are_deduped_not_crashing(adapter_client): 
         assert [p.name for p in pls] == ["DUP"]  # deduped to one, refresh did not crash
         assert [a.name for a in aps] == ["AP"]
         duplicates = [record for record in logs if record["event"] == "route_policy.refresh.duplicate_name_skipped"]
-        assert [(record["device_id"], record["name"]) for record in duplicates] == [
-            (device.id, "DUP"),
-            (device.id, "AP"),
-        ]
-        assert_records_free_of(duplicates, [device.nso_device_name])
+        assert [record["device_id"] for record in duplicates] == [device.id, device.id]
+        for record in duplicates:
+            assert_keys_absent(record, ["name"])
+        assert_records_free_of(duplicates, [device.nso_device_name, "DUP", "AP"])
         return
 
 

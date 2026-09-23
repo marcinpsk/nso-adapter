@@ -271,6 +271,15 @@ rules:
       - pattern: logger.$LEVEL(..., stream=stream_url, ...)
       - pattern: logger.$LEVEL(..., stream_url=stream_url, ...)
       - pattern: logger.$LEVEL(..., url=stream_url, ...)
+  - id: nso-route-policy-raw-name
+    languages: [python]
+    severity: ERROR
+    message: Omit device-derived route-policy names from diagnostic records.
+    paths:
+      include:
+        - nso_adapter/core/route_policy.py
+        - review-patterns.py
+    pattern: logger.$LEVEL(..., name=$VALUE, ...)
   - id: nso-diagnostic-raw-identifier-alias
     languages: [python]
     severity: ERROR
@@ -314,7 +323,7 @@ rules:
               - pattern: $D.sw_version
           - metavariable-regex:
               metavariable: $D
-              regex: ^(?:.*\.)?[a-z_][A-Za-z0-9_]*$
+              regex: ^(?!(?:.*\.)?[A-Z][A-Za-z0-9_]*$)
         exact: true
       - pattern: stream_url
         exact: true

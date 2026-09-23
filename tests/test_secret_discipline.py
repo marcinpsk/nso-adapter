@@ -52,6 +52,8 @@ class _InspectedSurfaceReader(ast.NodeVisitor):
     def visit_Attribute(self, node: ast.Attribute) -> None:  # noqa: N802 - ast visitor API
         if node.attr in _RENDERED_SURFACE_ATTRIBUTES:
             self.found = True
+            return
+        self.visit(node.value)
 
     def visit_Subscript(self, node: ast.Subscript) -> None:  # noqa: N802 - ast visitor API
         # A subscript narrows a decoded container to one member.
@@ -1365,7 +1367,7 @@ assert protected not in body
 
 
 def _unsafe_identifier_key_checks(source: str) -> list[int]:
-    protected_keys = {"device", "nso_device", "nso_device_name", "nso_instance", "lag_name"}
+    protected_keys = {"device", "nso_device", "nso_device_name", "nso_instance", "lag_name", "keys"}
     return [
         node.lineno
         for node in ast.walk(ast.parse(source))
@@ -1382,6 +1384,7 @@ def test_identifier_key_checks_do_not_render_records_on_failure() -> None:
     unsafe = 'assert "device" not in record'
     safe = 'assert_keys_absent(record, ["device"])'
     assert _unsafe_identifier_key_checks(unsafe) == [1]
+    assert _unsafe_identifier_key_checks('assert "keys" not in warnings[0]') == [1]
     assert _unsafe_identifier_key_checks(safe) == []
 
     violations = [
@@ -1397,11 +1400,15 @@ def test_membership_guard_covers_complete_decoded_surfaces() -> None:
 assert protected not in response.json()
 assert protected not in caught.value
 assert protected not in result.read_failures()
+assert protected not in caught.value.detail
+assert protected not in captured.upper
 assert "device_id" not in response.json()["record"]
 assert queued not in [record["id"] for record in response.json()]
 """
 
-    assert _non_disclosure_assertion_lines(source) == [1, 2, 3]
+    alias_source = "captured = response.text\nassert protected not in captured.upper\n"
+    assert _non_disclosure_assertion_lines(source) == [1, 2, 3, 4]
+    assert _non_disclosure_assertion_lines(alias_source) == [2]
 
 
 def test_a_NOT_IN_used_as_a_comprehension_filter_is_not_a_disclosure_check() -> None:

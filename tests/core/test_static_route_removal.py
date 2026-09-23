@@ -486,9 +486,9 @@ async def test_c4_6_a_reclaimed_key_is_not_dropped(adapter_client, shape):
     if rendered:
         assert warnings[0]["device_id"] == device_id
         assert warnings[0]["job_id"] == job_id
-        assert "keys" not in warnings[0]
-        from tests._secret_discipline import assert_records_free_of
+        from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
+        assert_keys_absent(warnings[0], ["keys"])
         assert_records_free_of(warnings, A[1:])
 
 

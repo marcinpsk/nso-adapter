@@ -76,6 +76,8 @@ allowlist covers `nso_adapter/main.py`, `nso_adapter/api/capability.py`,
 `nso_adapter/notifications/persistent_subscriber.py`, `nso_adapter/nso/apply.py`,
 `nso_adapter/nso/client.py`, and the `review-patterns.py` fixture. It matches the
 keyword name, so it sees only a value written directly into the field.
+`nso-route-policy-raw-name` rejects a device-derived `name` field in
+`nso_adapter/core/route_policy.py` diagnostic calls.
 
 It does **not** reject the NSO instance name, under either spelling. The instance
 name is operator-authored configuration, not caller text: every endpoint that takes

@@ -68,7 +68,6 @@ def _dedup_by_name(items: list, family: str, device_id: int) -> list:
                 "route_policy.refresh.duplicate_name_skipped",
                 **device_fields(device_id=device_id),
                 family=family,
-                name=name,
             )
             continue
         seen.add(name)
