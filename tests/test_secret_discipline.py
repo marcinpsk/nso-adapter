@@ -60,18 +60,28 @@ class _InspectedSurfaceReader(ast.NodeVisitor):
         if isinstance(node.slice, ast.Slice):
             self.visit(node.value)
 
+    def _visit_comprehension(self, generators: list[ast.comprehension], *results: ast.expr) -> None:
+        for result in results:
+            self.visit(result)
+        pass_through_names = {result.id for result in results if isinstance(result, ast.Name)}
+        for generator in reversed(generators):
+            if _target_names(generator.target).isdisjoint(pass_through_names):
+                continue
+            self.visit(generator.iter)
+            if isinstance(generator.iter, ast.Name):
+                pass_through_names.add(generator.iter.id)
+
     def visit_ListComp(self, node: ast.ListComp) -> None:  # noqa: N802 - ast visitor API
-        self.visit(node.elt)
+        self._visit_comprehension(node.generators, node.elt)
 
     def visit_SetComp(self, node: ast.SetComp) -> None:  # noqa: N802 - ast visitor API
-        self.visit(node.elt)
+        self._visit_comprehension(node.generators, node.elt)
 
     def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:  # noqa: N802 - ast visitor API
-        self.visit(node.elt)
+        self._visit_comprehension(node.generators, node.elt)
 
     def visit_DictComp(self, node: ast.DictComp) -> None:  # noqa: N802 - ast visitor API
-        self.visit(node.key)
-        self.visit(node.value)
+        self._visit_comprehension(node.generators, node.key, node.value)
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 - ast visitor API
         if isinstance(node.func, ast.Name) and node.func.id in _INSPECTED_CALLS:
@@ -1412,12 +1422,19 @@ assert protected not in result.read_failures()
 assert protected not in caught.value.detail
 assert protected not in captured.upper
 assert "device_id" not in response.json()["record"]
-assert queued not in [record["id"] for record in response.json()]
+assert queued not in [record for record in response.json()]
+assert queued not in {record for record in response.json()}
+assert queued not in list(record for record in response.json())
+assert queued not in {key: value for key, value in response.json().items()}
+assert queued not in [record for record in response.json() if record]
+assert queued not in [member for record in response.json() for member in record]
 """
 
     alias_source = "captured = response.text\nassert protected not in captured.upper\n"
-    assert _non_disclosure_assertion_lines(source) == [1, 2, 3, 4]
+    narrowed_projection = 'assert queued not in [record["id"] for record in response.json()]\n'
+    assert _non_disclosure_assertion_lines(source) == [1, 2, 3, 4, 7, 8, 9, 10, 11, 12]
     assert _non_disclosure_assertion_lines(alias_source) == [2]
+    assert _non_disclosure_assertion_lines(narrowed_projection) == []
 
 
 def test_membership_guard_covers_serialized_surfaces() -> None:
