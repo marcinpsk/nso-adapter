@@ -68,8 +68,18 @@ class _InspectedSurfaceReader(ast.NodeVisitor):
             if _target_names(generator.target).isdisjoint(pass_through_names):
                 continue
             self.visit(generator.iter)
-            if isinstance(generator.iter, ast.Name):
-                pass_through_names.add(generator.iter.id)
+            iterable = generator.iter
+            if isinstance(iterable, ast.Name):
+                pass_through_names.add(iterable.id)
+            elif (
+                isinstance(iterable, ast.Call)
+                and isinstance(iterable.func, ast.Name)
+                and iterable.func.id == "iter"
+                and len(iterable.args) == 1
+                and not iterable.keywords
+                and isinstance(iterable.args[0], ast.Name)
+            ):
+                pass_through_names.add(iterable.args[0].id)
 
     def visit_ListComp(self, node: ast.ListComp) -> None:  # noqa: N802 - ast visitor API
         self._visit_comprehension(node.generators, node.elt)
