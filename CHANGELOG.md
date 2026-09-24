@@ -2,6 +2,40 @@
 
 <!-- version list -->
 
+## v1.6.0 (2026-09-24)
+
+### Bug Fixes
+
+- Update tests/test_secret_discipline.py
+  ([`b961b49`](https://github.com/marcinpsk/nso-adapter/commit/b961b4903aad0d20a30d81ecff794ba56cf817b1))
+
+- **diagnostics**: Close remaining disclosure and guard gaps
+  ([`652714f`](https://github.com/marcinpsk/nso-adapter/commit/652714ffe28c81c332ce316c66aebf8ac31a5d4e))
+
+- **diagnostics**: Close review disclosure and guard gaps
+  ([`145745c`](https://github.com/marcinpsk/nso-adapter/commit/145745c49a8716acc15da6661b6275c444d4bb78))
+
+- **jobs**: Log job failures as their classification, not the exception text
+  ([`e6d70d4`](https://github.com/marcinpsk/nso-adapter/commit/e6d70d4807922f73e5555d44a484c795420e55e2))
+
+### Testing
+
+- Guard secret assertions on serialized surfaces
+  ([`010933c`](https://github.com/marcinpsk/nso-adapter/commit/010933c129fc3bc28d16aa00c968293e0e180375))
+
+- **diagnostics**: Isolate the process-global device reference key per test
+  ([`9f4a2be`](https://github.com/marcinpsk/nso-adapter/commit/9f4a2bed67db9f75343d0b88fb02f903f3213fdf))
+
+- **lint**: Accept repeated unaliased imports of one package
+  ([`9bac0d4`](https://github.com/marcinpsk/nso-adapter/commit/9bac0d454c6459dbfd42e79873f350f60514273a))
+
+- **secrets**: Guard interface and device-id key checks
+  ([`cc99ef3`](https://github.com/marcinpsk/nso-adapter/commit/cc99ef3790b2657c60313f3b61719447442e6ad9))
+
+- **secrets**: Inspect pass-through comprehension iterables
+  ([`ad7a76b`](https://github.com/marcinpsk/nso-adapter/commit/ad7a76b673ed374fbe9b4fd7367d749cc0c4f160))
+
+
 ## v1.5.0 (2026-09-22)
 
 ### Bug Fixes
