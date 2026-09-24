@@ -11,6 +11,7 @@ rules:
         - nso_adapter/core/failover.py
         - nso_adapter/core/generation.py
         - nso_adapter/core/importer.py
+        - nso_adapter/core/jobs.py
         - nso_adapter/core/removal.py
         - nso_adapter/core/refresh_engine.py
         - nso_adapter/core/redistribution.py

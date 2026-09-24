@@ -38,7 +38,7 @@ for its configuration names and workflow skip conditions.
 
 `nso-outcome-raw-exception-renderer` rejects traceback logging and raw exception
 values in every positional or structured log field. It covers `nso_adapter/main.py`,
-`core/importer.py`, `core/generation.py`, `core/removal.py`, `core/failover.py`,
+`core/importer.py`, `core/generation.py`, `core/jobs.py`, `core/removal.py`, `core/failover.py`,
 `bindings/netbox/client.py`, `bindings/netbox/mapper.py`, `bindings/netbox/writer.py`,
 `notifications/sse_subscriber.py`, `notifications/persistent_subscriber.py`, and the
 outcome bookkeeping logs in `refresh_engine.py` and `redistribution.py`. These logs

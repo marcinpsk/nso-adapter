@@ -45,7 +45,7 @@ _GUARDED_LOG_SINKS = (
     Path(__file__).resolve().parents[2] / "nso_adapter" / "main.py",
     *(
         Path(__file__).resolve().parents[2] / "nso_adapter" / "core" / name
-        for name in ("failover.py", "generation.py", "refresh_engine.py", "redistribution.py", "removal.py")
+        for name in ("failover.py", "generation.py", "jobs.py", "refresh_engine.py", "redistribution.py", "removal.py")
     ),
     *(
         Path(__file__).resolve().parents[2] / "nso_adapter" / "bindings" / "netbox" / name

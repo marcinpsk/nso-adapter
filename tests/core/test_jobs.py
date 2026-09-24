@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 from sqlalchemy import select
+from structlog.testing import capture_logs
 
 from nso_adapter.core.jobs import (
     _run_apply,
@@ -27,7 +28,7 @@ from nso_adapter.core.jobs import (
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
-from tests._secret_discipline import assert_text_free_of
+from tests._secret_discipline import assert_records_free_of, assert_text_free_of
 from tests.conftest import session
 
 
@@ -62,6 +63,13 @@ async def _seed_job(device_id: int, status: JobStatus = JobStatus.queued) -> int
         await db.commit()
         await db.refresh(j)
         return j.id
+
+
+def _assert_logs_classify_only(records, secret: str, event: str) -> None:
+    """The failure is logged as its classification: no exception text, no traceback."""
+    assert_records_free_of(records, [secret])
+    assert [record["error"] for record in records if record["event"] == event] == ["RuntimeError"]
+    assert [record["event"] for record in records if record.get("exc_info")] == []
 
 
 # ── JobType enum invariant ──────────────────────────────────────────────────────
@@ -279,7 +287,8 @@ async def test_run_with_db_failure(adapter_client):
     async def fail_factory(dev_id, db):
         raise RuntimeError("Bearer sekrit-credential")
 
-    await _run_with_db(job_id, device_id, fail_factory)
+    with capture_logs() as records:
+        await _run_with_db(job_id, device_id, fail_factory)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -287,6 +296,7 @@ async def test_run_with_db_failure(adapter_client):
         assert job.error["code"] == "internal"
         assert_text_free_of(json.dumps(job.error), ["sekrit-credential"])
         assert "RuntimeError" in job.error["message"]
+    _assert_logs_classify_only(records, "sekrit-credential", "job.failed")
 
 
 async def test_a_refused_terminal_write_discards_the_runner_transaction(adapter_client):
@@ -658,6 +668,22 @@ async def test_run_connect_device_not_found(adapter_client):
         assert job.status == JobStatus.failed
 
 
+async def test_run_connect_failure_logs_only_the_classification(adapter_client):
+    """The connect runner's generic failure log carries the exception type, never its text."""
+    device_id = await _seed_device("rtr-31-log", 48)
+    job_id = await _seed_job(device_id, JobStatus.running)
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", side_effect=RuntimeError("Bearer connect-secret")),
+        capture_logs() as records,
+    ):
+        await _run_connect(job_id, device_id)
+
+    async with session() as db:
+        assert (await db.get(Job, job_id)).status == JobStatus.failed
+    _assert_logs_classify_only(records, "connect-secret", "job.connect.failed")
+
+
 async def test_run_connect_device_not_in_db(adapter_client):
     """_run_connect marks job failed when device_id doesn't exist in DB."""
     # Seed a device just to have the job FK work, then use non-existent device_id
@@ -854,3 +880,86 @@ async def test_run_provision_notifies_plugin_on_failure(adapter_client):
     async with session() as db:
         assert (await db.get(Job, job_id)).status == JobStatus.failed
     assert fake.calls == [job_id]
+
+
+class _EchoingNb:
+    """A NetBox client whose callbacks fail with the protected text in the message."""
+
+    def __init__(self, secret: str):
+        self.secret = secret
+
+    async def notify_provision_complete(self, job_id):
+        raise RuntimeError(f"callback refused: {self.secret}")
+
+    async def notify_sync_complete(self, netbox_device_id):
+        raise RuntimeError(f"callback refused: {self.secret}")
+
+
+async def test_run_provision_failure_logs_only_the_classification(adapter_client):
+    """Neither the provision failure nor the failed callback logs exception text."""
+    job_id = await _queue_provision_job("prov-log-fail")
+
+    async def boom_provision(db, **params):
+        raise RuntimeError("Bearer provision-secret")
+
+    with (
+        patch("nso_adapter.core.onboarding.provision_nso_device", boom_provision),
+        patch("nso_adapter.core.importer.get_netbox_client", lambda: _EchoingNb("provision-secret")),
+        capture_logs() as records,
+    ):
+        await _run_provision(job_id, None)
+
+    async with session() as db:
+        assert (await db.get(Job, job_id)).status == JobStatus.failed
+    _assert_logs_classify_only(records, "provision-secret", "job.provision.failed")
+    _assert_logs_classify_only(records, "provision-secret", "netbox.provision_complete_notify_failed")
+
+
+async def test_run_provision_device_busy_logs_only_the_classification(adapter_client):
+    """A busy-claim refusal logs its type, never the refusal's text."""
+    from nso_adapter.core.claim import ClaimUnavailableError
+
+    job_id = await _queue_provision_job("prov-log-busy")
+
+    async def busy_provision(db, **params):
+        raise ClaimUnavailableError("claim held for busy-secret")
+
+    with (
+        patch("nso_adapter.core.onboarding.provision_nso_device", busy_provision),
+        patch("nso_adapter.core.importer.get_netbox_client", lambda: None),
+        capture_logs() as records,
+    ):
+        await _run_provision(job_id, None)
+
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.error["code"] == "device_busy"
+    assert_records_free_of(records, ["busy-secret"])
+    assert [r["error"] for r in records if r["event"] == "job.provision.device_busy"] == ["ClaimUnavailableError"]
+
+
+async def test_run_sync_from_nso_notify_failure_logs_only_the_classification(adapter_client):
+    """A failed sync-complete callback logs its type, never the callback's error text."""
+    from nso_adapter.core import importer as imp
+    from nso_adapter.core.jobs import _run_sync_from_nso
+    from nso_adapter.nso.client import NsoClient as _NsoClient
+
+    device_id = await _seed_device("sfn-rtr-log", 93)
+    job_id = await _seed_job(device_id, JobStatus.running)
+    imp._nso_clients["nso-dev"] = AsyncMock(spec=_NsoClient)
+    imp._netbox_client = _EchoingNb("notify-secret")
+
+    with (
+        patch(
+            "nso_adapter.core.importer.refresh_all_surfaces_for_device",
+            new_callable=AsyncMock,
+            return_value=([], None),
+        ),
+        capture_logs() as records,
+    ):
+        await _run_sync_from_nso(job_id, device_id)
+
+    async with session() as db:
+        assert (await db.get(Job, job_id)).status == JobStatus.succeeded
+    _assert_logs_classify_only(records, "notify-secret", "netbox.sync_complete_notify_failed")
