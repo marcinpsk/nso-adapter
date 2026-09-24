@@ -30,6 +30,8 @@ from nso_adapter.core.claim import (
     lock_claim,
     terminalize,
 )
+from nso_adapter.domain.diagnostics import device_fields
+from nso_adapter.nso.client import failure_detail
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
 
 logger = structlog.get_logger(__name__)
@@ -324,9 +326,21 @@ async def enqueue_provision_job(params: dict, db: AsyncSession) -> tuple[Job, bo
         active = await get_active_provision_job(params["nso_instance"], params["device_name"], db)
         if active is not None:
             return active, False
-        logger.debug("job.provision_admission.winner_finished", device_name=params.get("device_name"))
+        logger.debug(
+            "job.provision_admission.winner_finished",
+            **device_fields(
+                nso_instance=params["nso_instance"],
+                nso_device_name=params["device_name"],
+            ),
+        )
 
-    logger.warning("job.provision_admission.retries_exhausted", device_name=params.get("device_name"))
+    logger.warning(
+        "job.provision_admission.retries_exhausted",
+        **device_fields(
+            nso_instance=params["nso_instance"],
+            nso_device_name=params["device_name"],
+        ),
+    )
     raise RuntimeError("could not admit a provision job")
 
 
@@ -438,7 +452,7 @@ async def _run_with_db(
             # really landed; recovery re-dispositions a job still `running` instead.
             raise
         except Exception as exc:
-            logger.exception("job.failed", job_id=job_id, device_id=device_id, error=repr(exc))
+            logger.error("job.failed", job_id=job_id, device_id=device_id, error=failure_detail(exc))
             await _mark_job_failed(db, job_id, error_envelope(exc), reg)
 
 
@@ -493,9 +507,7 @@ async def _run_sync_from_nso(job_id: int, device_id: int, reg: ClaimRegistration
             try:
                 await nb_client.notify_sync_complete(device.netbox_device_id)
             except Exception as exc:  # noqa: BLE001 — best-effort; the mirror is refreshed
-                logger.warning(
-                    "netbox.sync_complete_notify_failed", device_id=device_id_, error=str(exc) or type(exc).__name__
-                )
+                logger.warning("netbox.sync_complete_notify_failed", device_id=device_id_, error=failure_detail(exc))
         return {"degraded_surfaces": sorted(failed)}
 
     await _run_with_db(job_id, device_id, _mirror_read, timeout=900.0, reg=reg)
@@ -562,7 +574,7 @@ async def _run_connect(job_id: int, device_id: int, reg: ClaimRegistration | Non
             # really landed; recovery re-dispositions a job still `running` instead.
             raise
         except Exception as exc:
-            logger.exception("job.connect.failed", job_id=job_id, error=repr(exc))
+            logger.error("job.connect.failed", job_id=job_id, error=failure_detail(exc))
             await _mark_job_failed(db, job_id, error_envelope(exc), reg)
 
 
@@ -597,7 +609,7 @@ async def _notify_provision_complete(job_id: int) -> None:
     try:
         await nb.notify_provision_complete(job_id)
     except Exception as exc:  # noqa: BLE001 - best-effort callback; never fail the job on it
-        logger.warning("netbox.provision_complete_notify_failed", job_id=job_id, error=str(exc) or type(exc).__name__)
+        logger.warning("netbox.provision_complete_notify_failed", job_id=job_id, error=failure_detail(exc))
 
 
 async def _run_provision(job_id: int, device_id: int | None, reg: ClaimRegistration | None = None) -> None:
@@ -662,7 +674,7 @@ async def _run_provision(job_id: int, device_id: int | None, reg: ClaimRegistrat
             # raised by the acquisition itself, which is exactly why the registration must
             # ride along — with no claim row to lock, the attempt on it is the only proof
             # this write belongs to THIS run and not to the successor that replaced it.
-            logger.warning("job.provision.device_busy", job_id=job_id, error=repr(exc))
+            logger.warning("job.provision.device_busy", job_id=job_id, error=failure_detail(exc))
             await _mark_job_failed(
                 db,
                 job_id,
@@ -690,7 +702,7 @@ async def _run_provision(job_id: int, device_id: int | None, reg: ClaimRegistrat
             # really landed; recovery re-dispositions a job still `running` instead.
             raise
         except Exception as exc:
-            logger.exception("job.provision.failed", job_id=job_id, error=repr(exc))
+            logger.error("job.provision.failed", job_id=job_id, error=failure_detail(exc))
             await _mark_job_failed(db, job_id, error_envelope(exc), reg)
 
     # Tell the plugin the provision job reached a terminal state (any branch above) so it advances

@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from structlog.testing import capture_logs
 
 from nso_adapter.config import NsoInstanceConfig
 from nso_adapter.core.community_dialect import community_dialect_for
@@ -41,9 +42,10 @@ from nso_adapter.nso.apply import (
 from nso_adapter.nso.client import DEVICE_INTENT_ROOT, NsoClient
 from nso_adapter.nso.nso_json import NSO_LEX_CHUNK, straddling_bare_tokens
 from nso_adapter.store.models import OspfInstanceIntent, OspfInterfaceIntent, RedistributionIntent
-from tests._secret_discipline import assert_text_contains, assert_text_omits
+from tests._secret_discipline import assert_records_free_of, assert_text_contains, assert_text_omits
 
 _EMPTY_DRYRUN = {"dry-run-result": {"native": {}}}
+_DEVICE_ID = 501
 
 #: What an encoder that reads no NED-conditioned fact is handed.
 _PLAIN = SectionExecution(None, community_dialect_for(None))
@@ -115,7 +117,13 @@ async def test_native_dry_run_returns_device_delta():
     transport = _RecordingTransport(dryrun_body=body)
     client = _client_with(transport)
 
-    delta = await native_dry_run(client, "http://nso/restconf/data/x:y", '{"a": 1}', "sw03")
+    delta = await native_dry_run(
+        client,
+        "http://nso/restconf/data/x:y",
+        '{"a": 1}',
+        "sw03",
+        device_id=_DEVICE_ID,
+    )
 
     assert delta == "router isis\n"
     assert_text_contains(transport.requests[0].url, ["dry-run=native"])
@@ -124,7 +132,7 @@ async def test_native_dry_run_returns_device_delta():
 
 async def test_native_dry_run_none_on_non_2xx():
     client = _client_with(_RecordingTransport(dryrun_status=503))
-    assert await native_dry_run(client, "http://nso/x", "{}", "sw03") is None
+    assert await native_dry_run(client, "http://nso/x", "{}", "sw03", device_id=_DEVICE_ID) is None
 
 
 async def test_strict_native_dry_run_rejection_does_not_echo_the_device():
@@ -134,7 +142,7 @@ async def test_strict_native_dry_run_rejection_does_not_echo_the_device():
     client = _client_with(_RecordingTransport(dryrun_status=409))
 
     with pytest.raises(NsoApplyError) as caught:
-        await native_dry_run(client, "http://nso/x", "{}", device, strict=True)
+        await native_dry_run(client, "http://nso/x", "{}", device, device_id=_DEVICE_ID, strict=True)
 
     assert caught.value.code == "dry_run_rejected"
     assert_chain_free_of(caught.value, [device])
@@ -142,7 +150,33 @@ async def test_strict_native_dry_run_rejection_does_not_echo_the_device():
 
 async def test_native_dry_run_none_on_transport_error():
     client = _client_with(_RecordingTransport(raise_exc=httpx.ConnectError("refused")))
-    assert await native_dry_run(client, "http://nso/x", "{}", "sw03") is None
+    assert await native_dry_run(client, "http://nso/x", "{}", "sw03", device_id=_DEVICE_ID) is None
+
+
+async def test_native_dry_run_absent_device_diagnostic_uses_id_and_count(debug_logs):
+    requested = "placeholder-requested-device"
+    provider_name = "placeholder-provider-device"
+    body = {"dry-run-result": {"native": {"device": [{"name": provider_name, "data": "change"}]}}}
+    client = _client_with(_RecordingTransport(dryrun_body=body))
+
+    assert await native_dry_run(client, "http://nso/x", "{}", requested, device_id=71) == ""
+
+    record = next(record for record in debug_logs if record["event"] == "nso.apply.dry_run_device_absent")
+    assert record["device_id"] == 71
+    assert record["present_count"] == 1
+    assert_records_free_of([record], [requested, provider_name])
+
+
+async def test_native_dry_run_non_2xx_diagnostic_uses_id():
+    device_name = "placeholder-dry-run-non-2xx"
+    client = _client_with(_RecordingTransport(dryrun_status=503))
+
+    with capture_logs() as logs:
+        assert await native_dry_run(client, "http://nso/x", "{}", device_name, device_id=72) is None
+
+    record = next(record for record in logs if record["event"] == "nso.apply.dry_run_non_2xx")
+    assert record["device_id"] == 72
+    assert_records_free_of([record], [device_name])
 
 
 # ── apply_device_intent: the ONE sender ────────────────────────────────────────
@@ -152,7 +186,12 @@ async def test_the_sender_puts_the_keyed_instance_then_verifies_clean():
     transport = _RecordingTransport(send_status=204)  # PUT 204, verify dry-run → empty
     client = _client_with(transport)
 
-    result = await apply_device_intent(client, "sw03", {"vlan": {"vlan": [{"vlan-id": 10}]}})
+    result = await apply_device_intent(
+        client,
+        "sw03",
+        {"vlan": {"vlan": [{"vlan-id": 10}]}},
+        device_id=_DEVICE_ID,
+    )
 
     # R2 §4.4: a committing send returns its PROOF VERDICT, not None — a consumer that is
     # about to record deletion authority has to tell "proven" from "we did not look".
@@ -177,6 +216,7 @@ async def test_the_sender_carries_every_family_in_one_request():
         client,
         "sw03",
         {"vlan": {"vlan": [{"vlan-id": 10}]}, "svi": {"interface": [{"interface-name": "Vlan10"}]}},
+        device_id=_DEVICE_ID,
     )
 
     assert len([r for r in transport.requests if "dry-run" not in str(r.url)]) == 1
@@ -193,7 +233,7 @@ async def test_an_empty_family_body_is_transmitted_rather_than_dropped():
     transport = _RecordingTransport()
     client = _client_with(transport)
 
-    await apply_device_intent(client, "sw03", {"vlan": {"vlan": []}, "snmp": {}})
+    await apply_device_intent(client, "sw03", {"vlan": {"vlan": []}, "snmp": {}}, device_id=_DEVICE_ID)
 
     assert _sent_document(transport) == {"device": "sw03", "vlan": {"vlan": []}, "snmp": {}}
 
@@ -203,8 +243,20 @@ async def test_the_sender_raises_on_a_rejected_commit():
     client = _client_with(transport)
 
     with pytest.raises(NsoApplyError) as exc:
-        await apply_device_intent(client, "sw03", {"snmp": {}})
+        await apply_device_intent(client, "sw03", {"snmp": {}}, device_id=_DEVICE_ID)
     assert exc.value.code == "nso_put_failed"
+
+
+async def test_rejected_sender_diagnostic_uses_id():
+    device_name = "placeholder-rejected-device"
+    client = _client_with(_RecordingTransport(send_status=409))
+
+    with capture_logs() as logs, pytest.raises(NsoApplyError):
+        await apply_device_intent(client, device_name, {"snmp": {}}, device_id=73)
+
+    record = next(record for record in logs if record["event"] == "nso.apply.device_intent_failed")
+    assert record["device_id"] == 73
+    assert_records_free_of([record], [device_name])
 
 
 async def test_the_sender_dry_run_returns_the_delta_without_committing():
@@ -212,7 +264,7 @@ async def test_the_sender_dry_run_returns_the_delta_without_committing():
     transport = _RecordingTransport(dryrun_body=body)
     client = _client_with(transport)
 
-    delta = await apply_device_intent(client, "sw03", {"snmp": {}}, dry_run=True)
+    delta = await apply_device_intent(client, "sw03", {"snmp": {}}, device_id=_DEVICE_ID, dry_run=True)
 
     assert delta == "snmp-server\n"
     # dry-run only — no plain (non-dry-run) PUT was sent
@@ -224,7 +276,7 @@ async def test_no_networking_reaches_the_wire_as_a_commit_param():
     transport = _RecordingTransport()
     client = _client_with(transport)
 
-    await apply_device_intent(client, "sw03", {"snmp": {}}, no_networking=True)
+    await apply_device_intent(client, "sw03", {"snmp": {}}, device_id=_DEVICE_ID, no_networking=True)
 
     assert_text_contains(transport.requests[0].url, ["no-networking"])
 
@@ -234,7 +286,7 @@ async def test_no_networking_also_reaches_the_post_commit_verification():
     transport = _RecordingTransport()
     client = _client_with(transport)
 
-    await apply_device_intent(client, "sw03", {"snmp": {}}, no_networking=True)
+    await apply_device_intent(client, "sw03", {"snmp": {}}, device_id=_DEVICE_ID, no_networking=True)
 
     verify = [r for r in transport.requests[1:] if "dry-run=native" in str(r.url)]
     if not verify:
@@ -254,7 +306,7 @@ async def test_verify_raises_when_delta_remains():
     client = _client_with(_RecordingTransport(dryrun_body=body))
 
     with pytest.raises(NsoApplyError) as exc:
-        await _verify_native_or_raise(client, "http://nso/x", "{}", device, scope="snmp")
+        await _verify_native_or_raise(client, "http://nso/x", "{}", device, device_id=_DEVICE_ID, scope="snmp")
     assert exc.value.code == "verify_mismatch"
     assert str(exc.value).startswith("snmp:")
     assert_chain_free_of(exc.value, [device])
@@ -262,7 +314,53 @@ async def test_verify_raises_when_delta_remains():
 
 async def test_verify_passes_when_delta_empty():
     client = _client_with(_RecordingTransport(dryrun_body=_EMPTY_DRYRUN))
-    await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="snmp")  # no raise
+    await _verify_native_or_raise(
+        client,
+        "http://nso/x",
+        "{}",
+        "sw03",
+        device_id=_DEVICE_ID,
+        scope="snmp",
+    )
+
+
+async def test_successful_sender_diagnostics_use_id():
+    device_name = "placeholder-success-device"
+    client = _client_with(_RecordingTransport())
+
+    with capture_logs() as logs:
+        assert await apply_device_intent(client, device_name, {"snmp": {}}, device_id=74) == VERIFY_CONCLUSIVE
+
+    events = {"nso.apply.device_intent_sent", "nso.apply.verify_ok"}
+    records = [record for record in logs if record["event"] in events]
+    assert {record["event"] for record in records} == events
+    assert all(record["device_id"] == 74 for record in records)
+    assert_records_free_of(records, [device_name])
+
+
+async def test_inconclusive_verify_diagnostic_uses_id():
+    device_name = "placeholder-inconclusive-device"
+    client = _client_with(_RecordingTransport(dryrun_body={"unexpected": True}))
+
+    with capture_logs() as logs:
+        await _verify_native_or_raise(client, "http://nso/x", "{}", device_name, device_id=75, scope="snmp")
+
+    record = next(record for record in logs if record["event"] == "nso.apply.verify_inconclusive_or_unexpected")
+    assert record["device_id"] == 75
+    assert_records_free_of([record], [device_name])
+
+
+async def test_mismatched_verify_diagnostic_uses_id():
+    device_name = "placeholder-mismatch-device"
+    body = {"dry-run-result": {"native": {"device": [{"name": device_name, "data": "leftover"}]}}}
+    client = _client_with(_RecordingTransport(dryrun_body=body))
+
+    with capture_logs() as logs, pytest.raises(NsoApplyError):
+        await _verify_native_or_raise(client, "http://nso/x", "{}", device_name, device_id=76, scope="snmp")
+
+    record = next(record for record in logs if record["event"] == "nso.apply.verify_mismatch")
+    assert record["device_id"] == 76
+    assert_records_free_of([record], [device_name])
 
 
 # ── per-family wire vocabulary (the real send captures the exact container body) ──
@@ -279,7 +377,13 @@ async def test_static_route_container_carries_the_route_list():
         SimpleNamespace(vrf="MGMT", prefix="0.0.0.0/0", next_hop="192.0.2.254", metric=None, permanent=False, tag=5),
     ]
     body = encode_static_route({"static_route_intent": rows}, _PLAIN)
-    delta = await apply_device_intent(client, "sw03", {"static-route": body}, dry_run=True)
+    delta = await apply_device_intent(
+        client,
+        "sw03",
+        {"static-route": body},
+        device_id=_DEVICE_ID,
+        dry_run=True,
+    )
 
     assert delta == ""
     routes = _sent(transport, "static-route")["route"]
@@ -318,7 +422,7 @@ async def test_static_route_emits_interface_and_next_hop_vrf():
         SimpleNamespace(vrf="", prefix="10.0.0.0/8", next_hop="192.0.2.1", metric=None, permanent=False, tag=None),
     ]
     body = encode_static_route({"static_route_intent": rows}, _PLAIN)
-    await apply_device_intent(client, "ra1xr", {"static-route": body}, dry_run=True)
+    await apply_device_intent(client, "ra1xr", {"static-route": body}, device_id=_DEVICE_ID, dry_run=True)
 
     routes = _sent(transport, "static-route")["route"]
     assert routes[0]["next-hop-vrf"] == "TMS-P"
@@ -336,7 +440,13 @@ async def test_bfd_container_carries_the_interface_list():
         SimpleNamespace(interface_name="ae1", micro_bfd=True, min_tx=300, min_rx=300, multiplier=3),
         SimpleNamespace(interface_name="ae2", micro_bfd=False, min_tx=None, min_rx=None, multiplier=None),
     ]
-    await apply_device_intent(client, "sw03", {"bfd": encode_bfd({"bfd_intent": rows}, _PLAIN)}, dry_run=True)
+    await apply_device_intent(
+        client,
+        "sw03",
+        {"bfd": encode_bfd({"bfd_intent": rows}, _PLAIN)},
+        device_id=_DEVICE_ID,
+        dry_run=True,
+    )
 
     ifaces = _sent(transport, "bfd")["interface"]
     assert ifaces[0] == {"interface-name": "ae1", "micro-bfd": True, "min-tx": 300, "min-rx": 300, "multiplier": 3}
@@ -351,7 +461,7 @@ async def test_mtu_container_carries_the_interface_list():
         SimpleNamespace(interface_name="Gi0/2", mtu=None, ip_mtu=None, mpls_mtu=1500),
     ]
     body = encode_interface_mtu({"interface_mtu_intent": rows}, _PLAIN)
-    await apply_device_intent(client, "sw03", {"mtu": body}, dry_run=True)
+    await apply_device_intent(client, "sw03", {"mtu": body}, device_id=_DEVICE_ID, dry_run=True)
 
     ifaces = _sent(transport, "mtu")["interface"]
     assert ifaces[0] == {"interface-name": "Gi0/1", "mtu": 9000, "ip-mtu": 8986}
@@ -411,7 +521,7 @@ async def test_snmp_container_uses_vault_triples_and_yang_enums():
         },
         _PLAIN,
     )
-    await apply_device_intent(client, "sw03", {"snmp": body}, dry_run=True)
+    await apply_device_intent(client, "sw03", {"snmp": body}, device_id=_DEVICE_ID, dry_run=True)
 
     entry = _sent(transport, "snmp")
     assert entry["community"] == [
@@ -555,7 +665,7 @@ async def test_logging_container_carries_the_host_list():
         SimpleNamespace(address="192.0.2.6", port=None, severity="", facility="", transport="", vrf="", source=""),
     ]
     body = encode_logging({"logging_host_intent": rows, "logging_levels_intent": []}, _PLAIN)
-    await apply_device_intent(client, "sw03", {"logging": body}, dry_run=True)
+    await apply_device_intent(client, "sw03", {"logging": body}, device_id=_DEVICE_ID, dry_run=True)
 
     hosts = _sent(transport, "logging")["host"]
     assert hosts[0] == {
@@ -658,7 +768,7 @@ async def test_isis_container_carries_process_and_interface_config():
         },
         _PLAIN,
     )
-    await apply_device_intent(client, "sw03", {"isis": body}, dry_run=True)
+    await apply_device_intent(client, "sw03", {"isis": body}, device_id=_DEVICE_ID, dry_run=True)
 
     sent = _sent(transport, "isis")
     assert sent["interface-config"][0]["circuit-type"] == "level-2-only"  # 'level-2' normalised
@@ -705,7 +815,7 @@ async def test_ospf_container_carries_process_interface_and_redistribute():
         metric_type="type-1",
     )
     body = encode_ospf(_ospf_rows([proc], [iface], [redist]), _PLAIN)
-    await apply_device_intent(client, "sw03", {"ospf": body}, dry_run=True)
+    await apply_device_intent(client, "sw03", {"ospf": body}, device_id=_DEVICE_ID, dry_run=True)
 
     sent = _sent(transport, "ospf")
     p = sent["process-config"][0]
@@ -737,7 +847,7 @@ async def test_a_real_ospf_commit_puts_then_verifies():
     iface = OspfInterfaceIntent(interface_name="Gi0/1", process_id="1", area_id="0", passive=False)
 
     body = encode_ospf(_ospf_rows([proc], [iface]), _PLAIN)
-    result = await apply_device_intent(client, "sw03", {"ospf": body})
+    result = await apply_device_intent(client, "sw03", {"ospf": body}, device_id=_DEVICE_ID)
 
     assert result == VERIFY_CONCLUSIVE  # the verdict rides out of the committing send
     put_req = transport.requests[0]
@@ -774,7 +884,7 @@ async def test_bgp_container_carries_the_router_scope_peer_tree():
         dest_ref="65000::ipv4-unicast", source_protocol="connected", source_ref="", route_map=None, metric=None
     )
     body = encode_bgp({"bgp_router_intent": [router], "redistribution_intent": [redist]}, _PLAIN)
-    await apply_device_intent(client, "sw03", {"bgp": body}, dry_run=True)
+    await apply_device_intent(client, "sw03", {"bgp": body}, device_id=_DEVICE_ID, dry_run=True)
 
     r = _sent(transport, "bgp")["router"][0]
     assert r["asn"] == 65000
@@ -826,7 +936,7 @@ async def test_an_oversized_document_is_boundary_safe():
     client = _client_with(transport)
     body = _straddling_container_body(_wrap_container)
 
-    await apply_device_intent(client, "sw03", {"snmp": body})
+    await apply_device_intent(client, "sw03", {"snmp": body}, device_id=_DEVICE_ID)
 
     _assert_wire_boundary_safe(transport)
     # whitespace-only protection: the parsed intent is unchanged
@@ -849,7 +959,12 @@ async def test_a_production_scale_interface_body_is_boundary_safe():
     payload = json.dumps({DEVICE_INTENT_ROOT: [{"device": "sw03", "interface": {"interface": [entry]}}]})
     assert straddling_bare_tokens(payload), "fixture premise: default dumps DOES straddle"
 
-    await apply_device_intent(client, "sw03", {"interface": {"interface": [entry]}})
+    await apply_device_intent(
+        client,
+        "sw03",
+        {"interface": {"interface": [entry]}},
+        device_id=_DEVICE_ID,
+    )
 
     _assert_wire_boundary_safe(transport)
     sent = _sent(transport, "interface")["interface"][0]

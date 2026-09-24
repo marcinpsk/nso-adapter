@@ -22,7 +22,9 @@ from typing import TYPE_CHECKING
 import structlog
 from sqlalchemy import select
 
+from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.actions import ProbeStatus, ReachabilityProbe, probe_reachable
+from nso_adapter.nso.client import failure_detail
 from nso_adapter.store.models import ActiveAddress, DeviceFailover, FailoverConfig
 
 if TYPE_CHECKING:
@@ -217,7 +219,7 @@ def _next_due(now: datetime, interval_minutes: int, jitter_fraction: float) -> d
     return now + timedelta(seconds=base + jitter)
 
 
-async def _safe_disconnect(client: NsoClient, name: str) -> bool:
+async def _safe_disconnect(client: NsoClient, name: str, device_id: int) -> bool:
     """Drop NSO's cached session so the new address is dialed. Absent session is fine.
 
     Returns True when the drop completed (or there was nothing to drop as far as we can
@@ -228,25 +230,32 @@ async def _safe_disconnect(client: NsoClient, name: str) -> bool:
         await client.disconnect(name)
         return True
     except Exception as exc:  # no live session / already disconnected — usually benign
-        logger.debug("failover.disconnect_ignored", device=name, error=repr(exc))
+        logger.debug("failover.disconnect_ignored", **device_fields(device_id=device_id), error=failure_detail(exc))
         return False
 
 
-async def _safe_sync_from(client: NsoClient, name: str) -> None:
+async def _safe_sync_from(client: NsoClient, name: str, device_id: int) -> None:
     """Best-effort sync-from after a switch — a failure must not fail the switch."""
     try:
         await client.sync_from(name)
     except Exception as exc:
-        logger.warning("failover.sync_from_failed", device=name, error=repr(exc))
+        logger.warning("failover.sync_from_failed", **device_fields(device_id=device_id), error=failure_detail(exc))
 
 
-async def _set_address(client: NsoClient, name: str, address: str) -> bool:
+async def _set_address(client: NsoClient, name: str, address: str, device_id: int) -> bool:
     """Point NSO at *address* and drop the cached session. Returns the disconnect outcome."""
     await client.set_address(name, address)
-    return await _safe_disconnect(client, name)
+    return await _safe_disconnect(client, name, device_id)
 
 
-async def _revert_address(client: NsoClient, name: str, address: str) -> None:
+async def _revert_address(
+    client: NsoClient,
+    name: str,
+    address: str,
+    device_id: int,
+    *,
+    role: str | None,
+) -> None:
     """Best-effort restore of NSO's address after a flip-probe — must not mask the original error.
 
     Called from the ``finally`` of every flip-probe so a raised probe/decision can't strand NSO
@@ -254,9 +263,14 @@ async def _revert_address(client: NsoClient, name: str, address: str) -> None:
     unreachable) but swallowed so it doesn't replace any in-flight exception.
     """
     try:
-        await _set_address(client, name, address)
+        await _set_address(client, name, address, device_id)
     except Exception as exc:
-        logger.error("failover.revert_failed", device=name, address=address, error=repr(exc))
+        logger.error(
+            "failover.revert_failed",
+            **device_fields(device_id=device_id),
+            **({"role": role} if role is not None else {}),
+            error=failure_detail(exc),
+        )
 
 
 # Why failback cannot proceed, surfaced on the row for the operator.
@@ -293,7 +307,22 @@ async def _maybe_clear_manual_override(client: NsoClient, fo: DeviceFailover, na
         return  # can't tell → leave the flag, retry next tick
     if current in (fo.primary_ip, fo.oob_ip):
         fo.manual_override = False
-        logger.info("failover.manual_override_cleared", device=name, address=current)
+        role = _managed_address_role(fo, current)
+        logger.info(
+            "failover.manual_override_cleared",
+            **device_fields(device_id=fo.device_id),
+            **({"role": role} if role is not None else {}),
+        )
+
+
+def _managed_address_role(fo: DeviceFailover, address: str | None) -> str | None:
+    if address is None or fo.primary_ip == fo.oob_ip:
+        return None
+    if address == fo.primary_ip:
+        return _PRIMARY
+    if address == fo.oob_ip:
+        return _OOB
+    return None
 
 
 def _coerce_probe(outcome) -> ReachabilityProbe:
@@ -332,7 +361,7 @@ async def _switch_to_oob(
     cfg: TickConfig,
     now: datetime,
 ) -> None:
-    dropped = await _set_address(client, name, oob_ip)
+    dropped = await _set_address(client, name, oob_ip, fo.device_id)
     fo.active_address = _OOB
     fo.consecutive_failures = 0
     fo.consecutive_successes = 0
@@ -346,10 +375,14 @@ async def _switch_to_oob(
         # address until it redials. The switch IS recorded (NSO's config is now on OOB) — but
         # surface the uncertainty instead of swallowing it (the deferred next-tick OOB liveness
         # verifies against a fresh session).
-        logger.warning("failover.switch.session_drop_failed", device=name, address=oob_ip)
+        logger.warning(
+            "failover.switch.session_drop_failed",
+            **device_fields(device_id=fo.device_id),
+            role=_OOB,
+        )
     if cfg.failover_sync_from_after_switch:
-        await _safe_sync_from(client, name)
-    logger.info("failover.switch", device=name, to=_OOB, address=oob_ip)
+        await _safe_sync_from(client, name, fo.device_id)
+    logger.info("failover.switch", **device_fields(device_id=fo.device_id), to=_OOB, role=_OOB)
 
 
 async def _commit_failback(client: NsoClient, fo: DeviceFailover, name: str, cfg: TickConfig, now: datetime) -> None:
@@ -364,8 +397,8 @@ async def _commit_failback(client: NsoClient, fo: DeviceFailover, name: str, cfg
     # failback (separate the switch from its verification — s3-19).
     fo.next_oob_probe_at = _next_due(now, cfg.failover_oob_probe_interval, 0.0)
     if cfg.failover_sync_from_after_switch:
-        await _safe_sync_from(client, name)
-    logger.info("failover.failback", device=name, address=fo.primary_ip)
+        await _safe_sync_from(client, name, fo.device_id)
+    logger.info("failover.failback", **device_fields(device_id=fo.device_id), role=_PRIMARY)
 
 
 # ── Per-address probe handlers ────────────────────────────────────────────────
@@ -389,7 +422,7 @@ async def _active_primary_probe(
     outcome = _coerce_probe(await probe_reachable(client, name, cfg.failover_active_probe_timeout))
     logger.debug(
         "failover.probe",
-        device=name,
+        **device_fields(device_id=fo.device_id),
         target=_PRIMARY,
         active=True,
         status=outcome.status.value,
@@ -442,7 +475,12 @@ async def _failback_flip_probe(
         address_before = await client.get_address(name)
     except Exception as exc:
         address_before = None
-        logger.warning("failover.failback_blocked", device=name, reason=_BLOCKED_ADDRESS_UNREADABLE, error=repr(exc))
+        logger.warning(
+            "failover.failback_blocked",
+            **device_fields(device_id=fo.device_id),
+            reason=_BLOCKED_ADDRESS_UNREADABLE,
+            error=failure_detail(exc),
+        )
     if address_before is None:
         if fo.failback_blocked_reason != _BLOCKED_ACTIVE_OOB_CONFLICT:
             fo.failback_blocked_reason = _BLOCKED_ADDRESS_UNREADABLE
@@ -455,13 +493,13 @@ async def _failback_flip_probe(
     if not _take_flip(flip_budget):
         return False
     fo.manual_override = False
-    await _set_address(client, name, primary_ip)  # flip to primary for the probe
+    await _set_address(client, name, primary_ip, fo.device_id)  # flip to primary for the probe
     committed = False
     try:
         outcome = _coerce_probe(await probe_reachable(client, name, cfg.failover_probe_timeout))
         logger.debug(
             "failover.flip_probe",
-            device=name,
+            **device_fields(device_id=fo.device_id),
             target=_PRIMARY,
             status=outcome.status.value,
             elapsed=outcome.elapsed,
@@ -477,7 +515,13 @@ async def _failback_flip_probe(
             # Threshold not met, primary still down, OR the probe/decision raised → guaranteed
             # revert to the address NSO actually had (never the stored oob_ip, which the
             # operator may have cleared meanwhile) so the device stays reachable.
-            await _revert_address(client, name, address_before)
+            await _revert_address(
+                client,
+                name,
+                address_before,
+                fo.device_id,
+                role=_managed_address_role(fo, address_before),
+            )
     return True
 
 
@@ -515,7 +559,7 @@ async def _probe_oob(
         outcome = _coerce_probe(await probe_reachable(client, name, cfg.failover_active_probe_timeout))
         logger.debug(
             "failover.probe",
-            device=name,
+            **device_fields(device_id=fo.device_id),
             target=_OOB,
             active=True,
             status=outcome.status.value,
@@ -539,12 +583,12 @@ async def _probe_oob(
     if not _take_flip(flip_budget):
         return False
     fo.manual_override = False
-    await _set_address(client, name, oob_ip)  # flip to OOB for the health probe
+    await _set_address(client, name, oob_ip, fo.device_id)  # flip to OOB for the health probe
     try:
         outcome = _coerce_probe(await probe_reachable(client, name, cfg.failover_probe_timeout))
         logger.debug(
             "failover.flip_probe",
-            device=name,
+            **device_fields(device_id=fo.device_id),
             target=_OOB,
             status=outcome.status.value,
             elapsed=outcome.elapsed,
@@ -555,7 +599,7 @@ async def _probe_oob(
         fo.oob_health_checked_at = now
     finally:
         # Always flip back to primary (even if the probe raised) — this was only a health check.
-        await _revert_address(client, name, primary_ip)
+        await _revert_address(client, name, primary_ip, fo.device_id, role=_PRIMARY)
     return True
 
 

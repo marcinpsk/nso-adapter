@@ -155,6 +155,7 @@ class AppConfig(BaseModel):
     nso_instances: list[NsoInstanceConfig] = []
     netbox: NetboxConfig
     api: ApiConfig
+    diagnostic_key_ref: str
     scheduler: SchedulerConfig = SchedulerConfig()
     database_url: str
     log_level: str = "INFO"

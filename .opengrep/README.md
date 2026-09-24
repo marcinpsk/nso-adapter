@@ -38,20 +38,47 @@ for its configuration names and workflow skip conditions.
 
 `nso-outcome-raw-exception-renderer` rejects traceback logging and raw exception
 values in every positional or structured log field. It covers `nso_adapter/main.py`,
-`core/importer.py`, `core/generation.py`, `core/removal.py`, `notifications/sse_subscriber.py`,
-`notifications/persistent_subscriber.py`, and the outcome bookkeeping logs in
-`refresh_engine.py` and `redistribution.py`. These logs must use `failure_detail`
-so an HTTP exception cannot repeat a request URL or server text. The behavioral
-and AST regressions in `tests/core/test_importer_failure_sinks.py` remain
-authoritative for the classification contract and complete Python syntax.
+`core/importer.py`, `core/generation.py`, `core/jobs.py`, `core/removal.py`, `core/failover.py`,
+`bindings/netbox/client.py`, `bindings/netbox/mapper.py`, `bindings/netbox/writer.py`,
+`notifications/sse_subscriber.py`, `notifications/persistent_subscriber.py`, and the
+outcome bookkeeping logs in `refresh_engine.py` and `redistribution.py`. These logs
+must use `failure_detail` so an HTTP exception cannot repeat a request URL or server
+text. The behavioral and AST regressions in `tests/core/test_importer_failure_sinks.py`
+remain authoritative for the classification contract and complete Python syntax.
 The pre-commit AST guard scans guarded modules for exception aliases after
 context-manager exits. Its control-flow model tracks conditional and later
 assignments that OpenGrep cannot classify reliably.
 
-`nso-diagnostic-raw-identifier` rejects `device_name` and `device` fields in the
-guarded importer, redistribution, client, refresh, capability, startup, and
-subscriber diagnostics. It also rejects raw SSE stream URL fields. It matches the
+`failover.py`, `client.py`, `mapper.py` and `writer.py` joined the list because each NSO or
+NetBox call takes the device or interface identity as an argument, so the raised
+transport error repeats it and the handler logged it raw. `mapper.py` is the narrowest
+case: its PATCH URL carries the NetBox interface id and its POST payload carries the
+interface name. `rejection_detail` is
+the second approved classifier, for a NetBox rejection body: NetBox repeats the
+submitted value in its validation messages, and a response key can repeat it too.
+Only the body's shape and counts travel. The
+remaining modules named in `test_guarded_modules_never_log_raw_exception_text` are
+tracked by the universal-guard card; this list is still an allowlist, not the tree.
+
+`nso-diagnostic-raw-identifier` rejects `device_name`, `device`, `nso_device`, and
+`lag_name` fields, plus raw SSE `stream`, `stream_url`, and `url` fields. Its
+allowlist covers `nso_adapter/main.py`, `nso_adapter/api/capability.py`,
+`nso_adapter/api/intent.py`, `nso_adapter/api/interface_ip.py`,
+`nso_adapter/bindings/netbox/client.py`, `nso_adapter/bindings/netbox/mapper.py`,
+`nso_adapter/bindings/netbox/writer.py`, `nso_adapter/core/apply.py`,
+`nso_adapter/core/capability.py`, `nso_adapter/core/failover.py`,
+`nso_adapter/core/importer.py`, `nso_adapter/core/jobs.py`,
+`nso_adapter/core/lag_topology.py`, `nso_adapter/core/onboarding.py`,
+`nso_adapter/core/redistribution.py`, `nso_adapter/core/refresh_engine.py`,
+`nso_adapter/core/removal.py`, `nso_adapter/core/route_policy.py`,
+`nso_adapter/core/scheduler.py`, `nso_adapter/core/static_route_reader.py`,
+`nso_adapter/core/topology_interfaces.py`,
+`nso_adapter/notifications/sse_subscriber.py`,
+`nso_adapter/notifications/persistent_subscriber.py`, `nso_adapter/nso/apply.py`,
+`nso_adapter/nso/client.py`, and the `review-patterns.py` fixture. It matches the
 keyword name, so it sees only a value written directly into the field.
+`nso-route-policy-raw-name` rejects a device-derived `name` field in
+`nso_adapter/core/route_policy.py` diagnostic calls.
 
 It does **not** reject the NSO instance name, under either spelling. The instance
 name is operator-authored configuration, not caller text: every endpoint that takes

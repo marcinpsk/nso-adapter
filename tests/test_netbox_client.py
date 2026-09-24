@@ -7,8 +7,10 @@ from __future__ import annotations
 import httpx
 import pytest
 import respx
+from structlog.testing import capture_logs
 
-from nso_adapter.bindings.netbox.client import NetboxClient
+from nso_adapter.bindings.netbox.client import NetboxClient, rejection_detail
+from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
 BASE = "http://netbox.local"
 TOKEN = "nb-test-token"
@@ -119,14 +121,14 @@ async def test_list_interfaces_follows_pagination(client):
 async def test_bulk_create_returns_list(client):
     created = [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]
     respx.post(f"{BASE}/api/dcim/interfaces/").mock(return_value=httpx.Response(201, json=created))
-    result = await client.bulk_create_interfaces([{"name": "a"}, {"name": "b"}])
+    result = await client.bulk_create_interfaces([{"name": "a"}, {"name": "b"}], netbox_device_id=42)
     assert result == created
 
 
 @respx.mock
 async def test_bulk_create_empty_is_noop(client):
     route = respx.post(f"{BASE}/api/dcim/interfaces/")
-    result = await client.bulk_create_interfaces([])
+    result = await client.bulk_create_interfaces([], netbox_device_id=42)
     assert result == []
     assert not route.called
 
@@ -146,7 +148,7 @@ async def test_bulk_create_chunks_large_payload(client):
         return httpx.Response(201, json=[{"id": i, "name": p["name"]} for i, p in enumerate(body)])
 
     route = respx.post(f"{BASE}/api/dcim/interfaces/").mock(side_effect=_echo)
-    result = await client.bulk_create_interfaces(payloads)
+    result = await client.bulk_create_interfaces(payloads, netbox_device_id=42)
 
     assert route.call_count == 3  # 100 + 100 + 5
     assert len(result) == n
@@ -172,11 +174,15 @@ async def test_bulk_patch_one_failed_batch_does_not_abandon_rest(client):
         return httpx.Response(200, json=body)
 
     respx.patch(f"{BASE}/api/dcim/interfaces/").mock(side_effect=_handler)
-    result = await client.bulk_patch_interfaces(payloads)
+    with capture_logs() as logs:
+        result = await client.bulk_patch_interfaces(payloads, netbox_device_id=42)
 
     # batches 1 and 3 succeeded (≈2/3 of rows); the timed-out batch was skipped,
     # NOT allowed to abandon the rest.
     assert len(result) == 2 * client_mod._BULK_PATCH_CHUNK
+    record = next(record for record in logs if record["event"] == "netbox.bulk_patch.batch_failed")
+    assert record["netbox_device_id"] == 42
+    assert_keys_absent(record, ["device_id"])
 
 
 @respx.mock
@@ -190,14 +196,178 @@ async def test_bulk_create_400_drops_bad_row_and_retries(client):
             httpx.Response(201, json=[{"id": 1, "name": "a"}]),
         ]
     )
-    result = await client.bulk_create_interfaces([{"name": "a"}, {"name": "dup"}])
+    result = await client.bulk_create_interfaces([{"name": "a"}, {"name": "dup"}], netbox_device_id=42)
     assert result == [{"id": 1, "name": "a"}]
+
+
+@respx.mock
+async def test_bulk_create_rejection_keeps_absolute_position_after_filtering(client):
+    names = ["placeholder-filter-zero", "placeholder-filter-one", "placeholder-filter-two"]
+    respx.post(f"{BASE}/api/dcim/interfaces/").mock(
+        side_effect=[
+            httpx.Response(400, json=[{"name": ["rejected"]}, {}, {}]),
+            httpx.Response(400, json=[{}, {"name": ["rejected"]}]),
+            httpx.Response(201, json=[{"id": 11, "name": names[1]}]),
+        ]
+    )
+
+    with capture_logs() as logs:
+        result = await client.bulk_create_interfaces(
+            [{"name": name} for name in names],
+            netbox_device_id=42,
+        )
+
+    assert result == [{"id": 11, "name": names[1]}]
+    records = [record for record in logs if record["event"] == "netbox.bulk_create.row_rejected"]
+    assert [record["payload_index"] for record in records] == [0, 2]
+    assert all(record["netbox_device_id"] == 42 for record in records)
+    assert all("device_id" not in record for record in records)
+    assert all("netbox_interface_id" not in record for record in records)
+    assert_records_free_of(records, names)
+
+
+@respx.mock
+async def test_bulk_create_rejection_keeps_absolute_position_after_chunking(client):
+    from nso_adapter.bindings.netbox import client as client_mod
+
+    chunk = client_mod._BULK_CREATE_CHUNK
+    names = [f"placeholder-chunk-{i}" for i in range(chunk + 2)]
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        rows = json.loads(request.content)
+        if len(rows) == chunk:
+            return httpx.Response(201, json=[{"id": i, "name": row["name"]} for i, row in enumerate(rows)])
+        if len(rows) == 2:
+            return httpx.Response(400, json=[{}, {"name": ["rejected"]}])
+        return httpx.Response(201, json=[{"id": chunk, "name": rows[0]["name"]}])
+
+    respx.post(f"{BASE}/api/dcim/interfaces/").mock(side_effect=_handler)
+
+    with capture_logs() as logs:
+        result = await client.bulk_create_interfaces(
+            [{"name": name} for name in names],
+            netbox_device_id=43,
+        )
+
+    assert len(result) == chunk + 1
+    record = next(record for record in logs if record["event"] == "netbox.bulk_create.row_rejected")
+    assert record["payload_index"] == chunk + 1
+    assert record["netbox_device_id"] == 43
+    assert_keys_absent(record, ["device_id", "netbox_interface_id"])
+    assert_records_free_of([record], names)
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ({"mtu": ["too big"], "name": ["'placeholder-x' is taken"]}, "fields: 2"),
+        ({"placeholder-secret": ["invalid"]}, "fields: 1"),
+        ({}, "fields: none"),
+        # A 400 whose positional list flags nothing reaches the single-row path as a list.
+        ([{}], "errors: 1"),
+        (None, "unparsed"),
+        ("<html>no such interface placeholder-x</html>", "unparsed"),
+    ],
+)
+def test_rejection_detail_keeps_only_the_shape_of_a_rejection_body(body, expected):
+    """The classifier is total: an unrecognized body degrades to a fixed string, never a value."""
+    if rejection_detail(body) != expected:
+        raise AssertionError("the rejection body was not classified by shape")
+
+
+@respx.mock
+async def test_bulk_create_rejection_keeps_a_reflected_name_out_of_the_record(client):
+    """NetBox echoes the submitted value in its validation message; the record may not carry it."""
+    name = "placeholder-reflected-create"
+    respx.post(f"{BASE}/api/dcim/interfaces/").mock(
+        return_value=httpx.Response(400, json=[{"name": [f"Interface with this name '{name}' already exists."]}])
+    )
+
+    with capture_logs() as logs:
+        result = await client.bulk_create_interfaces([{"name": name}], netbox_device_id=45)
+
+    assert result == []
+    record = next(record for record in logs if record["event"] == "netbox.bulk_create.row_rejected")
+    assert record["payload_index"] == 0
+    if record["error"] != "fields: 1":
+        raise AssertionError("the rejected row was not classified by shape")
+    assert_records_free_of([record], [name])
+
+
+@respx.mock
+async def test_bulk_create_rejection_keeps_a_reflected_error_key_out_of_the_record(client):
+    """A response key can reflect the submitted name, so it must not reach the log."""
+    name = "placeholder-reflected-error-key"
+    respx.post(f"{BASE}/api/dcim/interfaces/").mock(return_value=httpx.Response(400, json=[{name: ["invalid"]}]))
+
+    with capture_logs() as logs:
+        result = await client.bulk_create_interfaces([{"name": name}], netbox_device_id=45)
+
+    assert result == []
+    record = next(record for record in logs if record["event"] == "netbox.bulk_create.row_rejected")
+    if record["error"] != "fields: 1":
+        raise AssertionError("the rejection record included a provider-controlled key")
+    assert_records_free_of([record], [name])
+
+
+@respx.mock
+async def test_bulk_patch_non_positional_rejection_keeps_a_reflected_name_out_of_the_record(client):
+    """The single-row non-positional path parses a dict body; only its shape and counts may travel."""
+    name = "placeholder-reflected-patch"
+    respx.patch(f"{BASE}/api/dcim/interfaces/").mock(
+        return_value=httpx.Response(400, json={"name": [f"'{name}' is already taken."], "mtu": ["too big"]})
+    )
+
+    with capture_logs() as logs:
+        result = await client.bulk_patch_interfaces([{"id": 7, "name": name}], netbox_device_id=46)
+
+    assert result == []
+    record = next(record for record in logs if record["event"] == "netbox.bulk_patch.row_rejected")
+    assert record["netbox_interface_id"] == 7
+    if record["error"] != "fields: 2":
+        raise AssertionError("the rejected row was not classified by shape")
+    assert_records_free_of([record], [name])
+
+
+@respx.mock
+async def test_bulk_patch_unparsed_rejection_body_never_reaches_the_record(client):
+    """An unparseable 400 body is a server document, not ours to print."""
+    name = "placeholder-unparsed-patch"
+    respx.patch(f"{BASE}/api/dcim/interfaces/").mock(
+        return_value=httpx.Response(400, text=f"<html><body>no such interface {name}</body></html>")
+    )
+
+    with capture_logs() as logs:
+        result = await client.bulk_patch_interfaces([{"id": 8, "name": name}], netbox_device_id=47)
+
+    assert result == []
+    record = next(record for record in logs if record["event"] == "netbox.bulk_patch.row_rejected")
+    assert record["netbox_interface_id"] == 8
+    assert record["error"] == "unparsed"
+    assert_records_free_of([record], [name])
+
+
+@respx.mock
+async def test_batch_failure_reports_only_the_classified_exception(client):
+    """A raised batch failure travels as its classification, never as the httpx message."""
+    name = "placeholder-batch-failure"
+    respx.post(f"{BASE}/api/dcim/interfaces/").mock(return_value=httpx.Response(500, text=f"boom {name}"))
+
+    with capture_logs() as logs:
+        result = await client.bulk_create_interfaces([{"name": name}], netbox_device_id=48)
+
+    assert result == []
+    record = next(record for record in logs if record["event"] == "netbox.bulk_create.batch_failed")
+    assert record["error"] == "HTTPStatusError (HTTP 500)"
+    assert_records_free_of([record], [name, f"{BASE}/api/dcim/interfaces/"])
 
 
 @respx.mock
 async def test_bulk_create_400_all_bad_returns_empty(client):
     respx.post(f"{BASE}/api/dcim/interfaces/").mock(return_value=httpx.Response(400, json=[{"__all__": ["dup"]}]))
-    result = await client.bulk_create_interfaces([{"name": "dup"}])
+    result = await client.bulk_create_interfaces([{"name": "dup"}], netbox_device_id=42)
     assert result == []
 
 
@@ -208,14 +378,14 @@ async def test_bulk_create_400_all_bad_returns_empty(client):
 async def test_bulk_patch_returns_list(client):
     updated = [{"id": 1, "description": "x"}]
     respx.patch(f"{BASE}/api/dcim/interfaces/").mock(return_value=httpx.Response(200, json=updated))
-    result = await client.bulk_patch_interfaces([{"id": 1, "description": "x"}])
+    result = await client.bulk_patch_interfaces([{"id": 1, "description": "x"}], netbox_device_id=42)
     assert result == updated
 
 
 @respx.mock
 async def test_bulk_patch_empty_is_noop(client):
     route = respx.patch(f"{BASE}/api/dcim/interfaces/")
-    result = await client.bulk_patch_interfaces([])
+    result = await client.bulk_patch_interfaces([], netbox_device_id=42)
     assert result == []
     assert not route.called
 
@@ -232,6 +402,7 @@ async def test_bulk_patch_400_non_positional_body_bisects_to_isolate_bad_row(cli
     import json
 
     bad_id = 99
+    names = ["placeholder-bisect-one", "placeholder-bisect-two", "placeholder-bisect-bad", "placeholder-bisect-four"]
 
     def _handler(request: httpx.Request) -> httpx.Response:
         rows = json.loads(request.content)
@@ -242,22 +413,29 @@ async def test_bulk_patch_400_non_positional_body_bisects_to_isolate_bad_row(cli
 
     respx.patch(f"{BASE}/api/dcim/interfaces/").mock(side_effect=_handler)
     payloads = [
-        {"id": 1, "description": "a"},
-        {"id": 2, "description": "b"},
-        {"id": bad_id, "description": "x"},
-        {"id": 4, "description": "d"},
+        {"id": 1, "name": names[0], "description": "a"},
+        {"id": 2, "name": names[1], "description": "b"},
+        {"id": bad_id, "name": names[2], "description": "x"},
+        {"id": 4, "name": names[3], "description": "d"},
     ]
-    result = await client.bulk_patch_interfaces(payloads)
+    with capture_logs() as logs:
+        result = await client.bulk_patch_interfaces(payloads, netbox_device_id=44)
 
     written_ids = sorted(r["id"] for r in result)
     assert written_ids == [1, 2, 4]  # innocent rows written; only the poison row dropped
+    record = next(record for record in logs if record["event"] == "netbox.bulk_patch.row_rejected")
+    assert record["payload_index"] == 2
+    assert record["netbox_device_id"] == 44
+    assert record["netbox_interface_id"] == bad_id
+    assert_keys_absent(record, ["device_id"])
+    assert_records_free_of([record], names)
 
 
 @respx.mock
 async def test_bulk_patch_400_single_non_positional_drops_row(client):
     """A single-row batch that 400s with a non-positional body is dropped, not retried forever."""
     respx.patch(f"{BASE}/api/dcim/interfaces/").mock(return_value=httpx.Response(400, json={"mtu": ["too big"]}))
-    result = await client.bulk_patch_interfaces([{"id": 7, "description": "x"}])
+    result = await client.bulk_patch_interfaces([{"id": 7, "description": "x"}], netbox_device_id=42)
     assert result == []
 
 

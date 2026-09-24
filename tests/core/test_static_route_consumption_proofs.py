@@ -620,7 +620,7 @@ async def test_a_malformed_route_leaf_reaches_no_sink_and_still_names_the_field(
     from structlog.testing import capture_logs
 
     from nso_adapter.core.static_route_reader import _project, _Uncertifiable
-    from tests._secret_discipline import assert_chain_free_of, assert_records_free_of
+    from tests._secret_discipline import assert_chain_free_of, assert_keys_absent, assert_records_free_of
 
     route = {"prefix": "10.0.0.0/24", "vrf": "", "next-hop": "10.0.0.1"} | {leaf: malformed}
     entry = {"device": "sr-malformed", "static-route": {"route": [route]}}
@@ -631,9 +631,11 @@ async def test_a_malformed_route_leaf_reaches_no_sink_and_still_names_the_field(
     assert (section.status, section.entry, section.instance) == ("inconclusive", None, None)
     reported = [record for record in logs if record["event"] == "static_route.section_uncertifiable"]
     assert reported, "the malformed answer was not reported at all"
+    assert reported[0]["device_id"] == _MALFORMED_DEVICE.id
+    assert_keys_absent(reported[0], ["device"])
     assert leaf in reported[0]["reason"], "the operator cannot tell WHICH leaf was malformed"
     assert arrived in reported[0]["reason"], "the operator cannot tell WHAT type arrived"
-    assert_records_free_of(logs, [_MALFORMED_SECRET])
+    assert_records_free_of(logs, [_MALFORMED_SECRET, _MALFORMED_DEVICE.nso_device_name])
 
     # The raise itself, on the real projector: no node of the chain repeats the value either.
     with pytest.raises(_Uncertifiable) as caught:

@@ -17,7 +17,7 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from tests._secret_discipline import assert_text_free_of
+from tests._secret_discipline import assert_keys_absent, assert_text_free_of
 from tests.api.test_static_route_deleted_routes import deleted as deleted_route
 from tests.api.test_static_route_identity import entry as route_entry
 from tests.conftest import VALID_TOKEN, seed_device, session
@@ -2196,7 +2196,8 @@ async def test_interface_promotion_keeps_an_interface_a_replacement_retains(adap
         )
         emptied = await promotion_removal_context(db, device_id, "interface_config", removed)
 
-    assert "interface" not in retained.removed, "the replacement keeps Gi0/1, so its root key stays unauthorized"
+    # The replacement keeps Gi0/1, so its root key stays unauthorized.
+    assert_keys_absent(retained.removed, ["interface"])
     assert retained.removed["address"] == [["Gi0/1", "198.18.11.1/30", ""]], "the address it does drop is authorized"
     assert emptied.removed["interface"] == [["Gi0/1"]], "with nothing retained the same drop empties the entry"
 

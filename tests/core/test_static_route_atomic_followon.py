@@ -27,6 +27,7 @@ import pytest
 from sqlalchemy import select
 
 from nso_adapter.store.models import JobStatus
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import seed_device, session
 from tests.core.test_static_route_proof import _ProofRecorder, dev_state, outcomes, run_the_apply
 from tests.core.test_static_route_put import _SR_ROOT, A, B, deployed_keys, present, seed_rows, wire
@@ -524,10 +525,11 @@ async def test_rejected_commit_redacts_secrets_in_logs_and_stored_errors(adapter
     async with session() as db:
         row = await db.scalar(select(OspfInterfaceIntent).where(OspfInterfaceIntent.device_id == device_id))
         error = row.last_apply_error
+    assert_text_free_of(json.dumps({"error": job.error, "logs": logs}), [secret])
+    assert_text_free_of(json.dumps(error), [secret])
     assert error is not None, json.dumps({"error": job.error, "logs": logs})
     assert error["code"] == ("nso_put_failed" if phase == "commit" else "dry_run_rejected"), error
-    assert secret not in json.dumps(error)
     event = "nso.apply.device_intent_failed" if phase == "commit" else "nso.apply.dry_run_non_2xx"
     failures = [record for record in logs if record["event"] == event]
     assert failures
-    assert secret not in json.dumps(logs)
+    assert_text_free_of(json.dumps(logs), [secret])

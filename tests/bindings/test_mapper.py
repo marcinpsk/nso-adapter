@@ -6,10 +6,12 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from structlog.testing import capture_logs
 
 from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.bindings.netbox.mapper import _guess_netbox_type, resolve_or_create_interface
 from nso_adapter.domain.models import Interface as DomainInterface
+from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
 # ---------------------------------------------------------------------------
 # _guess_netbox_type — pure function tests
@@ -159,30 +161,44 @@ async def test_resolve_returns_existing_id():
 
 
 @pytest.mark.anyio
-async def test_resolve_creates_missing_interface():
+async def test_resolve_creates_missing_interface(debug_logs):
+    interface_name = "placeholder-created-interface"
     client = _make_nb_client()
     client.get_interface.return_value = None  # not found
-    client.create_interface.return_value = {"id": 55, "name": "GigabitEthernet0/0"}
+    client.create_interface.return_value = {"id": 55, "name": interface_name}
 
-    result = await resolve_or_create_interface(client, 42, _domain_iface())
+    result = await resolve_or_create_interface(client, 42, _domain_iface(interface_name))
 
     assert result == 55
     client.create_interface.assert_called_once()
     payload = client.create_interface.call_args[0][0]
-    assert payload["name"] == "GigabitEthernet0/0"
+    assert payload["name"] == interface_name
     assert payload["device"] == 42
-    assert payload["type"] == "1000base-t"
+    assert payload["type"] == "other"
+    record = next(record for record in debug_logs if record["event"] == "netbox.interface.created")
+    assert record["netbox_device_id"] == 42
+    assert record["netbox_interface_id"] == 55
+    assert record["netbox_parent_id"] is None
+    assert record["type"] == "other"
+    assert_keys_absent(record, ["device_id", "netbox_id", "name", "parent"])
+    assert_records_free_of([record], [interface_name])
 
 
 @pytest.mark.anyio
 async def test_resolve_returns_none_on_create_failure():
+    interface_name = "placeholder-create-failed-interface"
     client = _make_nb_client()
     client.get_interface.return_value = None
     client.create_interface.side_effect = Exception("NetBox 403")
 
-    result = await resolve_or_create_interface(client, 42, _domain_iface())
+    with capture_logs() as logs:
+        result = await resolve_or_create_interface(client, 42, _domain_iface(interface_name))
 
     assert result is None
+    record = next(record for record in logs if record["event"] == "netbox.interface.create_failed")
+    assert record["netbox_device_id"] == 42
+    assert_keys_absent(record, ["device_id", "netbox_interface_id", "name"])
+    assert_records_free_of([record], [interface_name])
 
 
 # ── logical-unit (subinterface) modeling ──────────────────────────────────────
@@ -231,24 +247,32 @@ async def test_dotted_unit_existing_base_only_creates_unit():
 
 
 @pytest.mark.anyio
-async def test_existing_flat_unit_gets_reparented():
+async def test_existing_flat_unit_gets_reparented(debug_logs):
     """A pre-existing unit with no parent is patched to point at the base."""
+    base_name = "placeholder-reparent-base"
+    interface_name = f"{base_name}.100"
     client = _make_nb_client()
 
     async def _get(dev_id, name):
-        if name == "ae98":
-            return {"id": 10, "name": "ae98", "parent": None}
-        if name == "ae98.100":
-            return {"id": 11, "name": "ae98.100", "parent": None}  # flat, needs parent
+        if name == base_name:
+            return {"id": 10, "name": base_name, "parent": None}
+        if name == interface_name:
+            return {"id": 11, "name": interface_name, "parent": None}  # flat, needs parent
         return None
 
     client.get_interface.side_effect = _get
 
-    result = await resolve_or_create_interface(client, 42, _domain_iface("ae98.100"))
+    result = await resolve_or_create_interface(client, 42, _domain_iface(interface_name))
 
     assert result == 11
     client.create_interface.assert_not_called()
     client.patch_interface.assert_awaited_once_with(11, {"parent": 10})
+    record = next(record for record in debug_logs if record["event"] == "netbox.interface.reparented")
+    assert record["netbox_device_id"] == 42
+    assert record["netbox_interface_id"] == 11
+    assert record["netbox_parent_id"] == 10
+    assert_keys_absent(record, ["device_id", "netbox_id", "name", "parent"])
+    assert_records_free_of([record], [base_name, interface_name])
 
 
 @pytest.mark.anyio
@@ -288,43 +312,60 @@ async def test_nokia_portid_not_treated_as_unit():
 @pytest.mark.anyio
 async def test_existing_flat_unit_reparent_failure_is_swallowed():
     """If patching a pre-existing unit's parent fails, the id is still returned."""
+    base_name = "placeholder-reparent-failed-base"
+    interface_name = f"{base_name}.100"
     client = _make_nb_client()
 
     async def _get(dev_id, name):
-        if name == "ae98":
-            return {"id": 10, "name": "ae98"}
-        if name == "ae98.100":
-            return {"id": 11, "name": "ae98.100", "parent": None}  # flat → reparent attempt
+        if name == base_name:
+            return {"id": 10, "name": base_name}
+        if name == interface_name:
+            return {"id": 11, "name": interface_name, "parent": None}  # flat → reparent attempt
         return None
 
     client.get_interface.side_effect = _get
     client.patch_interface.side_effect = Exception("NetBox 409")
 
-    result = await resolve_or_create_interface(client, 42, _domain_iface("ae98.100"))
+    with capture_logs() as logs:
+        result = await resolve_or_create_interface(client, 42, _domain_iface(interface_name))
 
     assert result == 11  # reparent_failed is logged, not raised
     client.create_interface.assert_not_called()
+    record = next(record for record in logs if record["event"] == "netbox.interface.reparent_failed")
+    assert record["netbox_device_id"] == 42
+    assert record["netbox_interface_id"] == 11
+    assert_keys_absent(record, ["device_id", "name"])
+    assert_records_free_of([record], [base_name, interface_name])
 
 
 @pytest.mark.anyio
 async def test_base_creation_failure_creates_unit_parentless():
     """When the base can't be created, the unit is still created — parentless — not dropped."""
+    base_name = "placeholder-unresolved-base"
+    interface_name = f"{base_name}.100"
     client = _make_nb_client()
     client.get_interface.return_value = None  # nothing exists yet
 
     async def _create(payload):
-        if payload["name"] == "ae98":
+        if payload["name"] == base_name:
             raise Exception("NetBox 403")  # base create fails → base_id resolves None
-        return {"id": 11, "name": "ae98.100"}
+        return {"id": 11, "name": interface_name}
 
     client.create_interface.side_effect = _create
 
-    result = await resolve_or_create_interface(client, 42, _domain_iface("ae98.100"))
+    with capture_logs() as logs:
+        result = await resolve_or_create_interface(client, 42, _domain_iface(interface_name))
 
     assert result == 11
-    unit_payload = next(c.args[0] for c in client.create_interface.await_args_list if c.args[0]["name"] == "ae98.100")
+    unit_payload = next(
+        call.args[0] for call in client.create_interface.await_args_list if call.args[0]["name"] == interface_name
+    )
     assert unit_payload["type"] == "virtual"
     assert "parent" not in unit_payload  # created without a parent rather than lost
+    record = next(record for record in logs if record["event"] == "netbox.interface.base_unresolved")
+    assert record["netbox_device_id"] == 42
+    assert_keys_absent(record, ["device_id", "unit", "base"])
+    assert_records_free_of([record], [base_name, interface_name])
 
 
 # ── bulk_ensure_interfaces (Layer A two-pass inventory) ───────────────────────
@@ -360,6 +401,31 @@ async def test_bulk_ensure_two_pass_bases_then_units():
     # pass 2 payloads = units, virtual, parented to ae98's id (by name, =10)
     unit_call = client.bulk_create_interfaces.await_args_list[1][0][0]
     assert all(p["type"] == "virtual" and p["parent"] == 10 for p in unit_call)
+    assert all(call.kwargs == {"netbox_device_id": 42} for call in client.bulk_create_interfaces.await_args_list)
+
+
+@pytest.mark.anyio
+async def test_bulk_ensure_parent_unresolved_uses_device_and_payload_position():
+    from nso_adapter.bindings.netbox.mapper import bulk_ensure_interfaces
+
+    child_name = "placeholder-unresolved-child"
+    parent_name = "placeholder-missing-parent"
+    client = _make_bulk_client()
+    client.bulk_create_interfaces.side_effect = [[], []]
+
+    with capture_logs() as logs:
+        await bulk_ensure_interfaces(
+            client,
+            42,
+            [{"name": child_name, "parent_binding": parent_name, "kind": "logical"}],
+        )
+
+    record = next(record for record in logs if record["event"] == "netbox.bulk_ensure.parent_unresolved")
+    assert record["netbox_device_id"] == 42
+    assert record["payload_index"] == 0
+    assert_keys_absent(record, ["device_id", "child", "parent"])
+    assert_records_free_of([record], [child_name, parent_name])
+    assert all(call.kwargs == {"netbox_device_id": 42} for call in client.bulk_create_interfaces.await_args_list)
 
 
 @pytest.mark.anyio
@@ -394,7 +460,7 @@ async def test_bulk_ensure_reparents_flat_unit():
     await bulk_ensure_interfaces(client, 42, ["ae98.100"])
 
     client.bulk_create_interfaces.assert_not_called()
-    client.bulk_patch_interfaces.assert_awaited_once_with([{"id": 11, "parent": 10}])
+    client.bulk_patch_interfaces.assert_awaited_once_with([{"id": 11, "parent": 10}], netbox_device_id=42)
 
 
 @pytest.mark.anyio
@@ -778,3 +844,66 @@ async def test_bulk_ensure_real_client_reparents_existing_flat_unit():
     assert state["posts"] == []
     assert state["patches"] == [[{"id": 11, "parent": 10}]]
     await client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# The single-interface create/reparent failures: a transport error names the
+# request, so only its classification may reach the log record.
+# ---------------------------------------------------------------------------
+
+#: What `str(exc)` on the httpx failure carries: the PATCH URL names the NetBox interface id,
+#: and the server's reason phrase is its own text.
+_REFUSED_REASON = "Denied by proxy"
+_REFUSED_INTERFACE = "GigabitEthernet0/0/0/7"
+
+
+def _refusing_netbox(status: int):
+    """A real NetboxClient whose interface GET succeeds and whose writes answer *status*."""
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            name = request.url.params.get("name")
+            existing = [{"id": 4711, "name": name, "parent": None}] if name == _REFUSED_INTERFACE else []
+            return httpx.Response(200, json={"results": existing, "next": None})
+        return httpx.Response(
+            status,
+            json={"name": [f"Interface {_REFUSED_INTERFACE} is not permitted"]},
+            extensions={"reason_phrase": _REFUSED_REASON.encode()},
+        )
+
+    return _real_client(handler)
+
+
+@pytest.mark.anyio
+async def test_a_REFUSED_reparent_records_the_STATUS_and_not_the_patch_url():
+    """The PATCH URL ends in the NetBox interface id, so `str(exc)` republished it."""
+    from nso_adapter.bindings.netbox.mapper import _resolve_or_create_simple
+
+    client = _refusing_netbox(403)
+    with capture_logs() as logs:
+        nb_id = await _resolve_or_create_simple(client, 42, _REFUSED_INTERFACE, parent_id=99)
+    await client.aclose()
+
+    assert nb_id == 4711, "a refused reparent still resolves the interface it found"
+    reported = [record for record in logs if record["event"] == "netbox.interface.reparent_failed"]
+    assert reported, "the refused reparent was not reported at all"
+    assert reported[0]["error"] == "HTTPStatusError (HTTP 403)", "the status tells the failures apart"
+    assert_records_free_of(logs, ["/api/dcim/interfaces/4711/", _REFUSED_REASON])
+
+
+@pytest.mark.anyio
+async def test_a_REFUSED_interface_create_records_the_STATUS_and_not_the_server_text():
+    """The create payload carries the interface name, and NetBox repeats it in its refusal."""
+    from nso_adapter.bindings.netbox.mapper import _resolve_or_create_simple
+
+    client = _refusing_netbox(400)
+    with capture_logs() as logs:
+        nb_id = await _resolve_or_create_simple(client, 42, "TenGigE0/0/0/3")
+    await client.aclose()
+
+    assert nb_id is None, "a refused create resolves to no interface"
+    reported = [record for record in logs if record["event"] == "netbox.interface.create_failed"]
+    assert reported, "the refused create was not reported at all"
+    assert reported[0]["error"] == "HTTPStatusError (HTTP 400)"
+    assert_records_free_of(logs, ["/api/dcim/interfaces/", _REFUSED_REASON])

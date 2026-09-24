@@ -82,8 +82,11 @@ async def test_duplicate_object_names_are_deduped_not_crashing(adapter_client): 
     """A reader reporting the same name twice (SR OS as-path vs as-path-group, or a doubled
     prefix-list read) must not abort the WHOLE full-replace refresh on the (device, name) key
     — dedup keeps the first and the refresh still lands every other object."""
+    from structlog.testing import capture_logs
+
     from nso_adapter.core.route_policy import _upsert_route_policy_data
     from nso_adapter.store.models import Device, DeviceRoutePolicyASPath, DeviceRoutePolicyPrefixList
+    from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
     nso_data = {
         "prefix-list": [
@@ -101,7 +104,8 @@ async def test_duplicate_object_names_are_deduped_not_crashing(adapter_client): 
         db.add(device)
         await db.flush()
 
-        await _upsert_route_policy_data(db, device, nso_data, "test")  # must not raise
+        with capture_logs() as logs:
+            await _upsert_route_policy_data(db, device, nso_data, "test")  # must not raise
 
         pls = (
             (
@@ -119,6 +123,11 @@ async def test_duplicate_object_names_are_deduped_not_crashing(adapter_client): 
         )
         assert [p.name for p in pls] == ["DUP"]  # deduped to one, refresh did not crash
         assert [a.name for a in aps] == ["AP"]
+        duplicates = [record for record in logs if record["event"] == "route_policy.refresh.duplicate_name_skipped"]
+        assert [record["device_id"] for record in duplicates] == [device.id, device.id]
+        for record in duplicates:
+            assert_keys_absent(record, ["name"])
+        assert_records_free_of(duplicates, [device.nso_device_name, "DUP", "AP"])
         return
 
 

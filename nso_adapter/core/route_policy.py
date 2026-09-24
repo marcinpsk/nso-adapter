@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.community_dialect import community_dialect_for
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import (
@@ -49,7 +50,7 @@ def _required(entry: dict, *keys: str) -> bool:
     return all(entry.get(k) is not None for k in keys)
 
 
-def _dedup_by_name(items: list, family: str, device_name: str) -> list:
+def _dedup_by_name(items: list, family: str, device_id: int) -> list:
     """Drop objects repeating a name within one refresh (keep the first, log the rest).
 
     The store keys route-policy objects by ``(device_id, name)``; a reader that reports the
@@ -63,7 +64,11 @@ def _dedup_by_name(items: list, family: str, device_name: str) -> list:
     for item in items:
         name = item.get("name")
         if name in seen:
-            logger.warning("route_policy.refresh.duplicate_name_skipped", device=device_name, family=family, name=name)
+            logger.warning(
+                "route_policy.refresh.duplicate_name_skipped",
+                **device_fields(device_id=device_id),
+                family=family,
+            )
             continue
         seen.add(name)
         out.append(item)
@@ -71,7 +76,7 @@ def _dedup_by_name(items: list, family: str, device_name: str) -> list:
 
 
 async def _upsert_prefix_lists(db, device, items, now, refresh_source) -> None:
-    for pl_data in _dedup_by_name(items, "prefix-list", device.nso_device_name):
+    for pl_data in _dedup_by_name(items, "prefix-list", device.id):
         if not pl_data.get("name"):
             continue  # list without a name → nothing to key on
         pl = DeviceRoutePolicyPrefixList(
@@ -100,7 +105,7 @@ async def _upsert_prefix_lists(db, device, items, now, refresh_source) -> None:
 
 
 async def _upsert_community_lists(db, device, items, now, refresh_source, dialect) -> None:
-    for cl_data in _dedup_by_name(items, "community-list", device.nso_device_name):
+    for cl_data in _dedup_by_name(items, "community-list", device.id):
         if not cl_data.get("name"):
             continue
         cl = DeviceRoutePolicyCommunityList(
@@ -128,7 +133,7 @@ async def _upsert_community_lists(db, device, items, now, refresh_source, dialec
 
 
 async def _upsert_as_paths(db, device, items, now, refresh_source) -> None:
-    for ap_data in _dedup_by_name(items, "as-path", device.nso_device_name):
+    for ap_data in _dedup_by_name(items, "as-path", device.id):
         if not ap_data.get("name"):
             continue
         ap = DeviceRoutePolicyASPath(
@@ -154,7 +159,7 @@ async def _upsert_as_paths(db, device, items, now, refresh_source) -> None:
 
 
 async def _upsert_route_maps(db, device, items, now, refresh_source) -> None:
-    for rm_data in _dedup_by_name(items, "route-map", device.nso_device_name):
+    for rm_data in _dedup_by_name(items, "route-map", device.id):
         if not rm_data.get("name"):
             continue
         rm = DeviceRoutePolicyRouteMap(

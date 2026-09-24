@@ -25,6 +25,7 @@ from nso_adapter.api.errors import (
 )
 from nso_adapter.api.pagination import DEFAULT_PAGE, LIMIT_MAX, LIMIT_MIN, validate_page_limit
 from nso_adapter.api.timestamps import iso_z
+from nso_adapter.domain.diagnostics import DEVICE_REF_PATTERN, device_ref
 from nso_adapter.store.models import (
     DbInterface,
     DeploymentApplyAttempt,
@@ -89,6 +90,7 @@ def _device_out(d: Device) -> dict:
         "id": d.id,
         "nso_instance": d.nso_instance,
         "nso_device_name": d.nso_device_name,
+        "device_ref": device_ref(d.nso_instance, d.nso_device_name),
         "netbox_device_id": d.netbox_device_id,
         "source_epoch": d.source_epoch,
         "mapping_status": d.mapping_status.value,
@@ -127,7 +129,7 @@ async def _load_failover(device_id: int, db: AsyncSession) -> DeviceFailover | N
 
 
 # ── Response models ───────────────────────────────────────────────────────────
-# One DeviceOut carries the 8 always-present base keys plus the additive keys the
+# One DeviceOut carries the always-present base keys plus the additive keys the
 # individual endpoints layer on (sync_state_summary / scope / last_job_id / failover).
 # Those additive fields default to unset, and every device endpoint sets
 # response_model_exclude_unset=True, so an endpoint that never added a key emits no key
@@ -161,6 +163,7 @@ class DeviceOut(BaseModel):
     id: int
     nso_instance: str
     nso_device_name: str
+    device_ref: str = Field(pattern=DEVICE_REF_PATTERN)
     netbox_device_id: int | None
     source_epoch: int
     mapping_status: str

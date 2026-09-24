@@ -25,6 +25,7 @@ import structlog
 
 from nso_adapter.core.community_dialect import UNREPRESENTABLE, CommunityDialect, community_dialect_for
 from nso_adapter.core.isis_canon import isis_level
+from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.client import DEVICE_INTENT_PATH, DEVICE_INTENT_ROOT, NsoClient, _url_key
 from nso_adapter.nso.nso_json import boundary_safe_dumps
 from nso_adapter.secrets.refs import VaultRefError, parse_vault_ref
@@ -101,7 +102,7 @@ class NsoApplyError(Exception):
         self.detail = detail or {}
 
 
-def _device_delta_from_dry_run(body: object, device_name: str) -> str | None:
+def _device_delta_from_dry_run(body: object, device_name: str, *, device_id: int) -> str | None:
     """Return the native device delta for *device_name* from a dry-run-result body.
 
     Returns the (possibly empty) southbound delta NSO would still push, or None
@@ -134,8 +135,8 @@ def _device_delta_from_dry_run(body: object, device_name: str) -> str | None:
     # different key and this "" is a false "verified" — the log makes that observable.
     logger.debug(
         "nso.apply.dry_run_device_absent",
-        device=device_name,
-        present=[e.get("name") for e in devices if isinstance(e, dict)],
+        **device_fields(device_id=device_id),
+        present_count=len(devices),
     )
     return ""
 
@@ -169,6 +170,7 @@ async def native_dry_run(
     payload: str,
     device_name: str,
     *,
+    device_id: int,
     method: str = "patch",
     strict: bool = False,
     outformat: str = "native",
@@ -207,7 +209,12 @@ async def native_dry_run(
         except ValueError:
             err = {"raw": "[redacted]"}
         err = _sanitized_nso_error(err)
-        logger.warning("nso.apply.dry_run_non_2xx", device=device_name, status=resp.status_code, body=err)
+        logger.warning(
+            "nso.apply.dry_run_non_2xx",
+            **device_fields(device_id=device_id),
+            status=resp.status_code,
+            body=err,
+        )
         if strict and 400 <= resp.status_code < 500:
             raise NsoApplyError(
                 "dry_run_rejected",
@@ -221,7 +228,7 @@ async def native_dry_run(
         return None
     if outformat == "cli":
         return _cli_delta_from_dry_run(body)
-    return _device_delta_from_dry_run(body, device_name)
+    return _device_delta_from_dry_run(body, device_name, device_id=device_id)
 
 
 async def _verify_native_or_raise(
@@ -230,6 +237,7 @@ async def _verify_native_or_raise(
     payload: str,
     device_name: str,
     *,
+    device_id: int,
     scope: str,
     method: str = "patch",
     no_networking: bool = False,
@@ -258,20 +266,31 @@ async def _verify_native_or_raise(
     # rather than being swallowed as an inconclusive false success.
     # The verification re-issues the commit, so it must carry the commit's own no-networking.
     delta = await native_dry_run(
-        client, url, payload, device_name, method=method, strict=True, no_networking=no_networking
+        client,
+        url,
+        payload,
+        device_name,
+        device_id=device_id,
+        method=method,
+        strict=True,
+        no_networking=no_networking,
     )
     if delta is None:
-        logger.warning("nso.apply.verify_inconclusive_or_unexpected", scope=scope, device=device_name)
+        logger.warning(
+            "nso.apply.verify_inconclusive_or_unexpected",
+            scope=scope,
+            **device_fields(device_id=device_id),
+        )
         return VERIFY_INCONCLUSIVE
     if delta.strip():
         delta = "[redacted]"
-        logger.error("nso.apply.verify_mismatch", scope=scope, device=device_name, delta=delta)
+        logger.error("nso.apply.verify_mismatch", scope=scope, **device_fields(device_id=device_id), delta=delta)
         raise NsoApplyError(
             "verify_mismatch",
             f"{scope}: applied intent did not land; NSO would still push changes to the device",
             detail={"device_delta": delta},
         )
-    logger.info("nso.apply.verify_ok", scope=scope, device=device_name)
+    logger.info("nso.apply.verify_ok", scope=scope, **device_fields(device_id=device_id))
     return VERIFY_CONCLUSIVE
 
 
@@ -328,6 +347,7 @@ async def apply_device_intent(
     device_name: str,
     containers: Mapping[str, dict],
     *,
+    device_id: int,
     dry_run: bool | str = False,
     no_networking: bool = False,
     strict: bool = False,
@@ -361,6 +381,7 @@ async def apply_device_intent(
             url,
             payload,
             device_name,
+            device_id=device_id,
             method="put",
             strict=strict,
             no_networking=no_networking,
@@ -381,7 +402,7 @@ async def apply_device_intent(
             err = _sanitized_nso_error(err)
             logger.error(
                 "nso.apply.device_intent_failed",
-                device=device_name,
+                **device_fields(device_id=device_id),
                 families=sorted(containers),
                 status=resp.status_code,
                 body=err,
@@ -391,9 +412,20 @@ async def apply_device_intent(
                 f"NSO device-intent PUT failed with status {resp.status_code}",
                 detail={"nso_error": err},
             )
-    logger.info("nso.apply.device_intent_sent", device=device_name, families=sorted(containers))
+    logger.info(
+        "nso.apply.device_intent_sent",
+        **device_fields(device_id=device_id),
+        families=sorted(containers),
+    )
     return await _verify_native_or_raise(
-        client, url, payload, device_name, scope="device-intent", method="put", no_networking=no_networking
+        client,
+        url,
+        payload,
+        device_name,
+        device_id=device_id,
+        scope="device-intent",
+        method="put",
+        no_networking=no_networking,
     )
 
 

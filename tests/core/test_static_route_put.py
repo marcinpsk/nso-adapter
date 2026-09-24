@@ -23,6 +23,7 @@ import pytest
 from sqlalchemy import select
 
 from nso_adapter.store.models import Job, JobStatus, JobType
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import VALID_TOKEN, attach_apply_generation, push_seq, seed_device, session
 
 pytestmark = pytest.mark.anyio
@@ -712,4 +713,4 @@ async def test_a_blocked_replace_reports_the_orphan_it_refused_over(adapter_clie
     row_error = await _first_row_error(device_id)
     assert row_error["code"] == "removal_blocked_collateral"
     assert row_error["detail"]["orphans"] == {"static_route/route": [list(C)]}
-    assert delta not in json.dumps(row_error), "the would-be device delta may not be persisted"
+    assert_text_free_of(json.dumps(row_error), [delta])

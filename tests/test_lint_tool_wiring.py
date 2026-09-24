@@ -14,6 +14,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests._secret_discipline import assert_text_omits
+
 ROOT = Path(__file__).parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 PRE_COMMIT = ROOT / ".pre-commit-config.yaml"
@@ -311,7 +313,7 @@ def test_review_pattern_scan_rejects_partial_parse_drift(
     assert heading in result.stderr
     assert changed_path in result.stderr
     for unchanged_path in _EXPECTED_PARTIAL_PATHS & partial_paths:
-        assert unchanged_path not in result.stderr
+        assert_text_omits(result.stderr, [unchanged_path])
 
 
 def test_review_pattern_scan_accepts_the_pinned_partial_paths(tmp_path: Path) -> None:
@@ -437,3 +439,133 @@ def test_the_scan_fails_when_opengrep_drops_a_malformed_rule(tmp_path: Path):
 
     assert result.returncode == 1, "a dropped rule must fail the scan, not pass it"
     assert "Rule parse error" in result.stderr
+
+
+def _is_overload(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> bool:
+    return any(
+        (isinstance(decorator, ast.Name) and decorator.id == "overload")
+        or (isinstance(decorator, ast.Attribute) and decorator.attr == "overload")
+        for decorator in node.decorator_list
+    )
+
+
+def _assigned_names(target: ast.expr) -> list[str]:
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, ast.Starred):
+        return _assigned_names(target.value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [name for element in target.elts for name in _assigned_names(element)]
+    return []
+
+
+def _redefined_top_level_lines(source: str) -> list[int]:
+    """The lines that bind a top-level name the module already bound."""
+    redefined: list[int] = []
+    defined: dict[str, int] = {}
+    package_roots: set[str] = set()  # names whose current binding is an unaliased `import root...`
+    for node in ast.parse(source).body:
+        bindings: list[tuple[str, bool]] = []  # (name, bound by an unaliased `import root...`)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if _is_overload(node):  # typing.overload declares the same name on purpose
+                continue
+            bindings = [(node.name, False)]
+        elif isinstance(node, ast.Import):
+            bindings = [
+                (alias.asname or alias.name.split(".", maxsplit=1)[0], alias.asname is None) for alias in node.names
+            ]
+        elif isinstance(node, ast.ImportFrom) and node.module != "__future__":
+            bindings = [(alias.asname or alias.name, False) for alias in node.names if alias.name != "*"]
+        elif isinstance(node, ast.Assign):
+            bindings = [(name, False) for target in node.targets for name in _assigned_names(target)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            bindings = [(node.target.id, False)]
+        for name, is_root in bindings:
+            if name in defined and not (is_root and name in package_roots):
+                redefined.append(node.lineno)
+            defined[name] = node.lineno
+            if is_root:
+                package_roots.add(name)
+            else:
+                package_roots.discard(name)
+    return redefined
+
+
+def test_no_module_defines_a_TOP_LEVEL_name_twice() -> None:
+    """A shadowed definition binds the later one, so edits to the earlier have no effect.
+
+    ruff's F811 cannot see this: it reports a redefinition of an UNUSED name, and a helper
+    that the module calls between the two definitions is used. test_secret_discipline.py
+    carried two `_assertion_comparisons`, and the security rule ran the copy nobody edited.
+    """
+    duplicates = [
+        f"{path.relative_to(ROOT)}:{lineno}"
+        for path in sorted((*ROOT.glob("tests/**/*.py"), *ROOT.glob("nso_adapter/**/*.py")))
+        for lineno in _redefined_top_level_lines(path.read_text(encoding="utf-8"))
+    ]
+
+    assert duplicates == []
+
+
+def test_the_redefinition_rule_reads_every_binding_form_and_spares_an_overload() -> None:
+    """An annotated constant shadows exactly like a plain one; an overload does not shadow."""
+    function = "def f():\n    pass\n\n\ndef f():\n    pass\n"
+    plain_constant = "X = 1\nX = 2\n"
+    annotated_constant = "from typing import Final\n\nX: Final = 1\nX: Final = 2\n"
+    overload = (
+        "from typing import overload\n\n\n@overload\ndef f(x: int) -> int: ...\n\n\n"
+        "@overload\ndef f(x: str) -> str: ...\n\n\ndef f(x):\n    return x\n"
+    )
+    nested = "def outer():\n    def g():\n        pass\n\n    def g():\n        pass\n"
+
+    assert _redefined_top_level_lines(function) == [5]
+    assert _redefined_top_level_lines(plain_constant) == [2]
+    assert _redefined_top_level_lines(annotated_constant) == [4]
+    assert _redefined_top_level_lines(overload) == []
+    assert _redefined_top_level_lines(nested) == [], "a local rebinding is not a shadowed module name"
+
+
+def test_the_redefinition_rule_tracks_import_bindings() -> None:
+    direct_import = "import pkg.module\npkg = 1\n"
+    aliased_import = "import pkg.module as alias\nalias = 1\n"
+    from_import = "from pkg import name\nname = 1\n"
+    aliased_from_import = "from pkg import name as alias\nalias = 1\n"
+    future_import = "from __future__ import annotations\nannotations = 1\n"
+    wildcard_import = "from pkg import *\nstar = 1\n"
+    same_package = "import os\nimport os.path\nimport xml.etree.ElementTree\nimport xml.dom\n"
+    package_after_value = "os = 1\nimport os.path\n"
+    package_after_alias = "import pkg as os\nimport os.path\n"
+    alias_then_package = "import pkg as os, os.path\n"
+
+    assert _redefined_top_level_lines(direct_import) == [2]
+    assert _redefined_top_level_lines(aliased_import) == [2]
+    assert _redefined_top_level_lines(from_import) == [2]
+    assert _redefined_top_level_lines(aliased_from_import) == [2]
+    assert _redefined_top_level_lines(future_import) == []
+    assert _redefined_top_level_lines(wildcard_import) == []
+    assert _redefined_top_level_lines(same_package) == [], "each import binds the same package module"
+    assert _redefined_top_level_lines(package_after_value) == [2]
+    assert _redefined_top_level_lines(package_after_alias) == [2]
+    assert _redefined_top_level_lines(alias_then_package) == [1]
+
+
+def test_the_redefinition_rule_tracks_destructured_bindings() -> None:
+    source = "first, [second, *rest] = values\nfirst = other\nsecond = other\nrest = other\n"
+    assert _redefined_top_level_lines(source) == [2, 3, 4]
+
+
+def test_the_redefinition_rule_ignores_bindings_inside_subscript_targets() -> None:
+    source = "first = 1\nitems = {}\nvalues = [2]\nitems[tuple(first for first in values)] = 3\n"
+    assert _redefined_top_level_lines(source) == []
+
+
+def test_diagnostic_identifier_rule_coverage_is_documented() -> None:
+    rules = yaml.safe_load((ROOT / ".opengrep" / "nso-rules.yaml").read_text(encoding="utf-8"))["rules"]
+    rule = next(rule for rule in rules if rule["id"] == "nso-diagnostic-raw-identifier")
+    readme = (ROOT / ".opengrep" / "README.md").read_text(encoding="utf-8")
+    coverage = readme.split("`nso-diagnostic-raw-identifier` rejects", 1)[1].split("\n\n", 1)[0]
+
+    for path in rule["paths"]["include"]:
+        assert f"`{path}`" in coverage, f"missing documented path: {path}"
+    for field in ("device_name", "device", "nso_device", "lag_name", "stream", "stream_url", "url"):
+        assert f"`{field}`" in coverage, f"missing documented field: {field}"
