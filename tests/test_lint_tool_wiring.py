@@ -463,24 +463,31 @@ def _redefined_top_level_lines(source: str) -> list[int]:
     """The lines that bind a top-level name the module already bound."""
     redefined: list[int] = []
     defined: dict[str, int] = {}
+    package_roots: set[str] = set()  # names whose current binding is an unaliased `import root...`
     for node in ast.parse(source).body:
-        names: list[str] = []
+        bindings: list[tuple[str, bool]] = []  # (name, bound by an unaliased `import root...`)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             if _is_overload(node):  # typing.overload declares the same name on purpose
                 continue
-            names = [node.name]
+            bindings = [(node.name, False)]
         elif isinstance(node, ast.Import):
-            names = [alias.asname or alias.name.split(".", maxsplit=1)[0] for alias in node.names]
+            bindings = [
+                (alias.asname or alias.name.split(".", maxsplit=1)[0], alias.asname is None) for alias in node.names
+            ]
         elif isinstance(node, ast.ImportFrom) and node.module != "__future__":
-            names = [alias.asname or alias.name for alias in node.names if alias.name != "*"]
+            bindings = [(alias.asname or alias.name, False) for alias in node.names if alias.name != "*"]
         elif isinstance(node, ast.Assign):
-            names = [name for target in node.targets for name in _assigned_names(target)]
+            bindings = [(name, False) for target in node.targets for name in _assigned_names(target)]
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            names = [node.target.id]
-        for name in names:
-            if name in defined:
+            bindings = [(node.target.id, False)]
+        for name, is_root in bindings:
+            if name in defined and not (is_root and name in package_roots):
                 redefined.append(node.lineno)
             defined[name] = node.lineno
+            if is_root:
+                package_roots.add(name)
+            else:
+                package_roots.discard(name)
     return redefined
 
 
@@ -525,6 +532,10 @@ def test_the_redefinition_rule_tracks_import_bindings() -> None:
     aliased_from_import = "from pkg import name as alias\nalias = 1\n"
     future_import = "from __future__ import annotations\nannotations = 1\n"
     wildcard_import = "from pkg import *\nstar = 1\n"
+    same_package = "import os\nimport os.path\nimport xml.etree.ElementTree\nimport xml.dom\n"
+    package_after_value = "os = 1\nimport os.path\n"
+    package_after_alias = "import pkg as os\nimport os.path\n"
+    alias_then_package = "import pkg as os, os.path\n"
 
     assert _redefined_top_level_lines(direct_import) == [2]
     assert _redefined_top_level_lines(aliased_import) == [2]
@@ -532,6 +543,10 @@ def test_the_redefinition_rule_tracks_import_bindings() -> None:
     assert _redefined_top_level_lines(aliased_from_import) == [2]
     assert _redefined_top_level_lines(future_import) == []
     assert _redefined_top_level_lines(wildcard_import) == []
+    assert _redefined_top_level_lines(same_package) == [], "each import binds the same package module"
+    assert _redefined_top_level_lines(package_after_value) == [2]
+    assert _redefined_top_level_lines(package_after_alias) == [2]
+    assert _redefined_top_level_lines(alias_then_package) == [1]
 
 
 def test_the_redefinition_rule_tracks_destructured_bindings() -> None:
