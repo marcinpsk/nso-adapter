@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import nso_adapter.domain.diagnostics as diagnostics
 from nso_adapter.config import ApiConfig, AppConfig, NetboxConfig, SecretsConfig
 from nso_adapter.domain.diagnostics import (
     DEVICE_REF_PATTERN,
@@ -20,6 +21,12 @@ from nso_adapter.domain.diagnostics import (
 from nso_adapter.main import _init_secrets
 from nso_adapter.secrets.base import SecretResolutionError
 from tests._secret_discipline import assert_chain_free_of
+
+
+@pytest.fixture(autouse=True)
+def _isolate_device_ref_key(monkeypatch) -> None:
+    # The key is process-global: start each test unconfigured and restore the prior value after.
+    monkeypatch.setattr(diagnostics, "_device_ref_key", None)
 
 
 def _config() -> AppConfig:
@@ -153,6 +160,11 @@ def test_startup_registers_the_resolved_diagnostic_key(monkeypatch) -> None:
     _init_secrets(app, _config(), SimpleNamespace())
 
     assert device_ref("nso-a", "edge-1") == "5682a11cb050d759"
+
+
+def test_device_ref_refuses_to_run_without_a_registered_key() -> None:
+    with pytest.raises(RuntimeError, match="diagnostic reference key is not configured"):
+        device_ref("nso-a", "edge-1")
 
 
 def test_device_ref_uses_the_keyed_domain_separated_pair() -> None:
