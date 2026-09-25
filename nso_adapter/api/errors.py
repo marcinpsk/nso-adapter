@@ -118,6 +118,7 @@ class StoredIntentResult(BaseModel):
     removed: int
     desired_revision: int
     selection_revision: int | None
+    unauthorized_deleted_roots: list[str]
 
 
 class ApiError(HTTPException):
@@ -339,6 +340,9 @@ RESP_409_APPLY_CONFLICT: ResponseSpec = {
     }
 }
 RESP_409: ResponseSpec = {409: {**_ENVELOPE_SCHEMA, "description": "Conflict"}}
+RESP_409_PREPARATION: ResponseSpec = {
+    409: {**_ENVELOPE_SCHEMA, "description": "An older source revision or conflicting snapshot was refused"}
+}
 RESP_409_PUSH_SEQ: ResponseSpec = {
     409: {
         **_ENVELOPE_SCHEMA,

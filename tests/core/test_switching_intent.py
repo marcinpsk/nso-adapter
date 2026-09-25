@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ast
+import itertools
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -33,13 +34,21 @@ from nso_adapter.store.models import (
 from tests._secret_discipline import assert_chain_free_of
 from tests.conftest import seed_device, session
 
+_source_revisions = itertools.count(1)
+
 
 @pytest.mark.anyio
 async def test_lag_replacement_rejects_duplicate_keys_without_mutating_snapshot(adapter_client):
     device_id = await seed_device(nso_device_name="lag-core-validation", netbox_device_id=1612)
     original = LagBundleSnapshot(name="Port-channel1", lag_id=1)
     async with session() as db:
-        await replace_lag_snapshot(db, device_id, (original,), deleted_roots=[])
+        await replace_lag_snapshot(
+            db,
+            device_id,
+            (original,),
+            source_revision=next(_source_revisions),
+            deleted_roots=[],
+        )
         await db.commit()
 
     async with session() as db:
@@ -51,6 +60,7 @@ async def test_lag_replacement_rejects_duplicate_keys_without_mutating_snapshot(
                     LagBundleSnapshot(name="Port-channel2", lag_id=2),
                     LagBundleSnapshot(name="Port-channel2", lag_id=3),
                 ),
+                source_revision=next(_source_revisions),
                 deleted_roots=[],
             )
         await db.rollback()
@@ -77,6 +87,7 @@ async def test_lag_replacement_rejects_one_interface_in_two_bundles(adapter_clie
                         name="Port-channel2", lag_id=2, members=(LagMemberSnapshot(interface_name="Gi0/1"),)
                     ),
                 ),
+                source_revision=next(_source_revisions),
                 deleted_roots=[],
             )
         await db.rollback()
@@ -106,7 +117,13 @@ async def test_lag_replacement_rejects_invalid_yang_values_before_mutation(adapt
     device_id = await seed_device(nso_device_name=f"lag-core-range-{message}", netbox_device_id=None)
     async with session() as db:
         with pytest.raises(ValueError, match=message):
-            await replace_lag_snapshot(db, device_id, (bundle,), deleted_roots=[])
+            await replace_lag_snapshot(
+                db,
+                device_id,
+                (bundle,),
+                source_revision=next(_source_revisions),
+                deleted_roots=[],
+            )
         await db.rollback()
 
     async with session() as db:
@@ -124,7 +141,13 @@ async def test_lag_replacement_preserves_identity_and_only_clears_evidence_on_ch
     )
     evidence_at = datetime(2026, 8, 1, tzinfo=UTC)
     async with session() as db:
-        await replace_lag_snapshot(db, device_id, (original,), deleted_roots=[])
+        await replace_lag_snapshot(
+            db,
+            device_id,
+            (original,),
+            source_revision=next(_source_revisions),
+            deleted_roots=[],
+        )
         row = await db.scalar(
             select(LagBundleIntent)
             .where(LagBundleIntent.device_id == device_id)
@@ -139,7 +162,13 @@ async def test_lag_replacement_preserves_identity_and_only_clears_evidence_on_ch
         await db.commit()
 
     async with session() as db:
-        await replace_lag_snapshot(db, device_id, (original,), deleted_roots=[])
+        await replace_lag_snapshot(
+            db,
+            device_id,
+            (original,),
+            source_revision=next(_source_revisions),
+            deleted_roots=[],
+        )
         await db.commit()
     async with session() as db:
         unchanged = await db.scalar(
@@ -159,7 +188,13 @@ async def test_lag_replacement_preserves_identity_and_only_clears_evidence_on_ch
         members=(LagMemberSnapshot(interface_name="Gi0/1", mode="active", port_priority=200),),
     )
     async with session() as db:
-        await replace_lag_snapshot(db, device_id, (changed,), deleted_roots=[])
+        await replace_lag_snapshot(
+            db,
+            device_id,
+            (changed,),
+            source_revision=next(_source_revisions),
+            deleted_roots=[],
+        )
         await db.commit()
     async with session() as db:
         row = (
@@ -212,7 +247,13 @@ async def test_switchport_replacement_rejects_invalid_graph_before_mutation(adap
     device_id = await seed_device(nso_device_name=f"switchport-core-{message}", netbox_device_id=None)
     async with session() as db:
         with pytest.raises(ValueError, match=message):
-            await replace_switchport_snapshot(db, device_id, interfaces, deleted_roots=[])
+            await replace_switchport_snapshot(
+                db,
+                device_id,
+                interfaces,
+                source_revision=next(_source_revisions),
+                deleted_roots=[],
+            )
         await db.rollback()
 
     async with session() as db:
@@ -241,6 +282,7 @@ async def test_the_encoders_are_canonical_and_omit_empty_values_and_families(ada
                     ),
                 ),
             ),
+            source_revision=next(_source_revisions),
             deleted_roots=[],
         )
         await replace_switchport_snapshot(
@@ -250,6 +292,7 @@ async def test_the_encoders_are_canonical_and_omit_empty_values_and_families(ada
                 SwitchportSnapshot(interface_name="Gi0/2", tagged_vlans=(30, 20)),
                 SwitchportSnapshot(interface_name="Gi0/1", mode="access", untagged_vlan=10),
             ),
+            source_revision=next(_source_revisions),
             deleted_roots=[],
         )
         await db.commit()
@@ -293,7 +336,13 @@ async def test_switchport_replacement_preserves_root_and_retained_tag_identity(a
     original = SwitchportSnapshot(interface_name="Gi0/1", mode="trunk", tagged_vlans=(10, 20))
     evidence_at = datetime(2026, 8, 2, tzinfo=UTC)
     async with session() as db:
-        await replace_switchport_snapshot(db, device_id, (original,), deleted_roots=[])
+        await replace_switchport_snapshot(
+            db,
+            device_id,
+            (original,),
+            source_revision=next(_source_revisions),
+            deleted_roots=[],
+        )
         row = await db.scalar(
             select(SwitchportIntent)
             .where(SwitchportIntent.device_id == device_id)
@@ -308,7 +357,13 @@ async def test_switchport_replacement_preserves_root_and_retained_tag_identity(a
         await db.commit()
 
     async with session() as db:
-        await replace_switchport_snapshot(db, device_id, (original,), deleted_roots=[])
+        await replace_switchport_snapshot(
+            db,
+            device_id,
+            (original,),
+            source_revision=next(_source_revisions),
+            deleted_roots=[],
+        )
         await db.commit()
     async with session() as db:
         unchanged = await db.scalar(
@@ -325,7 +380,13 @@ async def test_switchport_replacement_preserves_root_and_retained_tag_identity(a
 
     changed = SwitchportSnapshot(interface_name="Gi0/1", mode="trunk", tagged_vlans=(20, 30))
     async with session() as db:
-        await replace_switchport_snapshot(db, device_id, (changed,), deleted_roots=[])
+        await replace_switchport_snapshot(
+            db,
+            device_id,
+            (changed,),
+            source_revision=next(_source_revisions),
+            deleted_roots=[],
+        )
         await db.commit()
     async with session() as db:
         row = await db.scalar(
@@ -365,12 +426,14 @@ async def test_replacements_keep_loaded_child_collections_current(adapter_client
                     ),
                 ),
             ),
+            source_revision=next(_source_revisions),
             deleted_roots=[],
         )
         await replace_switchport_snapshot(
             db,
             device_id,
             (SwitchportSnapshot(interface_name="Gi0/3", mode="trunk", tagged_vlans=(10, 20)),),
+            source_revision=next(_source_revisions),
             deleted_roots=[],
         )
         lag_row = await db.scalar(
@@ -399,12 +462,14 @@ async def test_replacements_keep_loaded_child_collections_current(adapter_client
                     ),
                 ),
             ),
+            source_revision=next(_source_revisions),
             deleted_roots=[],
         )
         await replace_switchport_snapshot(
             db,
             device_id,
             (SwitchportSnapshot(interface_name="Gi0/3", mode="trunk", tagged_vlans=(20, 30)),),
+            source_revision=next(_source_revisions),
             deleted_roots=[],
         )
 
@@ -439,9 +504,21 @@ async def test_a_replacement_flushes_once_however_many_roots_it_writes(adapter_c
 
         event.listen(db.sync_session, "after_flush", count_flush)
         try:
-            await replace_lag_snapshot(db, device_id, bundles, deleted_roots=[])
+            await replace_lag_snapshot(
+                db,
+                device_id,
+                bundles,
+                source_revision=next(_source_revisions),
+                deleted_roots=[],
+            )
             lag_flushes = len(flushes)
-            await replace_switchport_snapshot(db, device_id, interfaces, deleted_roots=[])
+            await replace_switchport_snapshot(
+                db,
+                device_id,
+                interfaces,
+                source_revision=next(_source_revisions),
+                deleted_roots=[],
+            )
             switchport_flushes = len(flushes) - lag_flushes
         finally:
             event.remove(db.sync_session, "after_flush", count_flush)
@@ -489,7 +566,11 @@ async def test_the_encoders_accept_a_fragment_carrying_its_frozen_execution_cont
     device_id = await seed_device(nso_device_name="switching-encode-execution", netbox_device_id=1620)
     async with session() as db:
         await replace_lag_snapshot(
-            db, device_id, (LagBundleSnapshot(name="Port-channel1", lag_id=1),), deleted_roots=[]
+            db,
+            device_id,
+            (LagBundleSnapshot(name="Port-channel1", lag_id=1),),
+            source_revision=next(_source_revisions),
+            deleted_roots=[],
         )
         await db.commit()
     async with session() as db:
@@ -509,7 +590,11 @@ async def test_a_preparation_records_one_revision_with_no_push_sequence(adapter_
     device_id = await seed_device(nso_device_name="switching-prepare-revision", netbox_device_id=1621)
     async with session() as db:
         prepared = await replace_lag_snapshot(
-            db, device_id, (LagBundleSnapshot(name="Port-channel1", lag_id=1),), deleted_roots=[]
+            db,
+            device_id,
+            (LagBundleSnapshot(name="Port-channel1", lag_id=1),),
+            source_revision=next(_source_revisions),
+            deleted_roots=[],
         )
         await db.commit()
 
@@ -540,7 +625,13 @@ async def test_a_preparation_splits_the_authorized_rows_it_drops_into_three_grou
         ),
     )
     async with session() as db:
-        await replace_lag_snapshot(db, device_id, authorized, deleted_roots=[])
+        await replace_lag_snapshot(
+            db,
+            device_id,
+            authorized,
+            source_revision=next(_source_revisions),
+            deleted_roots=[],
+        )
         tables = await snapshot_stream(db, device_id, "lag")
         # The state an Apply promotion leaves behind: this stream's authorized fragment.
         await db.execute(
@@ -558,6 +649,7 @@ async def test_a_preparation_splits_the_authorized_rows_it_drops_into_three_grou
             db,
             device_id,
             (LagBundleSnapshot(name="C", lag_id=3, members=(LagMemberSnapshot(interface_name="Gi0/3"),)),),
+            source_revision=next(_source_revisions),
             deleted_roots=["A"],
         )
         await db.commit()
@@ -580,23 +672,31 @@ async def test_a_preparation_splits_the_authorized_rows_it_drops_into_three_grou
 
 
 @pytest.mark.anyio
-async def test_a_refused_preparation_leaves_the_store_and_every_revision_untouched(adapter_client):
-    from nso_adapter.core.switching_intent import SwitchingRequestRefused
+async def test_an_unauthorized_deleted_root_is_reported_without_a_delete_mark(adapter_client):
     from nso_adapter.store.models import DeviceProjectionStream
 
     submitted_root = "caller-root-credential-shaped"
     device_id = await seed_device(nso_device_name="switching-refusal", netbox_device_id=1623)
     async with session() as db:
         await replace_lag_snapshot(
-            db, device_id, (LagBundleSnapshot(name="Port-channel1", lag_id=1),), deleted_roots=[]
+            db,
+            device_id,
+            (LagBundleSnapshot(name="Port-channel1", lag_id=1),),
+            source_revision=next(_source_revisions),
+            deleted_roots=[],
         )
         await db.commit()
 
     async with session() as db:
-        with pytest.raises(SwitchingRequestRefused, match="not authorized") as exc_info:
-            await replace_lag_snapshot(db, device_id, (), deleted_roots=[submitted_root])
-        assert_chain_free_of(exc_info.value, [submitted_root])
-        await db.rollback()
+        prepared = await replace_lag_snapshot(
+            db,
+            device_id,
+            (),
+            source_revision=next(_source_revisions),
+            deleted_roots=[submitted_root],
+        )
+        await db.commit()
+    assert prepared.unauthorized_deleted_roots == [submitted_root]
 
     async with session() as db:
         row = await db.scalar(
@@ -610,8 +710,9 @@ async def test_a_refused_preparation_leaves_the_store_and_every_revision_untouch
             .scalars()
             .all()
         )
-    assert (row.desired_revision, row.prepared_revision) == (1, 1)
-    assert names == ["Port-channel1"]
+    assert (row.desired_revision, row.prepared_revision) == (2, 2)
+    assert row.prepared_deletions["delete_origin"] == {}
+    assert names == []
 
 
 @pytest.mark.anyio
@@ -623,7 +724,13 @@ async def test_repeated_deleted_root_refusal_does_not_echo_the_submitted_root(ad
 
     async with session() as db:
         with pytest.raises(SwitchingRequestRefused) as exc_info:
-            await replace_lag_snapshot(db, device_id, (), deleted_roots=[submitted_root, submitted_root])
+            await replace_lag_snapshot(
+                db,
+                device_id,
+                (),
+                source_revision=next(_source_revisions),
+                deleted_roots=[submitted_root, submitted_root],
+            )
 
     assert_chain_free_of(exc_info.value, [submitted_root])
 
@@ -641,6 +748,7 @@ async def test_retained_deleted_root_refusal_does_not_echo_the_submitted_root(ad
                 db,
                 device_id,
                 (LagBundleSnapshot(name=submitted_root, lag_id=1),),
+                source_revision=next(_source_revisions),
                 deleted_roots=[submitted_root],
             )
 
@@ -690,6 +798,7 @@ async def test_lag_replacement_rejects_duplicate_ids(adapter_client):
                     LagBundleSnapshot(name="Port-channel1", lag_id=7),
                     LagBundleSnapshot(name="Port-channel2", lag_id=7),
                 ),
+                source_revision=next(_source_revisions),
                 deleted_roots=[],
             )
         assert await db.scalar(select(LagBundleIntent.id).where(LagBundleIntent.device_id == device_id)) is None
@@ -711,6 +820,7 @@ async def test_lag_id_constraint_allows_nulls_and_other_devices(adapter_client):
                     LagBundleSnapshot(name="Port-channel2"),
                     LagBundleSnapshot(name="Port-channel3"),
                 ),
+                source_revision=next(_source_revisions),
                 deleted_roots=[],
             )
         await db.commit()
@@ -730,7 +840,13 @@ async def test_lag_replacement_can_swap_and_reassign_ids(adapter_client):
         (LagBundleSnapshot(name="Port-channel3", lag_id=1),),
     ):
         async with session() as db:
-            await replace_lag_snapshot(db, device_id, bundles, deleted_roots=[])
+            await replace_lag_snapshot(
+                db,
+                device_id,
+                bundles,
+                source_revision=next(_source_revisions),
+                deleted_roots=[],
+            )
             await db.commit()
         async with session() as db:
             rows = (await db.execute(select(LagBundleIntent).where(LagBundleIntent.device_id == device_id))).scalars()
