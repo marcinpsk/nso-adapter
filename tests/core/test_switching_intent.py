@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import ast
 import itertools
-from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -47,7 +46,6 @@ async def test_lag_replacement_rejects_duplicate_keys_without_mutating_snapshot(
             db,
             device_id,
             (original,),
-            snapshot_rows=[asdict(item) for item in ((original,))],
             source_revision=next(_source_revisions),
             deleted_roots=[],
         )
@@ -62,15 +60,6 @@ async def test_lag_replacement_rejects_duplicate_keys_without_mutating_snapshot(
                     LagBundleSnapshot(name="Port-channel2", lag_id=2),
                     LagBundleSnapshot(name="Port-channel2", lag_id=3),
                 ),
-                snapshot_rows=[
-                    asdict(item)
-                    for item in (
-                        (
-                            LagBundleSnapshot(name="Port-channel2", lag_id=2),
-                            LagBundleSnapshot(name="Port-channel2", lag_id=3),
-                        )
-                    )
-                ],
                 source_revision=next(_source_revisions),
                 deleted_roots=[],
             )
@@ -98,19 +87,6 @@ async def test_lag_replacement_rejects_one_interface_in_two_bundles(adapter_clie
                         name="Port-channel2", lag_id=2, members=(LagMemberSnapshot(interface_name="Gi0/1"),)
                     ),
                 ),
-                snapshot_rows=[
-                    asdict(item)
-                    for item in (
-                        (
-                            LagBundleSnapshot(
-                                name="Port-channel1", lag_id=1, members=(LagMemberSnapshot(interface_name="Gi0/1"),)
-                            ),
-                            LagBundleSnapshot(
-                                name="Port-channel2", lag_id=2, members=(LagMemberSnapshot(interface_name="Gi0/1"),)
-                            ),
-                        )
-                    )
-                ],
                 source_revision=next(_source_revisions),
                 deleted_roots=[],
             )
@@ -145,7 +121,6 @@ async def test_lag_replacement_rejects_invalid_yang_values_before_mutation(adapt
                 db,
                 device_id,
                 (bundle,),
-                snapshot_rows=[asdict(item) for item in ((bundle,))],
                 source_revision=next(_source_revisions),
                 deleted_roots=[],
             )
@@ -170,7 +145,6 @@ async def test_lag_replacement_preserves_identity_and_only_clears_evidence_on_ch
             db,
             device_id,
             (original,),
-            snapshot_rows=[asdict(item) for item in ((original,))],
             source_revision=next(_source_revisions),
             deleted_roots=[],
         )
@@ -192,7 +166,6 @@ async def test_lag_replacement_preserves_identity_and_only_clears_evidence_on_ch
             db,
             device_id,
             (original,),
-            snapshot_rows=[asdict(item) for item in ((original,))],
             source_revision=next(_source_revisions),
             deleted_roots=[],
         )
@@ -219,7 +192,6 @@ async def test_lag_replacement_preserves_identity_and_only_clears_evidence_on_ch
             db,
             device_id,
             (changed,),
-            snapshot_rows=[asdict(item) for item in ((changed,))],
             source_revision=next(_source_revisions),
             deleted_roots=[],
         )
@@ -279,7 +251,6 @@ async def test_switchport_replacement_rejects_invalid_graph_before_mutation(adap
                 db,
                 device_id,
                 interfaces,
-                snapshot_rows=[asdict(item) for item in (interfaces)],
                 source_revision=next(_source_revisions),
                 deleted_roots=[],
             )
@@ -311,22 +282,6 @@ async def test_the_encoders_are_canonical_and_omit_empty_values_and_families(ada
                     ),
                 ),
             ),
-            snapshot_rows=[
-                asdict(item)
-                for item in (
-                    (
-                        LagBundleSnapshot(name="Port-channel2", lag_id=7),
-                        LagBundleSnapshot(
-                            name="Port-channel1",
-                            lag_id=None,
-                            members=(
-                                LagMemberSnapshot(interface_name="Gi0/2"),
-                                LagMemberSnapshot(interface_name="Gi0/1", mode="active"),
-                            ),
-                        ),
-                    )
-                )
-            ],
             source_revision=next(_source_revisions),
             deleted_roots=[],
         )
@@ -337,15 +292,6 @@ async def test_the_encoders_are_canonical_and_omit_empty_values_and_families(ada
                 SwitchportSnapshot(interface_name="Gi0/2", tagged_vlans=(30, 20)),
                 SwitchportSnapshot(interface_name="Gi0/1", mode="access", untagged_vlan=10),
             ),
-            snapshot_rows=[
-                asdict(item)
-                for item in (
-                    (
-                        SwitchportSnapshot(interface_name="Gi0/2", tagged_vlans=(30, 20)),
-                        SwitchportSnapshot(interface_name="Gi0/1", mode="access", untagged_vlan=10),
-                    )
-                )
-            ],
             source_revision=next(_source_revisions),
             deleted_roots=[],
         )
@@ -394,7 +340,6 @@ async def test_switchport_replacement_preserves_root_and_retained_tag_identity(a
             db,
             device_id,
             (original,),
-            snapshot_rows=[asdict(item) for item in ((original,))],
             source_revision=next(_source_revisions),
             deleted_roots=[],
         )
@@ -416,7 +361,6 @@ async def test_switchport_replacement_preserves_root_and_retained_tag_identity(a
             db,
             device_id,
             (original,),
-            snapshot_rows=[asdict(item) for item in ((original,))],
             source_revision=next(_source_revisions),
             deleted_roots=[],
         )
@@ -440,7 +384,6 @@ async def test_switchport_replacement_preserves_root_and_retained_tag_identity(a
             db,
             device_id,
             (changed,),
-            snapshot_rows=[asdict(item) for item in ((changed,))],
             source_revision=next(_source_revisions),
             deleted_roots=[],
         )
@@ -483,21 +426,6 @@ async def test_replacements_keep_loaded_child_collections_current(adapter_client
                     ),
                 ),
             ),
-            snapshot_rows=[
-                asdict(item)
-                for item in (
-                    (
-                        LagBundleSnapshot(
-                            name="Port-channel1",
-                            lag_id=1,
-                            members=(
-                                LagMemberSnapshot(interface_name="Gi0/1"),
-                                LagMemberSnapshot(interface_name="Gi0/2"),
-                            ),
-                        ),
-                    )
-                )
-            ],
             source_revision=next(_source_revisions),
             deleted_roots=[],
         )
@@ -505,10 +433,6 @@ async def test_replacements_keep_loaded_child_collections_current(adapter_client
             db,
             device_id,
             (SwitchportSnapshot(interface_name="Gi0/3", mode="trunk", tagged_vlans=(10, 20)),),
-            snapshot_rows=[
-                asdict(item)
-                for item in ((SwitchportSnapshot(interface_name="Gi0/3", mode="trunk", tagged_vlans=(10, 20)),))
-            ],
             source_revision=next(_source_revisions),
             deleted_roots=[],
         )
@@ -538,21 +462,6 @@ async def test_replacements_keep_loaded_child_collections_current(adapter_client
                     ),
                 ),
             ),
-            snapshot_rows=[
-                asdict(item)
-                for item in (
-                    (
-                        LagBundleSnapshot(
-                            name="Port-channel1",
-                            lag_id=1,
-                            members=(
-                                LagMemberSnapshot(interface_name="Gi0/2"),
-                                LagMemberSnapshot(interface_name="Gi0/4"),
-                            ),
-                        ),
-                    )
-                )
-            ],
             source_revision=next(_source_revisions),
             deleted_roots=[],
         )
@@ -560,10 +469,6 @@ async def test_replacements_keep_loaded_child_collections_current(adapter_client
             db,
             device_id,
             (SwitchportSnapshot(interface_name="Gi0/3", mode="trunk", tagged_vlans=(20, 30)),),
-            snapshot_rows=[
-                asdict(item)
-                for item in ((SwitchportSnapshot(interface_name="Gi0/3", mode="trunk", tagged_vlans=(20, 30)),))
-            ],
             source_revision=next(_source_revisions),
             deleted_roots=[],
         )
@@ -603,7 +508,6 @@ async def test_a_replacement_flushes_once_however_many_roots_it_writes(adapter_c
                 db,
                 device_id,
                 bundles,
-                snapshot_rows=[asdict(item) for item in (bundles)],
                 source_revision=next(_source_revisions),
                 deleted_roots=[],
             )
@@ -612,7 +516,6 @@ async def test_a_replacement_flushes_once_however_many_roots_it_writes(adapter_c
                 db,
                 device_id,
                 interfaces,
-                snapshot_rows=[asdict(item) for item in (interfaces)],
                 source_revision=next(_source_revisions),
                 deleted_roots=[],
             )
@@ -666,7 +569,6 @@ async def test_the_encoders_accept_a_fragment_carrying_its_frozen_execution_cont
             db,
             device_id,
             (LagBundleSnapshot(name="Port-channel1", lag_id=1),),
-            snapshot_rows=[asdict(item) for item in ((LagBundleSnapshot(name="Port-channel1", lag_id=1),))],
             source_revision=next(_source_revisions),
             deleted_roots=[],
         )
@@ -691,7 +593,6 @@ async def test_a_preparation_records_one_revision_with_no_push_sequence(adapter_
             db,
             device_id,
             (LagBundleSnapshot(name="Port-channel1", lag_id=1),),
-            snapshot_rows=[asdict(item) for item in ((LagBundleSnapshot(name="Port-channel1", lag_id=1),))],
             source_revision=next(_source_revisions),
             deleted_roots=[],
         )
@@ -728,7 +629,6 @@ async def test_a_preparation_splits_the_authorized_rows_it_drops_into_three_grou
             db,
             device_id,
             authorized,
-            snapshot_rows=[asdict(item) for item in (authorized)],
             source_revision=next(_source_revisions),
             deleted_roots=[],
         )
@@ -749,12 +649,6 @@ async def test_a_preparation_splits_the_authorized_rows_it_drops_into_three_grou
             db,
             device_id,
             (LagBundleSnapshot(name="C", lag_id=3, members=(LagMemberSnapshot(interface_name="Gi0/3"),)),),
-            snapshot_rows=[
-                asdict(item)
-                for item in (
-                    (LagBundleSnapshot(name="C", lag_id=3, members=(LagMemberSnapshot(interface_name="Gi0/3"),)),)
-                )
-            ],
             source_revision=next(_source_revisions),
             deleted_roots=["A"],
         )
@@ -788,7 +682,6 @@ async def test_an_unauthorized_deleted_root_is_reported_without_a_delete_mark(ad
             db,
             device_id,
             (LagBundleSnapshot(name="Port-channel1", lag_id=1),),
-            snapshot_rows=[asdict(item) for item in ((LagBundleSnapshot(name="Port-channel1", lag_id=1),))],
             source_revision=next(_source_revisions),
             deleted_roots=[],
         )
@@ -799,7 +692,6 @@ async def test_an_unauthorized_deleted_root_is_reported_without_a_delete_mark(ad
             db,
             device_id,
             (),
-            snapshot_rows=[asdict(item) for item in (())],
             source_revision=next(_source_revisions),
             deleted_roots=[submitted_root],
         )
@@ -836,7 +728,6 @@ async def test_repeated_deleted_root_refusal_does_not_echo_the_submitted_root(ad
                 db,
                 device_id,
                 (),
-                snapshot_rows=[asdict(item) for item in (())],
                 source_revision=next(_source_revisions),
                 deleted_roots=[submitted_root, submitted_root],
             )
@@ -857,7 +748,6 @@ async def test_retained_deleted_root_refusal_does_not_echo_the_submitted_root(ad
                 db,
                 device_id,
                 (LagBundleSnapshot(name=submitted_root, lag_id=1),),
-                snapshot_rows=[asdict(item) for item in ((LagBundleSnapshot(name=submitted_root, lag_id=1),))],
                 source_revision=next(_source_revisions),
                 deleted_roots=[submitted_root],
             )
@@ -908,15 +798,6 @@ async def test_lag_replacement_rejects_duplicate_ids(adapter_client):
                     LagBundleSnapshot(name="Port-channel1", lag_id=7),
                     LagBundleSnapshot(name="Port-channel2", lag_id=7),
                 ),
-                snapshot_rows=[
-                    asdict(item)
-                    for item in (
-                        (
-                            LagBundleSnapshot(name="Port-channel1", lag_id=7),
-                            LagBundleSnapshot(name="Port-channel2", lag_id=7),
-                        )
-                    )
-                ],
                 source_revision=next(_source_revisions),
                 deleted_roots=[],
             )
@@ -939,16 +820,6 @@ async def test_lag_id_constraint_allows_nulls_and_other_devices(adapter_client):
                     LagBundleSnapshot(name="Port-channel2"),
                     LagBundleSnapshot(name="Port-channel3"),
                 ),
-                snapshot_rows=[
-                    asdict(item)
-                    for item in (
-                        (
-                            LagBundleSnapshot(name="Port-channel1", lag_id=7),
-                            LagBundleSnapshot(name="Port-channel2"),
-                            LagBundleSnapshot(name="Port-channel3"),
-                        )
-                    )
-                ],
                 source_revision=next(_source_revisions),
                 deleted_roots=[],
             )
@@ -973,7 +844,6 @@ async def test_lag_replacement_can_swap_and_reassign_ids(adapter_client):
                 db,
                 device_id,
                 bundles,
-                snapshot_rows=[asdict(item) for item in (bundles)],
                 source_revision=next(_source_revisions),
                 deleted_roots=[],
             )

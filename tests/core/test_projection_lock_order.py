@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import itertools
 from contextlib import nullcontext
-from dataclasses import asdict
 from unittest.mock import patch
 
 import pytest
@@ -309,7 +308,6 @@ async def test_switching_writer_commits_before_real_offboard(adapter_client, riv
                     writer,
                     device_id,
                     (LagBundleSnapshot(name="Port-channel1", lag_id=1),),
-                    snapshot_rows=[asdict(item) for item in ((LagBundleSnapshot(name="Port-channel1", lag_id=1),))],
                     source_revision=next(_source_revisions),
                     deleted_roots=[],
                 )
@@ -362,18 +360,6 @@ async def test_document_snapshot_waits_for_a_switching_replacement(adapter_clien
                     members=(LagMemberSnapshot(interface_name="Gi0/1", mode="active"),),
                 ),
             ),
-            snapshot_rows=[
-                asdict(item)
-                for item in (
-                    (
-                        LagBundleSnapshot(
-                            name="Port-channel1",
-                            lag_id=1,
-                            members=(LagMemberSnapshot(interface_name="Gi0/1", mode="active"),),
-                        ),
-                    )
-                )
-            ],
             source_revision=next(_source_revisions),
             deleted_roots=[],
         )

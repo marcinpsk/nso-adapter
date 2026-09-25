@@ -48,26 +48,14 @@ async def _replace(
             )
             for index, (name, children) in enumerate(roots.items(), 1)
         )
-        rows = [
-            {
-                "name": bundle.name,
-                "lag_id": bundle.lag_id,
-                "members": [{"interface_name": member.interface_name} for member in bundle.members],
-            }
-            for bundle in bundles
-        ]
         return await replace_lag_snapshot(
-            db, device_id, bundles, source_revision=source_revision, deleted_roots=deleted_roots, snapshot_rows=rows
+            db, device_id, bundles, source_revision=source_revision, deleted_roots=deleted_roots
         )
     interfaces = tuple(
         SwitchportSnapshot(interface_name=name, tagged_vlans=tuple(children)) for name, children in roots.items()
     )
-    rows = [
-        {"interface_name": interface.interface_name, "tagged_vlans": list(interface.tagged_vlans)}
-        for interface in interfaces
-    ]
     return await replace_switchport_snapshot(
-        db, device_id, interfaces, source_revision=source_revision, deleted_roots=deleted_roots, snapshot_rows=rows
+        db, device_id, interfaces, source_revision=source_revision, deleted_roots=deleted_roots
     )
 
 
@@ -267,28 +255,17 @@ async def test_equal_source_accepts_empty_null_omitted_and_identical_snapshots(a
     assert first.status_code == 200, first.text
     first_revision = first.json()["selection_revision"]
 
-    # A core caller must give the same validated digest rows as the API caller.
     if stream == "lag":
-        from nso_adapter.api.lag_config import LagBundleApply
-
-        canonical = LagBundleApply.model_validate(root).model_dump(mode="json")
         snapshot = LagBundleSnapshot(
             name="A", lag_id=1, timer="", members=(LagMemberSnapshot(interface_name="Gi0/1", mode=""),)
         )
         async with session() as db:
-            await replace_lag_snapshot(
-                db, device_id, (snapshot,), source_revision=40, deleted_roots=[], snapshot_rows=[canonical]
-            )
+            await replace_lag_snapshot(db, device_id, (snapshot,), source_revision=40, deleted_roots=[])
             await db.commit()
     else:
-        from nso_adapter.api.vlan import SwitchportApply
-
-        canonical = SwitchportApply.model_validate(root).model_dump(mode="json")
         snapshot = SwitchportSnapshot(interface_name="A", mode="", tagged_vlans=(1,))
         async with session() as db:
-            await replace_switchport_snapshot(
-                db, device_id, (snapshot,), source_revision=40, deleted_roots=[], snapshot_rows=[canonical]
-            )
+            await replace_switchport_snapshot(db, device_id, (snapshot,), source_revision=40, deleted_roots=[])
             await db.commit()
 
     explicit_null = (
@@ -351,3 +328,39 @@ async def test_equal_source_accepts_reordered_roots_and_children_but_refuses_cha
     response = await post(changed)
     assert response.status_code == 409, response.text
     assert response.json()["error"]["detail"] == {"reason": "revision_conflict"}
+
+
+@pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
+async def test_core_equal_source_reordered_snapshot_keeps_digest(adapter_client, stream):
+    device_id = await seed_device(nso_device_name=f"core-same-source-order-{stream}", netbox_device_id=None)
+    if stream == "lag":
+        items = (
+            LagBundleSnapshot(name="A", lag_id=1, members=(LagMemberSnapshot("Gi0/1"), LagMemberSnapshot("Gi0/2"))),
+            LagBundleSnapshot(name="B", lag_id=2, members=(LagMemberSnapshot("Gi0/3"), LagMemberSnapshot("Gi0/4"))),
+        )
+        replace = replace_lag_snapshot
+        reordered = tuple(
+            LagBundleSnapshot(name=item.name, lag_id=item.lag_id, members=tuple(reversed(item.members)))
+            for item in reversed(items)
+        )
+    else:
+        items = (
+            SwitchportSnapshot(interface_name="A", tagged_vlans=(10, 20)),
+            SwitchportSnapshot(interface_name="B", tagged_vlans=(30, 40)),
+        )
+        replace = replace_switchport_snapshot
+        reordered = tuple(
+            SwitchportSnapshot(interface_name=item.interface_name, tagged_vlans=tuple(reversed(item.tagged_vlans)))
+            for item in reversed(items)
+        )
+
+    async with session() as db:
+        await replace(db, device_id, items, source_revision=40, deleted_roots=[])
+        await db.commit()
+    first_digest = (await _stream(device_id, stream)).prepared_source_digest
+    assert first_digest is not None
+
+    async with session() as db:
+        await replace(db, device_id, reordered, source_revision=40, deleted_roots=[])
+        await db.commit()
+    assert (await _stream(device_id, stream)).prepared_source_digest == first_digest

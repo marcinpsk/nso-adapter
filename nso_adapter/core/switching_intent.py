@@ -21,7 +21,7 @@ import json
 from collections import Counter
 from collections.abc import Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy import select
@@ -158,8 +158,9 @@ class PreparedSnapshot:
     unauthorized_deleted_roots: list[str]
 
 
-def _snapshot_digest(rows: Sequence[dict], stream: str) -> str:
-    """Hash validated rows (empty strings as null) by bundle name/interface_name and member name/numeric VLAN."""
+def _snapshot_digest(items: Sequence[LagBundleSnapshot] | Sequence[SwitchportSnapshot], stream: str) -> str:
+    """Hash validated snapshots in canonical root and child order."""
+    rows = [asdict(item) for item in items]
     if stream == LAG_STREAM:
         ordered = [
             {**row, "members": sorted(row["members"], key=lambda member: member["interface_name"])}
@@ -409,7 +410,6 @@ async def replace_lag_snapshot(
     *,
     deleted_roots: Sequence[str],
     source_revision: int,
-    snapshot_rows: Sequence[dict],
 ) -> PreparedSnapshot:
     """Prepare one device's complete LAG snapshot. Caller commits."""
     _validate_lag_snapshot(bundles)
@@ -419,7 +419,7 @@ async def replace_lag_snapshot(
         LAG_STREAM,
         deleted_roots=deleted_roots,
         source_revision=source_revision,
-        source_digest=_snapshot_digest(snapshot_rows, LAG_STREAM),
+        source_digest=_snapshot_digest(bundles, LAG_STREAM),
         desired_roots={bundle.name for bundle in bundles},
         replace=lambda: _replace_lag_rows(db, device_id, bundles),
     )
@@ -491,7 +491,6 @@ async def replace_switchport_snapshot(
     *,
     deleted_roots: Sequence[str],
     source_revision: int,
-    snapshot_rows: Sequence[dict],
 ) -> PreparedSnapshot:
     """Prepare one device's complete switchport snapshot. Caller commits."""
     _validate_switchport_snapshot(interfaces)
@@ -501,7 +500,7 @@ async def replace_switchport_snapshot(
         SWITCHPORT_STREAM,
         deleted_roots=deleted_roots,
         source_revision=source_revision,
-        source_digest=_snapshot_digest(snapshot_rows, SWITCHPORT_STREAM),
+        source_digest=_snapshot_digest(interfaces, SWITCHPORT_STREAM),
         desired_roots={interface.interface_name for interface in interfaces},
         replace=lambda: _replace_switchport_rows(db, device_id, interfaces),
     )

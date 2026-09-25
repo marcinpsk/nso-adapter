@@ -220,7 +220,6 @@ async def apply_switchport(
             interfaces,
             deleted_roots=payload.deleted_roots,
             source_revision=payload.source_revision,
-            snapshot_rows=[interface.model_dump(mode="json") for interface in payload.interfaces],
         )
     except DeviceProjectionGone:
         # Built in the handler, raised after it: a raise inside attaches the caught exception.

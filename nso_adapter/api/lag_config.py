@@ -245,7 +245,6 @@ async def apply_lag_config(
             bundles,
             deleted_roots=payload.deleted_roots,
             source_revision=payload.source_revision,
-            snapshot_rows=[bundle.model_dump(mode="json") for bundle in payload.bundles],
         )
     except DeviceProjectionGone:
         # Built in the handler, raised after it: a raise inside attaches the caught exception.
