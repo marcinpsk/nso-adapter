@@ -1493,6 +1493,14 @@
           "status": {
             "$ref": "#/components/schemas/GenerationStatus"
           },
+          "stream_revisions": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "description": "Stream revision each generation carries, keyed by intent stream.",
+            "title": "Stream Revisions",
+            "type": "object"
+          },
           "updated_at": {
             "title": "Updated At",
             "type": "string"
@@ -1504,6 +1512,7 @@
           "status",
           "sections",
           "source_push_seq",
+          "stream_revisions",
           "carrier_job_id",
           "carrier_job_status",
           "carrier_job_result",

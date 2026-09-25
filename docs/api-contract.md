@@ -508,6 +508,7 @@ The response contains:
           "status": "failed",
           "sections": ["vlan"],
           "source_push_seq": {"vlan": 501},
+          "stream_revisions": {"vlan": 12},
           "carrier_job_id": 900,
           "carrier_job_status": "failed",
           "carrier_job_result": null,
@@ -528,7 +529,9 @@ device-writing job that the barrier refuses appears in `held_jobs` and does not 
 `write_work_pending` true. `pending_generations` counts non-crossable generations after
 the head. No part of this response is paginated.
 
-`sections` contains unique document section names. `source_push_seq` is keyed by intent stream.
+`sections` contains unique document section names. `source_push_seq` and
+`stream_revisions` are keyed by intent stream. `stream_revisions` identifies the
+stream revision that each attempt generation carries.
 This preserves both stream values when `interface_config` and `ip` map to the
 `interface_config` section, or when `isis` and `isis_flex_algo` map to the `isis` section.
 

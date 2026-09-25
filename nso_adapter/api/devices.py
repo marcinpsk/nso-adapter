@@ -254,6 +254,9 @@ class DeploymentEvidenceGenerationOut(BaseModel):
     status: GenerationStatus
     sections: list[str]
     source_push_seq: dict[str, int | None] = Field(description="Plugin X-Push-Seq keyed by intent stream.")
+    stream_revisions: dict[str, int] = Field(
+        description="Stream revision each generation carries, keyed by intent stream."
+    )
     carrier_job_id: int | None
     carrier_job_status: str | None
     carrier_job_result: dict | None
@@ -376,6 +379,7 @@ def _attempt_generation_out(generation: DeploymentGeneration) -> dict:
         "status": generation.status,
         "sections": _generation_sections(generation),
         "source_push_seq": _generation_source_push_seq(generation),
+        "stream_revisions": generation.stream_revisions,
         "carrier_job_id": generation.carrier_job_id,
         "carrier_job_status": generation.carrier_job_status,
         "carrier_job_result": generation.carrier_job_result,
