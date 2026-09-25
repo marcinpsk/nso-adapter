@@ -168,6 +168,7 @@ async def test_evidence_serves_terminal_attempt_after_carrier_deletion(adapter_c
                         "status": "failed",
                         "sections": ["vlan"],
                         "source_push_seq": {"vlan": 71},
+                        "stream_revisions": {"vlan": 4},
                         "carrier_job_id": job_id,
                         "carrier_job_status": "failed",
                         "carrier_job_result": result,
@@ -181,7 +182,16 @@ async def test_evidence_serves_terminal_attempt_after_carrier_deletion(adapter_c
     }
 
 
-async def test_evidence_preserves_split_stream_provenance_without_duplicate_sections(adapter_client):
+@pytest.mark.parametrize(
+    ("stream_revisions", "source_push_seq", "sections"),
+    [
+        ({"interface_config": 7, "ip": 8}, {"interface_config": 201, "ip": 202}, ["interface_config"]),
+        ({"lag": 7, "switchport": 8}, {"lag": 201, "switchport": 202}, ["lag", "switchport"]),
+    ],
+)
+async def test_evidence_preserves_stream_revisions_and_provenance(
+    adapter_client, stream_revisions, source_push_seq, sections
+):
     from nso_adapter.store.models import DeploymentApplyAttempt, GenerationStatus
 
     device_id = await seed_device(nso_device_name="evidence-split-streams", netbox_device_id=16240)
@@ -190,7 +200,7 @@ async def test_evidence_preserves_split_stream_provenance_without_duplicate_sect
         attempt = DeploymentApplyAttempt(
             id=attempt_id,
             device_id=device_id,
-            selected={"interface_config": 201, "ip": 202},
+            selected=source_push_seq,
             admission_state="admitted",
             http_status=202,
             response={},
@@ -201,8 +211,8 @@ async def test_evidence_preserves_split_stream_provenance_without_duplicate_sect
             1,
             GenerationStatus.failed,
             apply_attempt_id=attempt_id,
-            source_push_seq={"interface_config": 201, "ip": 202},
-            stream_revisions={"interface_config": 7, "ip": 8},
+            source_push_seq=source_push_seq,
+            stream_revisions=stream_revisions,
         )
         db.add(generation)
         await db.flush()
@@ -218,8 +228,9 @@ async def test_evidence_preserves_split_stream_provenance_without_duplicate_sect
     assert response.status_code == 200, response.text
     body = response.json()
     for served_generation in (body["head"], body["attempts"][0]["generations"][0]):
-        assert served_generation["sections"] == ["interface_config"]
-        assert served_generation["source_push_seq"] == {"interface_config": 201, "ip": 202}
+        assert served_generation["sections"] == sections
+        assert served_generation["source_push_seq"] == source_push_seq
+    assert body["attempts"][0]["generations"][0]["stream_revisions"] == stream_revisions
 
 
 @pytest.mark.parametrize(
@@ -340,6 +351,7 @@ async def test_terminal_snapshots_survive_carrier_deletion_in_evidence(
             "status": generation_status,
             "sections": ["vlan"],
             "source_push_seq": {"vlan": 73},
+            "stream_revisions": {"vlan": 5},
             "carrier_job_id": job_id,
             "carrier_job_status": job_status,
             "carrier_job_result": result,
@@ -860,6 +872,11 @@ def test_evidence_openapi_pins_the_bound_and_non_actionable_contract():
         assert schema["components"]["schemas"][component]["properties"]["source_push_seq"]["description"] == (
             "Plugin X-Push-Seq keyed by intent stream."
         )
+    generation_schema = schema["components"]["schemas"]["DeploymentEvidenceGenerationOut"]
+    assert generation_schema["properties"]["stream_revisions"]["description"] == (
+        "Stream revision each generation carries, keyed by intent stream."
+    )
+    assert "stream_revisions" in generation_schema["required"]
 
 
 def test_api_contract_documents_unknown_attempts_and_retention():

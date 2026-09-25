@@ -552,8 +552,10 @@ class DeviceProjectionStream(Base):
     __table_args__ = (
         UniqueConstraint("device_id", "stream", name="uq_projection_stream"),
         CheckConstraint(
-            "(prepared_revision IS NULL AND prepared_tables IS NULL AND prepared_deletions IS NULL) OR "
-            "(prepared_revision IS NOT NULL AND prepared_tables IS NOT NULL AND prepared_deletions IS NOT NULL)",
+            "(prepared_revision IS NULL AND prepared_tables IS NULL AND prepared_deletions IS NULL AND "
+            "prepared_source_revision IS NULL AND prepared_source_digest IS NULL) OR "
+            "(prepared_revision IS NOT NULL AND prepared_tables IS NOT NULL AND prepared_deletions IS NOT NULL AND "
+            "prepared_source_revision IS NOT NULL AND prepared_source_digest IS NOT NULL)",
             name="ck_projection_stream_prepared_slot",
         ),
         CheckConstraint(
@@ -587,6 +589,8 @@ class DeviceProjectionStream(Base):
     prepared_revision: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     prepared_tables: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     prepared_deletions: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    prepared_source_revision: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    prepared_source_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
 

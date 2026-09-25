@@ -4,13 +4,15 @@
 
 from __future__ import annotations
 
+from itertools import count
+
 import pytest
 from sqlalchemy import text
 
-from tests._secret_discipline import assert_text_free_of
 from tests.conftest import VALID_TOKEN, push_seq, seed_device, seed_switchport, seed_vlan_database, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
+_source_revisions = count(1000)
 
 
 @pytest.mark.anyio
@@ -76,6 +78,7 @@ async def test_apply_switchport_stores_full_snapshot(adapter_client):
             {"interface_name": "Gi0/1", "mode": "access", "untagged_vlan": 10, "tagged_vlans": []},
             {"interface_name": "Gi0/2", "mode": "trunk", "untagged_vlan": 99, "tagged_vlans": [20, 30]},
         ],
+        "source_revision": 1,
         "deleted_roots": [],
     }
     resp = await adapter_client.post(f"/api/v1/devices/{device_id}/switchport/apply", json=body, headers=AUTH)
@@ -89,6 +92,7 @@ async def test_apply_switchport_stores_full_snapshot(adapter_client):
         "removed": 0,
         "desired_revision": 1,
         "selection_revision": 1,
+        "unauthorized_deleted_roots": [],
     }
 
     async with session() as db:
@@ -137,7 +141,7 @@ async def test_apply_switchport_stores_full_snapshot(adapter_client):
 async def test_apply_switchport_device_not_found(adapter_client):
     resp = await adapter_client.post(
         "/api/v1/devices/999999/switchport/apply",
-        json={"interfaces": [], "deleted_roots": []},
+        json={"interfaces": [], "source_revision": 1, "deleted_roots": []},
         headers=AUTH,
     )
     assert resp.status_code == 404
@@ -148,7 +152,11 @@ async def test_apply_switchport_requires_explicit_snapshot_without_mutating_stor
     device_id = await seed_device(nso_device_name="switchport-required-snapshot", netbox_device_id=None)
     stored = await adapter_client.post(
         f"/api/v1/devices/{device_id}/switchport/apply",
-        json={"interfaces": [{"interface_name": "Gi0/1", "untagged_vlan": 10}], "deleted_roots": []},
+        json={
+            "interfaces": [{"interface_name": "Gi0/1", "untagged_vlan": 10}],
+            "source_revision": 1,
+            "deleted_roots": [],
+        },
         headers=AUTH,
     )
     assert stored.status_code == 200
@@ -196,7 +204,7 @@ async def test_apply_switchport_rejects_invalid_graph_without_mutating_store(ada
     device_id = await seed_device(nso_device_name="switchport-invalid-request", netbox_device_id=None)
     response = await adapter_client.post(
         f"/api/v1/devices/{device_id}/switchport/apply",
-        json={"interfaces": interfaces, "deleted_roots": []},
+        json={"interfaces": interfaces, "source_revision": 1, "deleted_roots": []},
         headers=AUTH,
     )
 
@@ -218,6 +226,7 @@ async def test_apply_switchport_full_replace_reports_removed_roots(adapter_clien
             {"interface_name": "Gi0/1", "untagged_vlan": 10},
             {"interface_name": "Gi0/2", "tagged_vlans": [20, 30]},
         ],
+        "source_revision": 1,
         "deleted_roots": [],
     }
     response = await adapter_client.post(
@@ -229,7 +238,11 @@ async def test_apply_switchport_full_replace_reports_removed_roots(adapter_clien
 
     response = await adapter_client.post(
         f"/api/v1/devices/{device_id}/switchport/apply",
-        json={"interfaces": [{"interface_name": "Gi0/2", "tagged_vlans": [30]}], "deleted_roots": []},
+        json={
+            "interfaces": [{"interface_name": "Gi0/2", "tagged_vlans": [30]}],
+            "source_revision": 2,
+            "deleted_roots": [],
+        },
         headers=AUTH,
     )
     assert (response.json()["count"], response.json()["removed"]) == (1, 1)
@@ -309,6 +322,7 @@ async def test_apply_switchport_accepts_the_trunk_all_mode(adapter_client):
         f"/api/v1/devices/{device_id}/switchport/apply",
         json={
             "interfaces": [{"interface_name": "Gi0/1", "mode": "trunk-all", "tagged_vlans": []}],
+            "source_revision": 1,
             "deleted_roots": [],
         },
         headers=AUTH,
@@ -343,7 +357,11 @@ async def test_apply_switchport_treats_an_empty_mode_as_unset(adapter_client):
     device_id = await seed_device(nso_device_name="switchport-empty-mode", netbox_device_id=1213)
     stored = await adapter_client.post(
         f"/api/v1/devices/{device_id}/switchport/apply",
-        json={"interfaces": [{"interface_name": "Gi0/1", "untagged_vlan": 10}], "deleted_roots": []},
+        json={
+            "interfaces": [{"interface_name": "Gi0/1", "untagged_vlan": 10}],
+            "source_revision": 1,
+            "deleted_roots": [],
+        },
         headers=AUTH,
     )
     assert stored.status_code == 200, stored.text
@@ -359,7 +377,11 @@ async def test_apply_switchport_treats_an_empty_mode_as_unset(adapter_client):
 
     response = await adapter_client.post(
         f"/api/v1/devices/{device_id}/switchport/apply",
-        json={"interfaces": [{"interface_name": "Gi0/1", "mode": "", "untagged_vlan": 10}], "deleted_roots": []},
+        json={
+            "interfaces": [{"interface_name": "Gi0/1", "mode": "", "untagged_vlan": 10}],
+            "source_revision": 2,
+            "deleted_roots": [],
+        },
         headers=AUTH,
     )
 
@@ -387,6 +409,7 @@ async def test_apply_lag_config_treats_an_empty_member_mode_as_unset(adapter_cli
     device_id = await seed_device(nso_device_name="lag-empty-member-mode", netbox_device_id=1214)
     body = {
         "bundles": [{"name": "Port-channel1", "lag_id": 1, "members": [{"interface_name": "Gi0/1"}]}],
+        "source_revision": 1,
         "deleted_roots": [],
     }
     stored = await adapter_client.post(f"/api/v1/devices/{device_id}/lag-config/apply", json=body, headers=AUTH)
@@ -402,6 +425,7 @@ async def test_apply_lag_config_treats_an_empty_member_mode_as_unset(adapter_cli
         await db.commit()
 
     body["bundles"][0]["members"][0]["mode"] = ""
+    body["source_revision"] = 2
     response = await adapter_client.post(f"/api/v1/devices/{device_id}/lag-config/apply", json=body, headers=AUTH)
 
     assert response.status_code == 200, response.text
@@ -427,13 +451,22 @@ async def test_apply_lag_config_treats_an_empty_member_mode_as_unset(adapter_cli
 
 _SWITCHPORT_A = {
     "interfaces": [{"interface_name": "Gi0/1", "mode": "access", "untagged_vlan": 10}],
+    "source_revision": 1,
     "deleted_roots": [],
 }
-_SWITCHPORT_B = {"interfaces": [{"interface_name": "Gi0/2", "tagged_vlans": [20]}], "deleted_roots": []}
+_SWITCHPORT_B = {
+    "interfaces": [{"interface_name": "Gi0/2", "tagged_vlans": [20]}],
+    "source_revision": 1,
+    "deleted_roots": [],
+}
 
 
 async def _post_switchport(client, device_id: int, body: dict, *, query: str = ""):
-    return await client.post(f"/api/v1/devices/{device_id}/switchport/apply{query}", json=body, headers=AUTH)
+    return await client.post(
+        f"/api/v1/devices/{device_id}/switchport/apply{query}",
+        json={"source_revision": next(_source_revisions), **body},
+        headers=AUTH,
+    )
 
 
 async def _switchport_stream_row(device_id: int):
@@ -451,6 +484,20 @@ async def _switchport_stream_row(device_id: int):
 
 
 @pytest.mark.anyio
+async def test_switchport_reports_unauthorized_deleted_roots_without_marking_them(adapter_client):
+    device_id = await seed_device(nso_device_name="switchport-unauthorized-deletion", netbox_device_id=None)
+    response = await _post_switchport(
+        adapter_client,
+        device_id,
+        {"interfaces": [], "deleted_roots": ["Gi0/9", "Gi0/3"], "source_revision": 1},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["unauthorized_deleted_roots"] == ["Gi0/3", "Gi0/9"]
+    assert (await _switchport_stream_row(device_id)).prepared_deletions["delete_origin"] == {}
+
+
+@pytest.mark.anyio
 async def test_apply_switchport_prepares_a_selectable_snapshot(adapter_client):
     device_id = await seed_device(nso_device_name="switchport-prepared", netbox_device_id=1622)
 
@@ -465,6 +512,7 @@ async def test_apply_switchport_prepares_a_selectable_snapshot(adapter_client):
         "removed": 0,
         "desired_revision": 1,
         "selection_revision": 1,
+        "unauthorized_deleted_roots": [],
     }
     row = await _switchport_stream_row(device_id)
     assert (row.desired_revision, row.authorized_revision, row.prepared_revision) == (1, 0, 1)
@@ -489,6 +537,7 @@ async def test_apply_switchport_store_only_preserves_the_prepared_slot(adapter_c
         "removed": 1,
         "desired_revision": 2,
         "selection_revision": None,
+        "unauthorized_deleted_roots": [],
     }
     row = await _switchport_stream_row(device_id)
     assert row.prepared_revision == 1
@@ -544,6 +593,7 @@ async def test_apply_switchport_store_only_accepts_a_deletion_authority_and_reco
         "removed": 1,
         "desired_revision": 2,
         "selection_revision": None,
+        "unauthorized_deleted_roots": [],
     }
     row = await _switchport_stream_row(device_id)
     assert (row.desired_revision, row.authorized_revision, row.prepared_revision) == (2, 1, 1)
@@ -569,20 +619,16 @@ async def test_apply_switchport_requires_an_explicit_deletion_authority(adapter_
 
 
 @pytest.mark.anyio
-async def test_apply_switchport_refusal_states_the_reason_and_not_the_root(adapter_client):
-    """The 422 forwarded str(exc), which interpolates the roots the request sent."""
-    device_id = await seed_device(nso_device_name="switchport-refusal-echo", netbox_device_id=None)
+async def test_apply_switchport_reports_unauthorized_deletion_names(adapter_client):
+    device_id = await seed_device(nso_device_name="switchport-unowned-root", netbox_device_id=None)
     assert (await _post_switchport(adapter_client, device_id, _SWITCHPORT_A)).status_code == 200
 
     response = await _post_switchport(
         adapter_client,
         device_id,
-        {"interfaces": [], "deleted_roots": ["placeholder-unauthorized-root"]},
+        {"interfaces": [], "deleted_roots": ["unowned-root"]},
     )
 
-    assert_text_free_of(response.text, ["placeholder-unauthorized-root"])
-    assert response.status_code == 422
-    error = response.json()["error"]
-    assert error["code"] == "validation_error"
-    assert error["message"] == "a deleted root is not authorized on this device"
-    assert error["detail"] == {"reason": "root_not_authorized"}
+    assert response.status_code == 200, response.text
+    assert response.json()["unauthorized_deleted_roots"] == ["unowned-root"]
+    assert (await _switchport_stream_row(device_id)).prepared_deletions["delete_origin"] == {}

@@ -17,6 +17,7 @@ from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import (
     RESP_401,
     RESP_404_DEVICE,
+    RESP_409_PREPARATION,
     RESP_409_PUSH_SEQ,
     RESP_422_VALIDATION,
     IntentApplyResult,
@@ -29,6 +30,7 @@ from nso_adapter.api.timestamps import UtcInstant
 from nso_adapter.core.generation import DeviceProjectionGone
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.core.switching_intent import (
+    SwitchingRefusal,
     SwitchingRequestRefused,
     SwitchportSnapshot,
     replace_switchport_snapshot,
@@ -57,6 +59,11 @@ class SwitchportApply(_StrictSwitchportRequest):
     untagged_vlan: Uint16 | None = None
     tagged_vlans: list[Uint16] = Field(default_factory=list)
 
+    @field_validator("mode")
+    @classmethod
+    def _empty_mode_is_unset(cls, value: str | None) -> str | None:
+        return value or None
+
     @field_validator("tagged_vlans")
     @classmethod
     def _tagged_vlans_are_unique(cls, tagged_vlans: list[int]) -> list[int]:
@@ -67,6 +74,7 @@ class SwitchportApply(_StrictSwitchportRequest):
 
 class SwitchportApplyRequest(_StrictSwitchportRequest):
     interfaces: list[SwitchportApply]
+    source_revision: int = Field(strict=True, ge=0, le=9223372036854775807)
     #: The switchport roots this preparation authorizes RETRACTING from the device.
     #: Required, an explicit empty list included — see ``LagConfigApplyRequest``.
     deleted_roots: list[RootName]
@@ -188,7 +196,7 @@ async def get_switchport(device_id: int, db: AsyncSession = Depends(get_read_db)
     "/{device_id}/switchport/apply",
     dependencies=[Depends(verify_token)],
     response_model=StoredIntentResult,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409_PREPARATION, **RESP_422_VALIDATION},
 )
 async def apply_switchport(
     device_id: int,
@@ -206,14 +214,26 @@ async def apply_switchport(
     )
     refused = None
     try:
-        prepared = await replace_switchport_snapshot(db, device_id, interfaces, deleted_roots=payload.deleted_roots)
+        prepared = await replace_switchport_snapshot(
+            db,
+            device_id,
+            interfaces,
+            deleted_roots=payload.deleted_roots,
+            source_revision=payload.source_revision,
+        )
     except DeviceProjectionGone:
         # Built in the handler, raised after it: a raise inside attaches the caught exception.
         refused = api_error(404, "not_found", "Device not found")
     except SwitchingRequestRefused as exc:
         await db.rollback()
         # Authored per reason: the answer names the refusal, never the roots the caller sent.
-        refused = api_error(422, "validation_error", exc.public_message, {"reason": exc.reason.value})
+        conflict = exc.reason in {SwitchingRefusal.stale_preparation, SwitchingRefusal.revision_conflict}
+        refused = api_error(
+            409 if conflict else 422,
+            "conflict" if conflict else "validation_error",
+            exc.public_message,
+            {"reason": exc.reason.value},
+        )
     if refused is not None:
         raise refused
     await db.commit()
@@ -225,6 +245,7 @@ async def apply_switchport(
         "removed": prepared.removed,
         "desired_revision": prepared.desired_revision,
         "selection_revision": prepared.selection_revision,
+        "unauthorized_deleted_roots": prepared.unauthorized_deleted_roots,
     }
 
 
