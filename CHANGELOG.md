@@ -2,6 +2,22 @@
 
 <!-- version list -->
 
+## v1.7.0 (2026-09-25)
+
+### Features
+
+- **evidence**: Report each generation's stream revisions in deployment evidence
+  ([`6227725`](https://github.com/marcinpsk/nso-adapter/commit/622772536f1c2cfa5ec27fc3fe2bc422d12d25ca))
+
+- **switching**: Order preparations by source revision and report unauthorized deletions
+  ([`3de085f`](https://github.com/marcinpsk/nso-adapter/commit/3de085fe843ca12d02cb93f8aff8e9afd6c2e21a))
+
+### Refactoring
+
+- **switching**: Derive the snapshot digest from the validated snapshots
+  ([`270827f`](https://github.com/marcinpsk/nso-adapter/commit/270827f9f51df452f4bff7954da379004558a47d))
+
+
 ## v1.6.0 (2026-09-24)
 
 ### Bug Fixes
