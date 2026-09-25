@@ -13,13 +13,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, StoredIntentResult, api_error
+from nso_adapter.api.errors import (
+    RESP_401,
+    RESP_404_DEVICE,
+    RESP_409_PREPARATION,
+    RESP_422_VALIDATION,
+    StoredIntentResult,
+    api_error,
+)
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import iso_z, latest_refreshed
 from nso_adapter.core.generation import DeviceProjectionGone
 from nso_adapter.core.switching_intent import (
     LagBundleSnapshot,
     LagMemberSnapshot,
+    SwitchingRefusal,
     SwitchingRequestRefused,
     replace_lag_snapshot,
 )
@@ -43,6 +51,11 @@ class LagMemberApply(_StrictRequestModel):
     mode: str | None = Field(default=None, max_length=16)
     port_priority: Uint16 | None = None
 
+    @field_validator("mode")
+    @classmethod
+    def _empty_mode_is_unset(cls, value: str | None) -> str | None:
+        return value or None
+
 
 class LagBundleApply(_StrictRequestModel):
     name: str = Field(min_length=1, max_length=128)
@@ -53,6 +66,11 @@ class LagBundleApply(_StrictRequestModel):
     timer: str | None = Field(default=None, max_length=8)
     admin_key: Uint16 | None = None
     members: list[LagMemberApply] = Field(default_factory=list)
+
+    @field_validator("system_id", "timer")
+    @classmethod
+    def _empty_leaf_is_unset(cls, value: str | None) -> str | None:
+        return value or None
 
     @field_validator("members")
     @classmethod
@@ -65,6 +83,7 @@ class LagBundleApply(_StrictRequestModel):
 
 class LagConfigApplyRequest(_StrictRequestModel):
     bundles: list[LagBundleApply]
+    source_revision: int = Field(strict=True, ge=0, le=9223372036854775807)
     #: The bundle roots this preparation authorizes RETRACTING from the device. Required,
     #: an explicit empty list included: an omitted root with no marking is an un-own, and
     #: the two cannot be told apart from the snapshot alone.
@@ -191,7 +210,7 @@ async def get_lag_config(device_id: int, db: AsyncSession = Depends(get_read_db)
     "/{device_id}/lag-config/apply",
     dependencies=[Depends(verify_token)],
     response_model=StoredIntentResult,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409_PREPARATION, **RESP_422_VALIDATION},
 )
 async def apply_lag_config(
     device_id: int,
@@ -220,14 +239,27 @@ async def apply_lag_config(
     )
     refused = None
     try:
-        prepared = await replace_lag_snapshot(db, device_id, bundles, deleted_roots=payload.deleted_roots)
+        prepared = await replace_lag_snapshot(
+            db,
+            device_id,
+            bundles,
+            deleted_roots=payload.deleted_roots,
+            source_revision=payload.source_revision,
+            snapshot_rows=[bundle.model_dump(mode="json") for bundle in payload.bundles],
+        )
     except DeviceProjectionGone:
         # Built in the handler, raised after it: a raise inside attaches the caught exception.
         refused = api_error(404, "not_found", "Device not found")
     except SwitchingRequestRefused as exc:
         await db.rollback()
         # Authored per reason: the answer names the refusal, never the roots the caller sent.
-        refused = api_error(422, "validation_error", exc.public_message, {"reason": exc.reason.value})
+        conflict = exc.reason in {SwitchingRefusal.stale_preparation, SwitchingRefusal.revision_conflict}
+        refused = api_error(
+            409 if conflict else 422,
+            "conflict" if conflict else "validation_error",
+            exc.public_message,
+            {"reason": exc.reason.value},
+        )
     if refused is not None:
         raise refused
     await db.commit()
@@ -239,4 +271,5 @@ async def apply_lag_config(
         "removed": prepared.removed,
         "desired_revision": prepared.desired_revision,
         "selection_revision": prepared.selection_revision,
+        "unauthorized_deleted_roots": prepared.unauthorized_deleted_roots,
     }

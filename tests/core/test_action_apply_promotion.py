@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import re
 import time
 from copy import deepcopy
@@ -26,6 +27,7 @@ from tests.core.test_generation_protocol import seed_settings
 pytestmark = pytest.mark.anyio
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
+_switching_source_revisions = itertools.count(1)
 
 _A = ("", "198.18.1.0/24", "192.0.2.1")
 _B = ("", "198.18.2.0/24", "192.0.2.2")
@@ -3036,7 +3038,10 @@ async def _prepare(
     shape = _SHAPE[stream]
     return await client.post(
         f"/api/v1/devices/{device_id}/{shape['path']}{query}",
-        json=shape["body"](roots, deleted_roots=deleted_roots, scalar=scalar, extra=extra),
+        json={
+            **shape["body"](roots, deleted_roots=deleted_roots, scalar=scalar, extra=extra),
+            "source_revision": next(_switching_source_revisions),
+        },
         headers=AUTH,
     )
 

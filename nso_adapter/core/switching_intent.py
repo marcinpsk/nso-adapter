@@ -16,6 +16,8 @@ promotes it, so the encoding context is the one read then and not the one read h
 from __future__ import annotations
 
 import enum
+import hashlib
+import json
 from collections import Counter
 from collections.abc import Sequence
 from copy import deepcopy
@@ -55,7 +57,8 @@ class SwitchingRefusal(str, enum.Enum):
     backfill_only_unsupported = "backfill_only_unsupported"
     repeated_root = "repeated_root"
     root_still_present = "root_still_present"
-    root_not_authorized = "root_not_authorized"
+    stale_preparation = "stale_preparation"
+    revision_conflict = "revision_conflict"
 
 
 #: The authored answer for each reason. None of them repeats a root the caller sent.
@@ -66,7 +69,8 @@ _REFUSAL_MESSAGES: dict[SwitchingRefusal, str] = {
     SwitchingRefusal.backfill_only_unsupported: "backfill_only is not valid on a switching snapshot",
     SwitchingRefusal.repeated_root: "deleted_roots repeats a root",
     SwitchingRefusal.root_still_present: "a deleted root is still present in this snapshot",
-    SwitchingRefusal.root_not_authorized: "a deleted root is not authorized on this device",
+    SwitchingRefusal.stale_preparation: "a newer source revision has already been prepared",
+    SwitchingRefusal.revision_conflict: "this source revision has a different prepared snapshot",
 }
 
 
@@ -151,6 +155,23 @@ class PreparedSnapshot:
     removed: int
     desired_revision: int
     selection_revision: int | None
+    unauthorized_deleted_roots: list[str]
+
+
+def _snapshot_digest(rows: Sequence[dict], stream: str) -> str:
+    """Hash validated rows (empty strings as null) by bundle name/interface_name and member name/numeric VLAN."""
+    if stream == LAG_STREAM:
+        ordered = [
+            {**row, "members": sorted(row["members"], key=lambda member: member["interface_name"])}
+            for row in sorted(rows, key=lambda row: row["name"])
+        ]
+    else:
+        ordered = [
+            {**row, "tagged_vlans": sorted(row["tagged_vlans"])}
+            for row in sorted(rows, key=lambda row: row["interface_name"])
+        ]
+    canonical = json.dumps(ordered, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 _LAG_SCALARS = ("lag_id", "min_links", "system_priority", "system_id", "timer", "admin_key")
@@ -260,6 +281,8 @@ async def _prepare_snapshot(
     stream: str,
     *,
     deleted_roots: Sequence[str],
+    source_revision: int,
+    source_digest: str,
     desired_roots: set[str],
     replace,
 ) -> PreparedSnapshot:
@@ -297,15 +320,16 @@ async def _prepare_snapshot(
     )
     authorized = (row.authorized_document if row is not None else None) or {}
     unauthorized = sorted(set(marked) - _root_names(authorized, root_table))
-    if unauthorized:
-        raise SwitchingRequestRefused(
-            SwitchingRefusal.root_not_authorized, "a deleted root is not authorized on this device"
-        )
+    if not store_only and row is not None and row.prepared_source_revision is not None:
+        if source_revision < row.prepared_source_revision:
+            raise SwitchingRequestRefused(SwitchingRefusal.stale_preparation)
+        if source_revision == row.prepared_source_revision and source_digest != row.prepared_source_digest:
+            raise SwitchingRequestRefused(SwitchingRefusal.revision_conflict)
 
     revision = await note_write(db, device_id, stream, push_seq=None)
     count, removed = await replace()
     if store_only:
-        return PreparedSnapshot("stored", stream, count, removed, revision, None)
+        return PreparedSnapshot("stored", stream, count, removed, revision, None, unauthorized)
 
     tables = await snapshot_stream(db, device_id, stream)
     await db.execute(
@@ -317,11 +341,15 @@ async def _prepare_snapshot(
         .values(
             prepared_revision=revision,
             prepared_tables=tables,
-            prepared_deletions=_resolve_deletions(authorized, tables, set(marked), root_table, child_table),
+            prepared_deletions=_resolve_deletions(
+                authorized, tables, set(marked) - set(unauthorized), root_table, child_table
+            ),
+            prepared_source_revision=source_revision,
+            prepared_source_digest=source_digest,
         )
         .execution_options(synchronize_session=False)
     )
-    return PreparedSnapshot("prepared", stream, count, removed, revision, revision)
+    return PreparedSnapshot("prepared", stream, count, removed, revision, revision, unauthorized)
 
 
 async def _replace_lag_rows(db: AsyncSession, device_id: int, bundles: Sequence[LagBundleSnapshot]) -> tuple[int, int]:
@@ -380,6 +408,8 @@ async def replace_lag_snapshot(
     bundles: Sequence[LagBundleSnapshot],
     *,
     deleted_roots: Sequence[str],
+    source_revision: int,
+    snapshot_rows: Sequence[dict],
 ) -> PreparedSnapshot:
     """Prepare one device's complete LAG snapshot. Caller commits."""
     _validate_lag_snapshot(bundles)
@@ -388,6 +418,8 @@ async def replace_lag_snapshot(
         device_id,
         LAG_STREAM,
         deleted_roots=deleted_roots,
+        source_revision=source_revision,
+        source_digest=_snapshot_digest(snapshot_rows, LAG_STREAM),
         desired_roots={bundle.name for bundle in bundles},
         replace=lambda: _replace_lag_rows(db, device_id, bundles),
     )
@@ -458,6 +490,8 @@ async def replace_switchport_snapshot(
     interfaces: Sequence[SwitchportSnapshot],
     *,
     deleted_roots: Sequence[str],
+    source_revision: int,
+    snapshot_rows: Sequence[dict],
 ) -> PreparedSnapshot:
     """Prepare one device's complete switchport snapshot. Caller commits."""
     _validate_switchport_snapshot(interfaces)
@@ -466,6 +500,8 @@ async def replace_switchport_snapshot(
         device_id,
         SWITCHPORT_STREAM,
         deleted_roots=deleted_roots,
+        source_revision=source_revision,
+        source_digest=_snapshot_digest(snapshot_rows, SWITCHPORT_STREAM),
         desired_roots={interface.interface_name for interface in interfaces},
         replace=lambda: _replace_switchport_rows(db, device_id, interfaces),
     )

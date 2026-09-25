@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 from contextlib import nullcontext
+from dataclasses import asdict
 from unittest.mock import patch
 
 import pytest
@@ -17,6 +19,7 @@ from tests.core.removal_helpers import authorize_static_route, authorize_stream
 from tests.core.test_generation_protocol import put_vlans, seed_settings
 
 pytestmark = pytest.mark.anyio
+_source_revisions = itertools.count(1)
 
 _AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 _A = ("", "198.18.0.0/24", "192.0.2.1")
@@ -306,6 +309,8 @@ async def test_switching_writer_commits_before_real_offboard(adapter_client, riv
                     writer,
                     device_id,
                     (LagBundleSnapshot(name="Port-channel1", lag_id=1),),
+                    snapshot_rows=[asdict(item) for item in ((LagBundleSnapshot(name="Port-channel1", lag_id=1),))],
+                    source_revision=next(_source_revisions),
                     deleted_roots=[],
                 )
                 continue_offboard.set()
@@ -357,6 +362,19 @@ async def test_document_snapshot_waits_for_a_switching_replacement(adapter_clien
                     members=(LagMemberSnapshot(interface_name="Gi0/1", mode="active"),),
                 ),
             ),
+            snapshot_rows=[
+                asdict(item)
+                for item in (
+                    (
+                        LagBundleSnapshot(
+                            name="Port-channel1",
+                            lag_id=1,
+                            members=(LagMemberSnapshot(interface_name="Gi0/1", mode="active"),),
+                        ),
+                    )
+                )
+            ],
+            source_revision=next(_source_revisions),
             deleted_roots=[],
         )
 
@@ -427,13 +445,17 @@ async def _run_offboard_loser(kind: str, adapter_client, device_id: int):
     if kind == "lag_store":
         return await adapter_client.post(
             f"/api/v1/devices/{device_id}/lag-config/apply",
-            json={"bundles": [{"name": "Port-channel1", "lag_id": 1}], "deleted_roots": []},
+            json={"bundles": [{"name": "Port-channel1", "lag_id": 1}], "deleted_roots": [], "source_revision": 1},
             headers=_AUTH,
         )
     if kind == "switchport_store":
         return await adapter_client.post(
             f"/api/v1/devices/{device_id}/switchport/apply",
-            json={"interfaces": [{"interface_name": "Gi0/1", "untagged_vlan": 10}], "deleted_roots": []},
+            json={
+                "interfaces": [{"interface_name": "Gi0/1", "untagged_vlan": 10}],
+                "deleted_roots": [],
+                "source_revision": 1,
+            },
             headers=_AUTH,
         )
     return await adapter_client.post(

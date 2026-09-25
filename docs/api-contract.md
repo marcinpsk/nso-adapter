@@ -2572,21 +2572,23 @@ member `mode`/`port_priority`.
   ] }
 ```
 
-### `POST /api/v1/devices/{id}/lag-config/apply` → `200 | 404 | 422`
+### `POST /api/v1/devices/{id}/lag-config/apply` → `200 | 404 | 409 | 422`
 
 Claim-less full-snapshot PREPARATION of desired LAG state. Body = the GET
-`bundles` shape, excluding read-only `vpc_sensitive`, plus a required
-`deleted_roots`. `lag_id` stays required and is a strict `uint32`; optional LAG
+`bundles` shape, excluding read-only `vpc_sensitive`, plus required
+`deleted_roots` and `source_revision` fields. `source_revision` is a nonnegative
+integer. `lag_id` stays required and is a strict `uint32`; optional LAG
 integer leaves are strict `uint16`. Bundle names, LAG IDs, and member interface
 names must be unique within the request.
 
 ```json
-{ "bundles": [ { "name": "lag-2", "lag_id": 2 } ], "deleted_roots": ["lag-1"] }
+{ "bundles": [ { "name": "lag-2", "lag_id": 2 } ], "deleted_roots": ["lag-1"], "source_revision": 7 }
 ```
 
 ```json
 { "status": "prepared", "device_id": 1, "stream": "lag", "count": 1,
-  "removed": 1, "desired_revision": 4, "selection_revision": 4 }
+  "removed": 1, "desired_revision": 4, "selection_revision": 4,
+  "unauthorized_deleted_roots": [] }
 ```
 
 The POST prepares; the manual Apply authorizes. It stores the snapshot
@@ -2600,15 +2602,22 @@ snapshot, so an Apply selecting that revision still promotes what was prepared.
 
 `deleted_roots` names the bundle roots this preparation authorizes RETRACTING
 from the device; every other authorized root the snapshot omits detaches
-instead. It is required, an explicit empty list included, and it is validated
-against the AUTHORIZED roots: a repeated root, a root the snapshot still
-carries, and a root this device has not authorized are each a 422 that leaves
-the store and every revision untouched. `?delete_origin=true` and
-`?backfill_only=true` are a 422 here. A store-only request validates
-`deleted_roots` the same way and then records no provenance at all, because it
-authorizes nothing.
+instead. It is required, an explicit empty list included. A repeated root or a
+root still present in the snapshot returns 422 and leaves the store untouched.
+Names outside the AUTHORIZED roots are dropped from the marking under the
+projection lock and reported, sorted, in `unauthorized_deleted_roots`.
+`?delete_origin=true` and `?backfill_only=true` return 422. A store-only request
+reports unauthorized names and records no provenance.
 
-The required `deleted_roots` field and the response fields beside it ship with
+Normal preparations record `source_revision` and a SHA-256 digest of canonical
+JSON for the validated `bundles` list. The digest excludes `deleted_roots` and
+`source_revision`. An older source revision returns 409 with reason
+`stale_preparation`. The same revision with a different snapshot returns 409
+with reason `revision_conflict`. Both leave the store untouched. The same
+revision and snapshot can change `deleted_roots`. Store-only requests neither
+check nor change the prepared source identity.
+
+The required request fields and the response fields beside them ship with
 the plugin's switching-delivery change, in the same version: the three
 repositories of this integration move together at 1.0, so there is no
 partial-rollout window and no older client to keep working. A request that omits
@@ -2642,17 +2651,18 @@ L2 switchport read-mirror. `mode` ∈ `access` · `trunk` · `trunk-all` · `""`
   ] }
 ```
 
-### `POST /api/v1/devices/{id}/switchport/apply` → `200 | 404 | 422`
+### `POST /api/v1/devices/{id}/switchport/apply` → `200 | 404 | 409 | 422`
 
 Claim-less full-snapshot PREPARATION of desired switchport state. Body =
-`{ "interfaces": [...], "deleted_roots": [...] }` with the GET row shape minus
+`{ "interfaces": [...], "deleted_roots": [...], "source_revision": 7 }` with the GET row shape minus
 `source`. `mode` is the closed vocabulary `access` · `trunk` · `trunk-all` · `""`,
 where `trunk-all` is NetBox's `tagged-all`. VLAN values are strict `uint16`; interface names and each interface's
 tagged VLAN values must be unique within the request.
 
 ```json
 { "status": "prepared", "device_id": 1, "stream": "switchport", "count": 2,
-  "removed": 0, "desired_revision": 1, "selection_revision": 1 }
+  "removed": 0, "desired_revision": 1, "selection_revision": 1,
+  "unauthorized_deleted_roots": [] }
 ```
 
 The POST prepares and the manual Apply authorizes, with the same response

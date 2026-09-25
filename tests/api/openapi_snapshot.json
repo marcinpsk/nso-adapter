@@ -5599,10 +5599,17 @@
             },
             "title": "Deleted Roots",
             "type": "array"
+          },
+          "source_revision": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Source Revision",
+            "type": "integer"
           }
         },
         "required": [
           "bundles",
+          "source_revision",
           "deleted_roots"
         ],
         "title": "LagConfigApplyRequest",
@@ -8631,6 +8638,13 @@
           "stream": {
             "title": "Stream",
             "type": "string"
+          },
+          "unauthorized_deleted_roots": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Unauthorized Deleted Roots",
+            "type": "array"
           }
         },
         "required": [
@@ -8640,7 +8654,8 @@
           "count",
           "removed",
           "desired_revision",
-          "selection_revision"
+          "selection_revision",
+          "unauthorized_deleted_roots"
         ],
         "title": "StoredIntentResult",
         "type": "object"
@@ -8976,10 +8991,17 @@
             },
             "title": "Interfaces",
             "type": "array"
+          },
+          "source_revision": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Source Revision",
+            "type": "integer"
           }
         },
         "required": [
           "interfaces",
+          "source_revision",
           "deleted_roots"
         ],
         "title": "SwitchportApplyRequest",
@@ -12655,6 +12677,16 @@
             },
             "description": "Device not found"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "An older source revision or conflicting snapshot was refused"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -14726,6 +14758,16 @@
               }
             },
             "description": "Device not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "An older source revision or conflicting snapshot was refused"
           },
           "422": {
             "content": {

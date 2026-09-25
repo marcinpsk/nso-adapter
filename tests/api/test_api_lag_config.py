@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from itertools import count
 from time import perf_counter
 
 import pytest
@@ -15,6 +16,7 @@ from tests._secret_discipline import assert_text_free_of
 from tests.conftest import VALID_TOKEN, seed_device, seed_lag_config, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
+_source_revisions = count(1000)
 
 
 @pytest.mark.anyio
@@ -126,6 +128,7 @@ _APPLY_BODY = {
             ],
         }
     ],
+    "source_revision": 1,
     "deleted_roots": [],
 }
 
@@ -144,6 +147,7 @@ async def test_apply_lag_config_stores_full_snapshot(adapter_client):
         "removed": 0,
         "desired_revision": 1,
         "selection_revision": 1,
+        "unauthorized_deleted_roots": [],
     }
 
     async with session() as db:
@@ -197,6 +201,7 @@ async def test_apply_lag_config_full_replace_reports_removed_roots(adapter_clien
             {"name": "Port-channel1", "lag_id": 6},
             {"name": "Port-channel2", "lag_id": 7},
         ],
+        "source_revision": 1,
         "deleted_roots": [],
     }
     response = await adapter_client.post(
@@ -209,7 +214,7 @@ async def test_apply_lag_config_full_replace_reports_removed_roots(adapter_clien
 
     response = await adapter_client.post(
         f"/api/v1/devices/{device_id}/lag-config/apply",
-        json={"bundles": [{"name": "Port-channel2", "lag_id": 7}], "deleted_roots": []},
+        json={"bundles": [{"name": "Port-channel2", "lag_id": 7}], "source_revision": 2, "deleted_roots": []},
         headers=AUTH,
     )
     assert response.json()["count"] == 1
@@ -247,7 +252,7 @@ async def test_apply_lag_config_requires_explicit_snapshot_without_mutating_stor
     device_id = await seed_device(nso_device_name="lag-required-snapshot", netbox_device_id=None)
     stored = await adapter_client.post(
         f"/api/v1/devices/{device_id}/lag-config/apply",
-        json={"bundles": [{"name": "Port-channel1", "lag_id": 1}], "deleted_roots": []},
+        json={"bundles": [{"name": "Port-channel1", "lag_id": 1}], "source_revision": 1, "deleted_roots": []},
         headers=AUTH,
     )
     assert stored.status_code == 200
@@ -307,7 +312,7 @@ async def test_apply_lag_config_rejects_invalid_graph_without_mutating_store(ada
     device_id = await seed_device(nso_device_name="lag-invalid-request", netbox_device_id=None)
     response = await adapter_client.post(
         f"/api/v1/devices/{device_id}/lag-config/apply",
-        json={"bundles": bundles, "deleted_roots": []},
+        json={"bundles": bundles, "source_revision": 1, "deleted_roots": []},
         headers=AUTH,
     )
 
@@ -334,7 +339,7 @@ async def test_apply_lag_config_treats_empty_timer_and_system_id_as_unset(adapte
     from tests.core.projection_helpers import freeze_snapshot
 
     device_id = await seed_device(nso_device_name="lag-empty-strings", netbox_device_id=1215)
-    body = {"bundles": [{"name": "Port-channel1", "lag_id": 1}], "deleted_roots": []}
+    body = {"bundles": [{"name": "Port-channel1", "lag_id": 1}], "source_revision": 1, "deleted_roots": []}
     assert (
         await adapter_client.post(f"/api/v1/devices/{device_id}/lag-config/apply", json=body, headers=AUTH)
     ).status_code == 200
@@ -349,6 +354,7 @@ async def test_apply_lag_config_treats_empty_timer_and_system_id_as_unset(adapte
         await db.commit()
 
     body["bundles"][0].update({"timer": "", "system_id": ""})
+    body["source_revision"] = 2
     response = await adapter_client.post(f"/api/v1/devices/{device_id}/lag-config/apply", json=body, headers=AUTH)
 
     assert response.status_code == 200, response.text
@@ -376,12 +382,16 @@ async def test_apply_lag_config_treats_empty_timer_and_system_id_as_unset(adapte
 
 # ── #1612: the POST prepares, Apply authorizes ────────────────────────────────
 
-_PREPARE_A = {"bundles": [{"name": "Port-channel1", "lag_id": 1}], "deleted_roots": []}
-_PREPARE_B = {"bundles": [{"name": "Port-channel2", "lag_id": 2}], "deleted_roots": []}
+_PREPARE_A = {"bundles": [{"name": "Port-channel1", "lag_id": 1}], "source_revision": 1, "deleted_roots": []}
+_PREPARE_B = {"bundles": [{"name": "Port-channel2", "lag_id": 2}], "source_revision": 1, "deleted_roots": []}
 
 
 async def _post_lag(client, device_id: int, body: dict, *, query: str = ""):
-    return await client.post(f"/api/v1/devices/{device_id}/lag-config/apply{query}", json=body, headers=AUTH)
+    return await client.post(
+        f"/api/v1/devices/{device_id}/lag-config/apply{query}",
+        json={"source_revision": next(_source_revisions), **body},
+        headers=AUTH,
+    )
 
 
 async def _stream_row(device_id: int, stream: str = "lag"):
@@ -399,6 +409,198 @@ async def _stream_row(device_id: int, stream: str = "lag"):
 
 
 @pytest.mark.anyio
+async def test_lag_reports_unauthorized_deleted_roots_without_marking_them(adapter_client):
+    device_id = await seed_device(nso_device_name="lag-unauthorized-deletion", netbox_device_id=None)
+    response = await _post_lag(
+        adapter_client,
+        device_id,
+        {"bundles": [], "deleted_roots": ["Port-channel9", "Port-channel3"], "source_revision": 1},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["unauthorized_deleted_roots"] == ["Port-channel3", "Port-channel9"]
+    assert (await _stream_row(device_id)).prepared_deletions["delete_origin"] == {}
+
+
+def _switching_body(stream: str, roots: list[str], deleted_roots: list[str], source_revision: int) -> dict:
+    if stream == "lag":
+        return {
+            "bundles": [{"name": root, "lag_id": index + 1} for index, root in enumerate(roots)],
+            "deleted_roots": deleted_roots,
+            "source_revision": source_revision,
+        }
+    return {
+        "interfaces": [{"interface_name": root, "mode": "access"} for root in roots],
+        "deleted_roots": deleted_roots,
+        "source_revision": source_revision,
+    }
+
+
+async def _post_switching(client, device_id: int, stream: str, body: dict, *, store_only: bool = False):
+    path = "lag-config" if stream == "lag" else "switchport"
+    query = "?store_only=true" if store_only else ""
+    return await client.post(f"/api/v1/devices/{device_id}/{path}/apply{query}", json=body, headers=AUTH)
+
+
+async def _switching_state(device_id: int, stream: str) -> tuple:
+    row = await _stream_row(device_id, stream)
+    root_table = "lag_bundle_intent" if stream == "lag" else "switchport_intent"
+    root_field = "name" if stream == "lag" else "interface_name"
+    async with session() as db:
+        roots = tuple(
+            (
+                await db.execute(
+                    text(f"SELECT {root_field} FROM {root_table} WHERE device_id = :device_id"),
+                    {"device_id": device_id},
+                )
+            )
+            .scalars()
+            .all()
+        )
+    return (
+        row.desired_revision,
+        row.prepared_revision,
+        row.prepared_tables,
+        row.prepared_deletions,
+        row.prepared_source_revision,
+        row.prepared_source_digest,
+        roots,
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("stream", ["lag", "switchport"])
+async def test_switching_source_order_and_equal_snapshot_are_atomic(adapter_client, stream):
+    device_id = await seed_device(nso_device_name=f"source-order-{stream}", netbox_device_id=None)
+    first = _switching_body(stream, ["A"], [], 8)
+    assert (await _post_switching(adapter_client, device_id, stream, first)).status_code == 200
+    original = await _switching_state(device_id, stream)
+    assert original[4] == 8
+    assert len(original[5]) == 64
+
+    stale = await _post_switching(adapter_client, device_id, stream, _switching_body(stream, [], [], 7))
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["error"]["detail"] == {"reason": "stale_preparation"}
+    assert await _switching_state(device_id, stream) == original
+
+    conflict = await _post_switching(adapter_client, device_id, stream, _switching_body(stream, [], [], 8))
+    assert conflict.status_code == 409, conflict.text
+    assert conflict.json()["error"]["detail"] == {"reason": "revision_conflict"}
+    assert await _switching_state(device_id, stream) == original
+
+    equal = await _post_switching(adapter_client, device_id, stream, _switching_body(stream, ["A"], ["Z"], 8))
+    assert equal.status_code == 200, equal.text
+    assert equal.json()["unauthorized_deleted_roots"] == ["Z"]
+    assert (await _switching_state(device_id, stream))[5] == original[5]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("stream", ["lag", "switchport"])
+async def test_switching_store_only_reports_unauthorized_roots_without_touching_source_slot(adapter_client, stream):
+    device_id = await seed_device(nso_device_name=f"store-source-{stream}", netbox_device_id=None)
+    assert (
+        await _post_switching(adapter_client, device_id, stream, _switching_body(stream, ["A"], [], 8))
+    ).status_code == 200
+    original = await _switching_state(device_id, stream)
+    response = await _post_switching(
+        adapter_client, device_id, stream, _switching_body(stream, [], ["Z"], 1), store_only=True
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "stored"
+    assert response.json()["unauthorized_deleted_roots"] == ["Z"]
+    current = await _switching_state(device_id, stream)
+    assert current[1:6] == original[1:6]
+    assert current[0] == original[0] + 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("stream", ["lag", "switchport"])
+async def test_switching_apply_first_authorizes_a_named_deletion(adapter_client, stream):
+    from tests.core.test_action_apply_promotion import _apply
+
+    device_id = await seed_device(nso_device_name=f"apply-first-{stream}", netbox_device_id=None)
+    prepared = await _post_switching(adapter_client, device_id, stream, _switching_body(stream, ["A"], [], 1))
+    revision = prepared.json()["selection_revision"]
+    applied = await _apply(adapter_client, device_id, {stream: revision})
+    assert applied.status_code == 202, applied.text
+    deleted = await _post_switching(adapter_client, device_id, stream, _switching_body(stream, [], ["A"], 2))
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["unauthorized_deleted_roots"] == []
+    row = await _stream_row(device_id, stream)
+    root_table = "lag_bundle_intent" if stream == "lag" else "switchport_intent"
+    assert len(row.prepared_deletions["delete_origin"][root_table]) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("stream", ["lag", "switchport"])
+async def test_switching_deletion_first_supersedes_the_old_selection(adapter_client, stream):
+    from tests.core.test_action_apply_promotion import _apply
+
+    device_id = await seed_device(nso_device_name=f"deletion-first-{stream}", netbox_device_id=None)
+    prepared = await _post_switching(adapter_client, device_id, stream, _switching_body(stream, ["A"], [], 1))
+    revision = prepared.json()["selection_revision"]
+    deleted = await _post_switching(adapter_client, device_id, stream, _switching_body(stream, [], ["A"], 2))
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["unauthorized_deleted_roots"] == ["A"]
+    assert (await _stream_row(device_id, stream)).prepared_deletions["delete_origin"] == {}
+    applied = await _apply(adapter_client, device_id, {stream: revision})
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["skipped"] == {stream: "superseded"}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("stream", ["lag", "switchport"])
+async def test_switching_newer_deletion_prevents_older_preparation_from_replacing_it(adapter_client, stream):
+    from tests.core.test_action_apply_promotion import _apply
+
+    device_id = await seed_device(nso_device_name=f"newer-deletion-{stream}", netbox_device_id=None)
+    prepared = await _post_switching(adapter_client, device_id, stream, _switching_body(stream, ["A"], [], 1))
+    assert (await _apply(adapter_client, device_id, {stream: prepared.json()["selection_revision"]})).status_code == 202
+    deleted = await _post_switching(adapter_client, device_id, stream, _switching_body(stream, [], ["A"], 3))
+    assert deleted.status_code == 200, deleted.text
+    deletion_state = await _switching_state(device_id, stream)
+    stale = await _post_switching(adapter_client, device_id, stream, _switching_body(stream, [], [], 2))
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["error"]["detail"] == {"reason": "stale_preparation"}
+    assert await _switching_state(device_id, stream) == deletion_state
+    assert deletion_state[3]["delete_origin"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("stream", ["lag", "switchport"])
+async def test_switching_newer_deletion_replaces_older_empty_preparation(adapter_client, stream):
+    from tests.core.test_action_apply_promotion import _apply
+
+    device_id = await seed_device(nso_device_name=f"older-empty-{stream}", netbox_device_id=None)
+    prepared = await _post_switching(adapter_client, device_id, stream, _switching_body(stream, ["A"], [], 1))
+    assert (await _apply(adapter_client, device_id, {stream: prepared.json()["selection_revision"]})).status_code == 202
+    assert (
+        await _post_switching(adapter_client, device_id, stream, _switching_body(stream, [], [], 2))
+    ).status_code == 200
+    deleted = await _post_switching(adapter_client, device_id, stream, _switching_body(stream, [], ["A"], 3))
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["unauthorized_deleted_roots"] == []
+    assert (await _stream_row(device_id, stream)).prepared_deletions["delete_origin"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("stream", ["lag", "switchport"])
+async def test_switching_requires_source_revision_and_rejects_a_present_deleted_root(adapter_client, stream):
+    device_id = await seed_device(nso_device_name=f"source-required-{stream}", netbox_device_id=None)
+    body = _switching_body(stream, ["A"], [], 1)
+    body.pop("source_revision")
+    missing = await _post_switching(adapter_client, device_id, stream, body)
+    assert missing.status_code == 422
+    assert await _stream_row(device_id, stream) is None
+    negative = await _post_switching(adapter_client, device_id, stream, _switching_body(stream, [], [], -1))
+    assert negative.status_code == 422
+    assert await _stream_row(device_id, stream) is None
+    present = await _post_switching(adapter_client, device_id, stream, _switching_body(stream, ["A"], ["A"], 1))
+    assert present.status_code == 422
+    assert present.json()["error"]["detail"] == {"reason": "root_still_present"}
+
+
+@pytest.mark.anyio
 async def test_apply_lag_config_prepares_a_selectable_snapshot(adapter_client):
     device_id = await seed_device(nso_device_name="lag-prepared", netbox_device_id=1620)
 
@@ -413,6 +615,7 @@ async def test_apply_lag_config_prepares_a_selectable_snapshot(adapter_client):
         "removed": 0,
         "desired_revision": 1,
         "selection_revision": 1,
+        "unauthorized_deleted_roots": [],
     }
     row = await _stream_row(device_id)
     assert (row.desired_revision, row.authorized_revision, row.applied_revision) == (1, 0, 0)
@@ -456,6 +659,7 @@ async def test_apply_lag_config_store_only_bumps_the_revision_and_preserves_the_
         "removed": 1,
         "desired_revision": 2,
         "selection_revision": None,
+        "unauthorized_deleted_roots": [],
     }
     row = await _stream_row(device_id)
     assert row.desired_revision == 2
@@ -501,11 +705,10 @@ async def test_apply_lag_config_refuses_the_request_modes_it_does_not_implement(
     [
         pytest.param(["Port-channel2", "Port-channel2"], "repeats", "repeated_root", id="duplicate"),
         pytest.param(["Port-channel1"], "still present", "root_still_present", id="still-present"),
-        pytest.param(["Port-channel9"], "not authorized", "root_not_authorized", id="unauthorized"),
     ],
 )
 async def test_apply_lag_config_refuses_an_invalid_deletion_authority(adapter_client, deleted_roots, reason, code):
-    """Three distinct refusals, each answered by its own reason and none by the roots sent."""
+    """Invalid deletion names refuse without echoing the roots sent."""
     device_id = await seed_device(nso_device_name=f"lag-roots-{reason.split()[0]}", netbox_device_id=None)
     assert (await _post_lag(adapter_client, device_id, _PREPARE_A)).status_code == 200
 
@@ -519,7 +722,7 @@ async def test_apply_lag_config_refuses_an_invalid_deletion_authority(adapter_cl
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "validation_error"
     assert reason in response.json()["error"]["message"]
-    assert response.json()["error"]["detail"] == {"reason": code}, "the three refusals must stay distinguishable"
+    assert response.json()["error"]["detail"] == {"reason": code}
     row = await _stream_row(device_id)
     assert (row.desired_revision, row.prepared_revision) == (1, 1), "a refusal leaves every revision untouched"
 
@@ -563,6 +766,7 @@ async def test_apply_lag_config_store_only_accepts_a_deletion_authority_and_reco
         "removed": 1,
         "desired_revision": 2,
         "selection_revision": None,
+        "unauthorized_deleted_roots": [],
     }
     row = await _stream_row(device_id)
     assert (row.desired_revision, row.authorized_revision, row.prepared_revision) == (2, 1, 1)
@@ -579,7 +783,7 @@ async def test_apply_lag_config_store_only_accepts_a_deletion_authority_and_reco
 
 
 @pytest.mark.anyio
-async def test_apply_lag_config_store_only_still_validates_the_deletion_authority(adapter_client):
+async def test_apply_lag_config_store_only_reports_unauthorized_deletion_names(adapter_client):
     device_id = await seed_device(nso_device_name="lag-store-only-invalid-roots", netbox_device_id=None)
 
     response = await _post_lag(
@@ -589,9 +793,12 @@ async def test_apply_lag_config_store_only_still_validates_the_deletion_authorit
         query="?store_only=true",
     )
 
-    assert response.status_code == 422
-    assert "not authorized" in response.json()["error"]["message"]
-    assert await _stream_row(device_id) is None
+    assert response.status_code == 200, response.text
+    assert response.json()["unauthorized_deleted_roots"] == ["Port-channel1"]
+    row = await _stream_row(device_id)
+    assert row.prepared_revision is None
+    assert row.prepared_source_revision is None
+    assert row.prepared_source_digest is None
 
 
 @pytest.mark.anyio
@@ -809,6 +1016,7 @@ async def test_apply_lag_rejects_duplicate_ids_without_mutation(adapter_client):
         f"/api/v1/devices/{device_id}/lag-config/apply",
         json={
             "bundles": [{"name": "Port-channel1", "lag_id": 7}, {"name": "Port-channel2", "lag_id": 7}],
+            "source_revision": 1,
             "deleted_roots": [],
         },
         headers=AUTH,
@@ -823,7 +1031,7 @@ async def test_apply_lag_rejects_duplicate_ids_without_mutation(adapter_client):
 @pytest.mark.parametrize(("route", "field"), [("lag-config", "bundles"), ("switchport", "interfaces")])
 async def test_switching_apply_refuses_many_duplicate_roots_promptly(adapter_client, route, field):
     device_id = await seed_device(nso_device_name="switching-large-deletion-list", netbox_device_id=None)
-    body = {field: [], "deleted_roots": ["root-z", "root-a"] * 39_999 + ["root-z", "root-once"]}
+    body = {field: [], "source_revision": 1, "deleted_roots": ["root-z", "root-a"] * 39_999 + ["root-z", "root-once"]}
 
     started = perf_counter()
     response = await adapter_client.post(f"/api/v1/devices/{device_id}/{route}/apply", json=body, headers=AUTH)
