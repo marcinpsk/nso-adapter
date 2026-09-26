@@ -577,15 +577,14 @@ class DeviceProjectionStream(Base):
     #: tables the stream owns and no others. A generation's document composes each section
     #: from its streams' fragments, so the document is the complete outbound device document
     #: and never an omission that would read as "delete this family" (#1522 §G1).
-    #: NULL until the stream is promoted once — an unpromoted lane has nothing on the device
-    #: the adapter authorized, so it contributes nothing.
+    #: NULL means no current authorized fragment or document contribution; device configuration can still exist.
     authorized_document: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     #: The PREPARED SLOT of an out-of-protocol stream (#1612): the snapshot one Apply POST
-    #: stored, the revision that selects it, and the deletion provenance resolved against the
-    #: authorized roots at that moment. The three are null together or present together, and a
-    #: present revision is one this device really reached, so a slot can never name a state no
-    #: write stands behind. Tables ONLY, with no execution metadata: the fragment is frozen at
-    #: authorization, inside the Apply that promotes it.
+    #: stored, the revision that selects it, the deletion provenance resolved against the
+    #: authorized roots at that moment, and its source revision and digest (#1685). The five are
+    #: null together or present together, and a present revision is one this device really
+    #: reached, so a slot can never name a state no write stands behind. Tables ONLY, with no
+    #: execution metadata: the fragment is frozen at authorization, inside the Apply that promotes it.
     prepared_revision: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     prepared_tables: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     prepared_deletions: Mapped[dict | None] = mapped_column(JSON, nullable=True)
