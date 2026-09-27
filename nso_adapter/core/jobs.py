@@ -217,6 +217,20 @@ async def create_dedicated_job(
     return job
 
 
+async def create_followup_sync(db: AsyncSession, device_id: int, followup_of_job_id: int) -> Job:
+    """Create one queued non-coalescible sync linked to its removal job. Caller commits."""
+    job = Job(
+        job_type=JobType.sync,
+        device_id=device_id,
+        status=JobStatus.queued,
+        coalescible=False,
+        context={FOLLOWUP_OF_JOB_ID: followup_of_job_id},
+    )
+    db.add(job)
+    await db.flush()
+    return job
+
+
 async def enqueue_job(
     device_id: int,
     job_type: JobType,

@@ -223,6 +223,22 @@ async def test_release_runs_only_its_removal_followup(maintenance_client):
         assert (await db.get(Job, unrelated_id)).status is JobStatus.queued
 
 
+async def test_release_followup_does_not_coalesce_into_queued_sync(maintenance_client):
+    device_id, removal = await _admit_vlan_removal(maintenance_client, 18110)
+    async with session() as db:
+        ordinary = Job(device_id=device_id, job_type=JobType.sync, status=JobStatus.queued, coalescible=True)
+        db.add(ordinary)
+        await db.commit()
+        ordinary_id = ordinary.id
+    assert await run_inspected_generation(device_id, removal.id, removal.digest) is JobStatus.succeeded
+    async with session() as db:
+        syncs = (await db.scalars(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.sync))).all()
+        followups = [sync for sync in syncs if sync.context == {"followup_of_job_id": removal.job_id}]
+        assert len(followups) == 1
+        assert followups[0].status is JobStatus.succeeded
+        assert (await db.get(Job, ordinary_id)).status is JobStatus.queued
+
+
 async def test_release_reports_failed_followup_without_changing_removal(maintenance_client):
     device_id, removal = await _admit_vlan_removal(maintenance_client, 18108)
     from nso_adapter.core.importer import get_nso_client
