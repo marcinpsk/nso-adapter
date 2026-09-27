@@ -309,6 +309,7 @@ async def run_inspected_generation(device_id: int, generation_id: int, document_
 
     async with session() as db:
         preview = await collect_apply_diff(db, device_id)
+        queue_frontier = await db.scalar(select(func.max(Job.id))) or 0
     reg = await acquire_claim(device_id, "job")
     if reg is None:
         raise ReleaseRefused(f"device {device_id} has an active claim")
@@ -327,8 +328,6 @@ async def run_inspected_generation(device_id: int, generation_id: int, document_
         await release_claim(reg)
         raise ReleaseRefused(f"generation {generation_id} has no queued Apply job")
     job_id, claimed_device_id, job_type = started
-    async with session() as db:
-        queue_frontier = await db.scalar(select(func.max(Job.id))) or 0
     await _run_one_job(0, job_id, claimed_device_id, job_type, _JOB_RUNNERS[job_type], reg)
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -350,10 +349,12 @@ async def run_inspected_generation(device_id: int, generation_id: int, document_
         if len(followups) > 1:
             await _report_queued_release_jobs(db, device_id)
             raise FollowupSyncFailed(f"removal job {job_id} queued multiple follow-up syncs")
-        followup_id = followups[0].id if followups else None
+        if not followups:
+            await _report_queued_release_jobs(db, device_id)
+            raise FollowupSyncFailed(f"removal job {job_id} queued no follow-up sync")
+        followup_id = followups[0].id
     try:
-        if followup_id is not None:
-            await _run_release_followup(device_id, followup_id)
+        await _run_release_followup(device_id, followup_id)
     finally:
         async with session() as db:
             await _report_queued_release_jobs(db, device_id)

@@ -5,12 +5,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.exc import DBAPIError
 
 from nso_adapter.config import reset_config
@@ -63,6 +64,28 @@ async def _admit(http, name: str, sequence: int) -> tuple[int, int, int, str]:
     assert admitted.status_code == 202
     generation = admitted.json()["generations"][0]
     return device_id, generation["generation_id"], generation["job_id"], generation["digest"]
+
+
+async def test_release_frontier_read_failure_leaves_job_queued(maintenance_client, store_engine):
+    http, _recorder = maintenance_client
+    device_id, generation_id, job_id, digest = await _admit(http, "cutover-vlan", 7111)
+
+    def fail_frontier(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if statement == "SELECT max(jobs.id) AS max_1 \nFROM jobs":
+            raise RuntimeError("frontier read failed")
+
+    event.listen(store_engine.sync_engine, "before_cursor_execute", fail_frontier)
+    try:
+        with pytest.raises(RuntimeError, match="frontier read failed"):
+            await run_inspected_generation(device_id, generation_id, digest)
+    finally:
+        event.remove(store_engine.sync_engine, "before_cursor_execute", fail_frontier)
+
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        claim = await db.get(DeviceClaim, device_id)
+        assert job is not None and job.status is JobStatus.queued
+        assert claim is None
 
 
 async def test_release_refuses_stale_digest_and_unavailable_preview(maintenance_client):
@@ -255,6 +278,29 @@ async def test_release_reports_failed_followup_without_changing_removal(maintena
         assert generation is not None and generation.status.value == "settled"
         assert carrier is not None and carrier.status is JobStatus.succeeded
         assert sync is not None and sync.context == {"followup_of_job_id": carrier.id}
+
+
+async def test_release_reports_missing_followup_without_changing_removal(maintenance_client, store_engine):
+    device_id, removal = await _admit_vlan_removal(maintenance_client, 18111)
+    followup_context = json.dumps({"followup_of_job_id": removal.job_id})
+
+    def fail_followup_insert(_conn, _cursor, statement, parameters, _context, _executemany):
+        values = parameters.values() if isinstance(parameters, dict) else parameters
+        if statement.startswith("INSERT INTO jobs ") and followup_context in values:
+            raise RuntimeError("follow-up insert failed")
+
+    event.listen(store_engine.sync_engine, "before_cursor_execute", fail_followup_insert)
+    try:
+        with pytest.raises(FollowupSyncFailed, match="queued no follow-up sync"):
+            await run_inspected_generation(device_id, removal.id, removal.digest)
+    finally:
+        event.remove(store_engine.sync_engine, "before_cursor_execute", fail_followup_insert)
+
+    async with session() as db:
+        generation = await db.get(DeploymentGeneration, removal.id)
+        carrier = await db.get(Job, removal.job_id)
+        assert generation is not None and generation.status.value == "settled"
+        assert carrier is not None and carrier.status is JobStatus.succeeded
 
 
 async def test_normal_lifespan_starts_background_components(store_engine, pg_url, tmp_path, monkeypatch):
