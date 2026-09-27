@@ -1823,14 +1823,13 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
 async def _enqueue_followup_sync(db: AsyncSession, job_id: int, device_id: int) -> None:
     """Option A follow-up: re-import any residue as an unowned mirror right away.
 
-    After the terminal commit this job is no longer active, so the per-device dedup admits
-    the sync; best-effort — the scheduler covers it if this loses a race.
+    After the terminal commit, enqueue a dedicated sync. The scheduler covers failures.
     """
     try:
-        from nso_adapter.core.jobs import enqueue_job
-        from nso_adapter.store.models import JobType
+        from nso_adapter.core.jobs import create_followup_sync
 
-        await enqueue_job(device_id, JobType.sync, db)
+        await create_followup_sync(db, device_id, job_id)
+        await db.commit()
     except ClaimLostError:
         # Revocation is not a runner error: recovery already owns the disposition.
         raise

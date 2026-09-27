@@ -36,6 +36,8 @@ from nso_adapter.store.models import Device, Job, JobStatus, JobType
 
 logger = structlog.get_logger(__name__)
 
+FOLLOWUP_OF_JOB_ID = "followup_of_job_id"
+
 
 async def get_queued_job_of_type(device_id: int, job_type: JobType, db: AsyncSession) -> Job | None:
     """Return the queued job of *job_type* — the exact cause of a same-type refusal.
@@ -215,10 +217,26 @@ async def create_dedicated_job(
     return job
 
 
+async def create_followup_sync(db: AsyncSession, device_id: int, followup_of_job_id: int) -> Job:
+    """Create one queued non-coalescible sync linked to its removal job. Caller commits."""
+    job = Job(
+        job_type=JobType.sync,
+        device_id=device_id,
+        status=JobStatus.queued,
+        coalescible=False,
+        context={FOLLOWUP_OF_JOB_ID: followup_of_job_id},
+    )
+    db.add(job)
+    await db.flush()
+    return job
+
+
 async def enqueue_job(
     device_id: int,
     job_type: JobType,
     db: AsyncSession,
+    *,
+    context: dict | None = None,
 ) -> tuple[Job, bool]:
     """Admit a queued coalescible job. Returns (job, created).
 
@@ -233,7 +251,7 @@ async def enqueue_job(
     # window exists and a conflict never surfaces as an IntegrityError the caller must
     # recover from. A queued removal does not refuse a sync, and a running job does not
     # refuse its own successor — the device claim serializes execution.
-    created, winner = await admit_coalescible_job(db, device_id, job_type)
+    created, winner = await admit_coalescible_job(db, device_id, job_type, context=context)
     if winner is not None:
         logger.debug("job.enqueue.race_lost", device_id=device_id, winner_id=winner.id)
         await db.commit()  # release the winner lock; this helper owns its transaction

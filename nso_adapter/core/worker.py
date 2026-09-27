@@ -32,7 +32,7 @@ import os
 import sys
 import time
 from datetime import UTC, datetime, timedelta
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict
 
 import structlog
 from sqlalchemy import func, or_, select
@@ -59,9 +59,21 @@ from nso_adapter.core.claim import (
     terminalize_running,
 )
 from nso_adapter.store.db import session
-from nso_adapter.store.models import DeviceClaim, Job, JobStatus, JobType
+from nso_adapter.store.models import DeploymentGeneration, DeviceClaim, Job, JobStatus, JobType
+
+if TYPE_CHECKING:
+    from nso_adapter.core.apply import ApplyPreview
 
 logger = structlog.get_logger(__name__)
+
+
+class ReleaseRefused(RuntimeError):
+    """The inspected generation is no longer safe to execute."""
+
+
+class FollowupSyncFailed(RuntimeError):
+    """The released removal's sync did not finish successfully."""
+
 
 # Seconds between heartbeat refreshes while a job runs.
 _HEARTBEAT_INTERVAL = 15.0
@@ -186,7 +198,15 @@ async def _claim_next_job() -> tuple[int, int | None, JobType, ClaimRegistration
     return None
 
 
-async def _start_head_under_claim(device_id: int, reg: ClaimRegistration) -> tuple[int, int, JobType] | None:
+async def _start_head_under_claim(
+    device_id: int,
+    reg: ClaimRegistration,
+    *,
+    expected_generation_id: int | None = None,
+    expected_digest: str | None = None,
+    expected_job_id: int | None = None,
+    expected_preview: ApplyPreview | None = None,
+) -> tuple[int, int, JobType] | None:
     """Lock this device's first ADMISSIBLE queued job under the claim and start it.
 
     One transaction. The candidates are walked in per-device FIFO order and the first one the
@@ -207,17 +227,10 @@ async def _start_head_under_claim(device_id: int, reg: ClaimRegistration) -> tup
     async with session() as db:
         await lock_claim(db, reg)  # claim -> jobs, per the global lock order
 
-        candidates = (
-            (
-                await db.execute(
-                    select(Job.id)
-                    .where(Job.device_id == device_id, Job.status == JobStatus.queued)
-                    .order_by(Job.created_at, Job.id)
-                )
-            )
-            .scalars()
-            .all()
-        )
+        candidate_query = select(Job.id).where(Job.device_id == device_id, Job.status == JobStatus.queued)
+        if expected_job_id is not None:
+            candidate_query = candidate_query.where(Job.id == expected_job_id)
+        candidates = (await db.scalars(candidate_query.order_by(Job.created_at, Job.id))).all()
 
         job = None
         for candidate in candidates:
@@ -238,6 +251,32 @@ async def _start_head_under_claim(device_id: int, reg: ClaimRegistration) -> tup
         if job is None:
             await db.rollback()
             return None
+        if expected_generation_id is not None:
+            from nso_adapter.core.apply import PREVIEW_KEY
+            from nso_adapter.core.generation import digest_document, executable_head, executing_generation
+
+            head = await executable_head(db, device_id)
+            carried = await executing_generation(db, job.id)
+            if head is None or head.job_id != job.id or carried is None or carried.id != expected_generation_id:
+                raise ReleaseRefused(f"generation {expected_generation_id} is not the execution document")
+            if carried.digest != expected_digest or carried.digest != digest_document(
+                carried.mode, carried.document, carried.allowed_removal_keys or {}
+            ):
+                raise ReleaseRefused(f"generation {expected_generation_id} document digest differs")
+            count = await db.scalar(
+                select(func.count()).select_from(DeploymentGeneration).where(DeploymentGeneration.job_id == job.id)
+            )
+            if job.job_type not in (JobType.apply, JobType.removal) or count != 1:
+                raise ReleaseRefused(f"generation {expected_generation_id} is not the job's sole document")
+            if (
+                expected_preview is None
+                or ((expected_preview.generation_id, expected_preview.document_digest) != (carried.id, carried.digest))
+                or (
+                    PREVIEW_KEY in expected_preview.diffs
+                    and "preview unavailable" in expected_preview.diffs[PREVIEW_KEY]
+                )
+            ):
+                raise ReleaseRefused(f"generation {expected_generation_id} preview unavailable")
         await mark_job_generations_running(db, job.id)
 
         claimed = (job.id, device_id, job.job_type)
@@ -261,6 +300,96 @@ async def _start_head_under_claim(device_id: int, reg: ClaimRegistration) -> tup
         await db.commit()
         return claimed
     return None
+
+
+async def run_inspected_generation(device_id: int, generation_id: int, document_digest: str) -> JobStatus:
+    """Run one inspected Apply and the sync created by its removal, if any."""
+    from nso_adapter.core.apply import collect_apply_diff
+    from nso_adapter.core.jobs import _JOB_RUNNERS, FOLLOWUP_OF_JOB_ID
+
+    async with session() as db:
+        preview = await collect_apply_diff(db, device_id)
+        queue_frontier = await db.scalar(select(func.max(Job.id))) or 0
+    reg = await acquire_claim(device_id, "job")
+    if reg is None:
+        raise ReleaseRefused(f"device {device_id} has an active claim")
+    try:
+        started = await _start_head_under_claim(
+            device_id,
+            reg,
+            expected_generation_id=generation_id,
+            expected_digest=document_digest,
+            expected_preview=preview,
+        )
+    except BaseException:
+        await release_claim(reg)
+        raise
+    if started is None:
+        await release_claim(reg)
+        raise ReleaseRefused(f"generation {generation_id} has no queued Apply job")
+    job_id, claimed_device_id, job_type = started
+    await _run_one_job(0, job_id, claimed_device_id, job_type, _JOB_RUNNERS[job_type], reg)
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job is not None
+        status = job.status
+        if status is not JobStatus.succeeded or job_type is not JobType.removal:
+            await _report_queued_release_jobs(db, device_id)
+            return status
+        syncs = (
+            await db.scalars(
+                select(Job)
+                .where(Job.device_id == device_id, Job.job_type == JobType.sync, Job.status == JobStatus.queued)
+                .order_by(Job.id)
+            )
+        ).all()
+        followups = [
+            sync for sync in syncs if sync.context == {FOLLOWUP_OF_JOB_ID: job_id} and sync.id > queue_frontier
+        ]
+        if len(followups) > 1:
+            await _report_queued_release_jobs(db, device_id)
+            raise FollowupSyncFailed(f"removal job {job_id} queued multiple follow-up syncs")
+        if not followups:
+            await _report_queued_release_jobs(db, device_id)
+            raise FollowupSyncFailed(f"removal job {job_id} queued no follow-up sync")
+        followup_id = followups[0].id
+    try:
+        await _run_release_followup(device_id, followup_id)
+    finally:
+        async with session() as db:
+            await _report_queued_release_jobs(db, device_id)
+    return status
+
+
+async def _run_release_followup(device_id: int, followup_id: int) -> None:
+    from nso_adapter.core.jobs import _JOB_RUNNERS
+
+    followup_claim = await acquire_claim(device_id, "job")
+    if followup_claim is None:
+        raise FollowupSyncFailed(f"follow-up sync {followup_id} could not acquire the device claim")
+    try:
+        started = await _start_head_under_claim(device_id, followup_claim, expected_job_id=followup_id)
+    except BaseException:
+        await release_claim(followup_claim)
+        raise
+    if started is None:
+        await release_claim(followup_claim)
+        raise FollowupSyncFailed(f"follow-up sync {followup_id} is no longer queued")
+    sync_job_id, sync_device_id, sync_type = started
+    await _run_one_job(0, sync_job_id, sync_device_id, sync_type, _JOB_RUNNERS[sync_type], followup_claim)
+    async with session() as db:
+        sync = await db.get(Job, followup_id)
+        assert sync is not None
+        if sync.status is not JobStatus.succeeded:
+            raise FollowupSyncFailed(f"follow-up sync {followup_id} finished with {sync.status.value}: {sync.error}")
+
+
+async def _report_queued_release_jobs(db, device_id: int) -> None:
+    queued_ids = (
+        await db.scalars(select(Job.id).where(Job.device_id == device_id, Job.status == JobStatus.queued))
+    ).all()
+    if queued_ids:
+        logger.warning("worker.inspected_release_jobs_left_queued", device_id=device_id, job_ids=queued_ids)
 
 
 async def _claim_next_claimless_job() -> tuple[int, None, JobType, int] | None:

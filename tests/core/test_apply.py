@@ -501,7 +501,7 @@ async def test_collect_apply_diff_returns_the_documents_delta(adapter_client):
         async with session() as db:
             diffs = await collect_apply_diff(db, device_id)
 
-    assert diffs == {PREVIEW_KEY: "DEVICE NATIVE DELTA"}
+    assert diffs.diffs == {PREVIEW_KEY: "DEVICE NATIVE DELTA"}
     assert sender.await_args.kwargs["dry_run"] is True, "a preview commits nothing"
     assert sent_list(sender, "ospf", "process-config")[0]["process-id"] == "1"
 
@@ -520,7 +520,7 @@ async def test_collect_apply_diff_empty_delta_is_omitted(adapter_client):
     ):
         async with session() as db:
             diffs = await collect_apply_diff(db, device_id)
-    assert diffs == {}
+    assert diffs.diffs == {}
 
 
 async def test_collect_apply_diff_outformat_cli_threads_the_format(adapter_client):
@@ -539,7 +539,7 @@ async def test_collect_apply_diff_outformat_cli_threads_the_format(adapter_clien
         async with session() as db:
             diffs = await collect_apply_diff(db, device_id, outformat="cli")
 
-    assert diffs == {PREVIEW_KEY: "+ router ospf 1"}
+    assert diffs.diffs == {PREVIEW_KEY: "+ router ospf 1"}
     assert sender.await_args.kwargs["dry_run"] == "cli"
 
 
@@ -612,7 +612,7 @@ async def test_collect_apply_diff_device_not_found(adapter_client):
 
     async with session() as db:
         diffs = await collect_apply_diff(db, 999999)
-    assert diffs == {}
+    assert diffs.diffs == {}
 
 
 async def test_collect_apply_diff_without_a_generation_reports_unavailable(adapter_client):
@@ -626,8 +626,8 @@ async def test_collect_apply_diff_without_a_generation_reports_unavailable(adapt
         async with session() as db:
             diffs = await collect_apply_diff(db, device_id)
 
-    assert list(diffs) == [PREVIEW_KEY]
-    assert diffs[PREVIEW_KEY].startswith("!! preview unavailable")
+    assert list(diffs.diffs) == [PREVIEW_KEY]
+    assert diffs.diffs[PREVIEW_KEY].startswith("!! preview unavailable")
 
 
 async def test_collect_apply_diff_classifies_an_unexpected_dry_run_failure(adapter_client):
@@ -647,9 +647,9 @@ async def test_collect_apply_diff_classifies_an_unexpected_dry_run_failure(adapt
         async with session() as db:
             diffs = await collect_apply_diff(db, device_id)
 
-    assert diffs[PREVIEW_KEY].startswith("!! preview unavailable")
-    assert "RuntimeError" in diffs[PREVIEW_KEY]
-    assert secret not in diffs[PREVIEW_KEY]
+    assert diffs.diffs[PREVIEW_KEY].startswith("!! preview unavailable")
+    assert "RuntimeError" in diffs.diffs[PREVIEW_KEY]
+    assert secret not in diffs.diffs[PREVIEW_KEY]
     record = next(record for record in logs if record["event"] == "apply_diff.failed")
     assert record["device_id"] == device_id
     assert_records_free_of([record], [secret, "rtr-diff-boom"])
@@ -680,8 +680,8 @@ async def test_collect_apply_diff_redacts_value_bearing_apply_error(adapter_clie
     build_record = next(record for record in logs if record["event"] == "apply.section_build_failed")
     diff_record = next(record for record in logs if record["event"] == "apply_diff.failed")
     assert_records_free_of([build_record, diff_record], [secret, "rtr-diff-invalid"])
-    assert "invalid_enabled_value" in diffs[PREVIEW_KEY]
-    assert secret not in diffs[PREVIEW_KEY]
+    assert "invalid_enabled_value" in diffs.diffs[PREVIEW_KEY]
+    assert secret not in diffs.diffs[PREVIEW_KEY]
     assert build_record["device_id"] == device_id
     assert build_record["section"] == "interface_config"
     assert diff_record["device_id"] == device_id

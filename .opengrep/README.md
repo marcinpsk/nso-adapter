@@ -36,6 +36,16 @@ for its configuration names and workflow skip conditions.
 
 ## Coverage
 
+| Rule | Coverage and accepted limits |
+| --- | --- |
+| `nso-authority-write`, `nso-authority-write-generation`, `nso-authority-write-cutover`, `nso-authority-write-generation-shadow`, `nso-authority-write-cutover-shadow` | Reject direct and chained assignments, resolved built-in `setattr` aliases, resolved `DeviceProjectionStream` constructor keywords, ORM keyword and ordered-value writes, authority keys in literal or constructed mappings, and authority names in `insert(...).from_select(...)`. Mapping checks can flag a dictionary intended for another model. Computed keys and `getattr` writes remain outside this guard. |
+| `nso-authority-augmented-write`, `nso-authority-augmented-write-generation`, `nso-authority-augmented-write-generation-shadow`, `nso-authority-augmented-write-cutover` | Reject augmented assignment to an authority attribute on any receiver expression, including indexed receivers, class methods, and nested functions. Only the four sanctioned module-level functions in `generation.py` are exempt. Computed attribute names remain outside this guard. |
+| `nso-authority-reset-value`, `nso-authority-reset-revision`, `nso-authority-reset-rebound-null` | In `cutover.py` `deauthorize_for_cutover`, accept only resolved `sqlalchemy.null()` for `authorized_document` and literal integer `0` for `authorized_revision` and `applied_revision`. String and column-object mapping keys share this check. A local `null()` and Python `None` are rejected. Local definitions and assignments that rebind an imported NULL callable are rejected for the tested direct and ORM keyword write forms. |
+| `nso-authority-raw-sql` | Conservatively reject a single Python string literal that contains both `UPDATE` or `INSERT` and a whole-word authority column name. Python implicit string concatenation forms one literal to OpenGrep. The rule deliberately flags mentions in predicates and comments, and does not parse SQL targets. Dynamically assembled SQL and direct database administration remain outside this guard. |
+| `nso-generation-construction`, `nso-generation-construction-producer` | Reject resolved `DeploymentGeneration` construction outside `generation.py` `_store_generation`, including absolute import and module aliases. Relative-import aliases remain outside this guard. |
+
+These rules scan `nso_adapter/` production code; fixtures are the only included test path.
+
 `nso-outcome-raw-exception-renderer` rejects traceback logging and raw exception
 values in every positional or structured log field. It covers `nso_adapter/main.py`,
 `core/importer.py`, `core/generation.py`, `core/jobs.py`, `core/removal.py`, `core/failover.py`,

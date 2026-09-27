@@ -49,6 +49,7 @@ def pytest_xdist_auto_num_workers(config: pytest.Config) -> int:
 
 
 VALID_TOKEN = "test-bearer-token"
+AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 
 @pytest.fixture
@@ -438,6 +439,33 @@ async def adapter_client_with_nso(store_engine, pg_url, tmp_path, monkeypatch):
         async with app.router.lifespan_context(app):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
                 yield client
+
+
+@pytest.fixture
+async def maintenance_client(store_engine, pg_url, tmp_path, monkeypatch):
+    """Maintenance API client with a recorded NSO boundary on a private database."""
+    from nso_adapter.config import reset_config
+    from nso_adapter.core.cutover_runner import create_maintenance_app
+    from nso_adapter.core.importer import register_nso_client
+    from tests.core.test_static_route_put import absent, sr_client
+
+    _write_config(tmp_path, monkeypatch, database_url=pg_url, nso_instances=NSO_DEV_INSTANCE)
+    monkeypatch.setenv("NSO_USERNAME", "placeholder-user")
+    monkeypatch.setenv("NSO_PASSWORD", "placeholder-password")
+    reset_config()
+    app = create_maintenance_app()
+    client, recorder = sr_client("cutover-vlan", state=absent(), dry_run_delta="+ vlan 10")
+    client.get_device_ned_id = AsyncMock(return_value="cisco-ios-cli-6.95")
+    client.get_device_state_doc = AsyncMock(return_value={"interface-attributes": {"status": "ok", "interface": []}})
+    with (
+        patch("nso_adapter.main.init_db"),
+        patch("nso_adapter.main._dispose_engine", new=AsyncMock()),
+        patch("nso_adapter.main.set_netbox_client"),
+    ):
+        async with app.router.lifespan_context(app):
+            register_nso_client("nso-dev", client)
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
+                yield http, recorder
 
 
 @pytest.fixture
