@@ -7,17 +7,27 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
-from sqlalchemy import event, select
+from sqlalchemy import delete, event, select
 from sqlalchemy.exc import DBAPIError
 
 from nso_adapter.config import reset_config
+from nso_adapter.core.cutover_runner import create_maintenance_app
 from nso_adapter.core.generation import executable_head
 from nso_adapter.core.worker import FollowupSyncFailed, run_inspected_generation
-from nso_adapter.store.models import DeploymentGeneration, DeviceClaim, Job, JobStatus, JobType
+from nso_adapter.store.models import (
+    DeploymentGeneration,
+    DeviceClaim,
+    DeviceSettleCounter,
+    GenerationStatus,
+    Job,
+    JobStatus,
+    JobType,
+)
 from tests.api.test_action_apply_attempt import _put_vlans
 from tests.conftest import AUTH, _write_config, seed_device, session
 from tests.core.test_action_apply_promotion import _apply
@@ -64,6 +74,72 @@ async def _admit(http, name: str, sequence: int) -> tuple[int, int, int, str]:
     assert admitted.status_code == 202
     generation = admitted.json()["generations"][0]
     return device_id, generation["generation_id"], generation["job_id"], generation["digest"]
+
+
+@pytest.mark.parametrize("claimed", [False, True])
+async def test_maintenance_restart_recovers_interrupted_apply(maintenance_client, claimed):
+    from nso_adapter.core.claim import CLAIM_STALE_AFTER, PROVISION_STALE_AFTER
+
+    http, _recorder = maintenance_client
+    device_id, generation_id, job_id, _digest = await _admit(http, "cutover-vlan", 7112)
+    old = datetime.now(UTC) - timedelta(seconds=max(CLAIM_STALE_AFTER, PROVISION_STALE_AFTER) + 60)
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        job.status = JobStatus.running
+        job.started_at = job.heartbeat_at = old
+        job.run_attempt = 1
+        generation = await db.get(DeploymentGeneration, generation_id)
+        generation.status = GenerationStatus.running
+        if claimed:
+            db.add(
+                DeviceClaim(
+                    device_id=device_id,
+                    job_id=job_id,
+                    claim_token=str(uuid.uuid4()),
+                    purpose="job",
+                    acquired_at=old,
+                    heartbeat_at=old,
+                )
+            )
+        await db.execute(delete(DeviceSettleCounter).where(DeviceSettleCounter.device_id == device_id))
+        await db.commit()
+
+    app = create_maintenance_app()
+    async with app.router.lifespan_context(app):
+        async with session() as db:
+            assert await db.get(DeviceClaim, device_id) is None
+            assert (await db.get(Job, job_id)).status is JobStatus.failed
+            assert (await db.get(DeploymentGeneration, generation_id)).status is GenerationStatus.outcome_unknown
+            assert (await db.get(DeviceSettleCounter, device_id)).last_seq > 0
+        response = await http.post(
+            f"/api/v1/devices/{device_id}/actions/retry-generation",
+            json={"generation_id": generation_id},
+            headers=AUTH,
+        )
+        assert response.status_code == 202
+        async with session() as db:
+            assert (await db.get(Job, response.json()["job_id"])).status is JobStatus.queued
+
+
+async def test_maintenance_restart_queues_uncovered_generation(maintenance_client):
+    http, _recorder = maintenance_client
+    device_id, generation_id, job_id, _digest = await _admit(http, "cutover-vlan", 7113)
+    async with session() as db:
+        await db.delete(await db.get(Job, job_id))
+        await db.commit()
+
+    app = create_maintenance_app()
+    async with app.router.lifespan_context(app):
+        async with session() as db:
+            generation = await db.get(DeploymentGeneration, generation_id)
+            assert generation.status is GenerationStatus.pending
+            assert generation.job_id is not None and generation.job_id != job_id
+            replacement_id = generation.job_id
+            assert (await db.get(Job, replacement_id)).status is JobStatus.queued
+    async with app.router.lifespan_context(app):
+        async with session() as db:
+            assert (await db.get(DeploymentGeneration, generation_id)).job_id == replacement_id
+            assert (await db.get(Job, replacement_id)).status is JobStatus.queued
 
 
 async def test_release_frontier_read_failure_leaves_job_queued(maintenance_client, store_engine):

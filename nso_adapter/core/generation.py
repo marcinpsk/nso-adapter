@@ -1684,6 +1684,7 @@ async def executable_head(db: AsyncSession, device_id: int) -> DeploymentGenerat
         .where(DeploymentGeneration.device_id == device_id, DeploymentGeneration.status.not_in(_CROSSABLE))
         .order_by(DeploymentGeneration.seq)
         .limit(1)
+        .execution_options(populate_existing=True)
     )
 
 

@@ -967,24 +967,29 @@ async def requeue_orphaned_jobs() -> None:
             logger.warning("worker.failed_orphaned_apply", count=failed)
 
 
-async def start_workers(concurrency: int = 1) -> None:
-    """Reconcile orphaned jobs, then start the worker pool."""
-    global _stop, _workers
+async def recover_interrupted_work() -> None:
+    """Recover claims and jobs, then queue uncovered generations without executing them."""
     from nso_adapter.core.generation import recover_generations
-    from nso_adapter.core.tombstone_sweep import sweep_tombstones
     from nso_adapter.store.device_settle import ensure_settle_counters
 
     # BEFORE the reaper, not after (Appendix S §3.3). Recovery terminalizes, and a
     # terminalization that finds no counter row raises — appended after the reaper, this
     # repair could be aborted out of the lifespan by the very state it exists to fix.
     await ensure_settle_counters()
+    await reap_stale_claims()
     await requeue_orphaned_jobs()
     # After the job recovery, so a generation whose job was just requeued is still covered,
     # and before the pool starts: a generation the dead process left ``running`` has an
     # unknown outcome and must block its successors from the first poll onwards (#1522 §H2).
     await recover_generations()
-    # Before any worker exists, so a revoked device is immediately claimable again.
-    await reap_stale_claims()
+
+
+async def start_workers(concurrency: int = 1) -> None:
+    """Reconcile orphaned jobs, then start the worker pool."""
+    global _stop, _workers
+    from nso_adapter.core.tombstone_sweep import sweep_tombstones
+
+    await recover_interrupted_work()
     # And before the pool drains anything: a deletion whose removal job was lost with the
     # process has no other carrier, and the sweep needs the device unclaimed to act.
     await sweep_tombstones()

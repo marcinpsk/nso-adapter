@@ -27,6 +27,14 @@ async def _store_generation(db):
     # ok: nso-generation-construction-producer
     db.add(DeploymentGeneration(document={}))
 
+    def nested():
+        # ruleid: nso-generation-construction-shadow
+        db.add(DeploymentGeneration(document={}))
+
+    async def async_nested():
+        # ruleid: nso-generation-construction-shadow
+        db.add(DeploymentGeneration(document={}))
+
 
 def rogue(db, row, rows):
     # ruleid: nso-authority-write-generation
@@ -38,6 +46,10 @@ def rogue(db, row, rows):
 
 
 class Rogue:
+    def _store_generation(self, db):
+        # ruleid: nso-generation-construction-shadow
+        db.add(DeploymentGeneration(document={}))
+
     def advance(self, row):
         # ruleid: nso-authority-augmented-write-generation, nso-authority-augmented-write-generation-shadow
         row.authorized_revision += 1
@@ -55,3 +67,19 @@ def outer(row):
     async def create_generation():
         # ruleid: nso-authority-write-generation-shadow
         row.authorized_revision = 5
+
+    def _store_generation(db):
+        # ruleid: nso-generation-construction-shadow
+        db.add(DeploymentGeneration(document={}))
+
+
+async def async_outer():
+    async def _store_generation(db):
+        # ruleid: nso-generation-construction-shadow
+        db.add(DeploymentGeneration(document={}))
+
+
+class AsyncRogue:
+    async def _store_generation(self, db):
+        # ruleid: nso-generation-construction-shadow
+        db.add(DeploymentGeneration(document={}))

@@ -52,6 +52,49 @@ async def test_preview_invalidated_when_job_document_changes_during_dry_run(main
     assert "preview unavailable" in response.json()["diffs"]["device_intent"]
 
 
+async def test_preview_invalidated_when_retry_rebinds_head_during_dry_run(maintenance_client):
+    from nso_adapter.store.models import DeploymentGeneration, GenerationStatus, Job, JobStatus
+    from tests.conftest import session
+
+    http, recorder = maintenance_client
+    device_id = await seed_device(nso_device_name="cutover-vlan", netbox_device_id=18104)
+    await seed_settings(device_id, auto_apply=True)
+    assert (await put_vlans(http, device_id, [10])).status_code == 200
+    assert (await put_vlans(http, device_id, [10, 20])).status_code == 200
+    chain = await generations(device_id)
+    assert len(chain) == 2 and chain[0].job_id == chain[1].job_id
+    async with session() as db:
+        job = await db.get(Job, chain[0].job_id)
+        job.status = JobStatus.failed
+        for generation in chain:
+            stored = await db.get(DeploymentGeneration, generation.id)
+            stored.status = GenerationStatus.failed
+        await db.commit()
+    original = recorder._handle
+    retried = False
+
+    async def retry_during_network(method, url, content=None, headers=None):
+        nonlocal retried
+        if "dry-run=" in url and not retried:
+            retried = True
+            response = await http.post(
+                f"/api/v1/devices/{device_id}/actions/retry-generation",
+                json={"generation_id": chain[0].id},
+                headers=AUTH,
+            )
+            assert response.status_code == 202
+        return await original(method, url, content, headers)
+
+    recorder._handle = retry_during_network
+    response = await http.get(f"/api/v1/devices/{device_id}/actions/apply-diff", headers=AUTH)
+    assert response.status_code == 200
+    current = await generations(device_id)
+    assert retried and current[0].job_id != current[1].job_id
+    assert response.json()["generation_id"] is None, response.json()
+    assert response.json()["document_digest"] is None
+    assert "preview unavailable" in response.json()["diffs"]["device_intent"]
+
+
 async def test_release_accepts_ordinary_apply_replacement_carrier(maintenance_client):
     from nso_adapter.core.generation import executable_head
     from nso_adapter.core.worker import run_inspected_generation

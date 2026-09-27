@@ -312,6 +312,15 @@ rules:
       - pattern-not-inside: |
           def _store_generation(...):
             ...
+  - id: nso-generation-construction-shadow
+    languages: [python]
+    severity: ERROR
+    message: A nested function or class method is not _store_generation.
+    paths:
+      include: [nso_adapter/core/generation.py]
+    patterns:
+      - pattern: nso_adapter.store.models.DeploymentGeneration(...)
+      - pattern-either: *shadow_owner
   - id: nso-authority-raw-sql
     languages: [python]
     severity: ERROR

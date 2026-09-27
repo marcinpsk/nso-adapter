@@ -466,6 +466,10 @@ async def _app_lifespan(app: FastAPI, *, background: bool):
     if background:
         await start_workers(cfg.scheduler.worker_concurrency)
         start_scheduler()
+    else:
+        from nso_adapter.core.worker import recover_interrupted_work
+
+        await recover_interrupted_work()
     try:
         yield
     finally:
