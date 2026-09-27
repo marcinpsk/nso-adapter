@@ -32,7 +32,7 @@ import os
 import sys
 import time
 from datetime import UTC, datetime, timedelta
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict
 
 import structlog
 from sqlalchemy import func, or_, select
@@ -60,6 +60,9 @@ from nso_adapter.core.claim import (
 )
 from nso_adapter.store.db import session
 from nso_adapter.store.models import DeploymentGeneration, DeviceClaim, Job, JobStatus, JobType
+
+if TYPE_CHECKING:
+    from nso_adapter.core.apply import ApplyPreview
 
 logger = structlog.get_logger(__name__)
 
@@ -202,6 +205,7 @@ async def _start_head_under_claim(
     expected_generation_id: int | None = None,
     expected_digest: str | None = None,
     expected_job_id: int | None = None,
+    expected_preview: ApplyPreview | None = None,
 ) -> tuple[int, int, JobType] | None:
     """Lock this device's first ADMISSIBLE queued job under the claim and start it.
 
@@ -248,7 +252,7 @@ async def _start_head_under_claim(
             await db.rollback()
             return None
         if expected_generation_id is not None:
-            from nso_adapter.core.apply import PREVIEW_KEY, collect_apply_diff
+            from nso_adapter.core.apply import PREVIEW_KEY
             from nso_adapter.core.generation import digest_document, executable_head, executing_generation
 
             head = await executable_head(db, device_id)
@@ -264,9 +268,13 @@ async def _start_head_under_claim(
             )
             if job.job_type not in (JobType.apply, JobType.removal) or count != 1:
                 raise ReleaseRefused(f"generation {expected_generation_id} is not the job's sole document")
-            preview = await collect_apply_diff(db, device_id)
-            if (preview.generation_id, preview.document_digest) != (carried.id, carried.digest) or (
-                PREVIEW_KEY in preview.diffs and "preview unavailable" in preview.diffs[PREVIEW_KEY]
+            if (
+                expected_preview is None
+                or ((expected_preview.generation_id, expected_preview.document_digest) != (carried.id, carried.digest))
+                or (
+                    PREVIEW_KEY in expected_preview.diffs
+                    and "preview unavailable" in expected_preview.diffs[PREVIEW_KEY]
+                )
             ):
                 raise ReleaseRefused(f"generation {expected_generation_id} preview unavailable")
         await mark_job_generations_running(db, job.id)
@@ -296,14 +304,21 @@ async def _start_head_under_claim(
 
 async def run_inspected_generation(device_id: int, generation_id: int, document_digest: str) -> JobStatus:
     """Run one inspected Apply and the sync created by its removal, if any."""
+    from nso_adapter.core.apply import collect_apply_diff
     from nso_adapter.core.jobs import _JOB_RUNNERS, FOLLOWUP_OF_JOB_ID
 
+    async with session() as db:
+        preview = await collect_apply_diff(db, device_id)
     reg = await acquire_claim(device_id, "job")
     if reg is None:
         raise ReleaseRefused(f"device {device_id} has an active claim")
     try:
         started = await _start_head_under_claim(
-            device_id, reg, expected_generation_id=generation_id, expected_digest=document_digest
+            device_id,
+            reg,
+            expected_generation_id=generation_id,
+            expected_digest=document_digest,
+            expected_preview=preview,
         )
     except BaseException:
         await release_claim(reg)

@@ -11,11 +11,12 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 
 from nso_adapter.config import reset_config
 from nso_adapter.core.generation import executable_head
 from nso_adapter.core.worker import FollowupSyncFailed, run_inspected_generation
-from nso_adapter.store.models import DeploymentGeneration, Job, JobStatus, JobType
+from nso_adapter.store.models import DeploymentGeneration, DeviceClaim, Job, JobStatus, JobType
 from tests.api.test_action_apply_attempt import _put_vlans
 from tests.conftest import AUTH, _write_config, seed_device, session
 from tests.core.test_action_apply_promotion import _apply
@@ -86,6 +87,36 @@ async def test_release_refuses_stale_digest_and_unavailable_preview(maintenance_
     assert recorder.commits == []
     async with session() as db:
         assert (await db.get(Job, job_id)).status is JobStatus.queued
+
+
+async def test_release_preview_does_not_hold_job_or_claim_locks(maintenance_client):
+    http, recorder = maintenance_client
+    device_id, generation_id, job_id, digest = await _admit(http, "cutover-vlan", 7105)
+    original = recorder._handle
+    observations = []
+
+    async def probe_dry_run(method, url, content=None, headers=None):
+        if "dry-run=" in url and not observations:
+            async with session() as db:
+                claim = await db.scalar(select(DeviceClaim).where(DeviceClaim.device_id == device_id))
+                try:
+                    locked = await db.scalar(select(Job).where(Job.id == job_id).with_for_update(nowait=True))
+                except DBAPIError as exc:
+                    if getattr(exc.orig, "sqlstate", None) != "55P03":
+                        raise
+                    observations.append((False, claim is None))
+                else:
+                    observations.append((locked is not None, claim is None))
+                finally:
+                    await db.rollback()
+        response = await original(method, url, content, headers)
+        if "dry-run=" not in url:
+            recorder.dry_run_delta = ""
+        return response
+
+    recorder._handle = probe_dry_run
+    assert await run_inspected_generation(device_id, generation_id, digest) is JobStatus.succeeded
+    assert observations == [(True, True)]
 
 
 async def test_release_executes_only_inspected_generation(maintenance_client):
