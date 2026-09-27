@@ -56,6 +56,8 @@ class ApplyDiffOut(BaseModel):
     device_id: int
     outformat: str
     diffs: dict[str, str]
+    generation_id: int | None
+    document_digest: str | None
 
 
 class ActionApplyIn(BaseModel):
@@ -612,11 +614,41 @@ async def action_apply_diff(
     tree diff — the "diff -u" style the preview panel renders.
     """
     from nso_adapter.core.apply import collect_apply_diff
+    from nso_adapter.core.generation import executable_head, executing_generation
 
     if outformat not in ("native", "cli"):
         raise api_error(400, "bad_request", "Unknown outformat; expected native or cli")
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
-    diffs = await collect_apply_diff(db, device_id, outformat=outformat)
-    return {"device_id": device_id, "outformat": outformat, "diffs": diffs}
+    head = await executable_head(db, device_id)
+    preview = await collect_apply_diff(db, device_id, outformat=outformat)
+    current = await executable_head(db, device_id)
+    execution = None
+    if preview.generation_id is not None:
+        execution = (
+            await executing_generation(db, current.job_id) if current is not None and current.job_id else current
+        )
+    if (
+        (head is None) != (current is None)
+        or (head is not None and current is not None and (current.id != head.id or current.digest != head.digest))
+        or (
+            preview.generation_id is not None
+            and (execution.id if execution else None, execution.digest if execution else None)
+            != (preview.generation_id, preview.document_digest)
+        )
+    ):
+        from nso_adapter.core.apply import PREVIEW_KEY
+
+        preview = preview._replace(
+            diffs={PREVIEW_KEY: "!! preview unavailable: executable generation changed during preview"},
+            generation_id=None,
+            document_digest=None,
+        )
+    return {
+        "device_id": device_id,
+        "outformat": outformat,
+        "diffs": preview.diffs,
+        "generation_id": preview.generation_id,
+        "document_digest": preview.document_digest,
+    }

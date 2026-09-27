@@ -1827,10 +1827,10 @@ async def _enqueue_followup_sync(db: AsyncSession, job_id: int, device_id: int) 
     the sync; best-effort — the scheduler covers it if this loses a race.
     """
     try:
-        from nso_adapter.core.jobs import enqueue_job
+        from nso_adapter.core.jobs import FOLLOWUP_OF_JOB_ID, enqueue_job
         from nso_adapter.store.models import JobType
 
-        await enqueue_job(device_id, JobType.sync, db)
+        await enqueue_job(device_id, JobType.sync, db, context={FOLLOWUP_OF_JOB_ID: job_id})
     except ClaimLostError:
         # Revocation is not a runner error: recovery already owns the disposition.
         raise

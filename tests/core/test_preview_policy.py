@@ -62,6 +62,6 @@ async def test_preview_distinguishes_empty_delta_from_unavailable(adapter_client
         with patch("nso_adapter.core.importer.get_nso_client", return_value=sr_client(fake)):
             preview = await collect_apply_diff(db, device_id)
     if dry_run_status == 200:
-        assert preview == {}
+        assert preview.diffs == {}
     else:
-        assert "preview unavailable" in preview[PREVIEW_KEY]
+        assert "preview unavailable" in preview.diffs[PREVIEW_KEY]

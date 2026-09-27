@@ -1028,6 +1028,9 @@ Preview the **native device diff** the next Apply would push (NSO
 reconcile param makes the preview match the real reconcile commit). Synchronous —
 no job. The preview is bound to the device's executable generation head, never to live
 intent, so it can only show a diff the next commit can produce.
+`generation_id` and `document_digest` identify that stored head for an inspected
+cutover release. Both are `null` when no executable head exists. A release checks
+them again and refuses if the head, digest, or preview changed.
 
 One document is one transaction, so there is ONE delta: `diffs` carries a single
 `device_intent` entry covering every family the document holds, the two switching sections
@@ -1037,7 +1040,8 @@ build), that one entry carries a `!! preview unavailable: <reason>` line instead
 `outformat=cli` renders NSO's NED-uniform `+`/`-` tree diff instead of device-native config.
 
 ```json
-{ "device_id": 1, "outformat": "native",
+{ "device_id": 1, "outformat": "native", "generation_id": 7,
+  "document_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "diffs": { "device_intent": "interface GigabitEthernet0/1\n description uplink\n!" } }
 ```
 

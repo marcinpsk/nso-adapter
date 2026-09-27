@@ -70,6 +70,14 @@ logger = structlog.get_logger(__name__)
 PREVIEW_KEY = "device_intent"
 
 
+class ApplyPreview(NamedTuple):
+    """The diff and identity of the generation rendered by the dry run."""
+
+    diffs: dict[str, str]
+    generation_id: int | None
+    document_digest: str | None
+
+
 def _apply_error_summary(exc: NsoApplyError) -> str:
     """Describe a typed apply failure without copying its value-bearing message."""
     return f"apply error ({exc.code}); see the server log"
@@ -741,11 +749,11 @@ async def build_device_containers(
     return DeviceBody(containers, sent_route_keys, errors, certified)
 
 
-async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = "native") -> dict[str, str]:
+async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = "native") -> ApplyPreview:
     """Read-only preview: the native device delta the device's next deployment would push.
 
-    The preview is bound to the DOCUMENT being committed — the device's executable
-    generation head — never to a live-store estimate: store-only intent never reaches the
+    The preview is bound to the document the head's job will execute, never to a live-store
+    estimate: store-only intent never reaches the
     device, so previewing it would show a diff the commit cannot produce. With
     ``outformat="native"`` NSO renders the device-native config the PUT would push;
     ``outformat="cli"`` renders the NED-uniform ``+``/``-`` tree diff (the "diff -u" panel).
@@ -764,15 +772,19 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
 
     device = await db.get(Device, device_id)
     if not device:
-        return {}
+        return ApplyPreview({}, None, None)
     generation = await executable_head(db, device_id)
     if generation is None:
-        return {PREVIEW_KEY: "!! preview unavailable: this device has no generation to deploy"}
+        return ApplyPreview(
+            {PREVIEW_KEY: "!! preview unavailable: this device has no generation to deploy"}, None, None
+        )
+    identity: tuple[int | None, str | None] = None, None
     try:
         if generation.job_id is not None:
             generation = await executing_generation(db, generation.job_id)
             if generation is None:
-                return {PREVIEW_KEY: "!! preview unavailable: job carries no generation"}
+                return ApplyPreview({PREVIEW_KEY: "!! preview unavailable: job carries no generation"}, None, None)
+        identity = generation.id, generation.digest
         client = get_nso_client(device.nso_instance)
         # dry_run is bool|str down the sender: True = native, "cli" = tree diff.
         fmt: bool | str = "cli" if outformat == "cli" else True
@@ -793,15 +805,15 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
     except NsoApplyError as exc:
         reason = _apply_error_summary(exc)
         logger.warning("apply_diff.failed", **device_fields(device_id=device_id), error=reason)
-        return {PREVIEW_KEY: f"!! preview unavailable: {reason}"}
+        return ApplyPreview({PREVIEW_KEY: f"!! preview unavailable: {reason}"}, *identity)
     except Exception as exc:  # noqa: BLE001 — the preview must never fail hard
         internal = internal_error(exc)
         logger.warning("apply_diff.failed", **device_fields(device_id=device_id), error=internal["message"])
         reason = internal["message"]
-        return {PREVIEW_KEY: f"!! preview unavailable: {reason}"}
+        return ApplyPreview({PREVIEW_KEY: f"!! preview unavailable: {reason}"}, *identity)
     if delta is None:
-        return {PREVIEW_KEY: "!! preview unavailable: NSO dry-run was inconclusive"}
-    return {PREVIEW_KEY: delta} if delta.strip() else {}
+        return ApplyPreview({PREVIEW_KEY: "!! preview unavailable: NSO dry-run was inconclusive"}, *identity)
+    return ApplyPreview({PREVIEW_KEY: delta} if delta.strip() else {}, *identity)
 
 
 # ── run_apply: shared eligibility + per-scope batch-commit helpers ────────────
