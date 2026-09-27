@@ -10,6 +10,9 @@ async def deauthorize_for_cutover(db, row):
     # ok: nso-authority-reset-value
     db.execute(update(DeviceProjectionStream).values({DeviceProjectionStream.authorized_document: sql_null()}))
 
+
+# Independent snippets use the sanctioned function name in separate scopes.
+async def deauthorize_for_cutover(db, row):
     def null():
         return {"_execution": {"context": {"source": "apply"}}}
 

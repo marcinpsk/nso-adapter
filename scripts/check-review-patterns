@@ -6,6 +6,9 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 scan_bin="${OPENGREP_BIN:-opengrep}"
+if [[ "$scan_bin" == */* && "$scan_bin" != /* ]]; then
+  scan_bin="$repo_root/$scan_bin"
+fi
 mode="${1:-scan}"
 if (( $# )); then shift; fi
 require_opengrep() {

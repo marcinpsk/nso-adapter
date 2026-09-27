@@ -253,10 +253,18 @@ async def _start_head_under_claim(
             return None
         if expected_generation_id is not None:
             from nso_adapter.core.apply import PREVIEW_KEY
-            from nso_adapter.core.generation import digest_document, executable_head, executing_generation
+            from nso_adapter.core.generation import (
+                GenerationTampered,
+                digest_document,
+                executable_head,
+                executing_generation,
+            )
 
             head = await executable_head(db, device_id)
-            carried = await executing_generation(db, job.id)
+            try:
+                carried = await executing_generation(db, job.id)
+            except GenerationTampered as exc:
+                raise ReleaseRefused(f"generation {expected_generation_id} document integrity check failed") from exc
             if head is None or head.job_id != job.id or carried is None or carried.id != expected_generation_id:
                 raise ReleaseRefused(f"generation {expected_generation_id} is not the execution document")
             if carried.digest != expected_digest or carried.digest != digest_document(

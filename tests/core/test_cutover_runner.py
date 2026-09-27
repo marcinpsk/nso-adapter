@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
-from sqlalchemy import delete, event, select
+from sqlalchemy import delete, event, select, text
 from sqlalchemy.exc import DBAPIError
 
 from nso_adapter.config import reset_config
@@ -162,6 +162,30 @@ async def test_release_frontier_read_failure_leaves_job_queued(maintenance_clien
         claim = await db.get(DeviceClaim, device_id)
         assert job is not None and job.status is JobStatus.queued
         assert claim is None
+
+
+async def test_release_refuses_tampered_document_and_releases_claim(maintenance_client):
+    from nso_adapter.core.generation import GenerationTampered
+    from nso_adapter.core.worker import ReleaseRefused
+
+    http, recorder = maintenance_client
+    device_id, generation_id, job_id, digest = await _admit(http, "cutover-vlan", 7114)
+    async with session() as db:
+        await db.execute(text("ALTER TABLE deployment_generation DISABLE TRIGGER deployment_generation_immutable"))
+        await db.execute(
+            text("UPDATE deployment_generation SET document = CAST(:doc AS json) WHERE id = :gid"),
+            {"doc": json.dumps({"vlan": {"vlan_intent": []}}), "gid": generation_id},
+        )
+        await db.execute(text("ALTER TABLE deployment_generation ENABLE TRIGGER deployment_generation_immutable"))
+        await db.commit()
+
+    with pytest.raises(ReleaseRefused, match="document integrity") as refused:
+        await run_inspected_generation(device_id, generation_id, digest)
+    assert isinstance(refused.value.__cause__, GenerationTampered)
+    assert recorder.commits == []
+    async with session() as db:
+        assert (await db.get(Job, job_id)).status is JobStatus.queued
+        assert await db.get(DeviceClaim, device_id) is None
 
 
 async def test_release_refuses_stale_digest_and_unavailable_preview(maintenance_client):

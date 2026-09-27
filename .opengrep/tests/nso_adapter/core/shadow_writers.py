@@ -5,6 +5,7 @@ from builtins import setattr as assign
 from nso_adapter.store.models import DeploymentGeneration, DeploymentGeneration as DG
 import nso_adapter.store.models as models
 from sqlalchemy import insert, literal, select, update as upd
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from nso_adapter.store.models import DeviceProjectionStream as DPS
 
 
@@ -60,7 +61,7 @@ def rogue(db, row, rows):
     # ruleid: nso-authority-write
     fields = {"authorized_revision": 5}
     db.execute(upd(DPS).values(**fields))
-    db.execute(upd(DPS).on_conflict_do_update(index_elements=[DPS.id], set_=fields))
+    db.execute(pg_insert(DPS).values(device_id=row.device_id, stream=row.stream).on_conflict_do_update(index_elements=[DPS.device_id, DPS.stream], set_=fields))
     # ruleid: nso-authority-write
     db.execute(upd(DPS).values([{"authorized_revision": 5}, {"authorized_revision": 6}]))
 
@@ -81,9 +82,7 @@ def more_writes(db, row):
     # ruleid: nso-authority-write
     fields.update(authorized_revision=5)
     # ruleid: nso-authority-write
-    db.execute(upd(DPS).values(set_=dict(authorized_revision=5)))
-    # ruleid: nso-authority-write
-    db.execute(upd(DPS).on_conflict_do_update(index_elements=[DPS.id], set_=dict(authorized_revision=5)))
+    db.execute(pg_insert(DPS).values(device_id=row.device_id, stream=row.stream).on_conflict_do_update(index_elements=[DPS.device_id, DPS.stream], set_=dict(authorized_revision=5)))
     # ruleid: nso-authority-write
     db.execute(upd(DPS).ordered_values((DPS.authorized_revision, 5)))
     # ruleid: nso-authority-write
