@@ -10,6 +10,7 @@ def rogue(db):
     db.execute(sql("UPDATE public.device_projection_stream SET authorized_revision = 5"))
     # ruleid: nso-authority-raw-sql
     query = 'INSERT INTO "public"."device_projection_stream" ("authorized_document") VALUES (NULL)'
+    # ruleid: nso-authority-raw-sql
     db.execute(sql(query))
 
 

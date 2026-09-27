@@ -15,6 +15,17 @@ ANNOTATION_LIKE = re.compile(r"#\s*(?:[\w]*ruleid|[\w]*ok)\b", re.IGNORECASE)
 AUTHORITY = ("nso-authority", "nso-generation")
 
 
+def _unexpected_authority_findings(found: dict, relative: str, annotated_lines: set[int]) -> list[str]:
+    failures = []
+    for (found_path, line), rules in sorted(found.items()):
+        if found_path != relative or line in annotated_lines:
+            continue
+        unexpected = {rule for rule in rules if rule.startswith(AUTHORITY)}
+        if unexpected:
+            failures.append(f"{relative}:{line}: unexpected {sorted(unexpected)}")
+    return failures
+
+
 def check(root: Path, report: dict, rule_ids: set[str]) -> tuple[int, list[str]]:
     if report.get("errors"):
         return 0, [f"OpenGrep authority fixture errors: {report['errors']}"]
@@ -32,6 +43,7 @@ def check(root: Path, report: dict, rule_ids: set[str]) -> tuple[int, list[str]]
         lines = path.read_text(encoding="utf-8").splitlines()
         relative = str(path.relative_to(root))
         file_checked = 0
+        annotated_lines = set()
         for line_number, line in enumerate(lines, 1):
             if not ANNOTATION_LIKE.search(line):
                 continue
@@ -48,10 +60,12 @@ def check(root: Path, report: dict, rule_ids: set[str]) -> tuple[int, list[str]]
                 failures.append(f"{relative}:{line_number}: unknown rule ids {sorted(unknown)}")
             checked += 1
             file_checked += 1
+            annotated_lines.add(line_number + 1)
             actual = {rule for rule in found.get((relative, line_number + 1), set()) if rule.startswith(AUTHORITY)}
             expected = wanted if kind in {"ruleid", "todook"} else set()
             if actual != expected:
                 failures.append(f"{relative}:{line_number + 1}: expected {sorted(expected)}, found {sorted(actual)}")
+        failures.extend(_unexpected_authority_findings(found, relative, annotated_lines))
         if not file_checked:
             failures.append(f"{relative}: no checked expectations")
     if not checked:
@@ -121,7 +135,15 @@ def selftest() -> None:
             count, failures = check(root, {"results": findings, "errors": []}, {"nso-authority-write"})
             if count != 2 or failures:
                 raise SystemExit(f"self-test {kind} failed: {failures}")
-        print("6 fixture-runner failure modes and 3 annotation kinds passed")
+        path.write_text("# ruleid: nso-authority-write\nx = 1\ny = 2\n", encoding="utf-8")
+        findings = [
+            {"path": "nso_adapter/fixture.py", "start": {"line": line}, "check_id": "nso-authority-write"}
+            for line in (2, 3)
+        ]
+        count, failures = check(root, {"results": findings, "errors": []}, {"nso-authority-write"})
+        if count != 1 or not any("unexpected" in failure for failure in failures):
+            raise SystemExit(f"self-test extra_finding missed its expected failure: {failures}")
+        print("7 fixture-runner failure modes and 3 annotation kinds passed")
 
 
 if __name__ == "__main__":
