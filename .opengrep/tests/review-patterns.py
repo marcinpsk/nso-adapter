@@ -2,7 +2,6 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Positive and negative examples for the custom review checks."""
 
-
 def raw_outcome_errors(logger, exc, failure_detail):
     # ruleid: nso-outcome-raw-exception-renderer
     logger.warning("family.outcome.read_record_failed", error=exc)
