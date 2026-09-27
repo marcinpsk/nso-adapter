@@ -12,11 +12,9 @@ def unpacked_authority_writes(source):
     authority = {"authorized_document", "authorized_revision", "applied_revision"}
     return sorted(
         {
-            assignment.lineno
-            for assignment in ast.walk(ast.parse(source))
-            if isinstance(assignment, ast.Assign)
-            for target in assignment.targets
-            if isinstance(target, (ast.Tuple, ast.List))
+            part.lineno
+            for target in ast.walk(ast.parse(source))
+            if isinstance(target, (ast.Tuple, ast.List)) and isinstance(target.ctx, ast.Store)
             for part in ast.walk(target)
             if isinstance(part, ast.Attribute) and isinstance(part.ctx, ast.Store) and part.attr in authority
         }
@@ -41,6 +39,25 @@ def test_unpacking_authority_is_rejected_for_every_owner(assignment, owner):
 
 
 @pytest.mark.parametrize(
+    "statement",
+    [
+        "for row.authorized_revision, other in values: pass",
+        "async for [other, row.applied_revision] in values: pass",
+        "for (other, [*row.authorized_document]) in values: pass",
+        "[other for row.authorized_revision, other in values]",
+        "{other for row.authorized_revision, other in values}",
+        "{other: 0 for row.authorized_revision, other in values}",
+        "(other for row.authorized_revision, other in values)",
+        "[other async for row.authorized_revision, other in values]",
+        "with manager() as (row.authorized_revision, other): pass",
+        "async with manager() as [row.authorized_document, other]: pass",
+    ],
+)
+def test_unpacking_authority_is_rejected_in_every_binding_form(statement):
+    assert unpacked_authority_writes(f"async def consumer():\n    {statement}\n") == [2]
+
+
+@pytest.mark.parametrize(
     "source",
     [
         "row.authorized_revision = 0",
@@ -49,6 +66,9 @@ def test_unpacking_authority_is_rejected_for_every_owner(assignment, owner):
         "items[row.authorized_revision], other = values",
         "items[(row.authorized_revision, key)], other = values",
         "row.authorized_document.normal, other = values",
+        "for items[row.authorized_revision], other in values: pass",
+        "[row.authorized_revision for normal, other in values]",
+        "with manager(row.authorized_revision) as (normal, other): pass",
     ],
 )
 def test_explicit_writes_and_reads_are_left_to_existing_guards(source):
