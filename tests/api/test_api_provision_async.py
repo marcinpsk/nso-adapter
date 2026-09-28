@@ -20,6 +20,7 @@ from tests.conftest import VALID_TOKEN, session, start_job
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 _PROVISION_BODY = {
+    "provision_attempt_id": "5f0e6c1a-7d4b-4c3e-9a2f-1b8d6e4c2a90",
     "nso_instance": "nso-dev",
     "device_name": "new-rtr",
     "address": "10.0.0.5",
@@ -68,7 +69,7 @@ async def test_provision_returns_202_and_enqueues_job(adapter_client_with_nso):
 
 
 async def test_provision_dedup_same_device_returns_same_job(adapter_client_with_nso):
-    """A double-submit for the same (instance, device_name) returns the in-flight job."""
+    """A double-submit of the same attempt returns the in-flight job."""
     first = await adapter_client_with_nso.post("/api/v1/devices/provision", json=_PROVISION_BODY, headers=AUTH)
     second = await adapter_client_with_nso.post("/api/v1/devices/provision", json=_PROVISION_BODY, headers=AUTH)
     assert first.status_code == 202 and second.status_code == 202

@@ -2270,6 +2270,11 @@
             ],
             "title": "Port"
           },
+          "provision_attempt_id": {
+            "format": "uuid",
+            "title": "Provision Attempt Id",
+            "type": "string"
+          },
           "sync": {
             "default": true,
             "title": "Sync",
@@ -2277,6 +2282,7 @@
           }
         },
         "required": [
+          "provision_attempt_id",
           "nso_instance",
           "device_name",
           "address",
@@ -5238,6 +5244,16 @@
         "title": "JobOut",
         "type": "object"
       },
+      "JobStatus": {
+        "enum": [
+          "queued",
+          "running",
+          "succeeded",
+          "failed"
+        ],
+        "title": "JobStatus",
+        "type": "string"
+      },
       "JobTriggerOut": {
         "description": "The async-action envelope: the id of the enqueued job (202).",
         "properties": {
@@ -6754,6 +6770,54 @@
         "title": "PreflightRequest",
         "type": "object"
       },
+      "ProvisionAttemptEvidence": {
+        "description": "EMIT-NULL attempt shape: every key always present.",
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "job_id": {
+            "title": "Job Id",
+            "type": "integer"
+          },
+          "provision_attempt_id": {
+            "format": "uuid",
+            "title": "Provision Attempt Id",
+            "type": "string"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProvisionResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus"
+          }
+        },
+        "required": [
+          "provision_attempt_id",
+          "status",
+          "job_id",
+          "result",
+          "error"
+        ],
+        "title": "ProvisionAttemptEvidence",
+        "type": "object"
+      },
       "ProvisionOut": {
         "properties": {
           "job_id": {
@@ -6775,6 +6839,41 @@
           "status"
         ],
         "title": "ProvisionOut",
+        "type": "object"
+      },
+      "ProvisionResult": {
+        "description": "What ``core.onboarding.provision_nso_device`` returns for a job that ran.",
+        "properties": {
+          "device_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device Id"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "steps": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Steps",
+            "type": "array"
+          }
+        },
+        "required": [
+          "ok",
+          "device_id",
+          "steps"
+        ],
+        "title": "ProvisionResult",
         "type": "object"
       },
       "ReadCapabilityElement": {
@@ -9531,7 +9630,7 @@
     },
     "/api/v1/devices/provision": {
       "post": {
-        "description": "Enqueue a device-onboarding job and return immediately.\n\nProvisioning (create node \u2192 fetch-host-keys \u2192 unlock \u2192 sync-from) can be slow \u2014 it may\nprobe an unreachable primary, bootstrap over OOB, then run a full sync-from \u2014 and used to\nrun inline, overrunning the plugin client's 30s read timeout. It now runs as a background\n``provision`` job; this endpoint validates the instance and returns ``202`` with a\n``job_id`` the caller polls (``GET /api/v1/jobs/{id}``). A double-submit for the same\n(instance, device_name) returns the in-flight job rather than provisioning twice.",
+        "description": "Admit one provision attempt as a background ``provision`` job and return ``202``.\n\nProvisioning (create node \u2192 fetch-host-keys \u2192 unlock \u2192 sync-from) is slow, so it runs\nas a job. The caller polls ``GET /api/v1/provision-attempts/{provision_attempt_id}``.\nA retry of the same attempt returns its job in any status and never provisions twice.\n``409 conflict`` names the attempt that holds the key: the same attempt id with another\nbody, or another attempt still active for the same (instance, device_name).",
         "operationId": "provision_device_api_v1_devices_provision_post",
         "requestBody": {
           "content": {
@@ -9563,6 +9662,16 @@
               }
             },
             "description": "Missing or invalid bearer token"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Conflict"
           },
           "422": {
             "content": {
@@ -15551,6 +15660,75 @@
         "summary": "List Instance Neds",
         "tags": [
           "nso-instances"
+        ]
+      }
+    },
+    "/api/v1/provision-attempts/{provision_attempt_id}": {
+      "get": {
+        "description": "Return the attempt's status, job, result and error; ``404`` when no job carries the id.",
+        "operationId": "get_provision_attempt_api_v1_provision_attempts__provision_attempt_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "provision_attempt_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Provision Attempt Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProvisionAttemptEvidence"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Request validation failed (envelope shape)"
+          }
+        },
+        "security": [
+          {
+            "_OptionalBearer": []
+          }
+        ],
+        "summary": "Get Provision Attempt",
+        "tags": [
+          "devices"
         ]
       }
     },

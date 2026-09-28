@@ -467,6 +467,8 @@ async def onboard_device(body: DeviceCreate, db: AsyncSession = Depends(get_db))
 
 
 class DeviceProvision(BaseModel):
+    # The caller's idempotency key: a retry with the same id returns the same job.
+    provision_attempt_id: UUID
     nso_instance: str
     device_name: str
     address: str
@@ -485,20 +487,20 @@ class DeviceProvision(BaseModel):
     status_code=202,
     dependencies=[Depends(verify_token)],
     response_model=ProvisionOut,
-    responses={**RESP_401, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_409, **RESP_422_VALIDATION},
 )
 async def provision_device(body: DeviceProvision, db: AsyncSession = Depends(get_db)):
-    """Enqueue a device-onboarding job and return immediately.
+    """Admit one provision attempt as a background ``provision`` job and return ``202``.
 
-    Provisioning (create node → fetch-host-keys → unlock → sync-from) can be slow — it may
-    probe an unreachable primary, bootstrap over OOB, then run a full sync-from — and used to
-    run inline, overrunning the plugin client's 30s read timeout. It now runs as a background
-    ``provision`` job; this endpoint validates the instance and returns ``202`` with a
-    ``job_id`` the caller polls (``GET /api/v1/jobs/{id}``). A double-submit for the same
-    (instance, device_name) returns the in-flight job rather than provisioning twice.
+    Provisioning (create node → fetch-host-keys → unlock → sync-from) is slow, so it runs
+    as a job. The caller polls ``GET /api/v1/provision-attempts/{provision_attempt_id}``.
+    A retry of the same attempt returns its job in any status and never provisions twice.
+    ``409 conflict`` names the attempt that holds the key: the same attempt id with another
+    body, or another attempt still active for the same (instance, device_name).
     """
     from nso_adapter.config import get_config
     from nso_adapter.core.jobs import enqueue_provision_job
+    from nso_adapter.core.provision_attempt import ProvisionAttemptConflict
 
     known = {inst.name for inst in get_config().nso_instances}
     if body.nso_instance not in known:
@@ -517,7 +519,19 @@ async def provision_device(body: DeviceProvision, db: AsyncSession = Depends(get
         "do_sync": body.sync,
         "oob_ip": body.oob_ip,
     }
-    job, _created = await enqueue_provision_job(params, db)
+    refused = None
+    try:
+        job, _created = await enqueue_provision_job(body.provision_attempt_id, params, db)
+    except ProvisionAttemptConflict as conflict:
+        detail = {
+            "reason": conflict.reason,
+            "provision_attempt_id": str(conflict.provision_attempt_id) if conflict.provision_attempt_id else None,
+            "job_id": conflict.job_id,
+        }
+        # Built in the handler, raised after it: a raise inside attaches the caught exception.
+        refused = api_error(409, "conflict", "Another provision attempt holds this request", detail)
+    if refused is not None:
+        raise refused
     return {"job_id": str(job.id), "nso_device_name": body.device_name, "status": job.status.value}
 
 

@@ -142,11 +142,13 @@ def _assert_job_queue_class_schema(snapshot: dict) -> None:
         "((status = 'queued'::jobstatus) AND coalescible)",
     ) in jobs["ixs"]
     checks = jobs["checks"]
-    assert len(checks) == 4
+    assert len(checks) == 5
     assert sum("removal" in condition and "coalescible" in condition for condition in checks) == 1
     assert sum("provision" in condition and "coalescible" in condition for condition in checks) == 1
     assert sum("provision" in condition and "device_id IS NULL" in condition for condition in checks) == 1
     assert sum("provision" in condition and "device_id IS NOT NULL" in condition for condition in checks) == 1
+    assert sum("provision_attempt_id IS NULL" in condition for condition in checks) == 1
+    assert (("provision_attempt_id",), False, "IMMEDIATE") in jobs["uqs"]
     trigger_name, trigger_definition, function_name, function_source = snapshot["__job_queue_class_trigger__"]
     assert trigger_name == "job_coalescible_immutable"
     assert "BEFORE UPDATE OF coalescible ON jobs" in trigger_definition

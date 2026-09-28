@@ -464,16 +464,23 @@ async def test_notify_sync_complete_raises_on_http_error(client):
 
 
 @respx.mock
-async def test_notify_provision_complete_posts_job_id(client):
-    """notify_provision_complete POSTs the provision job id to the plugin's provision-complete endpoint."""
+async def test_notify_provision_complete_posts_the_attempt_evidence(client):
+    """notify_provision_complete POSTs the attempt evidence document to the plugin's provision-complete endpoint."""
     import json
 
+    evidence = {
+        "provision_attempt_id": "5f0e6c1a-7d4b-4c3e-9a2f-1b8d6e4c2a90",
+        "status": "succeeded",
+        "job_id": 38013,
+        "result": {"ok": True, "device_id": None, "steps": []},
+        "error": None,
+    }
     route = respx.post(f"{BASE}/api/plugins/nso/provision-complete/").mock(
         return_value=httpx.Response(202, json={"queued": True})
     )
-    await client.notify_provision_complete(38013)
+    await client.notify_provision_complete(evidence)
     assert route.called
-    assert json.loads(route.calls.last.request.content) == {"provision_job_id": 38013}
+    assert json.loads(route.calls.last.request.content) == evidence
 
 
 @respx.mock
@@ -481,4 +488,4 @@ async def test_notify_provision_complete_raises_on_http_error(client):
     """A non-2xx propagates (the job runner's _notify_provision_complete swallows it)."""
     respx.post(f"{BASE}/api/plugins/nso/provision-complete/").mock(return_value=httpx.Response(500))
     with pytest.raises(httpx.HTTPStatusError):
-        await client.notify_provision_complete(38013)
+        await client.notify_provision_complete({"provision_attempt_id": "x", "status": "failed"})

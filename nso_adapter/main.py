@@ -45,6 +45,7 @@ from nso_adapter.api.lag_topology import router as lag_topology_router
 from nso_adapter.api.logging_config import router as logging_config_router
 from nso_adapter.api.nso_instances import router as nso_instances_router
 from nso_adapter.api.ospf import router as ospf_router
+from nso_adapter.api.provision_attempts import router as provision_attempts_router
 from nso_adapter.api.read_state import router as read_state_router
 from nso_adapter.api.redistribution import router as redistribution_router
 from nso_adapter.api.route_policy import router as route_policy_router
@@ -581,6 +582,7 @@ def create_app(*, lifespan_context: Callable[[FastAPI], AbstractAsyncContextMana
     app.include_router(ospf_router)
     app.include_router(redistribution_router)
     app.include_router(jobs_router)
+    app.include_router(provision_attempts_router)
     app.include_router(config_router)
     _preserve_exact_openapi_integer_bounds(app)
     _declare_bearer_requirement(app)

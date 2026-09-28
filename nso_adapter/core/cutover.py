@@ -184,7 +184,7 @@ _KEEP_SCHEMA = {
     ),
     # Terminal jobs are history; live jobs block the reset.
     "jobs": frozenset(
-        "id job_type status coalescible device_id result error context created_at updated_at started_at heartbeat_at run_attempt settle_seq".split()
+        "id job_type status coalescible device_id result error context created_at updated_at started_at heartbeat_at run_attempt settle_seq provision_attempt_id".split()
     ),
     # Desired intent survives for a later authorization.
     "l2_sap_intent": frozenset(
