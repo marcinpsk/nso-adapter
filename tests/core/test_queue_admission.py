@@ -473,6 +473,57 @@ async def test_two_concurrent_retries_of_one_attempt_share_one_job(adapter_clien
     assert await _active_provisions("adm-rtr") == [winner.id]
 
 
+@pytest.mark.parametrize("same_body", [True, False])
+async def test_provision_retry_finds_its_attempt_after_the_pair_winner_finishes(
+    adapter_client, rival_engine, same_body
+):
+    from nso_adapter.core import jobs as jobs_mod
+    from nso_adapter.core.provision_attempt import ProvisionAttemptConflict
+    from nso_adapter.store.models import Job, JobStatus
+
+    rival = async_sessionmaker(rival_engine, expire_on_commit=False)
+    first_attempt = uuid.uuid4()
+    retry_attempt = uuid.uuid4()
+    params = {**_PROVISION, "address": "10.0.0.1"}
+    retry_params = dict(params) if same_body else {**params, "address": "10.0.0.2"}
+
+    async with session() as db:
+        first, _ = await jobs_mod.enqueue_provision_job(first_attempt, params, db)
+
+    original = jobs_mod.get_provision_attempt_job
+    admitted: dict = {}
+
+    async def _admit_retry_after_missed_attempt(attempt_id, db):
+        existing = await original(attempt_id, db)
+        assert existing is None
+        async with rival() as other:
+            await other.execute(sa.update(Job).where(Job.id == first.id).values(status=JobStatus.succeeded))
+            await other.commit()
+        async with rival() as other:
+            admitted["job"], admitted["created"] = await jobs_mod.enqueue_provision_job(retry_attempt, params, other)
+        return existing
+
+    jobs_mod.get_provision_attempt_job = _admit_retry_after_missed_attempt
+    try:
+        async with session() as db:
+            if same_body:
+                job, created = await jobs_mod.enqueue_provision_job(retry_attempt, retry_params, db)
+            else:
+                with pytest.raises(ProvisionAttemptConflict) as refused:
+                    await jobs_mod.enqueue_provision_job(retry_attempt, retry_params, db)
+    finally:
+        jobs_mod.get_provision_attempt_job = original
+
+    assert admitted["created"] is True
+    if same_body:
+        assert created is False and job.id == admitted["job"].id
+    else:
+        assert (refused.value.reason, refused.value.job_id) == (
+            "provision_attempt_mismatch",
+            admitted["job"].id,
+        )
+
+
 async def test_a_terminal_provision_does_not_block_a_new_one(adapter_client):
     """The index covers queued and running only — a finished onboarding must be repeatable."""
     from nso_adapter.core.jobs import enqueue_provision_job

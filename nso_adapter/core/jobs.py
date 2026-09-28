@@ -351,6 +351,10 @@ async def enqueue_provision_job(provision_attempt_id: uuid.UUID, params: dict, d
             return existing, False
         active = await get_active_provision_job(params["nso_instance"], params["device_name"], db)
         if active is not None:
+            if active.provision_attempt_id == provision_attempt_id:
+                if active.context != params:
+                    raise ProvisionAttemptConflict("provision_attempt_mismatch", active)
+                return active, False
             raise ProvisionAttemptConflict("provision_active", active)
         logger.debug(
             "job.provision_admission.winner_finished",
