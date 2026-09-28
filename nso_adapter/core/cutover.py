@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
-"""Preflight (#1683) and reduce-only authority retirement (#1613) for C9's cutover window.
+"""Preflight (#1683), read-job discard and reduce-only authority retirement (#1613) for C9's cutover window.
 
 A PARKED carrier (a key that no authorized positive row renders) loses its only payload source
 when the legacy instances go, and seeding the key back would convert the owed deletion into adopted
@@ -14,10 +14,11 @@ from collections import Counter, defaultdict
 from typing import NamedTuple
 
 import structlog
-from sqlalchemy import MetaData, delete, null, or_, select, text, update
+from sqlalchemy import MetaData, delete, exists, null, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.generation import CROSSABLE_STATUSES
+from nso_adapter.core.claim import terminalize
+from nso_adapter.core.generation import CROSSABLE_STATUSES, DEVICE_WRITING_JOB_TYPES
 from nso_adapter.core.projection import projection_streams
 from nso_adapter.store.models import (
     Base,
@@ -25,6 +26,7 @@ from nso_adapter.store.models import (
     DeviceProjectionStream,
     Job,
     JobStatus,
+    JobType,
     StaticRouteIntent,
     StaticRouteTombstone,
     StreamPendingClear,
@@ -327,6 +329,15 @@ class CutoverStateBlocked(RuntimeError):
         super().__init__("cutover blocked by " + ", ".join(offenders))
 
 
+class CutoverJobsBlocked(RuntimeError):
+    """A live job is not a queued read, so the discard may not decide its outcome."""
+
+    def __init__(self, jobs: list[tuple[int | None, int, str]]):
+        self.jobs = jobs
+        named = ", ".join(f"device {device_id} job {job_id} ({what})" for device_id, job_id, what in jobs)
+        super().__init__(f"{len(jobs)} live job(s) are not discardable reads: {named}")
+
+
 class CutoverSchemaBlocked(RuntimeError):
     """A device-scoped table or column has not been reviewed for the reset."""
 
@@ -352,6 +363,24 @@ class CutoverReset(NamedTuple):
     """The post-cutover worklist for devices whose authority changed."""
 
     devices: tuple[DeviceCutoverReset, ...]
+
+
+class DiscardedJob(NamedTuple):
+    """One queued read job the window failed before the reset."""
+
+    device_id: int
+    job_id: int
+    job_type: str
+
+
+#: The success barrier's reads; provision is excluded because it creates the NSO device.
+READ_JOB_TYPES = frozenset(JobType).difference(DEVICE_WRITING_JOB_TYPES, (JobType.provision,))
+
+_DISCARDED_ERROR = {
+    "code": "cutover_discarded",
+    "message": "Queued read job discarded before the cutover authority reset",
+    "detail": {},
+}
 
 
 def _refuse_unreviewed_schema(metadata: MetaData) -> None:
@@ -486,6 +515,37 @@ async def deauthorize_for_cutover(db: AsyncSession) -> CutoverReset:
     return CutoverReset(devices)
 
 
+async def discard_queued_read_jobs(db: AsyncSession) -> tuple[DiscardedJob, ...]:
+    """Fail every queued read job in the caller's transaction, or refuse while another job is live."""
+    await db.execute(text("LOCK TABLE jobs IN SHARE ROW EXCLUSIVE MODE"))
+    carries = exists().where(DeploymentGeneration.job_id == Job.id)
+    live = (
+        await db.execute(
+            select(Job.device_id, Job.id, Job.job_type, Job.status, carries.label("carries"))
+            .where(Job.status.in_((JobStatus.queued, JobStatus.running)))
+            .order_by(Job.device_id, Job.id)
+        )
+    ).all()
+    discard: list[DiscardedJob] = []
+    blocked: list[tuple[int | None, int, str]] = []
+    for device_id, job_id, job_type, status, carried in live:
+        if status is JobStatus.queued and job_type in READ_JOB_TYPES and not carried:
+            discard.append(DiscardedJob(device_id, job_id, job_type.value))
+        else:
+            carrying = " carrying a generation" if carried else ""
+            blocked.append((device_id, job_id, f"{status.value} {job_type.value}{carrying}"))
+    if blocked:
+        raise CutoverJobsBlocked(blocked)
+    for job in discard:
+        written = await terminalize(
+            db, job.job_id, status=JobStatus.failed, expect=JobStatus.queued, error=_DISCARDED_ERROR
+        )
+        if written is None:
+            raise RuntimeError(f"job {job.job_id} left the queue under the jobs table lock")
+    logger.info("cutover.read_jobs_discarded", jobs=len(discard))
+    return tuple(discard)
+
+
 async def parked_static_route_carriers(db: AsyncSession) -> list[ParkedCarrier]:
     """Return every carrier that would lose its payload source when the legacy instances go."""
     rows = (await db.execute(_PARKED_CARRIERS)).mappings().all()
@@ -511,13 +571,17 @@ async def refuse_cutover_while_carriers_are_parked(db: AsyncSession) -> None:
 
 
 __all__ = [
+    "READ_JOB_TYPES",
     "CutoverBlocked",
+    "CutoverJobsBlocked",
     "CutoverReset",
     "CutoverSchemaBlocked",
     "CutoverStateBlocked",
     "DeviceCutoverReset",
+    "DiscardedJob",
     "ParkedCarrier",
     "deauthorize_for_cutover",
+    "discard_queued_read_jobs",
     "parked_static_route_carriers",
     "refuse_cutover_while_carriers_are_parked",
 ]
