@@ -17,6 +17,7 @@ having already executed DDL on the wrong engine. Both entry points share one val
 from __future__ import annotations
 
 import ast
+import asyncio
 import subprocess
 import sys
 from pathlib import Path
@@ -214,9 +215,12 @@ def check(output):
     assert _unsafe_migration_diagnostic_lines(target) == [2]
 
 
-def test_db_migrate_and_init_db_share_one_validator():
-    """Both entry points must reject identically — two copies would drift."""
+def test_database_entry_points_share_their_url_validation(tmp_path, monkeypatch):
+    """Migration accepts sync PostgreSQL, while both async engines reject it alike."""
+    from nso_adapter.config import reset_config
+    from nso_adapter.core.cutover_runner import discard_read_jobs
     from nso_adapter.store.db import require_postgresql_url
+    from tests.conftest import _write_config
 
     with pytest.raises(ValueError) as via_helper:
         require_postgresql_url(_RETIRED_URL)
@@ -224,3 +228,17 @@ def test_db_migrate_and_init_db_share_one_validator():
         store_db.init_db(_RETIRED_URL)
     assert str(via_helper.value) == str(via_init.value)
     assert require_postgresql_url("postgresql+asyncpg://u:p@h/db") == "postgresql+asyncpg://u:p@h/db"
+
+    sync_url = "postgresql+psycopg2://placeholder:placeholder@127.0.0.1:1/placeholder"
+    assert require_postgresql_url(sync_url) == sync_url
+    with pytest.raises(ValueError) as via_init:
+        store_db.init_db(sync_url)
+    _write_config(tmp_path, monkeypatch, database_url=sync_url)
+    reset_config()
+    try:
+        with pytest.raises(ValueError) as via_runner:
+            asyncio.run(discard_read_jobs())
+    finally:
+        reset_config()
+    assert str(via_init.value) == str(via_runner.value)
+    assert "postgresql+psycopg2" in str(via_init.value)

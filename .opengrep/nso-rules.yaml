@@ -714,6 +714,17 @@ rules:
     severity: ERROR
     message: Query the store with select() and execute()/scalars(); Session.query is the legacy API.
     pattern: $SESSION.query(...)
+  - id: nso-store-async-engine-factory
+    languages: [python]
+    severity: ERROR
+    message: Create async store engines through create_store_engine so the driver is checked.
+    paths:
+      include: [nso_adapter/**]
+    patterns:
+      - pattern: create_async_engine(...)
+      - pattern-not-inside: |
+          def create_store_engine(...):
+              ...
   - id: nso-store-execute-raw-string
     languages: [python]
     severity: ERROR

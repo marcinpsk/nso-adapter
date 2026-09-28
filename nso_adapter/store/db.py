@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from typing import Any, cast
 
 from sqlalchemy.engine import CursorResult
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.sql.dml import UpdateBase
 
 _engine = None
@@ -77,6 +77,26 @@ def require_postgresql_url(database_url: str, *, label: str = "database_url") ->
     return database_url
 
 
+class StoreEngineUrlError(ValueError):
+    """The store URL does not name the asyncpg driver the async engine needs."""
+
+
+def create_store_engine(database_url: str, *, application_name: str, **engine_kwargs: Any) -> AsyncEngine:
+    """Create an async PostgreSQL store engine after checking its driver."""
+    database_url = require_postgresql_url(database_url)
+    if not database_url.startswith("postgresql+asyncpg://"):
+        scheme = database_url.split("://", 1)[0]
+        raise StoreEngineUrlError(
+            f"database_url must use PostgreSQL asyncpg (postgresql+asyncpg://…); got {scheme!r}. "
+            "The adapter store requires an async PostgreSQL driver."
+        )
+    return create_async_engine(
+        database_url,
+        connect_args={"server_settings": {"application_name": application_name}},
+        **engine_kwargs,
+    )
+
+
 def init_db(database_url: str, *, application_name: str = "nso-adapter.store") -> None:
     """Bind the process-global engine and session factory to *database_url*.
 
@@ -84,18 +104,17 @@ def init_db(database_url: str, *, application_name: str = "nso-adapter.store") -
     rather than on the first write.
     """
     global _engine, _session_factory
-    require_postgresql_url(database_url)
     # The failover base tick can hold one session per concurrent probe for the full
     # unreachable-probe timeout (~10s), and normal API/sync traffic shares this pool. Keep
     # it comfortably above failover_probe_concurrency (capped at 16 in api/config.py) so a
     # worst-case tick can't starve the pool: 20 + 10 overflow = 30, leaving 14 for everyone else.
-    _engine = create_async_engine(
+    _engine = create_store_engine(
         database_url,
+        application_name=application_name,
         pool_size=20,
         max_overflow=10,
         pool_pre_ping=True,
         echo=False,
-        connect_args={"server_settings": {"application_name": application_name}},
     )
     _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
 
