@@ -82,6 +82,12 @@ repos:
         language: system
         pass_filenames: false
         files: ^(nso_adapter/.*\.py|tests/(core/test_importer_failure_sinks|_ast_scanner_support)\.py|\.pre-commit-config\.yaml)$
+      - id: authority-assignment-guard
+        name: explicit authority assignment guard (AST)
+        entry: uv run --locked --system-certs -- pytest -q -n 8 --no-cov tests/test_authority_discipline.py
+        language: system
+        pass_filenames: false
+        files: ^(nso_adapter/.*\.py|tests/test_authority_discipline\.py|\.pre-commit-config\.yaml)$
 
   # Type-check nso_adapter and fail only on errors absent from mypy-baseline.txt.
   # Runs on pre-push (not every commit). CI runs the same script in the lint job,

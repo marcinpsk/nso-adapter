@@ -4,10 +4,9 @@
 from __future__ import annotations
 
 from nso_adapter.config import AppConfig, EnvSettings, SecretsConfig
-
-from .base import SecretResolutionError, SecretsProvider, require_nonblank_secret, resolve_secret
-from .local import LocalSecretsProvider
-from .vault import VaultSecretsProvider
+from nso_adapter.secrets.base import SecretResolutionError, SecretsProvider, require_nonblank_secret, resolve_secret
+from nso_adapter.secrets.local import LocalSecretsProvider
+from nso_adapter.secrets.vault import VaultSecretsProvider
 
 __all__ = [
     "LocalSecretsProvider",

@@ -10,9 +10,8 @@ from collections.abc import Callable
 import httpx
 import structlog
 
+from nso_adapter.notifications.sse_subscriber import SseIdleTimeout, SSESubscriber
 from nso_adapter.nso.client import failure_detail
-
-from .sse_subscriber import SseIdleTimeout, SSESubscriber
 
 logger = structlog.get_logger(__name__)
 

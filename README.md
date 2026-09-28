@@ -32,3 +32,9 @@ The custom review-pattern pre-commit hooks require the `opengrep` executable on
 `PATH`. Follow the [official OpenGrep installation instructions](https://github.com/opengrep/opengrep/blob/main/INSTALL.md),
 or set `OPENGREP_BIN` to an installed executable. These checks run in local
 pre-commit only. GitHub Actions and the pre-push stage do not run OpenGrep.
+
+Projection authority writes must use explicit targets, even in sanctioned functions.
+Do not unpack tuples or lists into `authorized_document`, `authorized_revision`, or
+`applied_revision`. The `authority-assignment-guard` AST check enforces this in
+pre-commit and pytest, including nested and starred targets. OpenGrep checks the
+owner and value of each explicit write.

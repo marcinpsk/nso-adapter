@@ -97,7 +97,7 @@ def test_only_jobs_module_constructs_jobs():
     assert not bad, (
         "Direct Job construction or insertion outside nso_adapter/core/jobs.py:\n"
         + "\n".join(f"  {violation}" for violation in bad)
-        + "\n\nUse admit_coalescible_job, create_dedicated_job, or enqueue_provision_job."
+        + "\n\nUse admit_coalescible_job, create_dedicated_job, create_followup_sync, or enqueue_provision_job."
     )
 
 

@@ -105,7 +105,7 @@ async def test_the_preview_is_the_document_being_committed_not_a_live_store_esti
         with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
             diffs = await collect_apply_diff(db, device_id)
 
-    assert set(diffs) == {PREVIEW_KEY}, "one document is one transaction, so the preview is one delta"
+    assert set(diffs.diffs) == {PREVIEW_KEY}, "one document is one transaction, so the preview is one delta"
     previewed = rec.sr_payloads(dry_run=True)[0][_SR_ROOT][0]["static-route"]["route"]
     assert 999 not in {entry.get("metric") for entry in previewed}, "the preview showed a store-only edit"
     assert static_route_entry_key(_RICH_A) in {static_route_entry_key(e) for e in previewed}, (

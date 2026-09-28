@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -569,3 +570,28 @@ def test_diagnostic_identifier_rule_coverage_is_documented() -> None:
         assert f"`{path}`" in coverage, f"missing documented path: {path}"
     for field in ("device_name", "device", "nso_device", "lag_name", "stream", "stream_url", "url"):
         assert f"`{field}`" in coverage, f"missing documented field: {field}"
+
+
+def test_ruff_rejects_relative_imports_in_the_package():
+    # OpenGrep does not resolve relative imports, so a relative alias would bypass the resolved-name guards.
+    snippet = "from ..store.models import DeploymentGeneration\n\nDeploymentGeneration()\n"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "ruff",
+            "check",
+            "--no-cache",
+            "--output-format",
+            "concise",
+            "--stdin-filename",
+            str(ROOT / "nso_adapter" / "core" / "rogue.py"),
+            "-",
+        ],
+        input=snippet,
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        check=False,
+    )
+    assert "TID252" in result.stdout, result.stdout + result.stderr

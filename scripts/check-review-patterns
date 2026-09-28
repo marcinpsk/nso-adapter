@@ -6,6 +6,9 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 scan_bin="${OPENGREP_BIN:-opengrep}"
+if [[ "$scan_bin" == */* && "$scan_bin" != /* ]]; then
+  scan_bin="$repo_root/$scan_bin"
+fi
 mode="${1:-scan}"
 if (( $# )); then shift; fi
 require_opengrep() {
@@ -126,8 +129,11 @@ target = Path(sys.argv[2])
 rules = json.loads(json.dumps(yaml.safe_load(source.read_text(encoding="utf-8"))))
 target.write_text(yaml.safe_dump(rules, sort_keys=False), encoding="utf-8")
 PY
-    cp .opengrep/tests/review-patterns.py "$staging_dir/review-patterns.py"
+    cp -R .opengrep/tests/. "$staging_dir/"
     "$scan_bin" test "$staging_dir"
+    (cd "$staging_dir" && "$scan_bin" scan --config review-patterns.yaml --no-git-ignore --json --quiet -- nso_adapter > authority-results.json)
+    python3 scripts/check_review_pattern_fixtures.py selftest
+    python3 scripts/check_review_pattern_fixtures.py "$staging_dir" .opengrep/nso-rules.yaml
     ;;
   *) echo "Usage: $0 [scan [path ...] | test]" >&2; exit 2 ;;
 esac

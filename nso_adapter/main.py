@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from contextlib import asynccontextmanager
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
 import structlog
 from fastapi import FastAPI
@@ -423,6 +424,18 @@ async def _dispose_engine() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    async with _app_lifespan(app, background=True):
+        yield
+
+
+@asynccontextmanager
+async def maintenance_lifespan(app: FastAPI):
+    async with _app_lifespan(app, background=False):
+        yield
+
+
+@asynccontextmanager
+async def _app_lifespan(app: FastAPI, *, background: bool):
     cfg = get_config()
     env = get_env_settings()
 
@@ -442,7 +455,7 @@ async def lifespan(app: FastAPI):
 
     sse_stop = asyncio.Event()
     sse_dispatch_tasks: set[asyncio.Task] = set()
-    sse_tasks = _start_sse_streams(cfg, provider, nso_clients, sse_stop, sse_dispatch_tasks)
+    sse_tasks = _start_sse_streams(cfg, provider, nso_clients, sse_stop, sse_dispatch_tasks) if background else []
     app.state.sse_stop = sse_stop
     app.state.sse_tasks = sse_tasks
     app.state.sse_dispatch_tasks = sse_dispatch_tasks
@@ -450,27 +463,32 @@ async def lifespan(app: FastAPI):
     # Start the durable worker pool first: it reconciles orphaned jobs from a
     # previous process (requeue idempotent / fail interrupted apply) before the
     # scheduler begins enqueuing fresh work.
-    await start_workers(cfg.scheduler.worker_concurrency)
+    if background:
+        await start_workers(cfg.scheduler.worker_concurrency)
+        start_scheduler()
+    else:
+        from nso_adapter.core.worker import recover_interrupted_work
 
-    start_scheduler()
+        await recover_interrupted_work()
     try:
         yield
     finally:
-        stop_scheduler()
-        await stop_workers()
+        if background:
+            stop_scheduler()
+            await stop_workers()
         await _shutdown_sse(sse_stop, sse_tasks, sse_dispatch_tasks)
         await _close_netbox(netbox_client)
         await _dispose_engine()
 
 
-def create_app() -> FastAPI:
+def create_app(*, lifespan_context: Callable[[FastAPI], AbstractAsyncContextManager[None]] = lifespan) -> FastAPI:
     # A browser cannot send a bearer header, so the documentation routes are opt-in and
     # serve everybody once ENABLE_API_DOCS turns them on.
     api_docs = get_env_settings().enable_api_docs
     app = FastAPI(
         title="NSO Adapter",
         version=__version__,
-        lifespan=lifespan,
+        lifespan=lifespan_context,
         docs_url="/docs" if api_docs else None,
         redoc_url="/redoc" if api_docs else None,
         openapi_url="/openapi.json" if api_docs else None,

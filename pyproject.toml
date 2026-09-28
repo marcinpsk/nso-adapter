@@ -128,7 +128,7 @@ line-length = 120
 extend-exclude = [".opengrep/tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "D", "C901", "I", "RET", "UP", "DTZ", "ASYNC"]
+select = ["E", "F", "W", "D", "C901", "I", "RET", "UP", "DTZ", "ASYNC", "TID252"]
 ignore = [
     "E501",
     "F403",
@@ -151,6 +151,10 @@ ignore = [
     # bounded timeouts down its own call chain rather than reading a global.
     "ASYNC109",
 ]
+
+[tool.ruff.lint.flake8-tidy-imports]
+# OpenGrep does not resolve relative imports, so the resolved-name guards need absolute ones.
+ban-relative-imports = "all"
 
 [tool.ruff.lint.mccabe]
 max-complexity = 15

@@ -272,7 +272,9 @@ async def test_action_apply_diff_forwards_outformat(adapter_client):
     from nso_adapter.api.actions import action_apply_diff
 
     device_id = await _seed_device("actions-adiff-01", 1350)
-    coll = AsyncMock(return_value={"isis": "+ interface x"})
+    from nso_adapter.core.apply import ApplyPreview
+
+    coll = AsyncMock(return_value=ApplyPreview({"isis": "+ interface x"}, None, None))
     with patch("nso_adapter.core.apply.collect_apply_diff", coll):
         async with session() as db:
             result = await action_apply_diff(device_id=device_id, outformat="cli", db=db)

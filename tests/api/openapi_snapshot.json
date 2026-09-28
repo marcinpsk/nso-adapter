@@ -212,6 +212,28 @@
             "title": "Diffs",
             "type": "object"
           },
+          "document_digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Document Digest"
+          },
+          "generation_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generation Id"
+          },
           "outformat": {
             "title": "Outformat",
             "type": "string"
@@ -220,7 +242,9 @@
         "required": [
           "device_id",
           "outformat",
-          "diffs"
+          "diffs",
+          "generation_id",
+          "document_digest"
         ],
         "title": "ApplyDiffOut",
         "type": "object"
