@@ -614,7 +614,7 @@ async def action_apply_diff(
     tree diff — the "diff -u" style the preview panel renders.
     """
     from nso_adapter.core.apply import collect_apply_diff
-    from nso_adapter.core.generation import executable_head, executing_generation
+    from nso_adapter.core.generation import GenerationTampered, executable_head, executing_generation
 
     if outformat not in ("native", "cli"):
         raise api_error(400, "bad_request", "Unknown outformat; expected native or cli")
@@ -626,9 +626,12 @@ async def action_apply_diff(
     current = await executable_head(db, device_id)
     execution = None
     if preview.generation_id is not None:
-        execution = (
-            await executing_generation(db, current.job_id) if current is not None and current.job_id else current
-        )
+        try:
+            execution = (
+                await executing_generation(db, current.job_id) if current is not None and current.job_id else current
+            )
+        except GenerationTampered:
+            execution = None
     if (
         (head is None) != (current is None)
         or (head is not None and current is not None and (current.id != head.id or current.digest != head.digest))

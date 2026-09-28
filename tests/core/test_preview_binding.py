@@ -52,6 +52,47 @@ async def test_preview_invalidated_when_job_document_changes_during_dry_run(main
     assert "preview unavailable" in response.json()["diffs"]["device_intent"]
 
 
+async def test_preview_unavailable_when_document_tampered_during_dry_run(maintenance_client):
+    import json
+
+    from sqlalchemy import text
+
+    from tests.conftest import session
+
+    http, recorder = maintenance_client
+    device_id = await seed_device(nso_device_name="cutover-vlan", netbox_device_id=18105)
+    await seed_settings(device_id, auto_apply=True)
+    assert (await put_vlans(http, device_id, [10])).status_code == 200
+    generation_id = (await generations(device_id))[-1].id
+    original = recorder._handle
+    tampered = False
+
+    async def tamper_during_network(method, url, content=None, headers=None):
+        nonlocal tampered
+        if "dry-run=" in url and not tampered:
+            tampered = True
+            async with session() as db:
+                await db.execute(
+                    text("ALTER TABLE deployment_generation DISABLE TRIGGER deployment_generation_immutable")
+                )
+                await db.execute(
+                    text("UPDATE deployment_generation SET document = CAST(:doc AS json) WHERE id = :gid"),
+                    {"doc": json.dumps({"vlan": {"vlan_intent": []}}), "gid": generation_id},
+                )
+                await db.execute(
+                    text("ALTER TABLE deployment_generation ENABLE TRIGGER deployment_generation_immutable")
+                )
+                await db.commit()
+        return await original(method, url, content, headers)
+
+    recorder._handle = tamper_during_network
+    response = await http.get(f"/api/v1/devices/{device_id}/actions/apply-diff", headers=AUTH)
+    assert tampered and response.status_code == 200, response.text
+    assert response.json()["generation_id"] is None, response.json()
+    assert response.json()["document_digest"] is None
+    assert "preview unavailable" in response.json()["diffs"]["device_intent"]
+
+
 async def test_preview_invalidated_when_retry_rebinds_head_during_dry_run(maintenance_client):
     from nso_adapter.store.models import DeploymentGeneration, GenerationStatus, Job, JobStatus
     from tests.conftest import session
