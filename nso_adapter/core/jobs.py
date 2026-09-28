@@ -12,6 +12,7 @@ only insert ``queued`` rows; a worker claims and runs them.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from typing import Any
 
 import structlog
@@ -30,6 +31,7 @@ from nso_adapter.core.claim import (
     lock_claim,
     terminalize,
 )
+from nso_adapter.core.provision_attempt import ProvisionAttemptConflict, ProvisionAttemptEvidence
 from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.client import failure_detail
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
@@ -266,10 +268,8 @@ async def enqueue_job(
     return created, True
 
 
-# The provision dedupe index's expressions and predicate, verbatim and defined ONCE: the
-# same two constants are the ON CONFLICT inference target and the lookup's filter, so the
-# lookup can never drift from what the database actually enforces. literal_column, not text:
-# ON CONFLICT infers from column EXPRESSIONS, and a TextClause is not one.
+# The provision dedupe index's expressions and predicate, verbatim and defined ONCE, so the
+# active-pair lookup can never drift from what the database actually enforces.
 _PROVISION_PAIR_ELEMENTS: tuple[Any, Any] = (
     literal_column("(context ->> 'nso_instance')"),
     literal_column("(context ->> 'device_name')"),
@@ -300,22 +300,27 @@ async def get_active_provision_job(nso_instance: str, device_name: str, db: Asyn
     )
 
 
-async def enqueue_provision_job(params: dict, db: AsyncSession) -> tuple[Job, bool]:
-    """Create a queued provision (device-onboarding) job.  Returns (job, created).
+async def get_provision_attempt_job(provision_attempt_id: uuid.UUID, db: AsyncSession) -> Job | None:
+    """Return the provision job that carries *provision_attempt_id*, or None."""
+    return await db.scalar(select(Job).where(Job.provision_attempt_id == provision_attempt_id))
+
+
+async def enqueue_provision_job(provision_attempt_id: uuid.UUID, params: dict, db: AsyncSession) -> tuple[Job, bool]:
+    """Admit the provision job of one plugin attempt.  Returns (job, created).
 
     Unlike :func:`enqueue_job`, a provision runs before the device exists, so the job has
-    ``device_id=None`` and carries its parameters in ``context``; de-dup is on
-    (nso_instance, device_name) so a double-click returns the in-flight job
-    (created=False) instead of provisioning twice.
+    ``device_id=None`` and carries its parameters in ``context``.
 
-    The DB decides, not a preceding lookup. A check-then-insert let two concurrent requests
-    for the same node both find nothing and both admit — and nothing downstream would have
-    stopped them, because the two runners onboard the same NSO node with no claim between
-    them until each reaches its own mapping. The loser now loses on the index conflict and
-    is handed the winner's job.
+    The attempt id is the idempotency key: a retry with the same id and the same
+    parameters returns that attempt's job in any status (created=False) and never starts a
+    second provision. The same id with other parameters raises
+    :class:`ProvisionAttemptConflict` (``provision_attempt_mismatch``). A new attempt for a
+    node that already has an active provision raises it too (``provision_active``): the
+    active job belongs to another attempt, so it is not an answer for this one.
 
-    Zero rows with no active job means the winner reached a terminal status between the two
-    statements; a fresh admission is then the correct answer, not "blocked".
+    The DB decides, not a preceding lookup: the insert skips on either unique index and
+    the lookups then name the winner. Zero rows with no match means the pair's winner
+    reached a terminal status between the two statements; a fresh admission is then correct.
     """
     for _attempt in range(_ADMISSION_RETRIES):
         async with db.begin_nested():
@@ -327,11 +332,9 @@ async def enqueue_provision_job(params: dict, db: AsyncSession) -> tuple[Job, bo
                     status=JobStatus.queued,
                     coalescible=False,
                     context=params,
+                    provision_attempt_id=provision_attempt_id,
                 )
-                .on_conflict_do_nothing(
-                    index_elements=_PROVISION_PAIR_ELEMENTS,
-                    index_where=_PROVISION_DEDUPE_PREDICATE,
-                )
+                .on_conflict_do_nothing()
                 .returning(Job.id)
             )
         if job_id is not None:
@@ -341,9 +344,14 @@ async def enqueue_provision_job(params: dict, db: AsyncSession) -> tuple[Job, bo
                 raise RuntimeError(f"newly admitted provision job {job_id} disappeared")
             return job, True
 
+        existing = await get_provision_attempt_job(provision_attempt_id, db)
+        if existing is not None:
+            if existing.context != params:
+                raise ProvisionAttemptConflict("provision_attempt_mismatch", existing)
+            return existing, False
         active = await get_active_provision_job(params["nso_instance"], params["device_name"], db)
         if active is not None:
-            return active, False
+            raise ProvisionAttemptConflict("provision_active", active)
         logger.debug(
             "job.provision_admission.winner_finished",
             **device_fields(
@@ -612,20 +620,28 @@ async def _run_removal(job_id: int, device_id: int, reg: ClaimRegistration | Non
     await run_removal(job_id, device_id, reg=reg)
 
 
-async def _notify_provision_complete(job_id: int) -> None:
-    """Best-effort: tell the plugin a provision job finished so it advances the onboarding row.
+_TERMINAL_PROVISION = frozenset({JobStatus.succeeded, JobStatus.failed})
 
-    Fire-and-forget — a callback failure must not fail the job; the plugin's device-tab self-heal
-    and hourly sweep still catch a missed notification. No-op when the NetBox client is unset
-    (e.g. tests, or a deployment without the plugin callback wired).
+
+async def _notify_provision_complete(job_id: int) -> None:
+    """Best-effort: post the terminal attempt evidence to the plugin's provision-complete callback.
+
+    A callback failure must not fail the job: the plugin also polls the attempt. No-op when
+    the NetBox client is unset, when recovery left the job non-terminal, or for a provision
+    admitted before attempts existed (no id to correlate).
     """
     from nso_adapter.core.importer import get_netbox_client
+    from nso_adapter.store.db import session
 
     nb = get_netbox_client()
     if nb is None:
         return
     try:
-        await nb.notify_provision_complete(job_id)
+        async with session() as db:
+            job = await db.get(Job, job_id)
+        if job is None or job.provision_attempt_id is None or job.status not in _TERMINAL_PROVISION:
+            return
+        await nb.notify_provision_complete(ProvisionAttemptEvidence.from_job(job).model_dump(mode="json"))
     except Exception as exc:  # noqa: BLE001 - best-effort callback; never fail the job on it
         logger.warning("netbox.provision_complete_notify_failed", job_id=job_id, error=failure_detail(exc))
 
