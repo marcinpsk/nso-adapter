@@ -11,10 +11,11 @@ is EMPTY: ``deauthorize_for_cutover`` only reduces authority and retires the pro
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import structlog
-from sqlalchemy import MetaData, delete, exists, null, or_, select, text, update
+from sqlalchemy import MetaData, Select, delete, exists, null, or_, select, text, update
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import terminalize
@@ -390,19 +391,28 @@ class FollowupRecovery(NamedTuple):
     job_id: int
 
 
+async def _recovery_rows(db: AsyncSession, query: Select[Any], device_id: int) -> list[Any]:
+    try:
+        return list((await db.scalars(query.with_for_update(nowait=True))).all())
+    except DBAPIError as exc:
+        if getattr(exc.orig, "sqlstate", None) != "55P03":
+            raise
+        refusal = CutoverFollowupBlocked(f"device {device_id} is busy")
+    raise refusal
+
+
 async def prepare_followup_recovery(db: AsyncSession, device_id: int) -> FollowupRecovery:
     """Select or recreate only the latest settled removal's failed follow-up read."""
     from nso_adapter.core.jobs import FOLLOWUP_OF_JOB_ID, create_followup_sync
 
     await lock_projection(db, device_id)
-    generations = (
-        await db.scalars(
-            select(DeploymentGeneration)
-            .where(DeploymentGeneration.device_id == device_id)
-            .order_by(DeploymentGeneration.seq)
-            .with_for_update()
-        )
-    ).all()
+    generations = await _recovery_rows(
+        db,
+        select(DeploymentGeneration)
+        .where(DeploymentGeneration.device_id == device_id)
+        .order_by(DeploymentGeneration.seq),
+        device_id,
+    )
     generation = next(
         (row for row in reversed(generations) if row.status is GenerationStatus.settled and row.removal_context),
         None,
@@ -422,7 +432,7 @@ async def prepare_followup_recovery(db: AsyncSession, device_id: int) -> Followu
         ):
             raise CutoverFollowupBlocked(f"generation {later.id} follows the settled removal")
         if later.job_id is not None:
-            job = await db.get(Job, later.job_id, with_for_update=True)
+            job = next(iter(await _recovery_rows(db, select(Job).where(Job.id == later.job_id), device_id)), None)
             if (
                 job is None
                 or job.device_id != device_id
@@ -441,14 +451,9 @@ async def prepare_followup_recovery(db: AsyncSession, device_id: int) -> Followu
         raise CutoverFollowupBlocked(f"generation {generation.id} has no succeeded removal carrier")
     if await db.get(DeviceClaim, device_id) is not None:
         raise CutoverFollowupBlocked(f"device {device_id} has an active claim")
-    syncs = (
-        await db.scalars(
-            select(Job)
-            .where(Job.device_id == device_id, Job.job_type == JobType.sync)
-            .order_by(Job.id)
-            .with_for_update()
-        )
-    ).all()
+    syncs = await _recovery_rows(
+        db, select(Job).where(Job.device_id == device_id, Job.job_type == JobType.sync).order_by(Job.id), device_id
+    )
     followups = [sync for sync in syncs if sync.context == {FOLLOWUP_OF_JOB_ID: carrier.id}]
     if any(sync.status is JobStatus.succeeded for sync in followups):
         raise CutoverFollowupBlocked(f"removal job {carrier.id} already has a succeeded follow-up")

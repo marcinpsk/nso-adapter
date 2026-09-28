@@ -15,13 +15,18 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import structlog
 from sqlalchemy import event, select
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from nso_adapter.core.claim import acquire_claim, lock_claim, release_claim
+from nso_adapter.core.cutover import CutoverFollowupBlocked, prepare_followup_recovery
 from nso_adapter.core.cutover_runner import main
+from nso_adapter.core.generation import mark_job_generations_running
 from nso_adapter.core.importer import get_nso_client
 from nso_adapter.core.jobs import enqueue_job, enqueue_provision_job
 from nso_adapter.core.worker import FollowupSyncFailed, run_inspected_generation
 from nso_adapter.store.models import (
     DeploymentGeneration,
+    DeviceClaim,
     DeviceProjectionStream,
     GenerationMode,
     GenerationStatus,
@@ -402,6 +407,60 @@ async def test_recover_followup_with_pending_companion_apply(maintenance_client,
         pending = await db.get(DeploymentGeneration, companion.id)
         assert pending.status is GenerationStatus.pending and pending.attempts == 0
         assert (await db.get(Job, pending.job_id)).status is JobStatus.queued
+
+
+async def test_recover_followup_refuses_a_companion_start_without_deadlock(
+    maintenance_client, store_engine, rival_engine
+):
+    device_id, _recorder, removal, companion = await _admit_mixed_vlan_chain(maintenance_client)
+    client = get_nso_client("nso-dev")
+    client.get_device_ned_id = AsyncMock(return_value="")
+    with pytest.raises(FollowupSyncFailed):
+        await run_inspected_generation(device_id, removal.id, removal.digest)
+
+    generations_locked = asyncio.Event()
+    worker_has_job = asyncio.Event()
+
+    def observe_generation_lock(_conn, _cursor, statement, *_rest):
+        if "FROM deployment_generation" in statement and "FOR UPDATE" in statement:
+            generations_locked.set()
+
+    async def start_companion():
+        reg = await acquire_claim(device_id, "job")
+        assert reg is not None
+        try:
+            maker = async_sessionmaker(rival_engine, expire_on_commit=False)
+            async with maker() as db:
+                await lock_claim(db, reg)
+                job = await db.get(Job, companion.job_id, with_for_update=True)
+                assert job is not None and job.status is JobStatus.queued
+                worker_has_job.set()
+                await asyncio.wait_for(generations_locked.wait(), timeout=10)
+                await mark_job_generations_running(db, job.id)
+                await db.commit()
+        finally:
+            await release_claim(reg)
+
+    async def recover():
+        async with session() as db:
+            return await prepare_followup_recovery(db, device_id)
+
+    event.listen(store_engine.sync_engine, "after_cursor_execute", observe_generation_lock)
+    try:
+        worker = asyncio.create_task(start_companion())
+        await asyncio.wait_for(worker_has_job.wait(), timeout=10)
+        results = await asyncio.wait_for(
+            asyncio.gather(asyncio.create_task(recover()), worker, return_exceptions=True), timeout=15
+        )
+    finally:
+        event.remove(store_engine.sync_engine, "after_cursor_execute", observe_generation_lock)
+
+    assert isinstance(results[0], CutoverFollowupBlocked), results
+    assert f"device {device_id} is busy" in str(results[0])
+    assert results[1] is None, results
+    async with session() as db:
+        assert await db.get(DeviceClaim, device_id) is None
+        assert (await db.get(DeploymentGeneration, companion.id)).status is GenerationStatus.running
 
 
 async def test_recover_followup_refuses_executed_companion(maintenance_client, store_engine, capsys):
