@@ -164,6 +164,54 @@ async def test_release_frontier_read_failure_leaves_job_queued(maintenance_clien
         assert claim is None
 
 
+async def test_release_runs_head_apply_behind_an_earlier_queued_sync(maintenance_client):
+    from nso_adapter.core.jobs import enqueue_job
+
+    http, recorder = maintenance_client
+    device_id, generation_id, job_id, digest = await _admit(http, "cutover-vlan", 7115)
+    async with session() as db:
+        sync, created = await enqueue_job(device_id, JobType.sync, db)
+        assert created
+        sync_id = sync.id
+        apply_created_at = (await db.get(Job, job_id)).created_at
+        await db.execute(
+            text("UPDATE jobs SET created_at = :at WHERE id = :sid"),
+            {"at": apply_created_at - timedelta(minutes=1), "sid": sync_id},
+        )
+        await db.commit()
+    original = recorder._handle
+
+    async def applied_state(method, url, content=None, headers=None):
+        response = await original(method, url, content, headers)
+        if "dry-run=" not in url:
+            recorder.dry_run_delta = ""
+        return response
+
+    recorder._handle = applied_state
+    assert await run_inspected_generation(device_id, generation_id, digest) is JobStatus.succeeded
+    assert len(recorder.commits) == 1
+    async with session() as db:
+        assert (await db.get(Job, job_id)).status is JobStatus.succeeded
+        assert (await db.get(Job, sync_id)).status is JobStatus.queued
+        assert await db.get(DeviceClaim, device_id) is None
+
+
+async def test_release_refuses_device_without_executable_head(maintenance_client):
+    from nso_adapter.core.jobs import enqueue_job
+    from nso_adapter.core.worker import ReleaseRefused
+
+    device_id = await seed_device(nso_device_name="cutover-vlan", netbox_device_id=7116)
+    async with session() as db:
+        sync, _created = await enqueue_job(device_id, JobType.sync, db)
+        sync_id = sync.id
+
+    with pytest.raises(ReleaseRefused, match="generation 999 is not the execution document"):
+        await run_inspected_generation(device_id, 999, "0" * 64)
+    async with session() as db:
+        assert (await db.get(Job, sync_id)).status is JobStatus.queued
+        assert await db.get(DeviceClaim, device_id) is None
+
+
 async def test_release_refuses_tampered_document_and_releases_claim(maintenance_client):
     from nso_adapter.core.generation import GenerationTampered
     from nso_adapter.core.worker import ReleaseRefused

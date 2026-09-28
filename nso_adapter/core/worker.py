@@ -222,10 +222,16 @@ async def _start_head_under_claim(
     intent is not visible yet, and running a later job in that window is the FIFO break the
     lock exists to prevent.
     """
-    from nso_adapter.core.generation import job_admissible, mark_job_generations_running
+    from nso_adapter.core.generation import executable_head, job_admissible, mark_job_generations_running
 
     async with session() as db:
         await lock_claim(db, reg)  # claim -> jobs, per the global lock order
+        if expected_generation_id is not None:
+            # An inspected release starts only the head's job, never an earlier queued sync.
+            release_head = await executable_head(db, device_id)
+            if release_head is None or release_head.job_id is None:
+                raise ReleaseRefused(f"generation {expected_generation_id} is not the execution document")
+            expected_job_id = release_head.job_id
 
         candidate_query = select(Job.id).where(Job.device_id == device_id, Job.status == JobStatus.queued)
         if expected_job_id is not None:
@@ -256,7 +262,6 @@ async def _start_head_under_claim(
             from nso_adapter.core.generation import (
                 GenerationTampered,
                 digest_document,
-                executable_head,
                 executing_generation,
             )
 
