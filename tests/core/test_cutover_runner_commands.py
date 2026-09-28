@@ -34,6 +34,7 @@ from nso_adapter.store.models import (
     JobStatus,
     JobType,
 )
+from tests._secret_discipline import assert_text_free_of
 from tests.conftest import AUTH, _write_config, seed_device, session, start_job
 from tests.core.test_cutover_runner import _admit, _admit_vlan_removal
 from tests.core.test_generation_protocol import put_vlans
@@ -547,3 +548,14 @@ async def test_recover_followup_refuses_without_failed_settled_removal(maintenan
 
     assert (code, out) == (1, "")
     assert "recover-followup refused: " in err
+
+
+async def test_recover_followup_refuses_missing_device(maintenance_client, store_engine, capsys):
+    device_id = 999999
+    client = get_nso_client("nso-dev")
+
+    code, out, err = await _run_with_live_app(capsys, store_engine, client, "recover-followup", str(device_id))
+
+    assert (code, out) == (1, "")
+    assert err.endswith(f"recover-followup refused: device {device_id} no longer exists\n")
+    assert_text_free_of(err, ["Traceback"])

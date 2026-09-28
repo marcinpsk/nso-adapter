@@ -22,6 +22,7 @@ from nso_adapter.core.claim import terminalize
 from nso_adapter.core.generation import (
     CROSSABLE_STATUSES,
     DEVICE_WRITING_JOB_TYPES,
+    DeviceProjectionGone,
     lock_projection,
 )
 from nso_adapter.core.projection import projection_streams
@@ -405,7 +406,10 @@ async def prepare_followup_recovery(db: AsyncSession, device_id: int) -> Followu
     """Select or recreate only the latest settled removal's failed follow-up read."""
     from nso_adapter.core.jobs import FOLLOWUP_OF_JOB_ID, create_followup_sync
 
-    await lock_projection(db, device_id)
+    try:
+        await lock_projection(db, device_id)
+    except DeviceProjectionGone as exc:
+        raise CutoverFollowupBlocked(str(exc)) from exc
     generations = await _recovery_rows(
         db,
         select(DeploymentGeneration)
