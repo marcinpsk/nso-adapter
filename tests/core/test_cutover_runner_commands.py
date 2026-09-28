@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 
 import pytest
 import structlog
@@ -203,7 +204,7 @@ async def test_discard_refuses_and_changes_nothing(maintenance_client, capsys, o
                 described = "running connect"
             else:
                 params = {"nso_instance": "nso-dev", "device_name": "cutover-discard-onboard"}
-                offender_id = (await enqueue_provision_job(params, db))[0].id
+                offender_id = (await enqueue_provision_job(uuid.uuid4(), params, db))[0].id
                 described = "queued provision"
     async with session() as db:
         sync_id = (await enqueue_job(device_id, JobType.sync, db))[0].id

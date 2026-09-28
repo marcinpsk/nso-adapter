@@ -16,6 +16,7 @@ exact queued winner is row-locked and that lock is held through the caller's out
 from __future__ import annotations
 
 import asyncio
+import uuid
 
 import pytest
 import sqlalchemy as sa
@@ -395,16 +396,15 @@ async def _active_provisions(device_name: str) -> list[int]:
         return list(rows)
 
 
-async def test_two_concurrent_provisions_admit_exactly_one(adapter_client, rival_engine):
-    """M6.9t — the loser must lose at the INDEX, not at a lookup it can race.
+async def _race_provisions(rival_engine, winner_args: tuple, loser_args: tuple) -> tuple:
+    """Hold the winner's INSERT uncommitted while the rival admits; return both outcomes.
 
-    The two requests differ in ``address``, so an index inferred on the wrong column would
-    admit both and this test would still fail. The contention is forced rather than
-    scheduled: the winner's INSERT is left uncommitted while the rival runs, so PostgreSQL
-    makes the rival wait on the speculative insertion — which is exactly the window where
-    check-then-insert let both callers find nothing and both admit.
+    The contention is forced rather than scheduled: PostgreSQL makes the rival wait on the
+    speculative insertion, which is exactly the window where check-then-insert let both
+    callers find nothing and both admit.
     """
     from nso_adapter.core.jobs import enqueue_provision_job
+    from nso_adapter.core.provision_attempt import ProvisionAttemptConflict
 
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
     winner_inserted = asyncio.Event()
@@ -413,7 +413,10 @@ async def test_two_concurrent_provisions_admit_exactly_one(adapter_client, rival
     async def _rival() -> None:
         await winner_inserted.wait()
         async with rival() as db:
-            loser["job"], loser["created"] = await enqueue_provision_job({**_PROVISION, "address": "10.0.0.2"}, db)
+            try:
+                loser["job"], loser["created"] = await enqueue_provision_job(*loser_args, db)
+            except ProvisionAttemptConflict as exc:
+                loser["refused"] = exc
 
     task = asyncio.create_task(_rival())
     async with session() as db:
@@ -427,14 +430,98 @@ async def test_two_concurrent_provisions_admit_exactly_one(adapter_client, rival
             await real_commit()
 
         db.commit = _commit_after_the_rival_contends
-        winner, created = await enqueue_provision_job({**_PROVISION, "address": "10.0.0.1"}, db)
+        winner, created = await enqueue_provision_job(*winner_args, db)
 
     await asyncio.wait_for(task, timeout=20)
-
     assert created is True
-    assert loser["created"] is False, "both callers admitted a provision for the same node"
-    assert loser["job"].id == winner.id
+    return winner, loser
+
+
+async def test_two_concurrent_provisions_admit_exactly_one(adapter_client, rival_engine):
+    """M6.9t — the loser must lose at the INDEX, not at a lookup it can race.
+
+    The two requests are two attempts that differ in ``address``, so an index inferred on
+    the wrong column would admit both. The loser is refused with the winner's attempt.
+    """
+    from nso_adapter.core.provision_attempt import ProvisionAttemptConflict
+
+    winner_attempt = uuid.uuid4()
+    winner, loser = await _race_provisions(
+        rival_engine,
+        (winner_attempt, {**_PROVISION, "address": "10.0.0.1"}),
+        (uuid.uuid4(), {**_PROVISION, "address": "10.0.0.2"}),
+    )
+
+    refused = loser.get("refused")
+    assert isinstance(refused, ProvisionAttemptConflict), loser
+    assert (refused.reason, refused.job_id, refused.provision_attempt_id) == (
+        "provision_active",
+        winner.id,
+        winner_attempt,
+    )
     assert await _active_provisions("adm-rtr") == [winner.id]
+
+
+async def test_two_concurrent_retries_of_one_attempt_share_one_job(adapter_client, rival_engine):
+    """The attempt-id key under contention: the retry waits for the winner and returns its job."""
+    attempt = uuid.uuid4()
+    params = {**_PROVISION, "address": "10.0.0.1"}
+    winner, loser = await _race_provisions(rival_engine, (attempt, params), (attempt, dict(params)))
+
+    assert "refused" not in loser, loser
+    assert loser["created"] is False and loser["job"].id == winner.id
+    assert await _active_provisions("adm-rtr") == [winner.id]
+
+
+@pytest.mark.parametrize("same_body", [True, False])
+async def test_provision_retry_finds_its_attempt_after_the_pair_winner_finishes(
+    adapter_client, rival_engine, same_body
+):
+    from nso_adapter.core import jobs as jobs_mod
+    from nso_adapter.core.provision_attempt import ProvisionAttemptConflict
+    from nso_adapter.store.models import Job, JobStatus
+
+    rival = async_sessionmaker(rival_engine, expire_on_commit=False)
+    first_attempt = uuid.uuid4()
+    retry_attempt = uuid.uuid4()
+    params = {**_PROVISION, "address": "10.0.0.1"}
+    retry_params = dict(params) if same_body else {**params, "address": "10.0.0.2"}
+
+    async with session() as db:
+        first, _ = await jobs_mod.enqueue_provision_job(first_attempt, params, db)
+
+    original = jobs_mod.get_provision_attempt_job
+    admitted: dict = {}
+
+    async def _admit_retry_after_missed_attempt(attempt_id, db):
+        existing = await original(attempt_id, db)
+        assert existing is None
+        async with rival() as other:
+            await other.execute(sa.update(Job).where(Job.id == first.id).values(status=JobStatus.succeeded))
+            await other.commit()
+        async with rival() as other:
+            admitted["job"], admitted["created"] = await jobs_mod.enqueue_provision_job(retry_attempt, params, other)
+        return existing
+
+    jobs_mod.get_provision_attempt_job = _admit_retry_after_missed_attempt
+    try:
+        async with session() as db:
+            if same_body:
+                job, created = await jobs_mod.enqueue_provision_job(retry_attempt, retry_params, db)
+            else:
+                with pytest.raises(ProvisionAttemptConflict) as refused:
+                    await jobs_mod.enqueue_provision_job(retry_attempt, retry_params, db)
+    finally:
+        jobs_mod.get_provision_attempt_job = original
+
+    assert admitted["created"] is True
+    if same_body:
+        assert created is False and job.id == admitted["job"].id
+    else:
+        assert (refused.value.reason, refused.value.job_id) == (
+            "provision_attempt_mismatch",
+            admitted["job"].id,
+        )
 
 
 async def test_a_terminal_provision_does_not_block_a_new_one(adapter_client):
@@ -443,7 +530,7 @@ async def test_a_terminal_provision_does_not_block_a_new_one(adapter_client):
     from nso_adapter.store.models import Job, JobStatus
 
     async with session() as db:
-        first, created = await enqueue_provision_job({**_PROVISION, "address": "10.0.0.1"}, db)
+        first, created = await enqueue_provision_job(uuid.uuid4(), {**_PROVISION, "address": "10.0.0.1"}, db)
         assert created is True
 
     async with session() as db:
@@ -451,7 +538,7 @@ async def test_a_terminal_provision_does_not_block_a_new_one(adapter_client):
         await db.commit()
 
     async with session() as db:
-        second, created = await enqueue_provision_job({**_PROVISION, "address": "10.0.0.1"}, db)
+        second, created = await enqueue_provision_job(uuid.uuid4(), {**_PROVISION, "address": "10.0.0.1"}, db)
     assert created is True and second.id != first.id
 
 
@@ -462,18 +549,20 @@ async def test_a_running_provision_still_refuses_a_second_one(adapter_client):
     node another runner is already onboarding.
     """
     from nso_adapter.core.jobs import enqueue_provision_job
+    from nso_adapter.core.provision_attempt import ProvisionAttemptConflict
     from nso_adapter.store.models import Job, JobStatus
 
     async with session() as db:
-        first, _ = await enqueue_provision_job({**_PROVISION, "address": "10.0.0.1"}, db)
+        first, _ = await enqueue_provision_job(uuid.uuid4(), {**_PROVISION, "address": "10.0.0.1"}, db)
 
     async with session() as db:
         await db.execute(sa.update(Job).where(Job.id == first.id).values(status=JobStatus.running))
         await db.commit()
 
     async with session() as db:
-        second, created = await enqueue_provision_job({**_PROVISION, "address": "10.0.0.1"}, db)
-    assert created is False and second.id == first.id
+        with pytest.raises(ProvisionAttemptConflict) as refused:
+            await enqueue_provision_job(uuid.uuid4(), {**_PROVISION, "address": "10.0.0.1"}, db)
+    assert (refused.value.reason, refused.value.job_id) == ("provision_active", first.id)
 
 
 async def test_provision_admission_retries_when_the_winner_finishes(adapter_client, rival_engine, debug_logs):
@@ -485,7 +574,7 @@ async def test_provision_admission_retries_when_the_winner_finishes(adapter_clie
 
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
     async with session() as db:
-        first, _ = await jobs_mod.enqueue_provision_job({**_PROVISION, "address": "10.0.0.1"}, db)
+        first, _ = await jobs_mod.enqueue_provision_job(uuid.uuid4(), {**_PROVISION, "address": "10.0.0.1"}, db)
 
     original = jobs_mod.get_active_provision_job
     fired = {"n": 0}
@@ -502,7 +591,9 @@ async def test_provision_admission_retries_when_the_winner_finishes(adapter_clie
     jobs_mod.get_active_provision_job = _finish_then_look
     try:
         async with session() as db:
-            second, created = await jobs_mod.enqueue_provision_job({**_PROVISION, "address": "10.0.0.1"}, db)
+            second, created = await jobs_mod.enqueue_provision_job(
+                uuid.uuid4(), {**_PROVISION, "address": "10.0.0.1"}, db
+            )
     finally:
         jobs_mod.get_active_provision_job = original
 
@@ -528,7 +619,7 @@ async def test_provision_admission_exhaustion_does_not_repeat_the_device_name(ad
         netbox_device_id=9750,
     )
     async with session() as db:
-        await jobs_mod.enqueue_provision_job(params, db)
+        await jobs_mod.enqueue_provision_job(uuid.uuid4(), params, db)
 
     async def _hide_active_job(instance, name, db):
         return None
@@ -536,7 +627,7 @@ async def test_provision_admission_exhaustion_does_not_repeat_the_device_name(ad
     monkeypatch.setattr(jobs_mod, "get_active_provision_job", _hide_active_job)
     async with session() as db:
         with capture_logs() as logs, pytest.raises(RuntimeError) as caught:
-            await jobs_mod.enqueue_provision_job(params, db)
+            await jobs_mod.enqueue_provision_job(uuid.uuid4(), params, db)
 
     assert_chain_free_of(caught.value, [device_name])
     record = next(record for record in logs if record["event"] == "job.provision_admission.retries_exhausted")

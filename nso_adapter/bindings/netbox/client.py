@@ -91,15 +91,14 @@ class NetboxClient:
         resp = await self._client().post(url, json={"netbox_device_id": netbox_device_id})
         resp.raise_for_status()
 
-    async def notify_provision_complete(self, provision_job_id: int) -> None:
-        """Tell the netbox-nso-plugin a device-provision job finished so it advances the onboard row.
+    async def notify_provision_complete(self, evidence: dict) -> None:
+        """POST one terminal provision attempt's evidence to the plugin's provision-complete callback.
 
-        The plugin advances the gated NSODeviceManagement row off the dashboard-poll path — to
-        ready (→ its signal maps/scopes/syncs) or provision_failed. Best-effort: the caller swallows
-        errors, and the plugin's device-tab self-heal + hourly sweep still catch a missed callback.
+        *evidence* is the ``GET /api/v1/provision-attempts/{id}`` document. Best-effort: the
+        caller swallows errors, and the plugin also polls the attempt.
         """
         url = f"{self._base}/api/plugins/nso/provision-complete/"
-        resp = await self._client().post(url, json={"provision_job_id": provision_job_id})
+        resp = await self._client().post(url, json=evidence)
         resp.raise_for_status()
 
     async def device_exists(self, netbox_device_id: int) -> bool:

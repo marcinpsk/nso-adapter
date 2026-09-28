@@ -178,7 +178,7 @@ configuration rather than intent deliveries and carry no claim either.
 
 Everything the adapter *reads* from the plugin goes through NetBox's own REST API for the
 plugin's models. Beyond those reads it calls exactly two plugin endpoints, both
-fire-and-forget notifications that carry no state and are never read back.
+fire-and-forget notifications whose answers are never read back.
 
 | From | To | What | Phase |
 |------|----|------|-------|
@@ -189,13 +189,14 @@ fire-and-forget notifications that carry no state and are never read back.
 | plugin → adapter | `POST /api/v1/devices/{id}/actions/{sync,detect-drift,connect,apply}` | trigger jobs | 1+, `apply` is 2 |
 | operator → adapter | `POST /api/v1/devices/{id}/actions/{retry,abandon}-generation` | clear a blocked deployment generation | 2 |
 | plugin → adapter | `GET /api/v1/devices/{id}/{interfaces,state,intent,intent-summary,scope}` (+ the per-scope read mirrors), `GET /api/v1/jobs/...` | read state | 1+, `intent` is 2 |
+| plugin → adapter | `POST /api/v1/devices/provision`, `GET /api/v1/provision-attempts/{provision_attempt_id}` | provision one attempt and poll its evidence | 1+ |
 | adapter → NetBox | `GET /api/plugins/nso/device-management/` | reconcile mirrored scope (pull) | 1+ |
 | adapter → NetBox | `GET /api/plugins/nso/interface-state/` | **reconcile mirrored intent (pull)** | 2 |
 | adapter → NetBox | `PATCH dcim.Interface` (and create if missing) | write synced attribute values | 1+ |
 | adapter → NSO   | RESTCONF `sync-from`, `compare-config`, `check-sync`, `connect` (`/devices/device`) | Phase 1 NSO surface | 1+ |
 | adapter → NSO   | RESTCONF write to a thin reconcile-commit service (Spike S2) | apply intent | 2 |
 | adapter → plugin | `POST /api/plugins/nso/sync-complete/` — `{"netbox_device_id": <int>}` | a device sync finished; refresh its overlays | 1+ |
-| adapter → plugin | `POST /api/plugins/nso/provision-complete/` — `{"provision_job_id": <int>}` | a provision job reached a terminal state | 1+ |
+| adapter → plugin | `POST /api/plugins/nso/provision-complete/` — the terminal [provision attempt evidence](#get-apiv1provision-attemptsprovision_attempt_id--200--404) | a provision attempt reached a terminal state | 1+ |
 
 Both notifications are best effort: the adapter logs a failure and does not retry, and
 neither answer is read. **No result may depend on them alone.** A plugin-side consumer
@@ -387,35 +388,54 @@ already exists in NSO. To create the device *in NSO* and bring it up, use
 ### `POST /api/v1/devices/provision` — create the device in NSO + bring it up
 Request:
 ```json
-{ "nso_instance": "nso-prod", "device_name": "core-rtr-01",
+{ "provision_attempt_id": "5f0e6c1a-7d4b-4c3e-9a2f-1b8d6e4c2a90",
+  "nso_instance": "nso-prod", "device_name": "core-rtr-01",
   "address": "10.0.0.1", "ned_id": "cisco-ios-cli-6.114:cisco-ios-cli-6.114",
   "authgroup": "network", "netbox_device_id": 42,
   "ned_type": "cli", "port": null, "admin_state": "unlocked", "sync": true }
 ```
-Runs the NSO onboarding sequence — **create** the device node (idempotent) →
-**ssh fetch-host-keys** (TOFU; needs the device reachable) → set **admin-state**
-(unlocked) → **sync-from** (non-fatal) → create the adapter **mapping** row (when
-`netbox_device_id` is given). Always `200` (even when a blocking step fails — the
-device is left in NSO for retry); inspect the body:
-```json
-{ "ok": true, "device_id": 17,
-  "steps": [ {"step": "create", "status": "ok"},
-             {"step": "fetch_host_keys", "status": "ok"},
-             {"step": "admin_state", "status": "ok", "detail": "unlocked"},
-             {"step": "sync_from", "status": "ok"},
-             {"step": "adapter_mapping", "status": "ok"} ] }
-```
-Step `status` ∈ `ok | exists | failed`; a `failed` blocking step (create /
-fetch_host_keys / admin_state) sets `ok=false` and stops. `422` if `nso_instance`
-is unknown.
+`provision_attempt_id` (UUID, required) is the caller's idempotency key. `202` admits one
+`provision` job and returns `{"job_id": "<id>", "nso_device_name": "...", "status": "queued"}`.
+The job runs the NSO onboarding sequence: **create** the device node (idempotent) → set
+**admin-state** (unlocked) → **ssh fetch-host-keys** (TOFU; needs the device reachable) →
+**sync-from** (non-fatal) → create the adapter **mapping** row (only when
+`netbox_device_id` is given). A blocking step failure does not fail the job: the job
+succeeds with `result.ok = false` and the device stays in NSO for a retry. Read the
+outcome from [the attempt](#get-apiv1provision-attemptsprovision_attempt_id--200--404).
+`422` if `nso_instance` is unknown or `provision_attempt_id` is missing.
 
-At most one provision is active per `(nso_instance, device_name)` — enforced by a unique
-index over queued and running rows, not by a lookup — so a double-submit returns the
-in-flight job. From the mapping step onwards the job holds the device's execution claim, so
-a sync, a failover tick or an offboard on that device waits or is refused while it runs. If
-the device is already held when the mapping is reached, the job ends `failed` with
-`error.code = "device_busy"` and `error.detail.reason = "claim_unavailable"`; nothing was
-written, and re-submitting is the retry.
+A retry with the same `provision_attempt_id` and the same body returns that attempt's job
+in any status (`202`, never a second provision). `409 conflict` names the attempt that
+holds the key in `error.detail` (`{"reason", "provision_attempt_id", "job_id"}`):
+- `reason = "provision_attempt_mismatch"`: the same attempt id with another body;
+- `reason = "provision_active"`: another attempt is queued or running for the same
+  `(nso_instance, device_name)`. The refused attempt is not admitted and stays unknown.
+
+At most one provision is active per `(nso_instance, device_name)`, and one job carries each
+attempt id. Unique indexes enforce both, not a lookup. From the mapping step onwards the job
+holds the device's execution claim, so a sync, a failover tick or an offboard on that device
+waits or is refused while it runs. If the device is already held when the mapping is
+reached, the job ends `failed` with `error.code = "device_busy"` and
+`error.detail.reason = "claim_unavailable"`; nothing was written, and a new attempt is the retry.
+
+### `GET /api/v1/provision-attempts/{provision_attempt_id}` → `200 | 404`
+```json
+{ "provision_attempt_id": "5f0e6c1a-7d4b-4c3e-9a2f-1b8d6e4c2a90",
+  "status": "succeeded", "job_id": 17,
+  "result": { "ok": true, "device_id": null,
+              "steps": [ {"step": "create", "status": "ok"},
+                         {"step": "admin_state", "status": "ok", "detail": "unlocked"},
+                         {"step": "fetch_host_keys", "status": "ok"},
+                         {"step": "sync_from", "status": "ok"} ] },
+  "error": null }
+```
+Every key is always present. `status` ∈ `queued | running | succeeded | failed` (the job's
+status). `result` is set once the job ran: `ok = false` when a blocking step failed, and
+`device_id` is the adapter mapping row the job created, or `null` when the request carried
+no `netbox_device_id`. A `failed` attempt carries `error` in the standard error shape and a
+`null` result. `404 not_found` when no job carries the id: the caller may treat an attempt
+that stays unknown as never admitted. The `provision-complete` callback posts this same
+document once the attempt is terminal.
 
 ### `GET /api/v1/devices/{id}` → `200`
 Device object plus `scope` (see below) and `last_job_id`.

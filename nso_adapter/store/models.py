@@ -384,6 +384,12 @@ class Job(Base):
             "job_type = 'provision' OR device_id IS NOT NULL OR status IN ('succeeded', 'failed')",
             name="ck_job_detached_non_provision_terminal",
         ),
+        # The plugin's provision attempt id is the idempotency key of one provision job.
+        UniqueConstraint("provision_attempt_id", name="uq_job_provision_attempt_id"),
+        CheckConstraint(
+            "provision_attempt_id IS NULL OR job_type = 'provision'",
+            name="ck_job_attempt_id_only_on_provision",
+        ),
         # One queued coalescible job per device and type; core.jobs keeps its inference target together.
         Index(
             "uq_job_queued_per_device_type",
@@ -446,6 +452,8 @@ class Job(Base):
     # what makes allocation order equal COMMIT order per device. NULL until then — a queued or
     # running job is invisible to an ascending ``settle_seq > :cursor`` page for free.
     settle_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Set on every provision the plugin admits; NULL only on provisions admitted before #1732.
+    provision_attempt_id: Mapped[uuid.UUID | None] = mapped_column(PGUUID(as_uuid=True), nullable=True)
 
     device: Mapped[Device | None] = relationship("Device", back_populates="jobs")
 

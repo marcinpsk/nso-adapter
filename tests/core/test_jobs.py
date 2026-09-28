@@ -5,12 +5,14 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 from sqlalchemy import select
+from sqlalchemy import update as sa_update
 from structlog.testing import capture_logs
 
 from nso_adapter.core.jobs import (
@@ -823,14 +825,15 @@ class _FakeNb:
     def __init__(self):
         self.calls = []
 
-    async def notify_provision_complete(self, job_id):
-        self.calls.append(job_id)
+    async def notify_provision_complete(self, evidence):
+        self.calls.append(evidence)
 
 
-async def _queue_provision_job(device_name: str) -> int:
+async def _queue_provision_job(device_name: str, *, provision_attempt_id: uuid.UUID | None = None) -> int:
     """A provision job as the CLAIMLESS worker head leaves it: started, at attempt 1."""
     async with session() as db:
         j = Job(
+            provision_attempt_id=provision_attempt_id or uuid.uuid4(),
             job_type=JobType.provision,
             device_id=None,
             status=JobStatus.running,
@@ -845,8 +848,9 @@ async def _queue_provision_job(device_name: str) -> int:
 
 
 async def test_run_provision_notifies_plugin_on_success(adapter_client):
-    """A successful provision fires the plugin provision-complete callback with the job id."""
-    job_id = await _queue_provision_job("prov-notify-ok")
+    """A successful provision posts the attempt's success evidence to the plugin callback."""
+    attempt = uuid.uuid4()
+    job_id = await _queue_provision_job("prov-notify-ok", provision_attempt_id=attempt)
     fake = _FakeNb()
 
     async def ok_provision(db, **params):
@@ -860,12 +864,21 @@ async def test_run_provision_notifies_plugin_on_success(adapter_client):
 
     async with session() as db:
         assert (await db.get(Job, job_id)).status == JobStatus.succeeded
-    assert fake.calls == [job_id]
+    assert fake.calls == [
+        {
+            "provision_attempt_id": str(attempt),
+            "status": "succeeded",
+            "job_id": job_id,
+            "result": {"ok": True, "device_id": None, "steps": [{"step": "create", "status": "ok"}]},
+            "error": None,
+        }
+    ]
 
 
 async def test_run_provision_notifies_plugin_on_failure(adapter_client):
     """Even when provisioning fails, the runner still fires the callback so the plugin marks it failed."""
-    job_id = await _queue_provision_job("prov-notify-fail")
+    attempt = uuid.uuid4()
+    job_id = await _queue_provision_job("prov-notify-fail", provision_attempt_id=attempt)
     fake = _FakeNb()
 
     async def boom_provision(db, **params):
@@ -878,8 +891,37 @@ async def test_run_provision_notifies_plugin_on_failure(adapter_client):
         await _run_provision(job_id, None)
 
     async with session() as db:
-        assert (await db.get(Job, job_id)).status == JobStatus.failed
-    assert fake.calls == [job_id]
+        job = await db.get(Job, job_id)
+    assert job.status == JobStatus.failed
+    [evidence] = fake.calls
+    assert (evidence["provision_attempt_id"], evidence["status"], evidence["job_id"]) == (
+        str(attempt),
+        "failed",
+        job_id,
+    )
+    assert evidence["result"] is None and evidence["error"] == job.error
+
+
+async def test_run_provision_without_an_attempt_posts_no_callback(adapter_client):
+    """A provision admitted before attempts existed has nothing the plugin can correlate."""
+    job_id = await _queue_provision_job("prov-notify-legacy")
+    async with session() as db:
+        await db.execute(sa_update(Job).where(Job.id == job_id).values(provision_attempt_id=None))
+        await db.commit()
+    fake = _FakeNb()
+
+    async def ok_provision(db, **params):
+        return {"ok": True, "steps": [], "device_id": None}
+
+    with (
+        patch("nso_adapter.core.onboarding.provision_nso_device", ok_provision),
+        patch("nso_adapter.core.importer.get_netbox_client", lambda: fake),
+    ):
+        await _run_provision(job_id, None)
+
+    async with session() as db:
+        assert (await db.get(Job, job_id)).status == JobStatus.succeeded
+    assert fake.calls == []
 
 
 class _EchoingNb:
@@ -888,7 +930,7 @@ class _EchoingNb:
     def __init__(self, secret: str):
         self.secret = secret
 
-    async def notify_provision_complete(self, job_id):
+    async def notify_provision_complete(self, evidence):
         raise RuntimeError(f"callback refused: {self.secret}")
 
     async def notify_sync_complete(self, netbox_device_id):
