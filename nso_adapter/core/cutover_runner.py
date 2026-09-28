@@ -114,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "recover-followup":
         try:
             recovery = asyncio.run(recover_followup(args.device_id))
-        except (CutoverFollowupBlocked, FollowupSyncFailed) as exc:
+        except (CutoverFollowupBlocked, FollowupSyncFailed, StoreEngineUrlError) as exc:
             parser.exit(1, f"recover-followup refused: {exc}\n")
         print(json.dumps({"generation_id": recovery.generation_id, "job_id": recovery.job_id, "status": "succeeded"}))
         return 0

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import uuid
@@ -48,8 +49,11 @@ _DISCARDED = {
 }
 
 
-@pytest.mark.parametrize("command", ("discard-read-jobs", "reset"))
-def test_runner_refuses_a_synchronous_postgresql_url_before_a_transaction(tmp_path, monkeypatch, command):
+@pytest.mark.parametrize(
+    ("argv", "prefix"),
+    ((["discard-read-jobs"], "discard"), (["reset"], "reset"), (["recover-followup", "1"], "recover-followup")),
+)
+def test_runner_refuses_a_synchronous_postgresql_url_before_a_transaction(tmp_path, monkeypatch, argv, prefix):
     config = _write_config(
         tmp_path,
         monkeypatch,
@@ -57,17 +61,21 @@ def test_runner_refuses_a_synchronous_postgresql_url_before_a_transaction(tmp_pa
     )
     repo_root = Path(__file__).resolve().parents[2]
     proc = subprocess.run(
-        [sys.executable, "-m", "nso_adapter.core.cutover_runner", command],
+        [sys.executable, "-m", "nso_adapter.core.cutover_runner", *argv],
         cwd=repo_root,
         capture_output=True,
         text=True,
         timeout=60,
-        env={"PATH": "/usr/bin:/bin", "CONFIG_FILE": str(config)},
+        env={
+            "PATH": "/usr/bin:/bin",
+            "CONFIG_FILE": str(config),
+            **{name: os.environ[name] for name in ("ADAPTER_TOKEN", "DIAGNOSTIC_KEY", "NETBOX_TOKEN")},
+        },
     )
 
     assert proc.returncode == 1
     assert proc.stdout == ""
-    assert proc.stderr.startswith(f"{command.split('-')[0]} refused: database_url must use ")
+    assert proc.stderr.startswith(f"{prefix} refused: database_url must use ")
     assert "postgresql+asyncpg" in proc.stderr
     assert "got 'postgresql'" in proc.stderr
     if "Traceback" in proc.stderr:
