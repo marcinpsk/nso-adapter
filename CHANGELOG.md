@@ -2,6 +2,39 @@
 
 <!-- version list -->
 
+## v1.8.0 (2026-09-28)
+
+### Bug Fixes
+
+- **api**: Mark the preview unavailable when the recheck finds a tampered generation
+  ([`59d2ba3`](https://github.com/marcinpsk/nso-adapter/commit/59d2ba352eb73b533cee8d7656fb43fefe76ce77))
+
+- **guards**: Detect authority unpacking in every binding target
+  ([`300aaed`](https://github.com/marcinpsk/nso-adapter/commit/300aaede8ec0faaf393c65a7d170945ce6ccca3c))
+
+- **guards**: Reject a rebound module receiver in the cutover NULL reset
+  ([`4b576a2`](https://github.com/marcinpsk/nso-adapter/commit/4b576a2cfc0058c2e22f14973d8afef5f75a4c54))
+
+- **lint**: Ban relative imports so the generation guard sees every construction
+  ([`013baca`](https://github.com/marcinpsk/nso-adapter/commit/013baca54bb4c1fbb21287e8d222423fff4a9fba))
+
+- **worker**: Start only the head's job in an inspected release
+  ([`ff55031`](https://github.com/marcinpsk/nso-adapter/commit/ff55031988d45a8490189c86c3552f767f25a3db))
+
+### Chores
+
+- **ci**: Bump the actions group with 2 updates
+  ([`8dad61c`](https://github.com/marcinpsk/nso-adapter/commit/8dad61c0bb9e23b4b1b051b2a84c66deea1d635f))
+
+- **deps**: Bump ruff in the python-minor-patch group
+  ([`3596660`](https://github.com/marcinpsk/nso-adapter/commit/35966602e611da5cc61f0e435e433c1ccc807072))
+
+### Refactoring
+
+- **guards**: Share authority write patterns across scopes
+  ([`3614984`](https://github.com/marcinpsk/nso-adapter/commit/36149840cbc47edffd1c199d0f172c72f9cb244a))
+
+
 ## v1.7.0 (2026-09-25)
 
 ### Features
