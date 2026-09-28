@@ -1,16 +1,39 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
-"""Execute SQL examples so rule fixtures cannot silently use invalid APIs."""
+"""Verify authority-rule configuration and executable SQL examples."""
 
 import ast
+import json
 from pathlib import Path
 
 import pytest
+import yaml
 from sqlalchemy import select
 
 from nso_adapter.store.models import Device, DeviceProjectionStream
 
 FIXTURES = Path(__file__).resolve().parents[1] / ".opengrep/tests/nso_adapter/core"
+
+
+def test_new_authority_write_forms_propagate_to_every_scope():
+    config = FIXTURES.parents[2] / "nso-rules.yaml"
+    rules = {rule["id"]: rule for rule in yaml.safe_load(config.read_text())["rules"]}
+    new_form = {"pattern": "$ROW.set_authority($FIELD, $VALUE)"}
+    rules["nso-authority-write"]["patterns"][0]["pattern-either"].append(new_form)
+    # The runner expands YAML aliases before it passes the configuration to OpenGrep.
+    expanded = json.loads(json.dumps(rules))
+    consumers = (
+        "nso-authority-write-generation",
+        "nso-authority-write-cutover",
+        "nso-authority-write-generation-shadow",
+        "nso-authority-write-cutover-shadow",
+        "nso-authority-reset-value",
+        "nso-authority-reset-revision",
+        "nso-authority-reset-rebound-null",
+    )
+    for name in consumers:
+        forms = next(pattern["pattern-either"] for pattern in expanded[name]["patterns"] if "pattern-either" in pattern)
+        assert new_form in forms, name
 
 
 def _snippet(name):

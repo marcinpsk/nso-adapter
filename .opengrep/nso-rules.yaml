@@ -9,7 +9,7 @@ rules:
       include: [nso_adapter/**]
       exclude: [nso_adapter/core/generation.py, nso_adapter/core/cutover.py]
     patterns:
-      - pattern-either:
+      - pattern-either: &authority_write_forms
           - pattern: $ROW.$FIELD = $VALUE
           - pattern: $ROW.$FIELD = $OTHER = $VALUE
           - pattern: $OTHER = $ROW.$FIELD = $VALUE
@@ -42,29 +42,7 @@ rules:
     paths:
       include: [nso_adapter/core/generation.py]
     patterns:
-      - pattern-either: &authority_write_forms
-          - pattern: $ROW.$FIELD = $VALUE
-          - pattern: $ROW.$FIELD = $OTHER = $VALUE
-          - pattern: $OTHER = $ROW.$FIELD = $VALUE
-          - pattern: $ROW.$FIELD = $OTHER.$ANY = $VALUE
-          - pattern: $OTHER.$ANY = $ROW.$FIELD = $VALUE
-          - pattern: nso_adapter.store.models.DeviceProjectionStream(..., $FIELD=$VALUE, ...)
-          - pattern: dict(..., $FIELD=$VALUE, ...)
-          - pattern: $MAP["$FIELD"] = $VALUE
-          - pattern: $MAP.update(..., $FIELD=$VALUE, ...)
-          - pattern: $STMT.ordered_values(..., ($MODEL.$FIELD, $VALUE), ...)
-          - pattern: $STMT.ordered_values(..., ("$FIELD", $VALUE), ...)
-          - pattern: $STMT.values(dict([..., ("$FIELD", $VALUE), ...]))
-          - pattern: $STMT.from_select([..., "$FIELD", ...], $VALUE)
-          - pattern: $STMT.ordered_values(..., ($MODEL.__table__.c["$FIELD"], $VALUE), ...)
-          - pattern: $STMT.ordered_values(..., ($MODEL.__table__.c.$FIELD, $VALUE), ...)
-          - pattern: setattr($ROW, "$FIELD", $VALUE)
-          - pattern: builtins.setattr($ROW, "$FIELD", $VALUE)
-          - pattern: $STMT.values(..., $FIELD=$VALUE, ...)
-          - pattern: '{..., "$FIELD": $VALUE, ...}'
-          - pattern: '{..., $MODEL.$FIELD: $VALUE, ...}'
-          - pattern: '{..., $MODEL.__table__.c["$FIELD"]: $VALUE, ...}'
-          - pattern: '{..., $MODEL.__table__.c.$FIELD: $VALUE, ...}'
+      - pattern-either: *authority_write_forms
       - metavariable-regex:
           metavariable: $FIELD
           regex: ^(authorized_document|authorized_revision|applied_revision)$
