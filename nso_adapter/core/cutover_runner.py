@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 import structlog
 import uvicorn
 from fastapi import FastAPI
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.config import get_config
 from nso_adapter.core.cutover import (
@@ -28,7 +28,7 @@ from nso_adapter.core.cutover import (
 )
 from nso_adapter.core.worker import FollowupSyncFailed, ReleaseRefused, run_inspected_generation
 from nso_adapter.main import create_app, maintenance_lifespan
-from nso_adapter.store.db import require_postgresql_url
+from nso_adapter.store.db import StoreEngineUrlError, create_store_engine
 from nso_adapter.store.models import JobStatus
 
 
@@ -49,10 +49,7 @@ async def release(device_id: int, generation_id: int, document_digest: str) -> J
 @asynccontextmanager
 async def _store_transaction() -> AsyncIterator[AsyncSession]:
     """Open one transaction on a private engine and commit it on success; no recovery or workers start."""
-    engine = create_async_engine(
-        require_postgresql_url(get_config().database_url),
-        connect_args={"server_settings": {"application_name": "nso-adapter.cutover"}},
-    )
+    engine = create_store_engine(get_config().database_url, application_name="nso-adapter.cutover")
     try:
         async with AsyncSession(engine, expire_on_commit=False) as db:
             yield db
@@ -95,14 +92,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "discard-read-jobs":
         try:
             discarded = asyncio.run(discard_read_jobs())
-        except CutoverJobsBlocked as exc:
+        except (CutoverJobsBlocked, StoreEngineUrlError) as exc:
             parser.exit(1, f"discard refused: {exc}\n")
         print(json.dumps({"discarded": [job._asdict() for job in discarded]}))
         return 0
     if args.command == "reset":
         try:
             worklist = asyncio.run(reset())
-        except (CutoverStateBlocked, CutoverBlocked, CutoverSchemaBlocked) as exc:
+        except (CutoverStateBlocked, CutoverBlocked, CutoverSchemaBlocked, StoreEngineUrlError) as exc:
             parser.exit(1, f"reset refused: {exc}\n")
         print(json.dumps({"devices": [device._asdict() for device in worklist.devices]}))
         return 0

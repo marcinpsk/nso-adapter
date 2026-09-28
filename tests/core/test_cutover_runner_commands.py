@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
 import uuid
+from pathlib import Path
 
 import pytest
 import structlog
@@ -24,7 +27,7 @@ from nso_adapter.store.models import (
     JobStatus,
     JobType,
 )
-from tests.conftest import seed_device, session, start_job
+from tests.conftest import _write_config, seed_device, session, start_job
 from tests.core.test_cutover_runner import _admit
 
 pytestmark = pytest.mark.anyio
@@ -34,6 +37,32 @@ _DISCARDED = {
     "message": "Queued read job discarded before the cutover authority reset",
     "detail": {},
 }
+
+
+@pytest.mark.parametrize("command", ("discard-read-jobs", "reset"))
+def test_runner_refuses_a_synchronous_postgresql_url_before_a_transaction(tmp_path, monkeypatch, command):
+    config = _write_config(
+        tmp_path,
+        monkeypatch,
+        database_url="postgresql://placeholder:placeholder@127.0.0.1:1/placeholder",
+    )
+    repo_root = Path(__file__).resolve().parents[2]
+    proc = subprocess.run(
+        [sys.executable, "-m", "nso_adapter.core.cutover_runner", command],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={"PATH": "/usr/bin:/bin", "CONFIG_FILE": str(config)},
+    )
+
+    assert proc.returncode == 1
+    assert proc.stdout == ""
+    assert proc.stderr.startswith(f"{command.split('-')[0]} refused: database_url must use ")
+    assert "postgresql+asyncpg" in proc.stderr
+    assert "got 'postgresql'" in proc.stderr
+    if "Traceback" in proc.stderr:
+        raise AssertionError("the runner printed a traceback for an unsupported driver")
 
 
 async def _run(capsys, *argv: str) -> tuple[int, str, str]:

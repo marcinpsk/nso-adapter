@@ -583,6 +583,18 @@ async def legacy_query_api(session, model, select):
     return await session.scalars(select(model))
 
 
+def async_engine_creation(create_async_engine, create_store_engine, database_url):
+    # ruleid: nso-store-async-engine-factory
+    create_async_engine(database_url)
+    # ok: nso-store-async-engine-factory
+    create_store_engine(database_url, application_name="placeholder")
+
+
+def create_store_engine(database_url, create_async_engine):
+    # ok: nso-store-async-engine-factory
+    return create_async_engine(database_url)
+
+
 async def raw_string_statement(conn, op, query, table, value, text):
     # ruleid: nso-store-execute-raw-string
     await conn.execute("SELECT 1")
