@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
+import sqlalchemy
 from sqlalchemy import insert, literal, null, null as sql_null, select, update
 from nso_adapter.store.models import DeviceProjectionStream
 
@@ -9,6 +10,8 @@ async def deauthorize_for_cutover(db, row):
     db.execute(update(DeviceProjectionStream).values(authorized_document=sql_null(), authorized_revision=0))
     # ok: nso-authority-reset-value
     db.execute(update(DeviceProjectionStream).values({DeviceProjectionStream.authorized_document: sql_null()}))
+    # ok: nso-authority-reset-value, nso-authority-reset-rebound-null
+    row.authorized_document = sqlalchemy.null()
 
 
 # Independent snippets use the sanctioned function name in separate scopes.
@@ -58,6 +61,9 @@ async def deauthorize_for_cutover(db, row):
     db.execute(update(DeviceProjectionStream).values(dict([("authorized_revision", 5)])))
     # ruleid: nso-authority-reset-revision
     db.execute(insert(DeviceProjectionStream).from_select(["device_id", "authorized_revision"], select(literal(1), literal(5))))
+    sqlalchemy = helper_namespace()
+    # ruleid: nso-authority-reset-rebound-null
+    row.authorized_document = sqlalchemy.null()
 
 
 async def rogue(db):

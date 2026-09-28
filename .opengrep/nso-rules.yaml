@@ -259,7 +259,9 @@ rules:
           regex: ^authorized_document$
       - metavariable-pattern:
           metavariable: $VALUE
-          pattern: $NAME()
+          pattern-either:
+            - pattern: $NAME()
+            - pattern: $NAME.$METHOD()
       - pattern-either:
           - pattern-inside: |
               def $NAME(...):
