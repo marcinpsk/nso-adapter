@@ -18,12 +18,18 @@ from sqlalchemy import MetaData, delete, exists, null, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import terminalize
-from nso_adapter.core.generation import CROSSABLE_STATUSES, DEVICE_WRITING_JOB_TYPES
+from nso_adapter.core.generation import (
+    CROSSABLE_STATUSES,
+    DEVICE_WRITING_JOB_TYPES,
+    lock_projection,
+)
 from nso_adapter.core.projection import projection_streams
 from nso_adapter.store.models import (
     Base,
     DeploymentGeneration,
+    DeviceClaim,
     DeviceProjectionStream,
+    GenerationStatus,
     Job,
     JobStatus,
     JobType,
@@ -373,6 +379,88 @@ class DiscardedJob(NamedTuple):
     job_type: str
 
 
+class CutoverFollowupBlocked(RuntimeError):
+    """The settled removal cannot have its follow-up read recovered."""
+
+
+class FollowupRecovery(NamedTuple):
+    """The settled removal and its selected follow-up sync."""
+
+    generation_id: int
+    job_id: int
+
+
+async def prepare_followup_recovery(db: AsyncSession, device_id: int) -> FollowupRecovery:
+    """Select or recreate only the latest settled removal's failed follow-up read."""
+    from nso_adapter.core.jobs import FOLLOWUP_OF_JOB_ID, create_followup_sync
+
+    await lock_projection(db, device_id)
+    generations = (
+        await db.scalars(
+            select(DeploymentGeneration)
+            .where(DeploymentGeneration.device_id == device_id)
+            .order_by(DeploymentGeneration.seq)
+            .with_for_update()
+        )
+    ).all()
+    generation = next(
+        (row for row in reversed(generations) if row.status is GenerationStatus.settled and row.removal_context),
+        None,
+    )
+    if generation is None:
+        raise CutoverFollowupBlocked(f"device {device_id} has no latest settled removal")
+    for later in generations:
+        if later.seq <= generation.seq:
+            continue
+        if (
+            generation.apply_attempt_id is None
+            or later.apply_attempt_id != generation.apply_attempt_id
+            or later.status is not GenerationStatus.pending
+            or later.attempts != 0
+            or later.carrier_job_id is not None
+            or later.settled_at is not None
+        ):
+            raise CutoverFollowupBlocked(f"generation {later.id} follows the settled removal")
+        if later.job_id is not None:
+            job = await db.get(Job, later.job_id, with_for_update=True)
+            if (
+                job is None
+                or job.device_id != device_id
+                or job.status is not JobStatus.queued
+                or job.run_attempt != 0
+                or job.started_at is not None
+            ):
+                raise CutoverFollowupBlocked(f"generation {later.id} has a started carrier")
+    carrier = await db.get(Job, generation.job_id)
+    if (
+        carrier is None
+        or carrier.device_id != device_id
+        or carrier.job_type is not JobType.removal
+        or carrier.status is not JobStatus.succeeded
+    ):
+        raise CutoverFollowupBlocked(f"generation {generation.id} has no succeeded removal carrier")
+    if await db.get(DeviceClaim, device_id) is not None:
+        raise CutoverFollowupBlocked(f"device {device_id} has an active claim")
+    syncs = (
+        await db.scalars(
+            select(Job)
+            .where(Job.device_id == device_id, Job.job_type == JobType.sync)
+            .order_by(Job.id)
+            .with_for_update()
+        )
+    ).all()
+    followups = [sync for sync in syncs if sync.context == {FOLLOWUP_OF_JOB_ID: carrier.id}]
+    if any(sync.status is JobStatus.succeeded for sync in followups):
+        raise CutoverFollowupBlocked(f"removal job {carrier.id} already has a succeeded follow-up")
+    if any(sync.status is JobStatus.running for sync in followups):
+        raise CutoverFollowupBlocked(f"removal job {carrier.id} has a running follow-up")
+    queued = [sync for sync in followups if sync.status is JobStatus.queued]
+    if len(queued) > 1:
+        raise CutoverFollowupBlocked(f"removal job {carrier.id} has multiple queued follow-ups")
+    followup = queued[0] if queued else await create_followup_sync(db, device_id, carrier.id)
+    return FollowupRecovery(generation.id, followup.id)
+
+
 #: The success barrier's reads; provision is excluded because it creates the NSO device.
 READ_JOB_TYPES = frozenset(JobType).difference(DEVICE_WRITING_JOB_TYPES, (JobType.provision,))
 
@@ -515,14 +603,15 @@ async def deauthorize_for_cutover(db: AsyncSession) -> CutoverReset:
     return CutoverReset(devices)
 
 
-async def discard_queued_read_jobs(db: AsyncSession) -> tuple[DiscardedJob, ...]:
-    """Fail every queued read job in the caller's transaction, or refuse while another job is live."""
+async def discard_queued_read_jobs(db: AsyncSession, device_id: int | None = None) -> tuple[DiscardedJob, ...]:
+    """Fail queued read jobs in scope, or refuse while another scoped job is live."""
     await db.execute(text("LOCK TABLE jobs IN SHARE ROW EXCLUSIVE MODE"))
     carries = exists().where(DeploymentGeneration.job_id == Job.id)
+    scope = (Job.device_id == device_id,) if device_id is not None else ()
     live = (
         await db.execute(
             select(Job.device_id, Job.id, Job.job_type, Job.status, carries.label("carries"))
-            .where(Job.status.in_((JobStatus.queued, JobStatus.running)))
+            .where(Job.status.in_((JobStatus.queued, JobStatus.running)), *scope)
             .order_by(Job.device_id, Job.id)
         )
     ).all()

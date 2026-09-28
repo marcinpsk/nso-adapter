@@ -18,15 +18,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.config import get_config
 from nso_adapter.core.cutover import (
     CutoverBlocked,
+    CutoverFollowupBlocked,
     CutoverJobsBlocked,
     CutoverReset,
     CutoverSchemaBlocked,
     CutoverStateBlocked,
     DiscardedJob,
+    FollowupRecovery,
     deauthorize_for_cutover,
     discard_queued_read_jobs,
+    prepare_followup_recovery,
 )
-from nso_adapter.core.worker import FollowupSyncFailed, ReleaseRefused, run_inspected_generation
+from nso_adapter.core.worker import FollowupSyncFailed, ReleaseRefused, _run_release_followup, run_inspected_generation
 from nso_adapter.main import create_app, maintenance_lifespan
 from nso_adapter.store.db import StoreEngineUrlError, create_store_engine
 from nso_adapter.store.models import JobStatus
@@ -58,16 +61,25 @@ async def _store_transaction() -> AsyncIterator[AsyncSession]:
         await engine.dispose()
 
 
-async def discard_read_jobs() -> tuple[DiscardedJob, ...]:
+async def discard_read_jobs(device_id: int | None = None) -> tuple[DiscardedJob, ...]:
     """Fail the queued read jobs the stopped scheduler left behind."""
     async with _store_transaction() as db:
-        return await discard_queued_read_jobs(db)
+        return await discard_queued_read_jobs(db, device_id)
 
 
 async def reset() -> CutoverReset:
     """Retire fleet authority and return the post-cutover worklist."""
     async with _store_transaction() as db:
         return await deauthorize_for_cutover(db)
+
+
+async def recover_followup(device_id: int) -> FollowupRecovery:
+    """Run the latest settled removal's follow-up read without replaying removal."""
+    async with app.router.lifespan_context(app):
+        async with _store_transaction() as db:
+            recovery = await prepare_followup_recovery(db, device_id)
+        await _run_release_followup(device_id, recovery.job_id)
+    return recovery
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -80,10 +92,13 @@ def main(argv: list[str] | None = None) -> int:
     release_cmd.add_argument("device_id", type=int)
     release_cmd.add_argument("--generation", type=int, required=True)
     release_cmd.add_argument("--document-digest", required=True)
-    commands.add_parser("discard-read-jobs", help="fail every queued read job; refuse on any other live job")
+    discard_cmd = commands.add_parser("discard-read-jobs", help="fail queued read jobs; refuse on other live jobs")
+    discard_cmd.add_argument("--device", type=int)
+    recover_cmd = commands.add_parser("recover-followup", help="run a settled removal's follow-up sync")
+    recover_cmd.add_argument("device_id", type=int)
     commands.add_parser("reset", help="retire fleet authority and print the post-cutover worklist")
     args = parser.parse_args(argv)
-    if args.command in ("discard-read-jobs", "reset"):
+    if args.command in ("discard-read-jobs", "reset", "recover-followup"):
         # Stdout carries only the JSON result.
         structlog.configure(logger_factory=structlog.PrintLoggerFactory(sys.stderr))
     if args.command == "serve":
@@ -91,10 +106,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "discard-read-jobs":
         try:
-            discarded = asyncio.run(discard_read_jobs())
+            discarded = asyncio.run(discard_read_jobs(args.device))
         except (CutoverJobsBlocked, StoreEngineUrlError) as exc:
             parser.exit(1, f"discard refused: {exc}\n")
         print(json.dumps({"discarded": [job._asdict() for job in discarded]}))
+        return 0
+    if args.command == "recover-followup":
+        try:
+            recovery = asyncio.run(recover_followup(args.device_id))
+        except (CutoverFollowupBlocked, FollowupSyncFailed) as exc:
+            parser.exit(1, f"recover-followup refused: {exc}\n")
+        print(json.dumps({"generation_id": recovery.generation_id, "job_id": recovery.job_id, "status": "succeeded"}))
         return 0
     if args.command == "reset":
         try:
