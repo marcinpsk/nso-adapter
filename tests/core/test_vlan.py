@@ -48,6 +48,14 @@ def _serve_sections(nso: AsyncMock) -> dict:
     return sections
 
 
+class _SectionsClient:
+    def __init__(self):
+        self.sections = {}
+
+    async def get_device_state_section(self, device_name, wire_name):
+        return self.sections[wire_name]
+
+
 @pytest.mark.parametrize("raw", [[], ["10", "20"], ("10", "20"), 10])
 def test_tagged_vlan_parser_rejects_non_wire_shapes(raw):
     with pytest.raises(ValueError, match=rf"^tagged-vlans must be a string \(type {type(raw).__name__}\)$"):
@@ -492,6 +500,45 @@ async def test_a_BOOLEAN_vlan_id_is_refused_and_never_bound_to_a_real_vlan(adapt
         rows = (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device_id))).scalars().all()
     # The harm the coercion caused: VLAN 1 counted as seen and the real rows were pruned.
     assert [row.vlan_id for row in rows] == [10]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("vlan_id", [0, 4095])
+async def test_out_of_range_vlan_database_id_refuses_refresh_and_keeps_rows(adapter_client, vlan_id):
+    device_id = await seed_device()
+    async with _device_session(device_id) as (db, device):
+        nso = _SectionsClient()
+        sections = nso.sections
+        sections["vlan-database"] = {"status": "ok", "vlan": [{"vlan-id": 10}]}
+        await refresh_vlan_database_for_device(db, device, nso)
+        sections["vlan-database"] = {"status": "ok", "vlan": [{"vlan-id": vlan_id}]}
+        with pytest.raises(ValueError, match="vlan-id"):
+            await refresh_vlan_database_for_device(db, device, nso)
+        rows = (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device_id))).scalars().all()
+        assert [row.vlan_id for row in rows] == [10]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("vlan_id", [0, 4095])
+async def test_out_of_range_untagged_vlan_refuses_switchport_refresh(adapter_client, vlan_id):
+    device_id = await seed_device()
+    async with _device_session(device_id) as (db, device):
+        nso = _SectionsClient()
+        sections = nso.sections
+        sections["vlan-database"] = {"status": "ok", "vlan": [{"vlan-id": 10}]}
+        await refresh_vlan_database_for_device(db, device, nso)
+        sections["switchport"] = {"status": "ok", "interface": [{"interface-name": "Gi0/1", "untagged-vlan": 10}]}
+        await refresh_switchport_for_device(db, device, nso)
+        sections["switchport"] = {
+            "status": "ok",
+            "interface": [{"interface-name": "Gi0/2", "untagged-vlan": vlan_id}],
+        }
+        with pytest.raises(ValueError, match="untagged-vlan"):
+            await refresh_switchport_for_device(db, device, nso)
+        rows = (
+            (await db.execute(select(DeviceSwitchport).where(DeviceSwitchport.device_id == device_id))).scalars().all()
+        )
+        assert [row.interface_name for row in rows] == ["Gi0/1"]
 
 
 @pytest.mark.anyio

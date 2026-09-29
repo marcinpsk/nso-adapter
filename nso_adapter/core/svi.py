@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.shape import as_list, wire_int
+from nso_adapter.nso.shape import as_list, require_vlan_id, wire_int
 from nso_adapter.store.models import Device, DeviceSvi
 
 logger = structlog.get_logger(__name__)
@@ -35,8 +35,7 @@ async def _upsert_svi(db: AsyncSession, device: Device, interfaces: list[dict], 
         if vlan_id is None:
             raise ValueError(f"svi {name} has no vlan-id")
         vlan_id = wire_int(vlan_id)
-        if not 1 <= vlan_id <= 4094:
-            raise ValueError(f"svi {name} has invalid vlan-id: {vlan_id}")
+        vlan_id = require_vlan_id(vlan_id, "svi", name, "vlan-id")
         db.add(
             DeviceSvi(
                 device_id=device.id,

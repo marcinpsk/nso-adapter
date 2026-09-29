@@ -31,6 +31,14 @@ async def _rows(db, device_id):
     return {r.interface_name: r for r in rows}
 
 
+class _SectionClient:
+    def __init__(self, section):
+        self.section = section
+
+    async def get_device_state_section(self, device_name, wire_name):
+        return self.section
+
+
 @pytest.mark.anyio
 async def test_refresh_inserts_subinterfaces(adapter_client):
     device_id = await seed_device(nso_device_name="subif-rtr01", netbox_device_id=970)
@@ -111,6 +119,27 @@ async def test_missing_tag_refuses_family_read_and_keeps_previous_rows(adapter_c
     ]
     state = response.json()["read_state"]
     assert (state["outcome"], state["result"], state["succeeded"]) == ("present", "error", False)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("dot1q_vlan", [0, 4095])
+async def test_out_of_range_tag_refuses_family_read_and_keeps_previous_rows(adapter_client, dot1q_vlan):
+    device_id = await seed_device()
+    async with _device_session(device_id) as (db, device):
+        nso_client = _SectionClient(
+            {
+                "status": "ok",
+                "interface": [{"interface-name": "xe-0/0/1.100", "dot1q-vlan": 100}],
+            }
+        )
+        await refresh_subinterface_for_device(db, device, nso_client, refresh_source="test")
+        nso_client.section = {
+            "status": "ok",
+            "interface": [{"interface-name": "xe-0/0/1.bad", "dot1q-vlan": dot1q_vlan}],
+        }
+        with pytest.raises(ValueError, match="dot1q-vlan"):
+            await refresh_subinterface_for_device(db, device, nso_client, refresh_source="test")
+        assert {name: row.dot1q_vlan for name, row in (await _rows(db, device_id)).items()} == {"xe-0/0/1.100": 100}
 
 
 @pytest.mark.anyio

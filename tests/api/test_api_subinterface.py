@@ -141,7 +141,7 @@ async def test_put_subinterface_intent_unknown_device_404(adapter_client):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("dot1q_vlan", [None, True, "200"])
+@pytest.mark.parametrize("dot1q_vlan", [None, 0, 4095, True, "200"])
 async def test_put_subinterface_intent_refuses_missing_tag_before_replacement(adapter_client, dot1q_vlan):
     device_id = await seed_device()
     valid = {"interfaces": [{"interface_name": "xe-0/0/1.5000", "dot1q_vlan": 100}]}

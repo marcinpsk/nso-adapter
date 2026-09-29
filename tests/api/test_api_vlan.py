@@ -189,6 +189,10 @@ async def test_apply_switchport_requires_explicit_snapshot_without_mutating_stor
     [
         [{"interface_name": "Gi0/1", "untagged_vlan": True}],
         [{"interface_name": "Gi0/1", "untagged_vlan": "10"}],
+        [{"interface_name": "Gi0/1", "untagged_vlan": 0}],
+        [{"interface_name": "Gi0/1", "untagged_vlan": 4095}],
+        [{"interface_name": "Gi0/1", "tagged_vlans": [0]}],
+        [{"interface_name": "Gi0/1", "tagged_vlans": [4095]}],
         [{"interface_name": "Gi0/1", "tagged_vlans": [65536]}],
         [
             {"interface_name": "Gi0/1"},
@@ -308,6 +312,29 @@ async def test_put_vlan_intent_stores_and_full_replaces(adapter_client):
 async def test_put_vlan_intent_unknown_device_404(adapter_client):
     resp = await adapter_client.put("/api/v1/devices/999999/vlan-intent", json={"vlans": []}, headers=AUTH | push_seq())
     assert resp.status_code == 404
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("vlan_id", [0, 4095, True, "10"])
+async def test_put_vlan_intent_refuses_invalid_id_before_replacement(adapter_client, vlan_id):
+    device_id = await seed_device()
+    path = f"/api/v1/devices/{device_id}/vlan-intent"
+    response = await adapter_client.put(path, json={"vlans": [{"vlan_id": 10}]}, headers=AUTH | push_seq())
+    assert response.status_code == 200
+
+    response = await adapter_client.put(path, json={"vlans": [{"vlan_id": vlan_id}]}, headers=AUTH | push_seq())
+    assert response.status_code == 422
+    async with session() as db:
+        rows = (
+            (
+                await db.execute(
+                    text("SELECT vlan_id FROM vlan_intent WHERE device_id = :device_id"), {"device_id": device_id}
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert rows == [10]
 
 
 @pytest.mark.anyio

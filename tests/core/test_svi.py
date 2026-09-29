@@ -68,7 +68,14 @@ async def test_refresh_full_replace(adapter_client):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("invalid_row", [{"interface-name": "irb.7"}, {"interface-name": "irb.7", "vlan-id": 0}])
+@pytest.mark.parametrize(
+    "invalid_row",
+    [
+        {"interface-name": "irb.7"},
+        {"interface-name": "irb.7", "vlan-id": 0},
+        {"interface-name": "irb.7", "vlan-id": 4095},
+    ],
+)
 async def test_invalid_vlan_id_refuses_family_read_and_keeps_previous_rows(adapter_client, invalid_row):
     device_id = await seed_device(nso_device_name="svi-missing-vid", netbox_device_id=983)
     async with _device_session(device_id) as (db, device):

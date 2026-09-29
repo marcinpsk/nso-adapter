@@ -8807,6 +8807,8 @@
             "title": "Accepted At"
           },
           "dot1q_vlan": {
+            "maximum": 4094.0,
+            "minimum": 1.0,
             "title": "Dot1Q Vlan",
             "type": "integer"
           },
@@ -9067,8 +9069,8 @@
           },
           "tagged_vlans": {
             "items": {
-              "maximum": 65535.0,
-              "minimum": 0.0,
+              "maximum": 4094.0,
+              "minimum": 1.0,
               "type": "integer"
             },
             "title": "Tagged Vlans",
@@ -9077,8 +9079,8 @@
           "untagged_vlan": {
             "anyOf": [
               {
-                "maximum": 65535.0,
-                "minimum": 0.0,
+                "maximum": 4094.0,
+                "minimum": 1.0,
                 "type": "integer"
               },
               {
@@ -9281,6 +9283,8 @@
             "type": "string"
           },
           "vlan_id": {
+            "maximum": 4094.0,
+            "minimum": 1.0,
             "title": "Vlan Id",
             "type": "integer"
           }

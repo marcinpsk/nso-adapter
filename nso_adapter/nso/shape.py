@@ -17,6 +17,16 @@ from __future__ import annotations
 
 from typing import Any
 
+VLAN_ID_MIN = 1
+VLAN_ID_MAX = 4094
+
+
+def require_vlan_id(value: object, family: str, name: str, field: str) -> int:
+    """Return a valid 802.1Q VLAN ID or refuse the row."""
+    if type(value) is not int or not VLAN_ID_MIN <= value <= VLAN_ID_MAX:
+        raise ValueError(f"{family} {name} has invalid {field}: {value}")
+    return value
+
 
 def wire_int(value: object) -> int:
     """Coerce a wire scalar to ``int``, refusing a JSON boolean.

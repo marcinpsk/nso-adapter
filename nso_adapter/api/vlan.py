@@ -27,6 +27,7 @@ from nso_adapter.api.errors import (
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant
+from nso_adapter.api.vlan_id import VlanId
 from nso_adapter.core.generation import DeviceProjectionGone
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.core.switching_intent import (
@@ -41,7 +42,6 @@ from nso_adapter.store.models import Device, DeviceSwitchport, DeviceVlan, VlanI
 router = APIRouter(prefix="/api/v1/devices", tags=["vlan"])
 
 
-Uint16 = Annotated[int, Field(strict=True, ge=0, le=65535)]
 RootName = Annotated[str, Field(min_length=1, max_length=128)]
 
 
@@ -56,8 +56,8 @@ class SwitchportApply(_StrictSwitchportRequest):
     #: member mode a LAG bundle carries. The empty string is the wire spelling of unset, and
     #: null means the same.
     mode: Literal["access", "trunk", "trunk-all", ""] | None = None
-    untagged_vlan: Uint16 | None = None
-    tagged_vlans: list[Uint16] = Field(default_factory=list)
+    untagged_vlan: VlanId | None = None
+    tagged_vlans: list[VlanId] = Field(default_factory=list)
 
     @field_validator("mode")
     @classmethod
@@ -255,7 +255,7 @@ async def apply_switchport(
 
 
 class VlanEntry(BaseModel):
-    vlan_id: int
+    vlan_id: VlanId
     name: str = ""
     accepted_at: UtcInstant | None = None
 

@@ -235,11 +235,27 @@ async def test_lag_replacement_preserves_identity_and_only_clears_evidence_on_ch
         ),
         (
             (SwitchportSnapshot(interface_name="Gi0/1", untagged_vlan=True),),
-            "untagged_vlan must be a uint16",
+            "invalid untagged_vlan",
+        ),
+        (
+            (SwitchportSnapshot(interface_name="Gi0/1", untagged_vlan=0),),
+            "invalid untagged_vlan",
+        ),
+        (
+            (SwitchportSnapshot(interface_name="Gi0/1", untagged_vlan=4095),),
+            "invalid untagged_vlan",
         ),
         (
             (SwitchportSnapshot(interface_name="Gi0/1", tagged_vlans=(65536,)),),
-            "tagged VLAN must be a uint16",
+            "invalid tagged VLAN",
+        ),
+        (
+            (SwitchportSnapshot(interface_name="Gi0/1", tagged_vlans=(0,)),),
+            "invalid tagged VLAN",
+        ),
+        (
+            (SwitchportSnapshot(interface_name="Gi0/1", tagged_vlans=(4095,)),),
+            "invalid tagged VLAN",
         ),
     ],
 )
