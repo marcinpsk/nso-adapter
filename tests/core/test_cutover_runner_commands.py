@@ -40,12 +40,15 @@ _DISCARDED = {
 
 
 @pytest.mark.parametrize("command", ("discard-read-jobs", "reset"))
-def test_runner_refuses_a_synchronous_postgresql_url_before_a_transaction(tmp_path, monkeypatch, command):
-    config = _write_config(
-        tmp_path,
-        monkeypatch,
-        database_url="postgresql://placeholder:placeholder@127.0.0.1:1/placeholder",
-    )
+@pytest.mark.parametrize(
+    ("database_url", "expected"),
+    (
+        ("postgresql://placeholder:placeholder@127.0.0.1:1/placeholder", ("must use ", "got 'postgresql'")),
+        ("sqlite+aiosqlite://", ("must be a PostgreSQL URL", "got 'sqlite+aiosqlite'")),
+    ),
+)
+def test_runner_refuses_an_unsupported_url_before_a_transaction(tmp_path, monkeypatch, command, database_url, expected):
+    config = _write_config(tmp_path, monkeypatch, database_url=database_url)
     repo_root = Path(__file__).resolve().parents[2]
     proc = subprocess.run(
         [sys.executable, "-m", "nso_adapter.core.cutover_runner", command],
@@ -58,9 +61,9 @@ def test_runner_refuses_a_synchronous_postgresql_url_before_a_transaction(tmp_pa
 
     assert proc.returncode == 1
     assert proc.stdout == ""
-    assert proc.stderr.startswith(f"{command.split('-')[0]} refused: database_url must use ")
+    assert proc.stderr.startswith(f"{command.split('-')[0]} refused: database_url {expected[0]}")
     assert "postgresql+asyncpg" in proc.stderr
-    assert "got 'postgresql'" in proc.stderr
+    assert expected[1] in proc.stderr
     if "Traceback" in proc.stderr:
         raise AssertionError("the runner printed a traceback for an unsupported driver")
 

@@ -83,7 +83,10 @@ class StoreEngineUrlError(ValueError):
 
 def create_store_engine(database_url: str, *, application_name: str, **engine_kwargs: Any) -> AsyncEngine:
     """Create an async PostgreSQL store engine after checking its driver."""
-    database_url = require_postgresql_url(database_url)
+    try:
+        database_url = require_postgresql_url(database_url)
+    except ValueError as exc:
+        raise StoreEngineUrlError(str(exc)) from exc
     if not database_url.startswith("postgresql+asyncpg://"):
         scheme = database_url.split("://", 1)[0]
         raise StoreEngineUrlError(
