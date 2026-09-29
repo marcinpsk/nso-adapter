@@ -7,7 +7,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,6 +23,7 @@ from nso_adapter.api.errors import (
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant
+from nso_adapter.api.vlan_id import VlanId
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device, DeviceSvi, SviIntent
@@ -87,7 +88,7 @@ async def get_svi(device_id: int, db: AsyncSession = Depends(get_read_db)):
 
 class SviEntry(BaseModel):
     interface_name: str
-    vlan_id: int = Field(strict=True, ge=1, le=4094)
+    vlan_id: VlanId
     type: str = "svi"
     vrf: str = ""
     accepted_at: UtcInstant | None = None

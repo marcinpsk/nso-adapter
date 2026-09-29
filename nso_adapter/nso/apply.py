@@ -28,6 +28,7 @@ from nso_adapter.core.isis_canon import isis_level
 from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.client import DEVICE_INTENT_PATH, DEVICE_INTENT_ROOT, NsoClient, _url_key
 from nso_adapter.nso.nso_json import boundary_safe_dumps
+from nso_adapter.nso.shape import require_vlan_id
 from nso_adapter.secrets.refs import VaultRefError, parse_vault_ref
 
 logger = structlog.get_logger(__name__)
@@ -701,6 +702,7 @@ def build_subif_interfaces(subif_intent_rows: list) -> list[dict]:
     for row in subif_intent_rows:
         if row.dot1q_vlan is None:
             raise ValueError(f"subinterface {row.interface_name} has no dot1q_vlan")
+        require_vlan_id(row.dot1q_vlan, "subinterface", row.interface_name, "dot1q_vlan")
         entry: dict = {
             "interface-name": row.interface_name,
             "parent-interface": row.parent_interface,
@@ -1219,8 +1221,7 @@ def encode_svi(rows: SectionRows, execution: SectionExecution) -> dict:
     """Encode the ``svi`` container: L3 VLAN interfaces (SVIs / IRBs)."""
     interfaces = []
     for row in rows["svi_intent"]:
-        if type(row.vlan_id) is not int or not 1 <= row.vlan_id <= 4094:
-            raise ValueError(f"svi {row.interface_name} has invalid vlan_id: {row.vlan_id}")
+        require_vlan_id(row.vlan_id, "svi", row.interface_name, "vlan_id")
         entry: dict = {"interface-name": row.interface_name, "vlan-id": row.vlan_id, "type": row.svi_type}
         if row.vrf:
             entry["vrf"] = row.vrf
@@ -1237,6 +1238,7 @@ def encode_vlan(rows: SectionRows, execution: SectionExecution) -> dict:
     """Encode the ``vlan`` container: the device's L2 VLAN database."""
     vlans = []
     for row in rows["vlan_intent"]:
+        require_vlan_id(row.vlan_id, "vlan", str(row.vlan_id), "vlan_id")
         entry: dict = {"vlan-id": row.vlan_id}
         if row.name:
             entry["name"] = row.name
@@ -1454,8 +1456,11 @@ def encode_switchport(rows: SectionRows, execution: SectionExecution) -> dict:
         if row.mode:
             entry["mode"] = row.mode
         if row.untagged_vlan is not None:
+            require_vlan_id(row.untagged_vlan, "switchport", row.interface_name, "untagged_vlan")
             entry["untagged-vlan"] = row.untagged_vlan
         tagged = sorted(tag.vlan_id for tag in row.tagged_vlans)
+        for vlan_id in tagged:
+            require_vlan_id(vlan_id, "switchport", row.interface_name, "tagged_vlans")
         if tagged:
             entry["tagged-vlan"] = tagged
         interfaces.append(entry)

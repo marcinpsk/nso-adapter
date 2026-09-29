@@ -1509,6 +1509,38 @@ def test_encode_svi_refuses_invalid_vlan_id(vlan_id):
         apply_mod.encode_svi(rows, _PLAIN)
 
 
+@pytest.mark.parametrize("vlan_id", [0, 4095])
+def test_encode_subinterface_refuses_invalid_dot1q_vlan(vlan_id):
+    rows = {
+        "subinterface_intent": [
+            SimpleNamespace(
+                interface_name="ae99.999", parent_interface="ae99", dot1q_vlan=vlan_id, sub_type="subinterface", vrf=""
+            )
+        ]
+    }
+    with pytest.raises(ValueError, match="dot1q_vlan"):
+        apply_mod.encode_subinterface(rows, _PLAIN)
+
+
+@pytest.mark.parametrize("vlan_id", [0, 4095])
+def test_encode_vlan_refuses_invalid_vlan_id(vlan_id):
+    rows = {"vlan_intent": [SimpleNamespace(vlan_id=vlan_id, name="")]}
+    with pytest.raises(ValueError, match="vlan_id"):
+        apply_mod.encode_vlan(rows, _PLAIN)
+
+
+@pytest.mark.parametrize("field", ["untagged_vlan", "tagged_vlans"])
+@pytest.mark.parametrize("vlan_id", [0, 4095])
+def test_encode_switchport_refuses_invalid_vlan_id(field, vlan_id):
+    row = SimpleNamespace(interface_name="Gi0/1", mode="access", untagged_vlan=10, tagged_vlans=[])
+    if field == "tagged_vlans":
+        row.tagged_vlans = [SimpleNamespace(vlan_id=vlan_id)]
+    else:
+        row.untagged_vlan = vlan_id
+    with pytest.raises(ValueError, match=field):
+        apply_mod.encode_switchport({"switchport_intent": [row]}, _PLAIN)
+
+
 def test_build_interface_ip_body_ipv4():
     rows = [_make_ip_row("198.18.1.1/24", family="ipv4")]
     entry = apply_mod.build_interface_ip_body("ae99.999", rows)

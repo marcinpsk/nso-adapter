@@ -18,7 +18,7 @@ from sqlalchemy.orm import selectinload
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.shape import as_list, wire_int
+from nso_adapter.nso.shape import VLAN_ID_MAX, VLAN_ID_MIN, as_list, require_vlan_id, wire_int
 from nso_adapter.store.models import (
     Device,
     DeviceSwitchport,
@@ -60,7 +60,7 @@ def parse_vlan_string(raw: str | None) -> list[int]:
             raise unusable
         # Bound to the legal 802.1Q range so a malformed upstream string
         # (e.g. "1-999999999") can't blow up memory via range expansion.
-        if not (1 <= start <= end <= 4094):
+        if not (VLAN_ID_MIN <= start <= end <= VLAN_ID_MAX):
             raise ValueError(_INVALID_TAGGED_VLAN_RANGE)
         vlans.update(range(start, end + 1))
     return sorted(vlans)
@@ -99,6 +99,7 @@ async def _upsert_vlans(
             )
         if unusable is not None:
             raise unusable
+        vid = require_vlan_id(vid, "vlan-database", str(device.id), "vlan-id")
         seen.add(vid)
         row = existing.get(vid) or DeviceVlan(device_id=device.id, vlan_id=vid)
         row.name = item.get("name") or ""
@@ -187,6 +188,7 @@ async def _upsert_switchports(
             # Raised outside the handler: the caught error repeats the value verbatim.
             if unusable is not None:
                 raise unusable
+            untagged_vid = require_vlan_id(untagged_vid, "switchport", name, "untagged-vlan")
             uv = vlan_by_vid.get(untagged_vid)
         row.untagged_vlan_id = uv.id if uv is not None else None
         row.last_refreshed_at = now

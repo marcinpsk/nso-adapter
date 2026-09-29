@@ -31,6 +31,7 @@ from sqlalchemy.orm import selectinload
 
 from nso_adapter.core.generation import lock_projection, note_write
 from nso_adapter.core.projection import rows_by_intent_identity, snapshot_stream, stream_tables
+from nso_adapter.nso.shape import require_vlan_id
 from nso_adapter.store.models import (
     DeviceProjectionStream,
     LagBundleIntent,
@@ -218,10 +219,11 @@ def _validate_lag_snapshot(bundles: Sequence[LagBundleSnapshot]) -> None:
 def _validate_switchport_snapshot(interfaces: Sequence[SwitchportSnapshot]) -> None:
     _require_unique([interface.interface_name for interface in interfaces], "switchport interface_name")
     for interface in interfaces:
-        _require_uint(interface.untagged_vlan, 65535, "untagged_vlan", 16)
+        if interface.untagged_vlan is not None:
+            require_vlan_id(interface.untagged_vlan, "switchport", interface.interface_name, "untagged_vlan")
         _require_unique(list(interface.tagged_vlans), "tagged VLAN")
         for vlan_id in interface.tagged_vlans:
-            _require_uint(vlan_id, 65535, "tagged VLAN", 16)
+            require_vlan_id(vlan_id, "switchport", interface.interface_name, "tagged VLAN")
 
 
 def _refuse_unsupported_request_modes() -> None:
