@@ -68,6 +68,34 @@ async def test_refresh_full_replace(adapter_client):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("invalid_row", [{"interface-name": "irb.7"}, {"interface-name": "irb.7", "vlan-id": 0}])
+async def test_invalid_vlan_id_refuses_family_read_and_keeps_previous_rows(adapter_client, invalid_row):
+    device_id = await seed_device(nso_device_name="svi-missing-vid", netbox_device_id=983)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "interface": [{"interface-name": "irb.0", "vlan-id": 1}],
+        }
+        await refresh_svi_for_device(db, device, nso_client, refresh_source="test")
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "interface": [{"interface-name": "Vlan200", "vlan-id": 200}, invalid_row],
+        }
+        with pytest.raises(ValueError, match="vlan-id"):
+            await refresh_svi_for_device(db, device, nso_client, refresh_source="test")
+        assert {name: row.vlan_id for name, row in (await _svis(db, device_id)).items()} == {"irb.0": 1}
+
+    response = await adapter_client.get(
+        f"/api/v1/devices/{device_id}/svi", headers={"Authorization": "Bearer test-bearer-token"}
+    )
+    assert response.status_code == 200
+    assert [(row["interface_name"], row["vlan_id"]) for row in response.json()["interfaces"]] == [("irb.0", 1)]
+    state = response.json()["read_state"]
+    assert (state["outcome"], state["result"], state["succeeded"]) == ("present", "error", False)
+
+
+@pytest.mark.anyio
 async def test_refresh_authoritative_empty_clears(adapter_client):
     """An authoritatively-empty read (status=ok, no list keys) clears the rows. (Device-absence, section None, now KEEPS — READSEM S5.)"""
     device_id = await seed_device(nso_device_name="svi-sw03", netbox_device_id=982)

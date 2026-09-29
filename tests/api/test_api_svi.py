@@ -93,3 +93,26 @@ async def test_put_svi_intent_unknown_device_404(adapter_client):
         "/api/v1/devices/999999/svi-intent", json={"interfaces": []}, headers=AUTH | push_seq()
     )
     assert resp.status_code == 404
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("vlan_id", [None, 0, -1, 4095])
+async def test_put_svi_intent_refuses_invalid_vlan_id_before_replacement(adapter_client, vlan_id):
+    device_id = await seed_device()
+    path = f"/api/v1/devices/{device_id}/svi-intent"
+    valid = {"interfaces": [{"interface_name": "irb.0", "vlan_id": 1}]}
+    response = await adapter_client.put(path, json=valid, headers=AUTH | push_seq())
+    assert response.status_code == 200
+
+    invalid = {"interfaces": [{"interface_name": "irb.7"}]}
+    if vlan_id is not None:
+        invalid["interfaces"][0]["vlan_id"] = vlan_id
+    response = await adapter_client.put(path, json=invalid, headers=AUTH | push_seq())
+    assert response.status_code == 422
+    from sqlalchemy import select
+
+    from nso_adapter.store.models import SviIntent
+
+    async with session() as db:
+        rows = (await db.execute(select(SviIntent).where(SviIntent.device_id == device_id))).scalars().all()
+        assert [(row.interface_name, row.vlan_id) for row in rows] == [("irb.0", 1)]

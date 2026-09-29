@@ -7,7 +7,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -87,7 +87,7 @@ async def get_svi(device_id: int, db: AsyncSession = Depends(get_read_db)):
 
 class SviEntry(BaseModel):
     interface_name: str
-    vlan_id: int
+    vlan_id: int = Field(ge=1, le=4094)
     type: str = "svi"
     vrf: str = ""
     accepted_at: UtcInstant | None = None
