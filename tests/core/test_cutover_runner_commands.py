@@ -29,6 +29,7 @@ from nso_adapter.store.models import (
 )
 from tests.conftest import _write_config, seed_device, session, start_job
 from tests.core.test_cutover_runner import _admit
+from tests.store.test_db_init import _RETIRED_SCHEME, _RETIRED_URL
 
 pytestmark = pytest.mark.anyio
 
@@ -44,7 +45,7 @@ _DISCARDED = {
     ("database_url", "expected"),
     (
         ("postgresql://placeholder:placeholder@127.0.0.1:1/placeholder", ("must use ", "got 'postgresql'")),
-        ("sqlite+aiosqlite://", ("must be a PostgreSQL URL", "got 'sqlite+aiosqlite'")),
+        (_RETIRED_URL, ("must be a PostgreSQL URL", f"got {_RETIRED_SCHEME!r}")),
     ),
 )
 def test_runner_refuses_an_unsupported_url_before_a_transaction(tmp_path, monkeypatch, command, database_url, expected):
