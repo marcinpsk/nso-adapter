@@ -1,6 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 rules:
+  - id: nso-api-vlan-id-type
+    languages: [python]
+    severity: ERROR
+    message: Use the strict VlanId alias for VLAN IDs in request models.
+    paths:
+      include: [nso_adapter/api/**]
+    patterns:
+      - pattern-either:
+          - pattern: '$FIELD: $TYPE'
+          - pattern: '$FIELD: $TYPE = $DEFAULT'
+      - pattern-inside: |
+          class $CLASS($BASE):
+            ...
+      - metavariable-regex:
+          metavariable: $CLASS
+          regex: '^(?!.*Out$).*$'
+      - metavariable-regex:
+          metavariable: $FIELD
+          regex: '.*vlan.*'
+      - metavariable-regex:
+          metavariable: $TYPE
+          regex: '^(?:int|int\s*\|\s*None|list\[int\]|Uint[0-9]+|Uint[0-9]+\s*\|\s*None|list\[Uint[0-9]+\])$'
   - id: nso-authority-write
     languages: [python]
     severity: ERROR

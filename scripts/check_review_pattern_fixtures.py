@@ -12,7 +12,7 @@ import yaml
 
 ANNOTATION = re.compile(r"#\s*(ruleid|ok|todoruleid|todook)\s*:\s*(nso-[\w-]+(?:\s*,\s*nso-[\w-]+)*)\s*$")
 ANNOTATION_LIKE = re.compile(r"#\s*(?:[\w]*ruleid|[\w]*ok)\b", re.IGNORECASE)
-AUTHORITY = ("nso-authority", "nso-generation")
+AUTHORITY = ("nso-authority", "nso-generation", "nso-api-vlan-id-type")
 
 
 def _unexpected_authority_findings(found: dict, relative: str, annotated_lines: set[int]) -> list[str]:
