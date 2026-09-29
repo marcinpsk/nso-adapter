@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Actions API: async device actions and deployment-generation barrier exits.
 
 The device claim permits one executing device job. Admission is endpoint-specific:

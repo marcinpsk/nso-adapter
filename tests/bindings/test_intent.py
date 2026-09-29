@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for bindings/netbox/intent.py — fetch_all_intent."""
 
 from __future__ import annotations

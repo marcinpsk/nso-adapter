@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Require explicit dot1q tags in subinterface mirror and intent.
 
 Revision ID: e4b8c2d6f0a1

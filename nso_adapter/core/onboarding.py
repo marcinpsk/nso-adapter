@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Device onboarding — create/validate device records and identity mapping.
 
 Onboarding does NOT pre-flight NSO; if the device name is wrong the first sync

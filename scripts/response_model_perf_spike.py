@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """OpenAPI-truthfulness S5 — response_model serialization-cost spike.
 
 Question (plan §S5 / F9): does the pydantic ``response_model`` validation we added

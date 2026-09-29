@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 name: CI
 
 on:
@@ -46,6 +47,8 @@ jobs:
         run: >-
           uv run --locked --native-tls -- zizmor --no-progress
           --collect=workflows --collect=actions --collect=dependabot .
+      - name: REUSE compliance
+        run: uv run --locked --native-tls -- reuse lint
 
   container-smoke:
     name: Container runtime smoke test

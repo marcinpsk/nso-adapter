@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Sync-state checker — compares NSO vs NetBox interface attributes.
 
 Phase 1 (no intent ownership):

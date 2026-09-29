@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """NetBox binding — read managed scope from the netbox-nso-plugin model.
 
 This is the self-healing / reconcile path (docs/nso-adapter.md §9).

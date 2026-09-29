@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for bindings/netbox/scope.py — fetch_all_scope."""
 
 from __future__ import annotations

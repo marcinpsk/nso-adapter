@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Closed error-code set + envelope contract for every non-2xx response.
 
 api-contract.md promises ONE error shape for all errors:

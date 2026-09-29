@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """APScheduler setup — periodic sync poll + scope reconcile from NetBox plugin."""
 
 from __future__ import annotations

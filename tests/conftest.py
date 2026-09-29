@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Shared pytest fixtures for all nso-adapter tests."""
 
 from __future__ import annotations

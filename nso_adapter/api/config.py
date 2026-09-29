@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Adapter config API — global mgmt-IP failover tuning (the plugin's settings singleton).
 
 The plugin's ``NSOFailoverSettings`` singleton pushes the tuning here on save; the base-tick

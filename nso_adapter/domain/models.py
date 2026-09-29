@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Domain models — pure dataclasses, no DB dependency."""
 
 from __future__ import annotations

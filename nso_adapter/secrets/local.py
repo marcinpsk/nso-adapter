@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Local secrets provider — reads from env vars or Docker secret files.
 
 The *reference* passed to ``get()`` is the environment-variable name

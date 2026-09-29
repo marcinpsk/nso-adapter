@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Management-IP failover — keep NSO pointed at an address it can actually manage.
 
 NSO probes reachability (only NSO has management-plane reach); the adapter switches the

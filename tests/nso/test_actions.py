@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for nso/actions.py — sync_from, compare_config, check_sync, connect."""
 
 from __future__ import annotations

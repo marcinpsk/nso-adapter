@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Own Job construction, queue admission, and background task runners.
 
 Coalescible admission atomically returns the same-type queued winner. Dedicated

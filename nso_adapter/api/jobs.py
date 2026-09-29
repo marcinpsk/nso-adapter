@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Jobs API — list and get job status.
 
 ``GET /api/v1/jobs`` serves two readings of the same rows. The default page is the job

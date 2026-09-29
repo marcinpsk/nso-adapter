@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for bindings/netbox/mapper.py — _guess_netbox_type and resolve_or_create_interface."""
 
 from __future__ import annotations

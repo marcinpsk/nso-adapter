@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for nso/apply.py: the wire vocabulary and the one sender.
 
 The per-family senders are gone with the reconcilers. What is left here is the pure

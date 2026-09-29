@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """NSO instances discovery endpoints — GET /api/v1/nso-instances."""
 
 from __future__ import annotations

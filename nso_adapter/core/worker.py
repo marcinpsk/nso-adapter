@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Durable in-process job worker (Layer B).
 
 Drains the ``jobs`` table: claims ``queued`` jobs atomically, runs the

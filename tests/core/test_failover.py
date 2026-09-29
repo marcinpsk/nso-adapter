@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Failover state machine: pure hysteresis primitives + tick orchestration.
 
 The hysteresis primitives (step_failover/step_failback) are tested as a pure transition

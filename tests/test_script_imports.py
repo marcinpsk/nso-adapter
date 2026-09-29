@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Maintenance scripts must not name anything the aggregate port deleted.
 
 Two rules: a symbol taken from the sender module has to exist, and no script may address a

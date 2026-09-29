@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Unit tests for LagInterface + LagMember ORM models."""
 
 from datetime import UTC, datetime
