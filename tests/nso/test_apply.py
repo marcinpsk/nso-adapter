@@ -1502,6 +1502,13 @@ def test_build_subif_interfaces_refuses_missing_tag():
         apply_mod.build_subif_interfaces(rows)
 
 
+@pytest.mark.parametrize("vlan_id", [None, 0, -1, 4095])
+def test_encode_svi_refuses_invalid_vlan_id(vlan_id):
+    rows = {"svi_intent": [SimpleNamespace(interface_name="irb.7", vlan_id=vlan_id, svi_type="irb", vrf="")]}
+    with pytest.raises(ValueError, match="vlan_id"):
+        apply_mod.encode_svi(rows, _PLAIN)
+
+
 def test_build_interface_ip_body_ipv4():
     rows = [_make_ip_row("198.18.1.1/24", family="ipv4")]
     entry = apply_mod.build_interface_ip_body("ae99.999", rows)

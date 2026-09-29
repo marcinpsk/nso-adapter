@@ -8947,6 +8947,8 @@
             "type": "string"
           },
           "vlan_id": {
+            "maximum": 4094.0,
+            "minimum": 1.0,
             "title": "Vlan Id",
             "type": "integer"
           },

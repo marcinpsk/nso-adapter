@@ -742,7 +742,7 @@ async def test_run_apply_refreshes_mirror_and_notifies_plugin(adapter_client):
     mock_client.get_device_state_doc.return_value = {
         "device-name": "rtr-settle",
         "route-policy": {"status": "ok", "prefix-list": [{"name": "PL-SETTLE", "entry": []}]},
-        "svi": {"status": "ok", "interface": [{"interface-name": "Vlan77"}]},
+        "svi": {"status": "ok", "interface": [{"interface-name": "Vlan77", "vlan-id": 77}]},
     }
     nb = AsyncMock(spec=NetboxClient)
     nb.notify_sync_complete = AsyncMock()

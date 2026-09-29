@@ -1219,6 +1219,8 @@ def encode_svi(rows: SectionRows, execution: SectionExecution) -> dict:
     """Encode the ``svi`` container: L3 VLAN interfaces (SVIs / IRBs)."""
     interfaces = []
     for row in rows["svi_intent"]:
+        if type(row.vlan_id) is not int or not 1 <= row.vlan_id <= 4094:
+            raise ValueError(f"svi {row.interface_name} has invalid vlan_id: {row.vlan_id}")
         entry: dict = {"interface-name": row.interface_name, "vlan-id": row.vlan_id, "type": row.svi_type}
         if row.vrf:
             entry["vrf"] = row.vrf
