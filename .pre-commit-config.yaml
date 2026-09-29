@@ -64,10 +64,10 @@ repos:
         language: system
         pass_filenames: false
         files: ^(nso_adapter|tests|scripts|alembic)/.*\.py$
-      # Every non-empty Python file starts with the SPDX line, after an optional shebang.
+      # Every Python file starts with the SPDX line, after an optional shebang.
       - id: spdx-header
         name: spdx-header (SPDX-License-Identifier on the first line)
-        entry: '\A(?:\Z|(?:#![^\n]*\n)?# SPDX-License-Identifier: Apache-2\.0\n)'
+        entry: '\A(?:#![^\n]*\n)?# SPDX-License-Identifier: Apache-2\.0\n'
         language: pygrep
         args: [--multiline, --negate]
         types: [python]
