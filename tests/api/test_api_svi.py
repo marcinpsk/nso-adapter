@@ -96,7 +96,7 @@ async def test_put_svi_intent_unknown_device_404(adapter_client):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("vlan_id", [None, 0, -1, 4095])
+@pytest.mark.parametrize("vlan_id", [None, 0, -1, 4095, True, "7"])
 async def test_put_svi_intent_refuses_invalid_vlan_id_before_replacement(adapter_client, vlan_id):
     device_id = await seed_device()
     path = f"/api/v1/devices/{device_id}/svi-intent"
