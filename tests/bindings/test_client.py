@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for bindings/netbox/client.py — device_exists + create_journal_entry.
 
 The pooled ``_client()`` is replaced with an AsyncMock returning REAL httpx.Response

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """End-to-end mgmt-IP failover: scheduler job → real NsoClient → real ORM.
 
 Only the NSO socket is faked (a stateful httpx.MockTransport simulating NSO RESTCONF). The

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """NetBox binding — write description/enabled onto dcim.Interface.
 
 Implements the NetBox write step of the sync flow (docs/nso-adapter.md §7 step 4).

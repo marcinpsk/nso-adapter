@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Preview and commit resolve the same frozen execution policy."""
 
 from unittest.mock import patch

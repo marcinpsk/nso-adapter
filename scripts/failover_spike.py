@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Management-IP failover performance spike (Phase 0 exit measurements).
 
 Runs INSIDE the adapter container (so it reaches ``nso:8080`` + Vault and resolves

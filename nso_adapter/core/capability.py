@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Route-policy capability matrix — populate + query the device_capability cache.
 
 The cache (keyed by ``(ned_id, sw_version)``) lets the plugin flag, at attach time,

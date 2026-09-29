@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 # NSO Adapter — non-secret configuration
 # Copy to config.yaml and edit for your environment.
 # Config holds REFERENCES to secrets, never secret values themselves.

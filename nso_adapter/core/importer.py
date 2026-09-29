@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Device sync importer — NSO → adapter DB → NetBox.
 
 Sync flow (docs/nso-adapter.md §7):

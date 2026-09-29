@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Golden vectors for the fully-qualified Vault reference parser.
 
 The plugin mirrors this parser (``netbox_nso_plugin/vault_refs.py``) — keep the

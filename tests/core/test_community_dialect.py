@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Per-NED community-member dialect codec (nso_adapter/core/community_dialect.py).
 
 Grounded in live-device + SR OS doc facts (see the module docstring): Nokia keeps

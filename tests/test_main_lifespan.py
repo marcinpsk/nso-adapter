@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Unit tests for the lifespan helpers extracted from nso_adapter.main.
 
 These cover the pieces the ``adapter_client`` fixture never exercises (it runs

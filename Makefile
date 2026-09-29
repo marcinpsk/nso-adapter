@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 # NSO Adapter — development workflow
 # Usage: make <target>
 #   make dev       bring up dev container (hot-reload)

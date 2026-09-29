@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Read path: NSO route-policy data -> DB read-mirror (invert-match + dialect canon)."""
 
 from __future__ import annotations

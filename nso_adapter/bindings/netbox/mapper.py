@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """NetBox binding — domain ↔ NetBox objects + interface identity mapping.
 
 Handles name resolution (NSO interface name → NetBox interface) and auto-creates

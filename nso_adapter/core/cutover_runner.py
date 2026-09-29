@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Temporary maintenance server, inspected Apply release, and window store commands for cutover."""
 
 from __future__ import annotations

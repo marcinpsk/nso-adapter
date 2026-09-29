@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Anti-drift contract for the adapter half of the capability matrix.
 
 Two guarantees that keep the matrix from silently lying:

@@ -174,7 +174,7 @@ parallel names (`adapter_bearer_token`, `api_token`, `bearer_token`, etc.).
 ## Coding Conventions
 
 - Python 3.12, `uv` for package management.
-- `# SPDX-License-Identifier: Apache-2.0` header on every Python file.
+- SPDX license and copyright information on every file. `reuse lint` checks it in pre-commit and CI.
 - Ruff `line-length = 120`; the canonical ignore set lives in this repo's
   `pyproject.toml` (do **not** assume parity with the plugin repo).
 - Async throughout: `async def`, `httpx.AsyncClient`, SQLAlchemy

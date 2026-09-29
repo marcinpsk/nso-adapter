@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for the failover config endpoints: GET/PUT /api/v1/config/failover.
 
 End-to-end through the real FastAPI app + the real SQLAlchemy store — only the HTTP client

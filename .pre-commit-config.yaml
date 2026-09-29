@@ -64,6 +64,11 @@ repos:
         language: system
         pass_filenames: false
         files: ^(nso_adapter|tests|scripts|alembic)/.*\.py$
+      - id: reuse-lint
+        name: REUSE compliance (license and copyright on every file)
+        entry: uv run --locked --system-certs -- reuse lint
+        language: system
+        pass_filenames: false
       - id: review-patterns
         name: custom review patterns (OpenGrep)
         entry: scripts/check-review-patterns scan

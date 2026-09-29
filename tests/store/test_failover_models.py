@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Unit tests for the DeviceFailover ORM model (mgmt-IP failover)."""
 
 from datetime import UTC, datetime

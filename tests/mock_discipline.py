@@ -251,6 +251,7 @@ def load_baseline(path: Path = _BASELINE_PATH) -> dict[str, int]:
 
 def save_baseline(counts: dict[str, int], path: Path = _BASELINE_PATH) -> None:
     """Write the per-site allowance file (sorted, with an explanatory header)."""
+    # REUSE-IgnoreStart: the baseline file's own header, not this file's.
     header = [
         "# SPDX-License-Identifier: Apache-2.0",
         "# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>",
@@ -262,6 +263,7 @@ def save_baseline(counts: dict[str, int], path: Path = _BASELINE_PATH) -> None:
         "# change with:  python -m tests.mock_discipline --update-baseline",
         "",
     ]
+    # REUSE-IgnoreEnd
     body = [f"{site}\t{counts[site]}" for site in sorted(counts)]
     path.write_text("\n".join(header + body) + "\n", encoding="utf-8")
 

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """NSO device actions — sync-from, compare-config, check-sync, connect.
 
 Each function is a thin wrapper around the RESTCONF POST calls documented in

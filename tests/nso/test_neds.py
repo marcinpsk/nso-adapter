@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for NED helper functions in nso_adapter.nso.neds."""
 
 from __future__ import annotations

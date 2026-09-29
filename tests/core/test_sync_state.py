@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for sync_state drift checker."""
 
 from nso_adapter.core.sync_state import compute_drift, compute_sync_state

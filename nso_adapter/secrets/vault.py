@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """HashiCorp Vault KV v2 secrets provider via AppRole.
 
 References use the format  ``path#field``  where *path* is the KV path within
