@@ -87,7 +87,7 @@ async def get_svi(device_id: int, db: AsyncSession = Depends(get_read_db)):
 
 class SviEntry(BaseModel):
     interface_name: str
-    vlan_id: int = Field(ge=1, le=4094)
+    vlan_id: int = Field(strict=True, ge=1, le=4094)
     type: str = "svi"
     vrf: str = ""
     accepted_at: UtcInstant | None = None
