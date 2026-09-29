@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 class SubinterfaceEntry(BaseModel):
     # ruleid: nso-api-vlan-id-type
     dot1q_vlan: int
