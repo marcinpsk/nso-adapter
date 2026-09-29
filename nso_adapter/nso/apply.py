@@ -699,6 +699,8 @@ def build_subif_interfaces(subif_intent_rows: list) -> list[dict]:
     """
     interfaces = []
     for row in subif_intent_rows:
+        if row.dot1q_vlan is None:
+            raise ValueError(f"subinterface {row.interface_name} has no dot1q_vlan")
         entry: dict = {
             "interface-name": row.interface_name,
             "parent-interface": row.parent_interface,

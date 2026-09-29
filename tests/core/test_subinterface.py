@@ -82,6 +82,38 @@ async def test_refresh_full_replace(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_missing_tag_refuses_family_read_and_keeps_previous_rows(adapter_client):
+    device_id = await seed_device(nso_device_name="subif-missing-tag", netbox_device_id=973)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "interface": [{"interface-name": "xe-0/0/1.5000", "dot1q-vlan": 100}],
+        }
+        await refresh_subinterface_for_device(db, device, nso_client, refresh_source="test")
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "interface": [
+                {"interface-name": "xe-0/0/1.200", "dot1q-vlan": 200},
+                {"interface-name": "xe-0/0/1.0", "parent-interface": "xe-0/0/1"},
+            ],
+        }
+        with pytest.raises(ValueError, match="dot1q-vlan"):
+            await refresh_subinterface_for_device(db, device, nso_client, refresh_source="test")
+        assert {name: row.dot1q_vlan for name, row in (await _rows(db, device_id)).items()} == {"xe-0/0/1.5000": 100}
+
+    response = await adapter_client.get(
+        f"/api/v1/devices/{device_id}/subinterface", headers={"Authorization": "Bearer test-bearer-token"}
+    )
+    assert response.status_code == 200
+    assert [(row["interface_name"], row["dot1q_vlan"]) for row in response.json()["interfaces"]] == [
+        ("xe-0/0/1.5000", 100)
+    ]
+    state = response.json()["read_state"]
+    assert (state["outcome"], state["result"], state["succeeded"]) == ("present", "error", False)
+
+
+@pytest.mark.anyio
 async def test_refresh_authoritative_empty_clears(adapter_client):
     """An authoritatively-empty read (status=ok, no list keys) clears the rows. (Device-absence, section None, now KEEPS — READSEM S5.)"""
     device_id = await seed_device(nso_device_name="subif-rtr03", netbox_device_id=972)

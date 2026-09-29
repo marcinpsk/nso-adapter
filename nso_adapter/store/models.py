@@ -1770,7 +1770,7 @@ class DeviceSubinterface(Base):
     )
     interface_name: Mapped[str] = mapped_column(String(128), nullable=False)
     parent_interface: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    dot1q_vlan: Mapped[int | None] = mapped_column(Integer, nullable=True)  # interface-local 802.1q tag
+    dot1q_vlan: Mapped[int] = mapped_column(Integer, nullable=False)  # interface-local 802.1q tag
     sub_type: Mapped[str] = mapped_column(String(16), nullable=False, default="subinterface")
     vrf: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -1818,7 +1818,7 @@ class SubinterfaceIntent(Base):
     )
     interface_name: Mapped[str] = mapped_column(String(128), nullable=False)
     parent_interface: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    dot1q_vlan: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    dot1q_vlan: Mapped[int] = mapped_column(Integer, nullable=False)
     sub_type: Mapped[str] = mapped_column(String(16), nullable=False, default="subinterface")
     vrf: Mapped[str | None] = mapped_column(String(128), nullable=True)
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

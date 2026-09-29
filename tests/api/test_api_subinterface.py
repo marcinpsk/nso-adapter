@@ -138,3 +138,30 @@ async def test_put_subinterface_intent_unknown_device_404(adapter_client):
         "/api/v1/devices/999999/subinterface-intent", json={"interfaces": []}, headers=AUTH | push_seq()
     )
     assert resp.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_put_subinterface_intent_refuses_missing_tag_before_replacement(adapter_client):
+    device_id = await seed_device()
+    valid = {"interfaces": [{"interface_name": "xe-0/0/1.5000", "dot1q_vlan": 100}]}
+    response = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/subinterface-intent", json=valid, headers=AUTH | push_seq()
+    )
+    assert response.status_code == 200
+
+    invalid = {"interfaces": [{"interface_name": "xe-0/0/1.200"}]}
+    response = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/subinterface-intent", json=invalid, headers=AUTH | push_seq()
+    )
+    assert response.status_code == 422
+    async with session() as db:
+        from sqlalchemy import select
+
+        from nso_adapter.store.models import SubinterfaceIntent
+
+        rows = (
+            (await db.execute(select(SubinterfaceIntent).where(SubinterfaceIntent.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        assert [(row.interface_name, row.dot1q_vlan) for row in rows] == [("xe-0/0/1.5000", 100)]

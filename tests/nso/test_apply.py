@@ -1492,6 +1492,16 @@ def test_build_subif_interfaces_shapes_rows():
     ]
 
 
+def test_build_subif_interfaces_refuses_missing_tag():
+    rows = [
+        SimpleNamespace(
+            interface_name="ae99.999", parent_interface="ae99", dot1q_vlan=None, sub_type="subinterface", vrf=""
+        )
+    ]
+    with pytest.raises(ValueError, match="dot1q_vlan"):
+        apply_mod.build_subif_interfaces(rows)
+
+
 def test_build_interface_ip_body_ipv4():
     rows = [_make_ip_row("198.18.1.1/24", family="ipv4")]
     entry = apply_mod.build_interface_ip_body("ae99.999", rows)

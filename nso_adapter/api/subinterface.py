@@ -36,7 +36,7 @@ router = APIRouter(prefix="/api/v1/devices", tags=["subinterface"])
 class SubinterfaceIfaceOut(BaseModel):
     interface_name: str
     parent_interface: str | None  # null when unset
-    dot1q_vlan: int | None  # null when unset
+    dot1q_vlan: int
     type: str
     vrf: str  # coerced to "" when unset
     source: str
@@ -99,7 +99,7 @@ async def get_subinterface(device_id: int, db: AsyncSession = Depends(get_read_d
 class SubinterfaceEntry(BaseModel):
     interface_name: str
     parent_interface: str = ""
-    dot1q_vlan: int | None = None
+    dot1q_vlan: int
     type: str = "subinterface"
     vrf: str = ""
     accepted_at: UtcInstant | None = None

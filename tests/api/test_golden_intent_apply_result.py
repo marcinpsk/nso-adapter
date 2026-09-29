@@ -25,7 +25,7 @@ AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 CASES = [
     ("vlan-intent", {"vlans": [{"vlan_id": 100, "name": "DATA"}]}),
     ("svi-intent", {"interfaces": [{"interface_name": "Vlan100", "vlan_id": 100}]}),
-    ("subinterface-intent", {"interfaces": [{"interface_name": "GE0/0.100"}]}),
+    ("subinterface-intent", {"interfaces": [{"interface_name": "GE0/0.100", "dot1q_vlan": 100}]}),
     ("l2-sap-intent", {"saps": [{"service_name": "EPIPE-1", "service_type": "epipe", "sap_id": "1/1/1:200"}]}),
     ("logging-intent", {"hosts": [{"address": "10.0.0.5"}]}),
     ("bfd-intent", {"interfaces": [{"interface_name": "GE0/0"}]}),
