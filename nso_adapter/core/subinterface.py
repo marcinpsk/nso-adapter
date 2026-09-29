@@ -32,12 +32,14 @@ async def _upsert_subinterface(db: AsyncSession, device: Device, interfaces: lis
         if not name:
             continue
         dot1q = item.get("dot1q-vlan")
+        if dot1q is None:
+            raise ValueError(f"subinterface {name} has no dot1q-vlan")
         db.add(
             DeviceSubinterface(
                 device_id=device.id,
                 interface_name=name,
                 parent_interface=item.get("parent-interface") or None,
-                dot1q_vlan=wire_int(dot1q) if dot1q is not None else None,
+                dot1q_vlan=wire_int(dot1q),
                 sub_type=item.get("type") or "subinterface",
                 vrf=item.get("vrf") or None,
                 last_refreshed_at=now,

@@ -1140,7 +1140,7 @@ _SCOPE_CASES = [
     ("SviIntent", dict(interface_name="Vlan10", vlan_id=10), "svi", "interface", "svi"),
     (
         "SubinterfaceIntent",
-        dict(interface_name="GigabitEthernet0/0.10"),
+        dict(interface_name="GigabitEthernet0/0.10", dot1q_vlan=10),
         "subinterface",
         "interface",
         "subinterface",

@@ -77,3 +77,11 @@ def test_subif_intent_unique_constraint(db):
     db.add(SubinterfaceIntent(device_id=d.id, interface_name="ge-0/0/0.10", dot1q_vlan=10))
     with pytest.raises(IntegrityError):
         db.flush()
+
+
+@pytest.mark.parametrize("model", [DeviceSubinterface, SubinterfaceIntent])
+def test_subinterface_tag_is_required_by_store(db, model):
+    d = _make_device(db)
+    db.add(model(device_id=d.id, interface_name="if.100", dot1q_vlan=None))
+    with pytest.raises(IntegrityError, match="dot1q_vlan"):
+        db.flush()

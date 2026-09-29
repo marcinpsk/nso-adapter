@@ -8807,15 +8807,8 @@
             "title": "Accepted At"
           },
           "dot1q_vlan": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Dot1Q Vlan"
+            "title": "Dot1Q Vlan",
+            "type": "integer"
           },
           "interface_name": {
             "title": "Interface Name",
@@ -8838,7 +8831,8 @@
           }
         },
         "required": [
-          "interface_name"
+          "interface_name",
+          "dot1q_vlan"
         ],
         "title": "SubinterfaceEntry",
         "type": "object"
@@ -8846,15 +8840,8 @@
       "SubinterfaceIfaceOut": {
         "properties": {
           "dot1q_vlan": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Dot1Q Vlan"
+            "title": "Dot1Q Vlan",
+            "type": "integer"
           },
           "interface_name": {
             "title": "Interface Name",

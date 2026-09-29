@@ -22,8 +22,9 @@ from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.bindings.netbox.scope import PluginScopeRecord
 from nso_adapter.core import scheduler as sched
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.store.models import DbInterface, Device, InterfaceIntent, ManagedScope
-from tests.conftest import session
+from nso_adapter.store.models import DbInterface, Device, DeviceSubinterface, InterfaceIntent, ManagedScope
+from nso_adapter.store.outcome_store import acquire_family_fence
+from tests.conftest import seed_subinterface, session
 
 
 def _nso_client():
@@ -107,6 +108,101 @@ async def test_family_refresh_skips_device_without_nso_client(adapter_client, mo
 
     await sched._scheduled_bgp_refresh()
     refresh.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_subinterface_poll_continues_after_one_device_refuses(adapter_client, monkeypatch, debug_logs):
+    ids = await _seed_devices(("subif-a", 5101), ("subif-b", 5102))
+    await seed_subinterface(ids["subif-a"], [{"interface_name": "if.100", "dot1q_vlan": 100}])
+
+    async def read_section(name, family):
+        assert family == "subinterface"
+        if name == "subif-a":
+            return {"status": "ok", "interface": [{"interface-name": "if.200"}]}
+        return {"status": "ok", "interface": [{"interface-name": "if.300", "dot1q-vlan": 300}]}
+
+    nso_client = AsyncMock(spec=NsoClient)
+    nso_client.get_device_state_section.side_effect = read_section
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: nso_client)
+
+    await sched._scheduled_subinterface_refresh()
+
+    async with session() as db:
+        rows = (await db.execute(select(DeviceSubinterface).order_by(DeviceSubinterface.device_id))).scalars().all()
+        assert [(row.device_id, row.interface_name, row.dot1q_vlan) for row in rows] == [
+            (ids["subif-a"], "if.100", 100),
+            (ids["subif-b"], "if.300", 300),
+        ]
+    failed = await adapter_client.get(
+        f"/api/v1/devices/{ids['subif-a']}/subinterface", headers={"Authorization": "Bearer test-bearer-token"}
+    )
+    assert failed.status_code == 200
+    assert (failed.json()["read_state"]["result"], failed.json()["read_state"]["succeeded"]) == ("error", False)
+    assert [row["interface_name"] for row in failed.json()["interfaces"]] == ["if.100"]
+    assert any(
+        log.get("event") == "scheduler.subinterface.failed"
+        and log.get("device_id") == ids["subif-a"]
+        and log.get("label") == "subinterface"
+        and log.get("error") == "ValueError"
+        for log in debug_logs
+    )
+
+
+@pytest.mark.anyio
+async def test_subinterface_poll_continues_after_materializer_database_error(adapter_client, monkeypatch, debug_logs):
+    ids = await _seed_devices(("subif-a", 5201), ("subif-b", 5202))
+
+    async def read_section(name, family):
+        assert family == "subinterface"
+        interface_name = "x" * 129 if name == "subif-a" else "if.300"
+        return {"status": "ok", "interface": [{"interface-name": interface_name, "dot1q-vlan": 300}]}
+
+    nso_client = AsyncMock(spec=NsoClient)
+    nso_client.get_device_state_section.side_effect = read_section
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: nso_client)
+
+    await sched._scheduled_subinterface_refresh()
+
+    async with session() as db:
+        rows = (await db.execute(select(DeviceSubinterface))).scalars().all()
+        assert [(row.device_id, row.interface_name, row.dot1q_vlan) for row in rows] == [
+            (ids["subif-b"], "if.300", 300)
+        ]
+    assert any(
+        log.get("event") == "scheduler.subinterface.failed"
+        and log.get("device_id") == ids["subif-a"]
+        and log.get("error") == "DBAPIError"
+        for log in debug_logs
+    )
+
+
+@pytest.mark.anyio
+async def test_subinterface_poll_continues_after_family_fence_timeout(adapter_client, monkeypatch, debug_logs):
+    ids = await _seed_devices(("subif-a", 5301), ("subif-b", 5302))
+
+    async def read_section(name, family):
+        assert family == "subinterface"
+        return {"status": "ok", "interface": [{"interface-name": "if.300", "dot1q-vlan": 300}]}
+
+    nso_client = AsyncMock(spec=NsoClient)
+    nso_client.get_device_state_section.side_effect = read_section
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: nso_client)
+
+    async with session() as lock_holder:
+        await acquire_family_fence(lock_holder, ids["subif-a"], "subinterface")
+        await sched._scheduled_subinterface_refresh()
+
+    async with session() as db:
+        rows = (await db.execute(select(DeviceSubinterface))).scalars().all()
+        assert [(row.device_id, row.interface_name, row.dot1q_vlan) for row in rows] == [
+            (ids["subif-b"], "if.300", 300)
+        ]
+    assert any(
+        log.get("event") == "scheduler.subinterface.failed"
+        and log.get("device_id") == ids["subif-a"]
+        and log.get("error") == "DBAPIError"
+        for log in debug_logs
+    )
 
 
 # ── Part B: sync_all / scope_reconcile / intent_reconcile / capability / topology ──
