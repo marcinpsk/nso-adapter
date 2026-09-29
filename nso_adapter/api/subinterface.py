@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -99,7 +99,7 @@ async def get_subinterface(device_id: int, db: AsyncSession = Depends(get_read_d
 class SubinterfaceEntry(BaseModel):
     interface_name: str
     parent_interface: str = ""
-    dot1q_vlan: int
+    dot1q_vlan: int = Field(strict=True)
     type: str = "subinterface"
     vrf: str = ""
     accepted_at: UtcInstant | None = None
