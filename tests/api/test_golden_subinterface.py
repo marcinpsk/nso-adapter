@@ -3,7 +3,7 @@
 """Golden-body test — GET /api/v1/devices/{id}/subinterface.
 
 Fixed-shape response, NO top-level timestamp; every key always present
-(parent_interface/dot1q_vlan null when unset; vrf coerced to ""). Deep-equality
+(parent_interface null when unset; vrf coerced to ""). Deep-equality
 pins the exact bytes.
 """
 

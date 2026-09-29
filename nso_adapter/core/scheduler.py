@@ -452,18 +452,32 @@ async def _refresh_all_devices(refresh_fn, label: str) -> None:
     from nso_adapter.store.models import Device
 
     async with session() as db:
-        result = await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))
-        for device in result.scalars().all():
+        device_ids = (await db.execute(select(Device.id).where(Device.nso_device_name.is_not(None)))).scalars().all()
+        for device_id in device_ids:
             try:
-                nso_client = get_nso_client(device.nso_instance)
-            except RuntimeError:
-                logger.debug(
-                    f"scheduler.{label}.skipped",
-                    device_id=device.id,
-                    reason="no_nso_client",
+                device = await db.get(Device, device_id)
+                if device is None:
+                    continue
+                try:
+                    nso_client = get_nso_client(device.nso_instance)
+                except RuntimeError:
+                    logger.debug(
+                        f"scheduler.{label}.skipped",
+                        device_id=device_id,
+                        reason="no_nso_client",
+                    )
+                    continue
+                await refresh_fn(db, device, nso_client, refresh_source="poll")
+            except Exception as exc:  # noqa: BLE001
+                from nso_adapter.nso.client import failure_detail
+
+                logger.warning(
+                    f"scheduler.{label}.failed",
+                    device_id=device_id,
+                    label=label,
+                    error=failure_detail(exc),
                 )
-                continue
-            await refresh_fn(db, device, nso_client, refresh_source="poll")
+                await db.rollback()
 
 
 async def _scheduled_vlan_refresh() -> None:
