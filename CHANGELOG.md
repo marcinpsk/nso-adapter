@@ -2,6 +2,50 @@
 
 <!-- version list -->
 
+## v1.9.0 (2026-09-29)
+
+### Bug Fixes
+
+- Honor provision attempt during active pair lookup
+  ([`c8d607c`](https://github.com/marcinpsk/nso-adapter/commit/c8d607c83c844067d5d3b26437578e0ddc295109))
+
+- **store**: Create async store engines only through a driver-checked factory
+  ([`102d8c2`](https://github.com/marcinpsk/nso-adapter/commit/102d8c287c7a4452ef2173e089472f356fdcf4fd))
+
+- **store**: Refuse a non-PostgreSQL URL with StoreEngineUrlError
+  ([`e103e1a`](https://github.com/marcinpsk/nso-adapter/commit/e103e1a1ddd54a08f96fdc6c0869846ede64a489))
+
+- **subinterface**: Require an explicit dot1q tag end to end
+  ([`c37871e`](https://github.com/marcinpsk/nso-adapter/commit/c37871e0197188e4ab815e9983c0406920b516a6))
+
+- **subinterface, svi**: Parse VLAN ids as strict integers
+  ([`9f30405`](https://github.com/marcinpsk/nso-adapter/commit/9f30405769193d580a5e40b9354943c776be5e5d))
+
+- **svi**: Refuse an SVI read or intent without a valid VLAN id
+  ([`9a6436d`](https://github.com/marcinpsk/nso-adapter/commit/9a6436dc73a114a5fc0cdbc1dd258d5b2b1bbd09))
+
+- **vlan**: Refuse VLAN ids outside 802.1Q 1..4094 at every boundary
+  ([`bdb42c2`](https://github.com/marcinpsk/nso-adapter/commit/bdb42c2c24c84394778af272eef32e5c64c7703e))
+
+### Chores
+
+- **opengrep**: Require the VlanId alias on API VLAN fields
+  ([`e49909e`](https://github.com/marcinpsk/nso-adapter/commit/e49909e3997b4d9520534f7ed177cfba0e20aded))
+
+### Features
+
+- **cutover**: Add discard-read-jobs and reset runner commands
+  ([`d499f4f`](https://github.com/marcinpsk/nso-adapter/commit/d499f4f1450529d8bbe007b5efa7e930941506a6))
+
+- **provision**: Serve provision attempts to the plugin
+  ([`2e80775`](https://github.com/marcinpsk/nso-adapter/commit/2e80775976e282b1840f69d19bbed0db5b8135ee))
+
+### Testing
+
+- **cutover**: Use the shared retired-URL fixture for the non-PostgreSQL case
+  ([`532be2e`](https://github.com/marcinpsk/nso-adapter/commit/532be2e49781dbb600df7d05a68fc5a3ebd802ef))
+
+
 ## v1.8.0 (2026-09-28)
 
 ### Bug Fixes
