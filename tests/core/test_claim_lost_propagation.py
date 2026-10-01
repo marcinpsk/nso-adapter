@@ -54,7 +54,6 @@ INVENTORY = [
     ("core/jobs.py", "_run_connect", "job.connect.failed"),
     ("core/jobs.py", "_run_provision", "job.provision.failed"),
     ("core/onboarding.py", "_initial_mirror_refresh", "device.onboard_mirror.failed"),
-    ("core/onboarding.py", "_seed_onboarding_failover", "failover_seed"),
     ("core/refresh_engine.py", None, "outcome.read_record_failed"),
     ("core/refresh_engine.py", None, "outcome.result_record_failed"),
 ]

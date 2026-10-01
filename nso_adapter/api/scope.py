@@ -7,7 +7,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, IPvAnyAddress
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -61,10 +61,9 @@ class ScopeUpdate(BaseModel):
     attributes: list[str]
     auto_apply: bool = False
     sync_before_apply: bool = True
-    # Fast-path mgmt-IP failover inputs (NetBox primary_ip / oob_ip, host only). Optional so
-    # an older plugin that omits them doesn't clear stored IPs; an explicit null DOES clear.
-    primary_ip: str | None = None
-    oob_ip: str | None = None
+    # Omitted IP fields preserve stored addresses; explicit null clears them.
+    primary_ip: IPvAnyAddress | None = None
+    oob_ip: IPvAnyAddress | None = None
 
 
 @router.put(

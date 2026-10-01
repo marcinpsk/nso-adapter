@@ -4,8 +4,8 @@
 
 Provision is the one runner that starts claimless and acquires mid-run. Everything up to
 the sync-from is CDB/NSO work against no adapter Device; the moment ``onboard_device``
-makes a Device visible, the run holds that device's claim and keeps it through the failover
-seed and the comprehensive mirror fill. Without it a scheduled sync, a failover tick or a
+makes a Device visible, the run holds that device's claim through the read mirror fill.
+Without it a scheduled sync, a failover tick or a
 teardown claims the freshly-visible device and interleaves with the refresh.
 
 Nothing about today's provisioning moved: the inline refresh is still inline and still
@@ -240,8 +240,8 @@ async def test_a_revocation_mid_refresh_stops_the_writes(adapter_client_with_nso
             await asyncio.wait_for(task, timeout=20)
 
 
-async def test_the_failover_seed_is_guarded_too(adapter_client_with_nso, monkeypatch):
-    """It commits device state between the mapping and the refresh, so it is not exempt."""
+async def test_revoked_mapping_cannot_refresh_device(adapter_client_with_nso, monkeypatch):
+    """The post-map refresh requires the claim held during mapping."""
     from nso_adapter.store.models import DeviceClaim, DeviceFailover
 
     monkeypatch.setattr(get_config().scheduler, "enable_failover", True)
@@ -702,28 +702,24 @@ async def test_a_cancellation_at_the_existing_device_acquisition_hands_over_the_
         assert (await db.get(Device, device_id)).netbox_device_id is None
 
 
-async def test_a_failed_failover_seed_does_not_poison_the_rest_of_the_run(adapter_client_with_nso, monkeypatch):
-    """Best-effort means the STEP fails, not the run: a failed transaction left behind kills
-    the mirror refresh and the runner's terminal write on a device that mapped fine."""
+async def test_provision_leaves_failover_row_creation_to_scope(adapter_client_with_nso, monkeypatch):
+    from nso_adapter.store.models import DeviceFailover
+
     monkeypatch.setattr(get_config().scheduler, "enable_failover", True)
-
-    async def _poison(db, *args, **kwargs):
-        await db.execute(sa.text("SELECT 1 / 0"))  # a real error, leaving a real failed txn
-
-    monkeypatch.setattr("nso_adapter.core.failover.set_initial_failover_state", _poison)
-
     reg = ClaimRegistration()
     job_id = await _seed_provision_job()
     refresh = _BarrierRefresh()
     refresh.release.set()
 
     async with session() as db:
-        result = await _provision(db, name="pg-poison", netbox_device_id=7300, reg=reg, job_id=job_id, refresh=refresh)
+        result = await _provision(
+            db, name="placeholder-no-seed", netbox_device_id=7300, reg=reg, job_id=job_id, refresh=refresh
+        )
 
-    seed = next(step for step in result["steps"] if step["step"] == "failover_seed")
-    assert seed["status"] == "failed"
     assert result["ok"] is True
-    assert refresh.calls == 1, "the poisoned session took the mirror refresh down with it"
+    assert refresh.calls == 1
+    async with session() as db:
+        assert await db.scalar(sa.select(DeviceFailover).where(DeviceFailover.device_id == reg.device_id)) is None
 
 
 async def test_the_terminal_write_is_guarded_once_the_run_is_claimed(adapter_client_with_nso):
