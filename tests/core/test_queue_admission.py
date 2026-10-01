@@ -22,6 +22,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from nso_adapter.core.provision_attempt import ProvisionJobParams
 from tests.conftest import VALID_TOKEN, note_projection_write, seed_device, session
 
 pytestmark = pytest.mark.anyio
@@ -406,6 +407,8 @@ async def _race_provisions(rival_engine, winner_args: tuple, loser_args: tuple) 
     from nso_adapter.core.jobs import enqueue_provision_job
     from nso_adapter.core.provision_attempt import ProvisionAttemptConflict
 
+    winner_args = (winner_args[0], ProvisionJobParams(**winner_args[1]))
+    loser_args = (loser_args[0], ProvisionJobParams(**loser_args[1]))
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
     winner_inserted = asyncio.Event()
     loser: dict = {}
@@ -488,7 +491,7 @@ async def test_provision_retry_finds_its_attempt_after_the_pair_winner_finishes(
     retry_params = dict(params) if same_body else {**params, "address": "10.0.0.2"}
 
     async with session() as db:
-        first, _ = await jobs_mod.enqueue_provision_job(first_attempt, params, db)
+        first, _ = await jobs_mod.enqueue_provision_job(first_attempt, ProvisionJobParams(**params), db)
 
     original = jobs_mod.get_provision_attempt_job
     admitted: dict = {}
@@ -500,17 +503,21 @@ async def test_provision_retry_finds_its_attempt_after_the_pair_winner_finishes(
             await other.execute(sa.update(Job).where(Job.id == first.id).values(status=JobStatus.succeeded))
             await other.commit()
         async with rival() as other:
-            admitted["job"], admitted["created"] = await jobs_mod.enqueue_provision_job(retry_attempt, params, other)
+            admitted["job"], admitted["created"] = await jobs_mod.enqueue_provision_job(
+                retry_attempt, ProvisionJobParams(**params), other
+            )
         return existing
 
     jobs_mod.get_provision_attempt_job = _admit_retry_after_missed_attempt
     try:
         async with session() as db:
             if same_body:
-                job, created = await jobs_mod.enqueue_provision_job(retry_attempt, retry_params, db)
+                job, created = await jobs_mod.enqueue_provision_job(
+                    retry_attempt, ProvisionJobParams(**retry_params), db
+                )
             else:
                 with pytest.raises(ProvisionAttemptConflict) as refused:
-                    await jobs_mod.enqueue_provision_job(retry_attempt, retry_params, db)
+                    await jobs_mod.enqueue_provision_job(retry_attempt, ProvisionJobParams(**retry_params), db)
     finally:
         jobs_mod.get_provision_attempt_job = original
 
@@ -530,7 +537,9 @@ async def test_a_terminal_provision_does_not_block_a_new_one(adapter_client):
     from nso_adapter.store.models import Job, JobStatus
 
     async with session() as db:
-        first, created = await enqueue_provision_job(uuid.uuid4(), {**_PROVISION, "address": "10.0.0.1"}, db)
+        first, created = await enqueue_provision_job(
+            uuid.uuid4(), ProvisionJobParams(**_PROVISION, address="10.0.0.1"), db
+        )
         assert created is True
 
     async with session() as db:
@@ -538,7 +547,9 @@ async def test_a_terminal_provision_does_not_block_a_new_one(adapter_client):
         await db.commit()
 
     async with session() as db:
-        second, created = await enqueue_provision_job(uuid.uuid4(), {**_PROVISION, "address": "10.0.0.1"}, db)
+        second, created = await enqueue_provision_job(
+            uuid.uuid4(), ProvisionJobParams(**_PROVISION, address="10.0.0.1"), db
+        )
     assert created is True and second.id != first.id
 
 
@@ -553,7 +564,7 @@ async def test_a_running_provision_still_refuses_a_second_one(adapter_client):
     from nso_adapter.store.models import Job, JobStatus
 
     async with session() as db:
-        first, _ = await enqueue_provision_job(uuid.uuid4(), {**_PROVISION, "address": "10.0.0.1"}, db)
+        first, _ = await enqueue_provision_job(uuid.uuid4(), ProvisionJobParams(**_PROVISION, address="10.0.0.1"), db)
 
     async with session() as db:
         await db.execute(sa.update(Job).where(Job.id == first.id).values(status=JobStatus.running))
@@ -561,7 +572,7 @@ async def test_a_running_provision_still_refuses_a_second_one(adapter_client):
 
     async with session() as db:
         with pytest.raises(ProvisionAttemptConflict) as refused:
-            await enqueue_provision_job(uuid.uuid4(), {**_PROVISION, "address": "10.0.0.1"}, db)
+            await enqueue_provision_job(uuid.uuid4(), ProvisionJobParams(**_PROVISION, address="10.0.0.1"), db)
     assert (refused.value.reason, refused.value.job_id) == ("provision_active", first.id)
 
 
@@ -574,7 +585,9 @@ async def test_provision_admission_retries_when_the_winner_finishes(adapter_clie
 
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
     async with session() as db:
-        first, _ = await jobs_mod.enqueue_provision_job(uuid.uuid4(), {**_PROVISION, "address": "10.0.0.1"}, db)
+        first, _ = await jobs_mod.enqueue_provision_job(
+            uuid.uuid4(), ProvisionJobParams(**_PROVISION, address="10.0.0.1"), db
+        )
 
     original = jobs_mod.get_active_provision_job
     fired = {"n": 0}
@@ -592,7 +605,7 @@ async def test_provision_admission_retries_when_the_winner_finishes(adapter_clie
     try:
         async with session() as db:
             second, created = await jobs_mod.enqueue_provision_job(
-                uuid.uuid4(), {**_PROVISION, "address": "10.0.0.1"}, db
+                uuid.uuid4(), ProvisionJobParams(**_PROVISION, address="10.0.0.1"), db
             )
     finally:
         jobs_mod.get_active_provision_job = original
@@ -619,7 +632,7 @@ async def test_provision_admission_exhaustion_does_not_repeat_the_device_name(ad
         netbox_device_id=9750,
     )
     async with session() as db:
-        await jobs_mod.enqueue_provision_job(uuid.uuid4(), params, db)
+        await jobs_mod.enqueue_provision_job(uuid.uuid4(), ProvisionJobParams(**params), db)
 
     async def _hide_active_job(instance, name, db):
         return None
@@ -627,7 +640,7 @@ async def test_provision_admission_exhaustion_does_not_repeat_the_device_name(ad
     monkeypatch.setattr(jobs_mod, "get_active_provision_job", _hide_active_job)
     async with session() as db:
         with capture_logs() as logs, pytest.raises(RuntimeError) as caught:
-            await jobs_mod.enqueue_provision_job(uuid.uuid4(), params, db)
+            await jobs_mod.enqueue_provision_job(uuid.uuid4(), ProvisionJobParams(**params), db)
 
     assert_chain_free_of(caught.value, [device_name])
     record = next(record for record in logs if record["event"] == "job.provision_admission.retries_exhausted")

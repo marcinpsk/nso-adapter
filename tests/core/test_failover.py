@@ -11,6 +11,7 @@ is deterministic — the real HTTP round-trip is covered separately in test_fail
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from ipaddress import ip_address
 
 import pytest
 from structlog.testing import capture_logs
@@ -626,14 +627,14 @@ def _stub_actions_probe(monkeypatch, reachable):
 async def test_bootstrap_disabled_returns_primary(monkeypatch):
     _enable_failover(monkeypatch, enabled=False)
     client = FakeNso()
-    active, step = await _bootstrap_address(client, "ra1", "10.0.0.1", "192.0.2.5")
+    active, step = await _bootstrap_address(client, "ra1", ip_address("10.0.0.1"), ip_address("192.0.2.5"))
     assert active == ActiveAddress.primary.value and step is None
     assert client.calls == []
 
 
 async def test_bootstrap_no_oob_returns_primary(monkeypatch):
     _enable_failover(monkeypatch, enabled=True)
-    active, step = await _bootstrap_address(FakeNso(), "ra1", "10.0.0.1", None)
+    active, step = await _bootstrap_address(FakeNso(), "ra1", ip_address("10.0.0.1"), None)
     assert active == ActiveAddress.primary.value and step is None
 
 
@@ -641,7 +642,7 @@ async def test_bootstrap_primary_reachable_stays_primary(monkeypatch):
     _enable_failover(monkeypatch, enabled=True)
     _stub_actions_probe(monkeypatch, reachable=True)
     client = FakeNso()
-    active, step = await _bootstrap_address(client, "ra1", "10.0.0.1", "192.0.2.5")
+    active, step = await _bootstrap_address(client, "ra1", ip_address("10.0.0.1"), ip_address("192.0.2.5"))
     assert active == ActiveAddress.primary.value
     assert client.calls == []  # never changed the address
     assert step["status"] == "primary"
@@ -651,7 +652,7 @@ async def test_bootstrap_primary_unreachable_switches_to_oob(monkeypatch):
     _enable_failover(monkeypatch, enabled=True)
     _stub_actions_probe(monkeypatch, reachable=False)
     client = FakeNso()
-    active, step = await _bootstrap_address(client, "ra1", "10.0.0.1", "192.0.2.5")
+    active, step = await _bootstrap_address(client, "ra1", ip_address("10.0.0.1"), ip_address("192.0.2.5"))
     assert active == ActiveAddress.oob.value
     assert ("set_address", "192.0.2.5") in client.calls
     assert client.address == "192.0.2.5"
@@ -998,7 +999,7 @@ async def test_bootstrap_skips_equivalent_ipv6_oob(monkeypatch):
     _enable_failover(monkeypatch, enabled=True)
     _stub_actions_probe(monkeypatch, reachable=False)
     client = FakeNso(address="2001:db8::1")
-    role, step = await _bootstrap_address(client, "ra1", "2001:db8::1", "2001:DB8::1")
+    role, step = await _bootstrap_address(client, "ra1", ip_address("2001:db8::1"), ip_address("2001:DB8::1"))
     assert (role, step) == ("primary", None)
     assert client.calls == []
 
@@ -1047,4 +1048,20 @@ async def test_tick_deduplicates_equivalent_ipv6_slots(monkeypatch):
     client = FakeNso(address=fo.primary_ip)
     await _tick(_device(), fo, client, SchedulerConfig(), now=_BASE, oob_due=True)
     assert calls["n"] == 1
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("active", ["primary", "oob"])
+@pytest.mark.parametrize("unreadable", [False, True])
+async def test_reconcile_failure_uses_the_oob_role_probe_interval(monkeypatch, active, unreadable):
+    cfg = SchedulerConfig(failover_primary_probe_interval=2, failover_oob_probe_interval=17)
+    calls = _stub_probe(monkeypatch, reachable=True)
+    fo = _failover_row(active=active)
+    client = _UnreadableAddressNso() if unreadable else FakeNso(address="198.18.0.9")
+
+    await _tick(_device(), fo, client, cfg, now=_BASE, primary_due=False, oob_due=True)
+
+    interval = cfg.failover_primary_probe_interval if active == "oob" else cfg.failover_oob_probe_interval
+    assert fo.next_oob_probe_at == _BASE + timedelta(minutes=interval)
+    assert calls["n"] == 0
     assert client.calls == []

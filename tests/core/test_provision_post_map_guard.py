@@ -15,6 +15,7 @@ gated on a successful ``sync_from``. What changed is who may touch the device wh
 from __future__ import annotations
 
 import asyncio
+from ipaddress import ip_address
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -111,7 +112,7 @@ async def _provision(db, *, name, netbox_device_id, reg, job_id, refresh, client
             db,
             nso_instance=_INSTANCE,
             device_name=name,
-            address="10.0.0.9",
+            address=ip_address("10.0.0.9"),
             ned_id=_NED,
             authgroup="network",
             netbox_device_id=netbox_device_id,

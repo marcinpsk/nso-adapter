@@ -9,6 +9,7 @@ ensure init_db() has run (creating schema) before any DB call.
 
 from __future__ import annotations
 
+from ipaddress import ip_address
 from uuid import uuid4
 
 import pytest
@@ -1070,7 +1071,7 @@ async def test_the_PROVISIONED_record_carries_step_names_and_statuses_but_no_ste
                     db,
                     nso_instance="nso-dev",
                     device_name=submitted_name,
-                    address="198.51.100.20",
+                    address=ip_address("198.51.100.20"),
                     ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
                     authgroup="network",
                     netbox_device_id=int(uuid4().int % 10**8),
@@ -1126,7 +1127,7 @@ async def test_an_UNLINKED_provision_is_still_correlatable_without_a_device_id(a
                     db,
                     nso_instance="nso-dev",
                     device_name=submitted_name,
-                    address="198.51.100.22",
+                    address=ip_address("198.51.100.22"),
                     ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
                     authgroup="network",
                     netbox_device_id=None,
@@ -1173,7 +1174,7 @@ async def test_a_NONFATAL_step_failure_keeps_its_CLASSIFICATION_in_the_record(ad
                     db,
                     nso_instance="nso-dev",
                     device_name=submitted_name,
-                    address="198.51.100.21",
+                    address=ip_address("198.51.100.21"),
                     ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
                     authgroup="network",
                     netbox_device_id=int(uuid4().int % 10**8),

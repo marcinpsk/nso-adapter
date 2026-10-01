@@ -9,6 +9,7 @@ refresh is gated on ``sync_from`` actually having pulled the running config.
 
 from __future__ import annotations
 
+from ipaddress import ip_address
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -35,7 +36,7 @@ async def _provision(db, client, refresh_spy, *, name):
             db,
             nso_instance="nso-dev",
             device_name=name,
-            address="10.0.0.9",
+            address=ip_address("10.0.0.9"),
             ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
             authgroup="network",
             netbox_device_id=771,

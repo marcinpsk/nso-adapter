@@ -6,6 +6,7 @@ import json
 import logging
 import traceback
 from datetime import UTC, datetime
+from ipaddress import ip_address
 
 import httpx
 import pytest
@@ -787,7 +788,7 @@ async def test_a_failed_host_key_fetch_keeps_the_action_info_out_of_the_provisio
                 db,
                 nso_instance="nso-dev",
                 device_name=name,
-                address="10.0.0.9",
+                address=ip_address("10.0.0.9"),
                 ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
                 authgroup="network",
             )
@@ -966,7 +967,7 @@ async def test_a_REDIRECTED_host_key_fetch_records_the_STATUS_and_not_the_locati
                 db,
                 nso_instance="nso-dev",
                 device_name="host-key-http",
-                address="10.0.0.11",
+                address=ip_address("10.0.0.11"),
                 ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
                 authgroup="network",
             )

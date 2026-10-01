@@ -12,7 +12,7 @@ import asyncio
 import time
 import uuid
 from contextlib import suppress
-from ipaddress import ip_address
+from ipaddress import IPv4Address, IPv6Address
 from typing import Any
 
 import structlog
@@ -108,7 +108,9 @@ _READ_MIRROR_ROOTS = (
 #: The failures whose message the adapter WROTE: it names the failure and repeats nothing
 #: the server said. Every other exception is classified by its type alone. A decode of a
 #: malformed answer carries the server's bytes, and a store failure carries the statement.
-async def _bootstrap_address(client, device_name: str, primary: str, oob_ip: str | None) -> tuple[str, dict | None]:
+async def _bootstrap_address(
+    client, device_name: str, primary: IPv4Address | IPv6Address, oob_ip: IPv4Address | IPv6Address | None
+) -> tuple[str, dict | None]:
     """Reachability-aware initial management address.
 
     When failover is enabled and a fresh device's primary IP is unreachable but its OOB IP
@@ -116,7 +118,7 @@ async def _bootstrap_address(client, device_name: str, primary: str, oob_ip: str
     back to primary once the in-band address comes up). Returns ``(active_address, step|None)``.
     """
     cfg = get_config().scheduler
-    if not (cfg.enable_failover and oob_ip is not None and ip_address(oob_ip) != ip_address(primary)):
+    if not (cfg.enable_failover and oob_ip is not None and oob_ip != primary):
         return ActiveAddress.primary.value, None
     from nso_adapter.nso.actions import probe_reachable
 
@@ -124,7 +126,7 @@ async def _bootstrap_address(client, device_name: str, primary: str, oob_ip: str
     if reachable:
         return ActiveAddress.primary.value, {"step": "failover_bootstrap", "status": "primary"}
     try:
-        await client.set_address(device_name, oob_ip)
+        await client.set_address(device_name, str(oob_ip))
         await client.disconnect(device_name)
     except Exception as exc:
         return ActiveAddress.primary.value, {
@@ -619,7 +621,7 @@ async def provision_nso_device(
     *,
     nso_instance: str,
     device_name: str,
-    address: str,
+    address: IPv4Address | IPv6Address,
     ned_id: str,
     authgroup: str,
     netbox_device_id: int | None = None,
@@ -627,7 +629,7 @@ async def provision_nso_device(
     port: int | None = None,
     admin_state: str = "unlocked",
     do_sync: bool = True,
-    oob_ip: str | None = None,
+    oob_ip: IPv4Address | IPv6Address | None = None,
     reg: ClaimRegistration | None = None,
     job_id: int | None = None,
 ) -> dict:
@@ -689,7 +691,7 @@ async def provision_nso_device(
         if await client.device_exists(device_name):
             _step("create", "exists")
         else:
-            await client.create_device(device_name, address, ned_id, authgroup, ned_type=device_type, port=port)
+            await client.create_device(device_name, str(address), ned_id, authgroup, ned_type=device_type, port=port)
             _step("create", "ok", f"device-type={device_type}")
     except Exception as exc:
         _step("create", "failed", failure=failure_detail(exc))

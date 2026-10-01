@@ -32,7 +32,7 @@ from nso_adapter.core.claim import (
     lock_claim,
     terminalize,
 )
-from nso_adapter.core.provision_attempt import ProvisionAttemptConflict, ProvisionAttemptEvidence
+from nso_adapter.core.provision_attempt import ProvisionAttemptConflict, ProvisionAttemptEvidence, ProvisionJobParams
 from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.client import failure_detail
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
@@ -306,7 +306,9 @@ async def get_provision_attempt_job(provision_attempt_id: uuid.UUID, db: AsyncSe
     return await db.scalar(select(Job).where(Job.provision_attempt_id == provision_attempt_id))
 
 
-async def enqueue_provision_job(provision_attempt_id: uuid.UUID, params: dict, db: AsyncSession) -> tuple[Job, bool]:
+async def enqueue_provision_job(
+    provision_attempt_id: uuid.UUID, params: ProvisionJobParams, db: AsyncSession
+) -> tuple[Job, bool]:
     """Admit the provision job of one plugin attempt.  Returns (job, created).
 
     Unlike :func:`enqueue_job`, a provision runs before the device exists, so the job has
@@ -323,6 +325,7 @@ async def enqueue_provision_job(provision_attempt_id: uuid.UUID, params: dict, d
     the lookups then name the winner. Zero rows with no match means the pair's winner
     reached a terminal status between the two statements; a fresh admission is then correct.
     """
+    context = params.model_dump(mode="json")
     for _attempt in range(_ADMISSION_RETRIES):
         async with db.begin_nested():
             job_id = await db.scalar(
@@ -332,7 +335,7 @@ async def enqueue_provision_job(provision_attempt_id: uuid.UUID, params: dict, d
                     device_id=None,
                     status=JobStatus.queued,
                     coalescible=False,
-                    context=params,
+                    context=context,
                     provision_attempt_id=provision_attempt_id,
                 )
                 .on_conflict_do_nothing()
@@ -347,29 +350,29 @@ async def enqueue_provision_job(provision_attempt_id: uuid.UUID, params: dict, d
 
         existing = await get_provision_attempt_job(provision_attempt_id, db)
         if existing is not None:
-            if existing.context != params:
+            if existing.context != context:
                 raise ProvisionAttemptConflict("provision_attempt_mismatch", existing)
             return existing, False
-        active = await get_active_provision_job(params["nso_instance"], params["device_name"], db)
+        active = await get_active_provision_job(params.nso_instance, params.device_name, db)
         if active is not None:
             if active.provision_attempt_id == provision_attempt_id:
-                if active.context != params:
+                if active.context != context:
                     raise ProvisionAttemptConflict("provision_attempt_mismatch", active)
                 return active, False
             raise ProvisionAttemptConflict("provision_active", active)
         logger.debug(
             "job.provision_admission.winner_finished",
             **device_fields(
-                nso_instance=params["nso_instance"],
-                nso_device_name=params["device_name"],
+                nso_instance=params.nso_instance,
+                nso_device_name=params.device_name,
             ),
         )
 
     logger.warning(
         "job.provision_admission.retries_exhausted",
         **device_fields(
-            nso_instance=params["nso_instance"],
-            nso_device_name=params["device_name"],
+            nso_instance=params.nso_instance,
+            nso_device_name=params.device_name,
         ),
     )
     raise RuntimeError("could not admit a provision job")
@@ -677,10 +680,10 @@ async def _run_provision(job_id: int, device_id: int | None, reg: ClaimRegistrat
         context = await db.scalar(select(Job.context).where(Job.id == job_id))
         if context is None and await db.scalar(select(Job.id).where(Job.id == job_id)) is None:
             return
-        params = dict(context or {})
         try:
+            params = ProvisionJobParams.model_validate(context)
             result = await asyncio.wait_for(
-                provision_nso_device(db, **params, reg=reg, job_id=job_id), timeout=_JOB_TIMEOUT
+                provision_nso_device(db, **params.model_dump(), reg=reg, job_id=job_id), timeout=_JOB_TIMEOUT
             )
             # The terminal write is an effect performed on behalf of the claim once the run
             # has one, so it takes the row lock like every other guarded write. Without it a

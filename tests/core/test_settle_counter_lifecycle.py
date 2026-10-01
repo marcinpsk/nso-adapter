@@ -23,6 +23,7 @@ import subprocess
 import sys
 import uuid
 from datetime import UTC, datetime, timedelta
+from ipaddress import ip_address
 from pathlib import Path
 
 import pytest
@@ -150,7 +151,7 @@ async def _created_by_onboard_claimed() -> int:
                 db,
                 nso_instance="nso-dev",
                 device_name="lc-claimed",
-                address="10.0.0.5",
+                address=ip_address("10.0.0.5"),
                 ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
                 authgroup="network",
                 netbox_device_id=8611,
