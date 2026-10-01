@@ -2,7 +2,10 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """AS number boundaries and stored-content refusals."""
 
+import json
+import re
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 from sqlalchemy import select
@@ -409,3 +412,29 @@ def test_redistribution_duplicates_are_handler_conflicts(protocol):
         validate_unique_redistribution_sources(process.redistribution)
     assert caught.value.status_code == 409
     assert caught.value.detail["error"]["code"] == "conflict"
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("PUT", "bgp-intent"),
+        ("PUT", "ospf-intent"),
+        ("PUT", "isis-interface-intent"),
+        ("PUT", "isis-flex-algo-intent"),
+        ("GET", "bgp-config"),
+        ("GET", "redistribution"),
+        ("GET", "actions/apply-diff"),
+    ],
+)
+def test_asn_refusing_endpoint_headings_list_409(method, path):
+    doc = (_REPO_ROOT / "docs" / "api-contract.md").read_text()
+    match = re.search(rf"^### `{method} /api/v1/devices/{{id}}/{re.escape(path)}` → `([^`]+)`$", doc, re.MULTILINE)
+    assert match, f"no heading for {method} {path}"
+    statuses = {s.strip() for s in match.group(1).split("|")}
+    assert "409" in statuses
+    snapshot = json.loads((_REPO_ROOT / "tests" / "api" / "openapi_snapshot.json").read_text())
+    responses = snapshot["paths"][f"/api/v1/devices/{{device_id}}/{path}"][method.lower()]["responses"]
+    assert statuses <= set(responses)
