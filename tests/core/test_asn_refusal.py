@@ -26,6 +26,21 @@ def test_asn_refusal_has_no_parser_exception_context():
     assert caught.value.__cause__ is None
 
 
+def test_asn_refusal_accumulates_sorted_degraded_surfaces_without_rejected_value():
+    refusal = AsnRuleViolation("device_read.bgp", "router[0]", "asn", "064512")
+
+    refusal.include_degraded_surfaces(["static_route", "bgp", "bgp"])
+    refusal.include_degraded_surfaces(["sync_from", "interface_attributes"])
+
+    assert refusal.error["detail"] == {
+        "table": "device_read.bgp",
+        "row_id": "router[0]",
+        "field": "asn",
+        "degraded_surfaces": ["bgp", "interface_attributes", "static_route", "sync_from"],
+    }
+    assert_text_free_of(refusal.error, ["064512"])
+
+
 async def test_projection_refuses_stored_router(adapter_client):
     device_id = await seed_device(nso_device_name="placeholder-device")
     async with session() as db:
@@ -329,16 +344,57 @@ def test_detach_only_colliding_prior_rows_refuse_without_retirement():
 
 async def test_comprehensive_refresh_surfaces_the_typed_refusal(adapter_client):
     from nso_adapter.core.importer import refresh_all_surfaces_for_device
+    from tests.core.test_importer import _ALL_PROJECTED_WIRES
 
     class InvalidDeviceRead:
         async def get_device_state_doc(self, device_name):
-            return {"bgp-config": {"status": "ok", "router": [{"asn": "064512"}]}}
+            sections = {wire: {"status": "ok"} for wire in _ALL_PROJECTED_WIRES}
+            sections["bgp-config"] = {"status": "ok", "router": [{"asn": "064512"}]}
+            sections["static-route"] = {"status": "error", "error-reason": "placeholder-read-failure"}
+            return sections
 
     device_id = await seed_device(nso_device_name="placeholder-device")
     async with session() as db:
         device = await db.get(Device, device_id)
-        with pytest.raises(AsnRuleViolation):
+        with pytest.raises(AsnRuleViolation) as caught:
             await refresh_all_surfaces_for_device(db, device, InvalidDeviceRead())
+        assert caught.value.error["code"] == "asn_rule_violation"
+        assert caught.value.error["detail"]["degraded_surfaces"] == ["bgp", "redistribution", "static_route"]
+
+
+@pytest.mark.parametrize("caller", ["onboard", "apply"])
+async def test_mirror_refresh_logs_asn_refusal_with_degraded_surfaces(adapter_client, monkeypatch, caller):
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core import importer as imp
+    from nso_adapter.core.apply import _post_apply_refresh_and_notify
+    from nso_adapter.core.onboarding import _initial_mirror_refresh
+    from tests.core.test_importer import _ALL_PROJECTED_WIRES
+
+    class InvalidDeviceRead:
+        async def get_device_state_doc(self, device_name):
+            sections = {wire: {"status": "ok"} for wire in _ALL_PROJECTED_WIRES}
+            sections["bgp-config"] = {"status": "ok", "router": [{"asn": "064512"}]}
+            sections["static-route"] = {"status": "error", "error-reason": "placeholder-read-failure"}
+            return sections
+
+        async def run_device_state_read(self, device_name, wire_names, *, timeout):
+            return {"atomic": True, **await self.get_device_state_doc(device_name)}
+
+    client = InvalidDeviceRead()
+    monkeypatch.setattr(imp, "get_nso_client", lambda _: client)
+    device_id = await seed_device(nso_device_name="placeholder-device")
+    async with session() as db:
+        with capture_logs() as logs:
+            if caller == "onboard":
+                await _initial_mirror_refresh(db, device_id, client)
+            else:
+                await _post_apply_refresh_and_notify(db, device_id)
+    event = "device.onboard_mirror.failed" if caller == "onboard" else "apply.post_refresh_failed"
+    record = next(record for record in logs if record["event"] == event)
+    assert record["error"]["code"] == "asn_rule_violation"
+    assert record["error"]["detail"]["degraded_surfaces"] == ["bgp", "redistribution", "static_route"]
+    assert_text_free_of(record, ["064512"])
 
 
 def test_reader_compare_refuses_colliding_stored_routers():

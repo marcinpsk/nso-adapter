@@ -39,6 +39,11 @@ class AsnRuleViolation(Exception):
         super().__init__(message)
         self.error: dict = {"code": "asn_rule_violation", "message": message, "detail": detail}
 
+    def include_degraded_surfaces(self, surfaces: list[str]) -> None:
+        """Keep the complete failed-surface list without rejected AS content."""
+        detail = self.error["detail"]
+        detail["degraded_surfaces"] = sorted(set(detail.get("degraded_surfaces", [])) | set(surfaces))
+
 
 def checked_asn(value: object, table: str, row_id: object, field: str) -> int:
     """Parse an AS value or refuse it at its content boundary."""

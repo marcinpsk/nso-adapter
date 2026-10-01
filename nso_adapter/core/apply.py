@@ -2426,6 +2426,8 @@ async def _post_apply_refresh_and_notify(db: AsyncSession, device_id: int) -> No
     except ClaimLostError:
         # Revocation is not a runner error: recovery already owns the disposition.
         raise
+    except AsnRuleViolation as exc:
+        logger.warning("apply.post_refresh_failed", device_id=device_id, error=exc.error)
     except Exception as exc:  # noqa: BLE001 — best-effort; never fail an already-finalized Apply
         logger.warning("apply.post_refresh_failed", device_id=device_id, error=failure_detail(exc))
 
