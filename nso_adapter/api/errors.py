@@ -47,6 +47,7 @@ ErrorCode = Literal[
     "not_implemented",
     "nso_commit_failed",
     "apply_unexecutable",
+    "asn_rule_violation",
     # per-endpoint
     "ambiguous_device",
     "bad_request",
@@ -370,3 +371,11 @@ RESP_500_INTERNAL: ResponseSpec = {500: {**_ENVELOPE_SCHEMA, "description": "Int
 RESP_501: ResponseSpec = {501: {**_ENVELOPE_SCHEMA, "description": "Not supported by the configured provider"}}
 RESP_502_NSO: ResponseSpec = {502: {**_ENVELOPE_SCHEMA, "description": "NSO unreachable"}}
 RESP_502: ResponseSpec = {502: {**_ENVELOPE_SCHEMA, "description": "Upstream (NSO/Vault) operation failed"}}
+
+
+async def asn_rule_violation_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Name the invalid row in a fail-closed content refusal."""
+    from nso_adapter.domain.asn import AsnRuleViolation
+
+    assert isinstance(exc, AsnRuleViolation)
+    return JSONResponse(status_code=409, content={"error": exc.error})

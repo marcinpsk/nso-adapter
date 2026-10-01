@@ -337,3 +337,24 @@ def test_lag_apply_contract_excludes_read_only_fields():
     examples = [json.loads(body) for body in re.findall(r"```json\n(.*?)\n```", section, re.DOTALL)]
     request = next(body for body in examples if "bundles" in body)
     assert LagConfigApplyRequest.model_validate(request).bundles
+
+
+@pytest.mark.parametrize(
+    "path,method",
+    [
+        ("bgp-config", "get"),
+        ("redistribution", "get"),
+        ("bgp-intent", "put"),
+        ("ospf-intent", "put"),
+        ("isis-interface-intent", "put"),
+        ("isis-flex-algo-intent", "put"),
+        ("intent", "put"),
+        ("actions/apply", "post"),
+        ("actions/apply-diff", "get"),
+    ],
+)
+def test_asn_refusal_operations_declare_error_envelope(openapi_schema, path, method):
+    operation = openapi_schema["paths"][f"/api/v1/devices/{{device_id}}/{path}"][method]
+    response = operation["responses"].get("409")
+    assert response is not None
+    assert response["content"]["application/json"]["schema"] == {"$ref": "#/components/schemas/ErrorEnvelope"}

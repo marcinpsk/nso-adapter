@@ -26,6 +26,7 @@ from nso_adapter.api.errors import (
     api_error,
     api_error_handler,
     apply_unexecutable_handler,
+    asn_rule_violation_handler,
     framework_http_error_handler,
     projection_gone_handler,
     promotion_provenance_handler,
@@ -72,6 +73,7 @@ from nso_adapter.core.request_flags import (
 )
 from nso_adapter.core.scheduler import start_scheduler, stop_scheduler
 from nso_adapter.core.worker import start_workers, stop_workers
+from nso_adapter.domain.asn import AsnRuleViolation
 from nso_adapter.notifications.persistent_subscriber import persistent_subscriber
 from nso_adapter.notifications.sse_subscriber import SSESubscriber
 from nso_adapter.nso.client import NsoClient, failure_detail
@@ -496,6 +498,7 @@ def create_app(*, lifespan_context: Callable[[FastAPI], AbstractAsyncContextMana
         openapi_url="/openapi.json" if api_docs else None,
     )
     app.add_exception_handler(ApiError, api_error_handler)
+    app.add_exception_handler(AsnRuleViolation, asn_rule_violation_handler)
     app.add_exception_handler(StarletteHTTPException, framework_http_error_handler)
     app.add_exception_handler(RequestValidationError, validation_error_handler)
     app.add_exception_handler(DeviceProjectionGone, projection_gone_handler)

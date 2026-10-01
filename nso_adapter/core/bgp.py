@@ -11,10 +11,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import structlog
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.domain.asn import AsnRuleViolation, checked_asn, validate_asn_rows, validate_source_as_numbers
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import (
@@ -29,6 +30,43 @@ from nso_adapter.store.models import (
 )
 
 logger = structlog.get_logger(__name__)
+
+
+def validate_bgp_as_numbers(routers: list[dict]) -> None:
+    """Refuse malformed AS numbers before materialization or device verification."""
+    seen: dict[int, str] = {}
+    for index, router in enumerate(as_list(routers)):
+        location = f"router[{index}]"
+        identity = checked_asn(router.get("asn"), "device_read.bgp", location, "asn")
+        if identity in seen:
+            raise AsnRuleViolation("device_read.bgp", location, "asn", router.get("asn"), other_row_id=seen[identity])
+        seen[identity] = location
+        for scope_index, scope in enumerate(as_list(router.get("scope"))):
+            scope_location = f"{location}.scope[{scope_index}]"
+            for af in as_list(scope.get("address-family")):
+                validate_source_as_numbers(as_list(af.get("redistribute")), "device_read.bgp", scope_location)
+            for kind in ("peer", "peer-group"):
+                for peer_index, peer in enumerate(as_list(scope.get(kind))):
+                    peer_location = f"{scope_location}.{kind}[{peer_index}]"
+                    for field in ("remote-as", "local-as"):
+                        if peer.get(field) is not None:
+                            checked_asn(peer[field], "device_read.bgp", peer_location, field)
+
+
+async def validate_bgp_mirror(db: AsyncSession, device_id: int) -> None:
+    """Refuse invalid stored mirror rows before a read or replacement."""
+    router_ids = select(DeviceBgpRouter.id).where(DeviceBgpRouter.device_id == device_id)
+    scope_ids = select(DeviceBgpScope.id).where(DeviceBgpScope.router_id.in_(router_ids))
+    for model, condition in (
+        (DeviceBgpRouter, DeviceBgpRouter.device_id == device_id),
+        (DeviceBgpPeer, DeviceBgpPeer.scope_id.in_(scope_ids)),
+        (DeviceBgpPeerGroup, DeviceBgpPeerGroup.scope_id.in_(scope_ids)),
+    ):
+        rows = (await db.scalars(select(model).where(condition).order_by(model.id))).all()
+        validate_asn_rows(
+            model.__tablename__,
+            [{column.name: getattr(row, column.name) for column in model.__table__.columns} for row in rows],
+        )
 
 
 def _paf_policy(paf_data: dict) -> dict:
@@ -209,14 +247,14 @@ async def _upsert_bgp_data(
     refresh_source: str,
 ) -> None:
     """Full-replace: delete existing BGP rows for *device*, then insert fresh ones."""
+    validate_bgp_as_numbers(routers)
+    await validate_bgp_mirror(db, device.id)
     await db.execute(delete(DeviceBgpRouter).where(DeviceBgpRouter.device_id == device.id))
 
     now = datetime.now(UTC)
 
     for router_data in routers:
         asn = str(router_data.get("asn", ""))
-        if not asn:
-            continue
         router = DeviceBgpRouter(
             device_id=device.id,
             asn=asn,

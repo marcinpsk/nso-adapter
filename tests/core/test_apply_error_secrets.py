@@ -17,7 +17,7 @@ from nso_adapter.core.apply import run_apply
 from nso_adapter.core.community_dialect import community_dialect_for
 from nso_adapter.nso.apply import NsoApplyError, SectionExecution, apply_device_intent, encode_snmp
 from nso_adapter.nso.client import DEVICE_INTENT_ROOT
-from nso_adapter.store.models import BgpRouterIntent, Job, JobStatus, OspfInterfaceIntent, SnmpCommunityIntent
+from nso_adapter.store.models import Job, JobStatus, OspfInterfaceIntent, SnmpCommunityIntent
 from tests._secret_discipline import (
     assert_chain_free_of,
     assert_keys_absent,
@@ -255,36 +255,31 @@ async def test_typed_commit_failure_keeps_its_message_out_of_logs_and_errors(
     }
 
 
-async def test_typed_build_failure_keeps_its_message_out_of_logs_and_errors(adapter_client, monkeypatch, recorded_logs):
+async def test_projection_refusal_keeps_malformed_value_out_of_logs_and_errors(adapter_client, recorded_logs):
+    from nso_adapter.domain.asn import AsnRuleViolation
+    from nso_adapter.store.models import RedistributionIntent
+    from tests.api.test_api_bgp_intent import _router_with_redist
+
     invalid_asn = "placeholder-sensitive-asn"
     device_id = await seed_device(nso_device_name=_DEVICE)
     response = await adapter_client.put(
         f"/api/v1/devices/{device_id}/bgp-intent",
-        json={"routers": [{"asn": invalid_asn}]},
+        json={"routers": [_router_with_redist([{"source_protocol": "bgp", "source_ref": "64513"}], asn="64512")]},
         headers={"Authorization": f"Bearer {VALID_TOKEN}"} | push_seq(),
     )
     assert response.status_code == 200
-
-    requests = []
-
-    def respond(request):
-        requests.append(request)
-        return httpx.Response(404)
-
-    job = await _run(device_id, _client_with(httpx.MockTransport(respond)), monkeypatch)
     async with session() as db:
-        stored = (
-            (await db.execute(select(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id))).scalars().one()
-        )
-
-    for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error), _log_surface(recorded_logs)):
+        source = await db.scalar(select(RedistributionIntent))
+        source.source_ref = invalid_asn
+        await db.commit()
+    with pytest.raises(AsnRuleViolation) as caught:
+        await seed_apply_job(device_id)
+    for surface in (json.dumps(caught.value.error), _log_surface(recorded_logs)):
         assert_text_free_of(surface, [invalid_asn])
-    assert stored.last_apply_error == {
-        "code": "invalid_asn",
-        "message": "apply error (invalid_asn); see the server log",
-        "detail": {},
-    }
-    assert not any(request.method == "PUT" for request in requests)
+    assert_chain_free_of(caught.value, [invalid_asn])
+    assert caught.value.error["code"] == "asn_rule_violation"
+    assert caught.value.error["detail"]["table"] == "redistribution_intent"
+    assert caught.value.error["detail"]["field"] == "source_ref"
 
 
 async def test_a_non_reference_secret_never_reaches_the_projection_refusal_chain(adapter_client):

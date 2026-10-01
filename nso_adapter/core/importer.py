@@ -32,6 +32,7 @@ from nso_adapter.core.refresh_engine import (
     run_family_refresh_from_outcome,
 )
 from nso_adapter.core.sync_state import compute_sync_state
+from nso_adapter.domain.asn import AsnRuleViolation
 from nso_adapter.domain.models import Interface, InterfaceAttr
 from nso_adapter.nso import actions as nso_actions
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError, failure_detail
@@ -490,6 +491,8 @@ async def _apply_projected(
                 )
             if not ok:
                 failed.append(name)
+        except AsnRuleViolation:
+            raise
         except Exception as exc:  # noqa: BLE001 — one surface must not take down the rest
             logger.warning("sync.surface_refresh_failed", device_id=device.id, surface=name, error=failure_detail(exc))
             failed.append(name)

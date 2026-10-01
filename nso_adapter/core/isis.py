@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.isis_canon import isis_level
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.domain.asn import validate_source_as_numbers
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceIsisInterface, DeviceIsisProcess
@@ -80,6 +81,9 @@ async def _upsert_isis_data(
     refresh_source: str,
 ) -> None:
     """Full-replace: delete existing IS-IS rows for *device*, then insert fresh ones."""
+    for index, entry in enumerate(processes):
+        validate_source_as_numbers(as_list(entry.get("redistribute")), "device_read.isis", f"process[{index}]")
+
     await db.execute(delete(DeviceIsisProcess).where(DeviceIsisProcess.device_id == device.id))
     await db.execute(delete(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id))
 

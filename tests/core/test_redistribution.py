@@ -661,7 +661,7 @@ async def _seed_redist_rows(db, device_id: int, entries: list[tuple[str, str]]) 
             DeviceRedistribution(
                 device_id=device_id,
                 dest_protocol=dest,
-                dest_ref="",
+                dest_ref="64512//ipv4-unicast" if dest == "bgp" else "",
                 source_protocol=source,
                 source_ref="",
                 last_refreshed_at=ts,
@@ -699,7 +699,11 @@ async def test_mixed_replaced_and_error_retained_is_degraded_present(adapter_cli
     async with _device_session(device_id) as (db, device):
         await _seed_redist_rows(db, device_id, [("ospf", "static"), ("isis", "connected")])
         client = _nso_client_with_data(
-            isis={"process": [{"process-tag": "CORE", "redistribute": [{"source-protocol": "bgp", "source-ref": ""}]}]},
+            isis={
+                "process": [
+                    {"process-tag": "CORE", "redistribute": [{"source-protocol": "bgp", "source-ref": "64512"}]}
+                ]
+            },
             bgp={},
         )
         client._sections["ospf-config"] = {"status": "error", "reason": "boom"}
