@@ -1885,7 +1885,7 @@ Field notes:
 - `circuit_type`, `network_type`, `metric`: omitted from response when `null` (device default applies).
 - `passive`: always present; `true` when the interface is in the process passive-interface list.
 
-### `PUT /api/v1/devices/{id}/isis-interface-intent` → `200 | 404`
+### `PUT /api/v1/devices/{id}/isis-interface-intent` → `200 | 404 | 409`
 
 Push (full-replace) the IS-IS intent (interfaces **and** processes) for this device.
 The `isis-reconciler` NSO service reads both blocks:
@@ -2029,7 +2029,7 @@ as `null`:
 
 ---
 
-### `PUT /api/v1/devices/{id}/bgp-intent` → `200 | 404`
+### `PUT /api/v1/devices/{id}/bgp-intent` → `200 | 404 | 409`
 
 Push (full-replace) the BGP intent snapshot for this device.  The `bgp-reconciler`
 NSO service reads this intent and writes IOS BGP router/scope/peer configuration.
@@ -2164,7 +2164,7 @@ configuration as last observed from NSO.
 list passthrough (the plugin stores it verbatim). `last_refreshed_at` on the OSPF
 endpoint is the raw datetime (no `Z` suffix, unlike BGP/ISIS).
 
-### `PUT /api/v1/devices/{id}/ospf-intent` → `200 | 404`
+### `PUT /api/v1/devices/{id}/ospf-intent` → `200 | 404 | 409`
 
 Push OSPF intent for this device.  Full-replace semantics: instances and
 interfaces not present in the payload are removed from the intent store.
@@ -2468,7 +2468,7 @@ Nested-bag key sets (snake_case): **instance level** = `level`, `default_metric`
 `priority`, `admin_group_exclude`, `admin_group_include_any`, `admin_group_include_all`.
 `process_tag` / `af` are strings; `settings` is an opaque EAV `{key: value}` bag.
 
-### `PUT /api/v1/devices/{id}/isis-flex-algo-intent` → `200 | 404`
+### `PUT /api/v1/devices/{id}/isis-flex-algo-intent` → `200 | 404 | 409`
 
 IS-IS Flex-Algorithm intent, keyed `(process_tag, algo_id)`. Standard
 *intent-mirror PUT* (see box below). `admin_group_*` are comma-joined
