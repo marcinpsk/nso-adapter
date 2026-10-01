@@ -10,16 +10,25 @@ from typing import NamedTuple
 
 import structlog
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
+from nso_adapter.api.errors import (
+    RESP_401,
+    RESP_404_DEVICE,
+    RESP_409,
+    RESP_409_PUSH_SEQ,
+    RESP_422_VALIDATION,
+    api_error,
+)
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
+from nso_adapter.api.redistribution import RedistributionSourceModel
 from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.core.removal import is_cleared
+from nso_adapter.domain.asn import parse_asn, redistribution_source_identity, validate_asn_rows
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
     BgpAfIntent,
@@ -224,7 +233,7 @@ class BgpConfigOut(BaseModel):
     dependencies=[Depends(verify_token)],
     response_model=BgpConfigOut,
     response_model_exclude_unset=True,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409, **RESP_422_VALIDATION},
 )
 async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_read_db)):
     """Return the BGP config read-mirror for this device."""
@@ -232,7 +241,7 @@ async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_read_db)
     if not device:
         raise api_error(404, "not_found", "Device not found")
 
-    # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
+    # Read the pointer before its mirror rows in the same snapshot.
     read_state = read_state_payload(
         await outcome_store.get_current_outcome(db, device_id, "bgp"), source_epoch=device.source_epoch
     )
@@ -247,6 +256,17 @@ async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_read_db)
         .all()
     )
 
+    graph = await _load_bgp_graph(db, bgp_routers)
+    for model, rows in (
+        (DeviceBgpRouter, bgp_routers),
+        (DeviceBgpPeer, [peer for peers in graph.peers_by_scope.values() for peer in peers]),
+        (DeviceBgpPeerGroup, [group for groups in graph.pgs_by_scope.values() for group in groups]),
+    ):
+        validate_asn_rows(
+            model.__tablename__,
+            [{column.name: getattr(row, column.name) for column in model.__table__.columns} for row in rows],
+        )
+
     if not bgp_routers:
         return {
             "device_id": device_id,
@@ -256,7 +276,6 @@ async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_read_db)
             "routers": [],
         }
 
-    graph = await _load_bgp_graph(db, bgp_routers)
     latest_ts = max((r.last_refreshed_at for r in bgp_routers if r.last_refreshed_at), default=None)
 
     routers_out = [
@@ -302,10 +321,15 @@ class BgpPeerModel(BaseModel):
     source: str | None = None
     address_families: list[BgpPeerAfModel] = []
 
+    @field_validator("remote_as", "local_as")
+    @classmethod
+    def validate_as_number(cls, value: str | None) -> str | None:
+        if value is not None:
+            parse_asn(value)
+        return value
 
-class BgpRedistributionEntry(BaseModel):
-    source_protocol: str
-    source_ref: str = ""
+
+class BgpRedistributionEntry(RedistributionSourceModel):
     route_map: str | None = None
     metric: int | None = None
 
@@ -326,6 +350,12 @@ class BgpRouterModel(BaseModel):
     router_id: str | None = None
     scopes: list[BgpScopeModel] = []
     accepted_at: UtcInstant | None = None
+
+    @field_validator("asn")
+    @classmethod
+    def validate_as_number(cls, value: str) -> str:
+        parse_asn(value)
+        return value
 
 
 class BgpIntentUpdate(BaseModel):
@@ -382,7 +412,8 @@ async def _capture_bgp_values(db: AsyncSession, device_id: int) -> dict:
         )
     ).all()
     for asn, router_id in routers:
-        image["router"][asn] = {"router_id": router_id}
+        identity = parse_asn(asn)
+        image["router"][identity] = {"router_id": router_id}
 
     peers = (
         (
@@ -420,7 +451,7 @@ def _bgp_cleared(before: dict, routers: list[BgpRouterModel]) -> bool:
     the merge-PATCH cannot drop, and it is not a peer removal, so nothing else would catch it.
     """
     for router in routers:
-        prev_router = before["router"].get(router.asn, {})
+        prev_router = before["router"].get(parse_asn(router.asn), {})
         if any(is_cleared(prev_router.get(f), getattr(router, f, None)) for f in _ROUTER_STATE_FIELDS):
             return True
         for scope in router.scopes:
@@ -508,6 +539,12 @@ def _iter_redistribution(routers: list[BgpRouterModel]):
                     yield dest_ref, entry
 
 
+def _bgp_redistribution_key(dest_ref: str, source_protocol: str, source_ref: str) -> tuple:
+    """Compare BGP redistribution identities by AS number."""
+    asn, vrf, af = dest_ref.split(":", 2)
+    return parse_asn(asn), vrf, af, source_protocol, redistribution_source_identity(source_protocol, source_ref)
+
+
 async def _sync_redistribution(
     db: AsyncSession, device_id: int, routers: list[BgpRouterModel], now: datetime
 ) -> tuple[list[tuple], bool]:
@@ -524,16 +561,25 @@ async def _sync_redistribution(
         .scalars()
         .all()
     )
-    existing_map = {(r.dest_ref, r.source_protocol, r.source_ref): r for r in existing}
-    incoming_keys = {(dest_ref, e.source_protocol, e.source_ref) for dest_ref, e in _iter_redistribution(routers)}
+    incoming_keys = {
+        _bgp_redistribution_key(dest_ref, e.source_protocol, e.source_ref)
+        for dest_ref, e in _iter_redistribution(routers)
+    }
 
-    removed = [k for k in existing_map if k not in incoming_keys]
-    for key in removed:
-        await db.delete(existing_map[key])
+    removed = []
+    existing_map = {}
+    for existing_row in existing:
+        key = _bgp_redistribution_key(existing_row.dest_ref, existing_row.source_protocol, existing_row.source_ref)
+        if key not in incoming_keys or key in existing_map:
+            removed.append((existing_row.dest_ref, existing_row.source_protocol, existing_row.source_ref))
+            await db.delete(existing_row)
+        else:
+            existing_map[key] = existing_row
+    await db.flush()
 
     cleared = False
     for dest_ref, entry in _iter_redistribution(routers):
-        key = (dest_ref, entry.source_protocol, entry.source_ref)
+        key = _bgp_redistribution_key(dest_ref, entry.source_protocol, entry.source_ref)
         row = existing_map.get(key)
         if row is None:
             row = RedistributionIntent(
@@ -547,6 +593,8 @@ async def _sync_redistribution(
             db.add(row)
         else:
             cleared = cleared or is_cleared(row.route_map, entry.route_map) or is_cleared(row.metric, entry.metric)
+        row.dest_ref = dest_ref
+        row.source_ref = entry.source_ref
         row.route_map = entry.route_map
         row.metric = entry.metric
     return removed, cleared
@@ -560,14 +608,32 @@ def _bgp_removed(
     The peer diff is device-wide (across all routers/scopes) — the same grain the
     removal collateral guard compares at.
     """
-    incoming_asns = {r.asn for r in routers}
+    incoming_asns = {parse_asn(r.asn) for r in routers}
     incoming_peers = {p.peer_address for r in routers for s in r.scopes for p in s.peers}
-    return sorted(existing_asns - incoming_asns), sorted(existing_peers - incoming_peers)
+    removed_asns = []
+    for asn in sorted(existing_asns):
+        identity = parse_asn(asn)
+        if identity not in incoming_asns:
+            removed_asns.append(asn)
+    return removed_asns, sorted(existing_peers - incoming_peers)
 
 
 class BgpIntentResult(BaseModel):
     device_id: int
     router_count: int
+
+
+def _validate_unique_as_identities(routers: list[BgpRouterModel]) -> None:
+    """Refuse duplicate router and redistribution identities before any store mutation."""
+    asns = [parse_asn(router.asn) for router in routers]
+    if len(asns) != len(set(asns)):
+        raise api_error(409, "conflict", "BGP routers must have unique AS numbers, including equivalent spellings")
+    keys = [
+        _bgp_redistribution_key(dest_ref, entry.source_protocol, entry.source_ref)
+        for dest_ref, entry in _iter_redistribution(routers)
+    ]
+    if len(keys) != len(set(keys)):
+        raise api_error(409, "conflict", "BGP redistribution destinations must have unique source identities")
 
 
 @router.put(
@@ -590,6 +656,7 @@ async def put_bgp_intent(
     router/peer/redistribution was dropped, a removal job is queued so FASTMAP
     reverts it on-device (a merge-PATCH apply would not drop it).
     """
+    _validate_unique_as_identities(body.routers)
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")

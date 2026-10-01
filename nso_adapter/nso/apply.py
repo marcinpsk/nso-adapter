@@ -25,6 +25,7 @@ import structlog
 
 from nso_adapter.core.community_dialect import UNREPRESENTABLE, CommunityDialect, community_dialect_for
 from nso_adapter.core.isis_canon import isis_level
+from nso_adapter.domain.asn import asn_row_identity, checked_asn, validate_asn_rows
 from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.client import DEVICE_INTENT_PATH, DEVICE_INTENT_ROOT, NsoClient, _url_key
 from nso_adapter.nso.nso_json import boundary_safe_dumps
@@ -721,7 +722,12 @@ def _redistribute_entry(row) -> dict:
     Shared by the IS-IS and OSPF process payloads — both group ``RedistributionIntent``
     rows by their destination process and nest this identical entry shape.
     """
-    entry: dict = {"source-protocol": row.source_protocol, "source-ref": row.source_ref}
+    source_ref = (
+        str(checked_asn(row.source_ref, "redistribution_intent", getattr(row, "id", None), "source_ref"))
+        if row.source_protocol == "bgp"
+        else row.source_ref
+    )
+    entry: dict = {"source-protocol": row.source_protocol, "source-ref": source_ref}
     if row.route_map:
         entry["route-map"] = row.route_map
     if row.metric is not None:
@@ -885,27 +891,14 @@ def build_isis_interface_payload(isis_intent_rows: list | None) -> list[dict]:
     return interfaces
 
 
-def _parse_asn(asn) -> int:
-    """Return the uint32 AS number for *asn*, accepting plain decimal or asdot ``X.Y``.
-
-    ``X.Y`` (4-byte asdot) → ``X * 65536 + Y``. Raises a descriptive NsoApplyError on an
-    unparseable value rather than a bare ``int()`` ValueError that would abort the whole
-    (possibly atomic) BGP apply with an opaque internal error.
-    """
-    s = str(asn).strip()
-    try:
-        if "." in s:
-            hi, lo = s.split(".", 1)
-            return int(hi) * 65536 + int(lo)
-        return int(s)
-    except ValueError:
-        pass
-    raise NsoApplyError("invalid_asn", "BGP ASN is not a valid AS number")
-
-
 def _bgp_redistribute_entry(row) -> dict:
     """One BGP AF ``redistribute`` entry; route-map/metric emitted only when set."""
-    entry: dict = {"source-protocol": row.source_protocol, "source-ref": row.source_ref}
+    source_ref = (
+        str(checked_asn(row.source_ref, "redistribution_intent", getattr(row, "id", None), "source_ref"))
+        if row.source_protocol == "bgp"
+        else row.source_ref
+    )
+    entry: dict = {"source-protocol": row.source_protocol, "source-ref": source_ref}
     if row.route_map:
         entry["route-map"] = row.route_map
     if row.metric is not None:
@@ -926,7 +919,11 @@ def _bgp_peer_entry(peer) -> dict:
     ):
         val = getattr(peer, attr)
         if val is not None:
-            entry[key] = val
+            entry[key] = (
+                str(checked_asn(val, "bgp_peer_intent", getattr(peer, "id", None), attr))
+                if attr in {"remote_as", "local_as"}
+                else val
+            )
     entry["peer-address-family"] = [
         {
             "afi": paf.af,
@@ -949,25 +946,21 @@ def _attach_orphan_bgp_redistribute(routers, redist_by_af, router_by_asn, scope_
     the minimal skeleton carrying just the redistribute rather than dropping it silently.
     Mutates *routers* and the index dicts in place.
     """
-    for dest_ref, redist_list in redist_by_af.items():
-        parts = dest_ref.split(":", 2)
-        if len(parts) != 3:
+    for (asn, vrf, af), redist_list in redist_by_af.items():
+        if (asn, vrf, af) in af_seen:
             continue
-        asn_str, vrf, af = parts
-        if (asn_str, vrf, af) in af_seen:
-            continue
-        router_dict = router_by_asn.get(asn_str)
+        router_dict = router_by_asn.get(asn)
         if router_dict is None:
-            router_dict = {"asn": _parse_asn(asn_str), "scope": []}
+            router_dict = {"asn": asn, "scope": []}
             routers.append(router_dict)
-            router_by_asn[asn_str] = router_dict
-        scope_dict = scope_by_key.get((asn_str, vrf))
+            router_by_asn[asn] = router_dict
+        scope_dict = scope_by_key.get((asn, vrf))
         if scope_dict is None:
             scope_dict = {"vrf": vrf, "address-family": [], "peer": []}
             router_dict["scope"].append(scope_dict)
-            scope_by_key[(asn_str, vrf)] = scope_dict
+            scope_by_key[(asn, vrf)] = scope_dict
         scope_dict["address-family"].append({"afi": af, "redistribute": redist_list})
-        af_seen.add((asn_str, vrf, af))
+        af_seen.add((asn, vrf, af))
 
 
 # Route-map intent entry keys → route-policy-reconciler YANG leaf names. The plugin
@@ -1318,38 +1311,55 @@ def encode_isis(rows: SectionRows, execution: SectionExecution) -> dict:
 
 def encode_bgp(rows: SectionRows, execution: SectionExecution) -> dict:
     """Encode the ``bgp`` container: the router / scope / address-family / peer tree."""
-    redist_by_af: dict[str, list[dict]] = {}
-    for row in rows["redistribution_intent"]:
-        redist_by_af.setdefault(row.dest_ref, []).append(_bgp_redistribute_entry(row))
+    validate_asn_rows(
+        "bgp_router_intent", [{"id": getattr(row, "id", None), "asn": row.asn} for row in rows["bgp_router_intent"]]
+    )
+    redistribution = [
+        {
+            "id": getattr(row, "id", None),
+            "dest_protocol": "bgp",
+            "dest_ref": row.dest_ref,
+            "source_protocol": row.source_protocol,
+            "source_ref": row.source_ref,
+        }
+        for row in rows["redistribution_intent"]
+    ]
+    validate_asn_rows("redistribution_intent", redistribution)
+    redist_by_af: dict[tuple[int, str, str], list[dict]] = {}
+    for row, record in zip(rows["redistribution_intent"], redistribution, strict=True):
+        identity = asn_row_identity("redistribution_intent", record)
+        assert identity is not None
+        asn, vrf, af = identity[1]
+        redist_by_af.setdefault((asn, vrf, af), []).append(_bgp_redistribute_entry(row))
 
     routers: list[dict] = []
-    router_by_asn: dict[str, dict] = {}
-    scope_by_key: dict[tuple[str, str], dict] = {}
-    af_seen: set[tuple[str, str, str]] = set()
+    router_by_asn: dict[int, dict] = {}
+    scope_by_key: dict[tuple[int, str], dict] = {}
+    af_seen: set[tuple[int, str, str]] = set()
     for r in rows["bgp_router_intent"]:
-        asn_str = str(r.asn)
+        asn = checked_asn(r.asn, "bgp_router_intent", getattr(r, "id", None), "asn")
         scopes_out = []
         for scope in r.scopes:
             afs_out = []
             for af in scope.address_families:
                 af_entry: dict = {"afi": af.af}
-                af_redist = redist_by_af.get(f"{asn_str}:{scope.vrf}:{af.af}", [])
+                af_redist = redist_by_af.get((asn, scope.vrf, af.af), [])
                 if af_redist:
                     af_entry["redistribute"] = af_redist
                 afs_out.append(af_entry)
-                af_seen.add((asn_str, scope.vrf, af.af))
+                af_seen.add((asn, scope.vrf, af.af))
             scope_dict = {
                 "vrf": scope.vrf,
                 "address-family": afs_out,
                 "peer": [_bgp_peer_entry(peer) for peer in scope.peers],
             }
             scopes_out.append(scope_dict)
-            scope_by_key[(asn_str, scope.vrf)] = scope_dict
-        router_dict: dict = {"asn": _parse_asn(r.asn), "scope": scopes_out}
+            scope_by_key[(asn, scope.vrf)] = scope_dict
+        router_dict: dict = {"asn": asn, "scope": scopes_out}
         if r.router_id:
             router_dict["router-id"] = r.router_id  # bgp-reconciler leaf, sibling of asn
         routers.append(router_dict)
-        router_by_asn[asn_str] = router_dict
+        router_by_asn[asn] = router_dict
 
     _attach_orphan_bgp_redistribute(routers, redist_by_af, router_by_asn, scope_by_key, af_seen)
     return {"router": routers}

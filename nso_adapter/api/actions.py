@@ -601,7 +601,7 @@ async def action_abandon_generation(
     "/{device_id}/actions/apply-diff",
     dependencies=[Depends(verify_token)],
     response_model=ApplyDiffOut,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_400, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_400, **RESP_409, **RESP_422_VALIDATION},
 )
 async def action_apply_diff(
     device_id: int,

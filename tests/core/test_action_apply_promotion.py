@@ -3923,3 +3923,29 @@ async def test_localized_refusal_fails_every_transmitted_scope(adapter_client):
             assert row.last_apply_error is not None
             assert row.last_apply_error["message"] == "apply error (nso_put_failed); see the server log"
             assert row.last_apply_at is None
+
+
+@pytest.mark.parametrize(("old_asn", "new_asn"), [("64086.59904", "4200000000"), ("4200000000", "64086.59904")])
+async def test_bgp_notation_change_with_router_id_clear_promotes_replacement(adapter_client, old_asn, new_asn):
+    from nso_adapter.store.models import GenerationMode, GenerationStatus, JobType
+
+    device_id = await seed_device(nso_device_name="placeholder-device")
+    await seed_settings(device_id, auto_apply=False)
+    endpoint = f"/api/v1/devices/{device_id}/bgp-intent?store_only=true"
+    for seq, asn, router_id in [(1, old_asn, "198.18.0.1"), (2, new_asn, None)]:
+        response = await adapter_client.put(
+            endpoint, json={"routers": [{"asn": asn, "router_id": router_id}]}, headers=AUTH | {"X-Push-Seq": str(seq)}
+        )
+        assert_text_free_of(response.text, ["placeholder-device"])
+        assert response.status_code == 200
+        response = await _apply(adapter_client, device_id, {"bgp": seq})
+        assert_text_free_of(response.text, ["placeholder-device"])
+        assert response.status_code == 202
+        if seq == 1:
+            await _settle((await _generations(device_id))[0].job_id, GenerationStatus.settled)
+    promoted = (await _generations(device_id))[1:]
+    assert len(promoted) == 1
+    assert promoted[0].mode is GenerationMode.networked
+    job = (await _jobs(device_id))[-1]
+    assert job.job_type is JobType.removal
+    assert job.context == {"scope": "bgp"}

@@ -2350,6 +2350,7 @@
               "not_implemented",
               "nso_commit_failed",
               "apply_unexecutable",
+              "asn_rule_violation",
               "ambiguous_device",
               "bad_request",
               "community_not_found",
@@ -10247,6 +10248,16 @@
             },
             "description": "Device not found"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -11065,6 +11076,16 @@
               }
             },
             "description": "Device not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Conflict"
           },
           "422": {
             "content": {
@@ -13361,6 +13382,16 @@
               }
             },
             "description": "Device not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Conflict"
           },
           "422": {
             "content": {

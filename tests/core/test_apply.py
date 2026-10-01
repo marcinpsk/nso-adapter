@@ -1524,7 +1524,11 @@ async def test_run_apply_ospf_applies_instance_interface_and_redist(adapter_clie
         # a bgp-destined redist row must NOT be swept into the ospf pass
         db.add(
             RedistributionIntent(
-                device_id=device_id, dest_protocol="bgp", source_protocol="static", accepted_at=datetime.now(UTC)
+                device_id=device_id,
+                dest_protocol="bgp",
+                dest_ref="64512::ipv4-unicast",
+                source_protocol="static",
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()

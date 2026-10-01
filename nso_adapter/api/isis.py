@@ -6,10 +6,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import Annotated
 
 import structlog
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import AfterValidator, BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,8 +18,10 @@ from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
+from nso_adapter.api.redistribution import RedistributionSourceModel, validate_unique_redistribution_sources
 from nso_adapter.api.timestamps import UtcInstant, iso_z, latest_refreshed
 from nso_adapter.core.removal import is_cleared
+from nso_adapter.domain.asn import redistribution_source_identity
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
     Device,
@@ -276,9 +279,7 @@ async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_rea
 # ---------------------------------------------------------------------------
 
 
-class RedistributionEntry(BaseModel):
-    source_protocol: str
-    source_ref: str = ""
+class RedistributionEntry(RedistributionSourceModel):
     route_map: str | None = None
     metric: int | None = None
     metric_type: str | None = None
@@ -318,7 +319,7 @@ class IsisProcessEntry(BaseModel):
     fast_reroute: str | None = None
     microloop_avoidance: bool | None = None
     accepted_at: UtcInstant | None = None
-    redistribution: list[RedistributionEntry] = []
+    redistribution: Annotated[list[RedistributionEntry], AfterValidator(validate_unique_redistribution_sources)] = []
     levels: list[IsisLevelEntry] = []
 
 
@@ -450,20 +451,28 @@ async def _sync_isis_redistribution(
         .scalars()
         .all()
     )
-    existing_map = {(r.dest_ref, r.source_protocol, r.source_ref): r for r in existing}
     incoming_keys = {
-        (dest_ref, e.source_protocol, e.source_ref) for dest_ref, e in _iter_isis_redistribution(processes)
+        (dest_ref, e.source_protocol, redistribution_source_identity(e.source_protocol, e.source_ref))
+        for dest_ref, e in _iter_isis_redistribution(processes)
     }
-
-    deleted = False
-    for key in list(existing_map):
-        if key not in incoming_keys:
-            await db.delete(existing_map[key])
-            deleted = True
+    existing_map = {}
+    removed = []
+    for existing_row in existing:
+        key = (
+            existing_row.dest_ref,
+            existing_row.source_protocol,
+            redistribution_source_identity(existing_row.source_protocol, existing_row.source_ref),
+        )
+        if key not in incoming_keys or key in existing_map:
+            removed.append((existing_row.dest_ref, existing_row.source_protocol, existing_row.source_ref))
+            await db.delete(existing_row)
+        else:
+            existing_map[key] = existing_row
+    await db.flush()
 
     cleared = False
     for dest_ref, entry in _iter_isis_redistribution(processes):
-        key = (dest_ref, entry.source_protocol, entry.source_ref)
+        key = (dest_ref, entry.source_protocol, redistribution_source_identity(entry.source_protocol, entry.source_ref))
         row = existing_map.get(key)
         if row is None:
             row = RedistributionIntent(
@@ -483,10 +492,11 @@ async def _sync_isis_redistribution(
             ):
                 if old is not None and new is None:
                     cleared = True
+        row.source_ref = entry.source_ref
         row.route_map = entry.route_map
         row.metric = entry.metric
         row.metric_type = entry.metric_type
-    return deleted, cleared
+    return bool(removed), cleared
 
 
 class IsisInterfaceIntentResult(BaseModel):

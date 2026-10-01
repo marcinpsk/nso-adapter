@@ -672,8 +672,10 @@ class JobError(Exception):
 
 
 def error_envelope(exc: BaseException, *, code: str = "internal", detail: dict | None = None) -> dict:
-    """Map an exception to its persisted envelope: a JobError verbatim, anything else type-only."""
-    if isinstance(exc, JobError):
+    """Keep typed refusal envelopes and redact unexpected exception text."""
+    from nso_adapter.domain.asn import AsnRuleViolation
+
+    if isinstance(exc, (JobError, AsnRuleViolation)):
         return {**exc.error, "detail": {**(detail or {}), **exc.error["detail"]}}
     return internal_error(exc, code=code, detail=detail)
 

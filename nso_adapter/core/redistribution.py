@@ -16,11 +16,13 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 
 import structlog
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.core.bgp import validate_bgp_as_numbers
 from nso_adapter.core.cancelsafe import await_uncancellable
 from nso_adapter.core.refresh_engine import classify_envelope_family_read
+from nso_adapter.domain.asn import checked_asn, validate_asn_rows, validate_source_as_numbers
 from nso_adapter.nso.client import NsoClient, failure_detail
 from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
@@ -63,11 +65,17 @@ def _build_rows(
     redist_list: list[dict],
     now: datetime,
     refresh_source: str,
+    location: str,
 ) -> list[DeviceRedistribution]:
+    validate_source_as_numbers(as_list(redist_list), "device_read.redistribution", location)
     rows = []
     for entry in as_list(redist_list):
         src_proto = str(entry.get("source-protocol", "")).strip()
-        src_ref = str(entry.get("source-ref", "")).strip()
+        if src_proto == "bgp":
+            checked_asn(entry.get("source-ref", ""), "device_read.redistribution", location, "source-ref")
+        src_ref = str(entry.get("source-ref", ""))
+        if src_proto != "bgp":
+            src_ref = src_ref.strip()
         if not src_proto:
             continue
         rows.append(
@@ -89,28 +97,59 @@ def _build_rows(
 
 def _ospf_redistribution_rows(device_id: int, entry: dict, now: datetime, refresh_source: str) -> list:
     rows: list[DeviceRedistribution] = []
-    for inst in as_list(entry.get("instance")):
-        rows.extend(_build_rows(device_id, "ospf", _ospf_dest_ref(inst), inst.get("redistribute"), now, refresh_source))
+    for index, inst in enumerate(as_list(entry.get("instance"))):
+        rows.extend(
+            _build_rows(
+                device_id,
+                "ospf",
+                _ospf_dest_ref(inst),
+                inst.get("redistribute"),
+                now,
+                refresh_source,
+                f"instance[{index}]",
+            )
+        )
     return rows
 
 
 def _isis_redistribution_rows(device_id: int, entry: dict, now: datetime, refresh_source: str) -> list:
     rows: list[DeviceRedistribution] = []
-    for proc in as_list(entry.get("process")):
-        rows.extend(_build_rows(device_id, "isis", _isis_dest_ref(proc), proc.get("redistribute"), now, refresh_source))
+    for index, proc in enumerate(as_list(entry.get("process"))):
+        rows.extend(
+            _build_rows(
+                device_id,
+                "isis",
+                _isis_dest_ref(proc),
+                proc.get("redistribute"),
+                now,
+                refresh_source,
+                f"process[{index}]",
+            )
+        )
     return rows
 
 
 def _bgp_redistribution_rows(device_id: int, entry: dict, now: datetime, refresh_source: str) -> list:
     rows: list[DeviceRedistribution] = []
-    for router in as_list(entry.get("router")):
+    validate_bgp_as_numbers(as_list(entry.get("router")))
+    for router_index, router in enumerate(as_list(entry.get("router"))):
         asn = str(router.get("asn", ""))
-        for scope in as_list(router.get("scope")):
+        for scope_index, scope in enumerate(as_list(router.get("scope"))):
             scope_dest_ref = _bgp_dest_ref(asn, scope)
-            for af in as_list(scope.get("address-family")):
+            for af_index, af in enumerate(as_list(scope.get("address-family"))):
                 afi = str(af.get("afi", ""))
                 dest_ref = f"{scope_dest_ref}/{afi}" if afi else scope_dest_ref
-                rows.extend(_build_rows(device_id, "bgp", dest_ref, af.get("redistribute"), now, refresh_source))
+                rows.extend(
+                    _build_rows(
+                        device_id,
+                        "bgp",
+                        dest_ref,
+                        af.get("redistribute"),
+                        now,
+                        refresh_source,
+                        f"router[{router_index}].scope[{scope_index}].address-family[{af_index}]",
+                    )
+                )
     return rows
 
 
@@ -368,6 +407,13 @@ async def _commit_partitions(
         rebuilt = await _rebuild_partitions(db, device_id, outcomes, now, refresh_source)
         # First-wins in-refresh dedup: a duplicate identity tuple in the export would
         # otherwise IntegrityError on commit (uq_deviceredistribution_identity).
+        validate_asn_rows(
+            "device_redistribution",
+            [
+                {column.name: getattr(row, column.name) for column in DeviceRedistribution.__table__.columns}
+                for row in rebuilt
+            ],
+        )
         seen: set[tuple[str, str, str, str]] = set()
         for row in rebuilt:
             key = (row.dest_protocol, row.dest_ref, row.source_protocol, row.source_ref)
@@ -492,6 +538,14 @@ async def _rebuild_partitions(
     refresh_source: str,
 ) -> list[DeviceRedistribution]:
     """Apply the per-component aggregation (R1-F7): replace / keep-unsupported / keep-failed."""
+    stored = (await db.scalars(select(DeviceRedistribution).where(DeviceRedistribution.device_id == device_id))).all()
+    validate_asn_rows(
+        "device_redistribution",
+        [
+            {column.name: getattr(row, column.name) for column in DeviceRedistribution.__table__.columns}
+            for row in stored
+        ],
+    )
     rebuilt: list[DeviceRedistribution] = []
     for proto, _wire_name, builder in _REDIST_COMPONENTS:
         outcome = outcomes[proto]

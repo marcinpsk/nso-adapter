@@ -46,6 +46,7 @@ from nso_adapter.core.static_route_plan import (
     hydrate_static_route_apply_plan,
     recorded_static_route_apply_mode,
 )
+from nso_adapter.domain.asn import AsnRuleViolation, validate_asn_rows
 from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.apply import NsoApplyError
 from nso_adapter.nso.client import failure_detail
@@ -806,6 +807,8 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
         reason = _apply_error_summary(exc)
         logger.warning("apply_diff.failed", **device_fields(device_id=device_id), error=reason)
         return ApplyPreview({PREVIEW_KEY: f"!! preview unavailable: {reason}"}, *identity)
+    except AsnRuleViolation:
+        raise
     except Exception as exc:  # noqa: BLE001 — the preview must never fail hard
         internal = internal_error(exc)
         logger.warning("apply_diff.failed", **device_fields(device_id=device_id), error=internal["message"])
@@ -1364,6 +1367,8 @@ async def _document_reader_compare(
             continue
         try:
             preps[section] = await _reader_compare_prepare(section, apply_rows.sent, apply_rows.ned_id)
+        except AsnRuleViolation:
+            raise
         except Exception as exc:  # noqa: BLE001 — a family's translation must never fail the apply
             logger.warning(
                 "apply.reader_compare_error",
@@ -1422,6 +1427,8 @@ async def _document_reader_compare(
                     device_id=device.id,
                     stamp_of=sections[section].stamp_of,
                 )
+            except AsnRuleViolation:
+                raise
             except Exception as exc:  # noqa: BLE001 — a read-side glitch never fails a good commit
                 logger.warning(
                     "apply.reader_compare_error",
@@ -1433,12 +1440,15 @@ async def _document_reader_compare(
                 n_ok, n_failed, fails, status, evidence = s_ok, 0, [], "error", {}
         reader_compare[section] = status
         evidence_by_section[section] = evidence
-        if unverifiable:
-            reader_compare_unverifiable[section] = unverifiable
+        reader_compare_unverifiable[section] = unverifiable
         if n_failed:
             outcomes[key] = (n_ok, n_failed)
             failures.setdefault(key, []).extend(fails)
-    return reader_compare, reader_compare_unverifiable, evidence_by_section
+    return (
+        reader_compare,
+        {key: values for key, values in reader_compare_unverifiable.items() if values},
+        evidence_by_section,
+    )
 
 
 class _SectionApply(NamedTuple):
@@ -1604,6 +1614,8 @@ async def _commit_document(
         blocked = True
     except NsoApplyError as exc:
         commit_error = exc
+    except AsnRuleViolation:
+        raise
     except Exception as exc:  # noqa: BLE001 — surface as a job-level failure
         # The TYPE only: exception text can carry credentials (a RESTCONF error echoes the
         # request, an httpx error its headers) and this payload is persisted on every row.
@@ -1839,6 +1851,27 @@ def _unrenderable_community_list(row, ned_id: str | None) -> bool:
     return len(community_dialect_for(ned_id).unrepresentable_members(sorted(members))) == len(members)
 
 
+def _validate_reader_as_numbers(rows) -> None:
+    """Refuse invalid stored AS values before reader key comparison."""
+    from nso_adapter.store import models as m
+
+    tables: dict[str, list[dict]] = {}
+    for row in rows:
+        model = type(row)
+        if hasattr(model, "__table__"):
+            tables.setdefault(model.__tablename__, []).append(
+                {column.name: getattr(row, column.name) for column in model.__table__.columns}
+            )
+        if isinstance(row, m.BgpRouterIntent):
+            for scope in row.scopes:
+                for peer in scope.peers:
+                    tables.setdefault("bgp_peer_intent", []).append(
+                        {column.name: getattr(peer, column.name) for column in peer.__table__.columns}
+                    )
+    for table, records in tables.items():
+        validate_asn_rows(table, records)
+
+
 def _reader_compare_expected(section: str, rows, ned_id: str | None = None) -> list[tuple[Any, str, tuple]]:
     """(intent row, YANG-list label, key tuple) for every checkable intended object (#108).
 
@@ -1853,6 +1886,7 @@ def _reader_compare_expected(section: str, rows, ned_id: str | None = None) -> l
     from nso_adapter.core.removal import _ROUTE_POLICY_FAMILY_LISTS
     from nso_adapter.store import models as m
 
+    _validate_reader_as_numbers(rows)
     verify = section_registry()[section].verify
     if isinstance(verify, NoComparison):
         return []
@@ -1976,12 +2010,13 @@ def _reader_compare_walk(
     from nso_adapter.core.removal import _norm_key, _reader_keys
 
     present = {gl.label: _reader_keys(scope, section, gl) for gl in lists}
+    guards = {gl.label: gl for gl in lists}
     row_by_id: dict[int, Any] = {}
     missing: dict[int, list[str]] = {}
     evidence: dict[int, str] = {}
     for row, label, key in translated:
         pk = getattr(row, "id", None)
-        if _norm_key(key) in present.get(label, set()):
+        if _norm_key(key, scope, guards[label]) in present.get(label, set()):
             # setdefault, never a plain assignment: a row can contribute several grains
             # (an IS-IS interface per address family), and one present grain must not
             # overwrite a sibling grain already found missing.
@@ -2402,7 +2437,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -
             # §4.6's single transaction exists to prevent. Nothing further is written, the
             # post-apply refresh is skipped, and claim recovery decides (G38).
             raise
-        except JobError as exc:
+        except (JobError, AsnRuleViolation) as exc:
             logger.warning("apply.refused", job_id=job_id, device_id=device_id, code=exc.error["code"])
             await db.rollback()
             if await _write_terminal(db, job_id, JobStatus.failed, None, exc.error, reg):
