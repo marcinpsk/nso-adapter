@@ -3672,6 +3672,82 @@ async def test_action_failure_preserves_unverifiable_labels(adapter_client, vaul
         assert job.result["reader_compare_unverifiable"]["snmp"], "the unverifiable community must survive the error"
 
 
+@pytest.mark.parametrize("reader_refuses_asn", [False, True], ids=["static-route-claim-loss", "reader-asn-refusal"])
+async def test_revoked_document_apply_preserves_successor_attribute_state(
+    adapter_client, monkeypatch, reader_refuses_asn
+):
+    from nso_adapter.core.claim import (
+        ClaimLostError,
+        acquire_claim,
+        claim_stale_cutoff,
+        lock_claim,
+        revoke_stale_claims,
+    )
+    from nso_adapter.domain.asn import AsnRuleViolation
+    from nso_adapter.store.models import BgpRouterIntent, StaticRouteIntent
+    from tests.core.test_claim import _backdate_heartbeat
+    from tests.core.test_generation_protocol import recorded_client
+
+    device_id = await _seed_device(name="placeholder-device")
+    _, attr_id = await _seed_interface_with_intent(device_id, "Gi0/0", "description", "uplink", SyncState.accepted)
+    async with session() as db:
+        db.add(BgpRouterIntent(device_id=device_id, asn="64512", accepted_at=datetime.now(UTC)))
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id,
+                vrf="",
+                prefix="198.18.0.0/24",
+                next_hop="198.18.1.1",
+                accepted_at=datetime.now(UTC),
+            )
+        )
+        await db.commit()
+    job_id = await _seed_apply_job(device_id)
+    reg = await acquire_claim(device_id, "job", job_id=job_id)
+    assert reg.registered
+    client, recorder = recorded_client("placeholder-device")
+    read_state = client.run_device_state_read.side_effect
+    revoked = False
+
+    async def read_after_takeover(device_name, wires, **kwargs):
+        nonlocal revoked
+        if not revoked:
+            assert recorder.commits
+            async with session() as db:
+                assert (await db.get(InterfaceAttrState, attr_id)).sync_state == SyncState.deploying
+            await _backdate_heartbeat(device_id, seconds=claim_stale_cutoff() + 60)
+            async with session() as db:
+                claims = await revoke_stale_claims(db=db)
+            assert [claim.device_id for claim in claims] == [device_id]
+            successor = await acquire_claim(device_id, "job")
+            assert successor.registered
+            async with session() as db:
+                await lock_claim(db, successor)
+                state = await db.get(InterfaceAttrState, attr_id)
+                state.sync_state = SyncState.in_sync
+                await db.commit()
+            revoked = True
+        state = await read_state(device_name, wires, **kwargs)
+        if "bgp-config" in wires:
+            state["bgp-config"] = {
+                "status": "ok",
+                "router": [{"asn": "064512" if reader_refuses_asn else "64512"}],
+            }
+        return state
+
+    client.run_device_state_read.side_effect = read_after_takeover
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda instance: client)
+
+    with pytest.raises(ClaimLostError) as raised:
+        await run_apply(job_id, device_id, reg=reg)
+
+    assert revoked
+    if reader_refuses_asn:
+        assert isinstance(raised.value.__context__, AsnRuleViolation)
+    async with session() as db:
+        assert (await db.get(InterfaceAttrState, attr_id)).sync_state == SyncState.in_sync
+
+
 async def test_reader_asn_refusal_reverts_deploying_and_discards_success_stamps(adapter_client, monkeypatch):
     from nso_adapter.store.models import BgpRouterIntent
     from tests.core.test_generation_protocol import recorded_client
