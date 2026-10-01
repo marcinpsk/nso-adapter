@@ -185,6 +185,57 @@ async def test_tick_unreadable_address_skips_all_probes_and_flips(monkeypatch, a
     assert client.calls == []
 
 
+@pytest.mark.parametrize("invalid_fields", [("primary_ip",), ("oob_ip",), ("primary_ip", "oob_ip")])
+@pytest.mark.parametrize("active", ["primary", "oob"])
+async def test_tick_invalid_stored_address_defers_without_io(monkeypatch, invalid_fields, active):
+    cfg = SchedulerConfig()
+    probes = _stub_probe(monkeypatch, reachable=True)
+    fo = _failover_row(active=active, consecutive_failures=2, consecutive_successes=4)
+    for field in invalid_fields:
+        setattr(fo, field, "not-an-ip")
+    client = FakeNso()
+
+    with capture_logs() as logs:
+        await _tick(_device(), fo, client, cfg, now=_BASE, oob_due=True)
+
+    assert fo.failback_blocked_reason == "stored_address_invalid"
+    assert fo.next_primary_probe_at == _BASE + timedelta(minutes=cfg.failover_primary_probe_interval)
+    interval = cfg.failover_primary_probe_interval if active == "oob" else cfg.failover_oob_probe_interval
+    assert fo.next_oob_probe_at == _BASE + timedelta(minutes=interval)
+    assert fo.active_address == active
+    assert (fo.consecutive_failures, fo.consecutive_successes) == (2, 4)
+    assert probes["n"] == 0
+    assert client.calls == []
+    assert logs == [
+        {
+            "event": "failover.stored_address_invalid",
+            "log_level": "error",
+            "device_id": 1,
+            "fields": list(invalid_fields),
+        }
+    ]
+
+
+@pytest.mark.parametrize("invalid_field", ["primary_ip", "oob_ip"])
+async def test_tick_invalid_stored_address_schedules_only_configured_fields(monkeypatch, invalid_field):
+    cfg = SchedulerConfig()
+    probes = _stub_probe(monkeypatch, reachable=True)
+    fo = DeviceFailover(device_id=1, primary_ip=None, oob_ip=None, active_address="primary")
+    setattr(fo, invalid_field, "not-an-ip")
+    client = FakeNso()
+
+    await run_failover_tick(_device(), fo, client, cfg, now=_BASE, jitter_fraction=0.25)
+
+    due_field = "next_primary_probe_at" if invalid_field == "primary_ip" else "next_oob_probe_at"
+    absent_due_field = "next_oob_probe_at" if invalid_field == "primary_ip" else "next_primary_probe_at"
+    interval = cfg.failover_primary_probe_interval if invalid_field == "primary_ip" else cfg.failover_oob_probe_interval
+    assert _BASE + timedelta(minutes=interval) <= getattr(fo, due_field) <= _BASE + timedelta(minutes=interval * 1.25)
+    assert getattr(fo, absent_due_field) is None
+    assert fo.failback_blocked_reason == "stored_address_invalid"
+    assert probes["n"] == 0
+    assert client.calls == []
+
+
 async def test_oob_health_probe_restores_observed_address(monkeypatch):
     _stub_probe(monkeypatch, reachable=True)
     fo = _failover_row()

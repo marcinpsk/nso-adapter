@@ -119,6 +119,79 @@ async def _arm_and_load(device_id: int) -> DeviceFailover:
         return row
 
 
+@pytest.mark.parametrize("invalid_field", ["primary_ip", "oob_ip"])
+async def test_scheduler_defers_invalid_stored_address(adapter_client, monkeypatch, invalid_field):
+    from datetime import UTC, datetime
+
+    sim = _NsoSim(address="198.18.0.1")
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+    device_id = await _seed(primary="198.18.0.1", oob="198.18.0.2")
+    now = datetime.now(UTC)
+    async with session() as db:
+        row = await db.scalar(select(DeviceFailover).where(DeviceFailover.device_id == device_id))
+        setattr(row, invalid_field, "not-an-ip")
+        await db.commit()
+        assert device_id in await sched._due_failover_device_ids(db, now)
+
+    await sched._scheduled_failover_probe()
+
+    async with session() as db:
+        row = await db.scalar(select(DeviceFailover).where(DeviceFailover.device_id == device_id))
+        assert row.failback_blocked_reason == "stored_address_invalid"
+        assert row.next_primary_probe_at > now
+        assert row.next_oob_probe_at > now
+        assert device_id not in await sched._due_failover_device_ids(db, datetime.now(UTC))
+    assert sim.patches == []
+    assert sim.connects == 0
+
+
+@pytest.mark.parametrize("invalid_field", ["primary_ip", "oob_ip"])
+@pytest.mark.parametrize("active", ["primary", "oob"])
+@pytest.mark.parametrize("remove", [False, True])
+async def test_upsert_repairs_invalid_stored_address(adapter_client, invalid_field, active, remove):
+    from datetime import UTC, datetime
+
+    from nso_adapter.core.failover import upsert_failover_ips
+
+    device_id = await _seed(primary="198.18.0.1", oob="198.18.0.2", active=active)
+    far = datetime(2099, 1, 1, tzinfo=UTC)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        row = await db.scalar(select(DeviceFailover).where(DeviceFailover.device_id == device_id))
+        setattr(row, invalid_field, "not-an-ip")
+        row.failback_blocked_reason = "stored_address_invalid"
+        row.next_primary_probe_at = row.next_oob_probe_at = far
+        row.consecutive_failures = 2
+        row.consecutive_successes = 4
+        row.last_probe_result = "unreachable"
+        row.oob_healthy = False
+        row.oob_health_result = "unreachable"
+        await db.commit()
+        primary = None if remove and invalid_field == "primary_ip" else "198.18.0.1"
+        oob = None if remove and invalid_field == "oob_ip" else "198.18.0.2"
+
+        assert await upsert_failover_ips(db, device, primary, oob)
+        await db.commit()
+        await db.refresh(row)
+
+        assert (row.primary_ip, row.oob_ip) == (primary, oob)
+        assert row.failback_blocked_reason is None
+        assert row.active_address == active
+        if invalid_field == "primary_ip":
+            assert (row.consecutive_failures, row.consecutive_successes) == (0, 0)
+            assert row.last_probe_result is None
+            if not remove:
+                assert row.next_primary_probe_at < far
+            assert row.next_oob_probe_at == far
+        else:
+            assert row.oob_healthy is None
+            assert row.oob_health_result is None
+            if not remove:
+                assert row.next_oob_probe_at < far
+            assert row.next_primary_probe_at == far
+
+
 async def test_plugin_scope_preserves_bootstrapped_oob(adapter_client_with_nso, monkeypatch):
     sim = _NsoSim(address="192.0.2.5")
     sim.reachable_addrs = {"192.0.2.5"}
@@ -763,6 +836,8 @@ async def test_upsert_retains_active_oob_and_accepts_distinct_primary(adapter_cl
 @pytest.mark.parametrize("field", ["primary_ip", "oob_ip"])
 @pytest.mark.parametrize("address", ["", "198.18.0.1/32", " 198.18.0.1"])
 async def test_stored_invalid_address_fails_closed(adapter_client, monkeypatch, debug_logs, field, address):
+    from datetime import UTC, datetime
+
     sim = _NsoSim(address="198.18.0.1")
     sim.always_reachable = True
     client = _client_for(sim)
@@ -774,14 +849,21 @@ async def test_stored_invalid_address_fails_closed(adapter_client, monkeypatch, 
 
     await sched._scheduled_failover_probe()
 
-    errors = [entry for entry in debug_logs if entry["event"] == "scheduler.failover.error"]
+    errors = [entry for entry in debug_logs if entry["event"] == "failover.stored_address_invalid"]
     assert len(errors) == 1
-    assert f"Invalid stored failover {field}" in errors[0]["error"]
-    assert errors[0]["device_id"] == device_id
+    assert errors[0] == {
+        "event": "failover.stored_address_invalid",
+        "log_level": "error",
+        "device_id": device_id,
+        "fields": [field],
+    }
     assert sim.connects == 0
     assert sim.patches == []
     row = await _load(device_id)
     assert getattr(row, field) == address
+    assert row.failback_blocked_reason == "stored_address_invalid"
+    async with session() as db:
+        assert device_id not in await sched._due_failover_device_ids(db, datetime.now(UTC))
 
 
 @pytest.mark.parametrize("role", ["primary", "oob"])
