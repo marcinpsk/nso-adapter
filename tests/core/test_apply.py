@@ -3670,3 +3670,62 @@ async def test_action_failure_preserves_unverifiable_labels(adapter_client, vaul
         assert job.status == JobStatus.succeeded  # a read error never fails a good apply
         assert job.result["reader_compare"]["snmp"] == "error"
         assert job.result["reader_compare_unverifiable"]["snmp"], "the unverifiable community must survive the error"
+
+
+async def test_reader_asn_refusal_reverts_deploying_and_discards_success_stamps(adapter_client, monkeypatch):
+    from nso_adapter.store.models import BgpRouterIntent
+    from tests.core.test_generation_protocol import recorded_client
+
+    device_id = await _seed_device(name="placeholder-device")
+    _, attr_id = await _seed_interface_with_intent(device_id, "Gi0/0", "description", "uplink", SyncState.accepted)
+    async with session() as db:
+        db.add(BgpRouterIntent(device_id=device_id, asn="64512", accepted_at=datetime.now(UTC)))
+        await db.commit()
+    job_id = await _seed_apply_job(device_id)
+    client, recorder = recorded_client(
+        "placeholder-device",
+        device_state={"bgp-config": {"status": "ok", "router": [{"asn": "064512"}]}},
+    )
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda instance: client)
+
+    await run_apply(job_id, device_id)
+
+    assert recorder.commits
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.error["code"] == "asn_rule_violation"
+        assert (await db.get(InterfaceAttrState, attr_id)).sync_state == SyncState.accepted
+        intent = await db.scalar(select(InterfaceIntent).where(InterfaceIntent.attribute == "description"))
+        assert intent.last_apply_at is None
+        assert (await db.scalar(select(BgpRouterIntent))).last_apply_at is None
+
+
+@pytest.mark.parametrize("commit_landed", [True, False])
+async def test_unknown_terminal_commit_does_not_revert_attribute_states(adapter_client, monkeypatch, commit_landed):
+    from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimOutcome
+    from tests.core.test_generation_protocol import recorded_client
+
+    device_id = await _seed_device(name="placeholder-device")
+    _, attr_id = await _seed_interface_with_intent(device_id, "Gi0/0", "description", "uplink", SyncState.accepted)
+    job_id = await _seed_apply_job(device_id)
+    client, recorder = recorded_client("placeholder-device")
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda instance: client)
+
+    async def unknown_commit(db):
+        if commit_landed:
+            await db.commit()
+        else:
+            await db.rollback()
+        return ClaimOutcome.OUTCOME_UNKNOWN
+
+    monkeypatch.setattr("nso_adapter.core.claim._commit_outcome", unknown_commit)
+    with pytest.raises(BookkeepingOutcomeUnknown):
+        await run_apply(job_id, device_id)
+
+    assert recorder.commits
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == (JobStatus.succeeded if commit_landed else JobStatus.running)
+        state = await db.get(InterfaceAttrState, attr_id)
+        assert state.sync_state == (SyncState.in_sync if commit_landed else SyncState.deploying)

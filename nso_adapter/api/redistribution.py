@@ -36,12 +36,11 @@ class RedistributionSourceModel(BaseModel):
         return value
 
 
-def validate_unique_redistribution_sources(entries: list) -> list:
+def validate_unique_redistribution_sources(entries: list) -> None:
     """Refuse repeated source identities within one redistribution destination."""
     keys = [(e.source_protocol, redistribution_source_identity(e.source_protocol, e.source_ref)) for e in entries]
     if len(keys) != len(set(keys)):
-        raise ValueError("Redistribution sources must have unique AS numbers or instance references")
-    return entries
+        raise api_error(409, "conflict", "Redistribution sources must have unique AS numbers or instance references")
 
 
 class RedistributionOut(BaseModel):

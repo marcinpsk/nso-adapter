@@ -6,11 +6,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Annotated
 
 import structlog
 from fastapi import APIRouter, Depends
-from pydantic import AfterValidator, BaseModel
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -178,7 +177,7 @@ class OspfInstanceEntry(BaseModel):
     vrf: str = ""
     enabled: bool | None = None
     areas: list[dict] = []
-    redistribution: Annotated[list[RedistributionEntry], AfterValidator(validate_unique_redistribution_sources)] = []
+    redistribution: list[RedistributionEntry] = []
 
 
 class OspfInterfaceEntry(BaseModel):
@@ -362,6 +361,8 @@ async def put_ospf_intent(
     on-device (a merge-PATCH apply would not). Both jobs run in the background so this PUT
     never blocks on the device commit.
     """
+    for process in payload.instances:
+        validate_unique_redistribution_sources(process.redistribution)
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")

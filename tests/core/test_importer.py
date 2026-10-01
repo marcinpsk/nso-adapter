@@ -2335,3 +2335,39 @@ async def test_ned_id_read_failure_records_use_stable_device_ids(db_session: Asy
     assert records[0] != records[1], "two instances' failures collapsed into one record"
     assert [record["device_id"] for record in records] == device_ids
     assert_records_free_of(records, ["sw-twins", "nso-east", "nso-west"])
+
+
+async def test_projected_asn_refusal_preserves_a_later_surface_refresh(adapter_client):
+    from nso_adapter.core.bgp import refresh_bgp_config_for_device
+    from nso_adapter.core.importer import _run_surfaces_projected
+    from nso_adapter.core.static_route import refresh_static_routes_for_device
+    from nso_adapter.domain.asn import AsnRuleViolation
+    from nso_adapter.store.models import DeviceStaticRoute
+    from tests.conftest import seed_device, session
+
+    class DeviceRead:
+        async def get_device_state_doc(self, device_name):
+            return {
+                "bgp-config": {"status": "ok", "router": [{"asn": "064512"}]},
+                "static-route": {
+                    "status": "ok",
+                    "route": [{"vrf": "", "prefix": "198.18.0.0/24", "next-hop": "198.18.1.1"}],
+                },
+            }
+
+    device_id = await seed_device(nso_device_name="placeholder-device")
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        with pytest.raises(AsnRuleViolation) as caught:
+            await _run_surfaces_projected(
+                db,
+                device,
+                DeviceRead(),
+                [("bgp", refresh_bgp_config_for_device), ("static_route", refresh_static_routes_for_device)],
+                "test",
+            )
+        assert caught.value.error["code"] == "asn_rule_violation"
+        await db.rollback()
+    async with session() as db:
+        routes = (await db.scalars(select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device_id))).all()
+        assert [(row.prefix, row.next_hop) for row in routes] == [("198.18.0.0/24", "198.18.1.1")]

@@ -413,3 +413,55 @@ def test_igp_verifiers_refuse_malformed_bgp_redistribution_source_as(protocol):
     body = {protocol: {"process-config": [parent]}}
     with pytest.raises(AsnRuleViolation, match="violates RFC 5396"):
         _document_orphans(body, body, {})
+
+
+@pytest.mark.parametrize("dest_ref", ["64512/", "64512/placeholder-vrf", "64512//ipv4-unicast"])
+def test_device_redistribution_accepts_builder_destination_shapes(dest_ref):
+    from nso_adapter.domain.asn import asn_row_identity
+
+    row = {"dest_protocol": "bgp", "dest_ref": dest_ref, "source_protocol": "connected", "source_ref": ""}
+    assert asn_row_identity("device_redistribution", row) == ("bgp", (64512, *dest_ref.split("/")[1:]), "connected", "")
+
+
+@pytest.mark.parametrize(
+    "table,dest_ref",
+    [
+        ("device_redistribution", "64512"),
+        ("redistribution_intent", "64512:vrf"),
+    ],
+)
+def test_redistribution_refuses_unknown_destination_shapes(table, dest_ref):
+    from nso_adapter.domain.asn import asn_row_identity
+
+    with pytest.raises(AsnRuleViolation) as caught:
+        asn_row_identity(table, {"dest_protocol": "bgp", "dest_ref": dest_ref, "source_protocol": "connected"})
+    assert caught.value.error["detail"]["field"] == "dest_ref"
+
+
+async def test_redistribution_refresh_accepts_an_afi_less_bgp_device_family(adapter_client):
+    from nso_adapter.core.redistribution import refresh_redistribution_from_outcomes
+    from nso_adapter.nso.read_outcome import Freshness, Present
+    from nso_adapter.store.models import DeviceRedistribution
+
+    device_id = await seed_device(nso_device_name="placeholder-device")
+    bgp = {
+        "router": [
+            {
+                "asn": "64512",
+                "scope": [
+                    {"vrf": "placeholder-vrf", "address-family": [{"redistribute": [{"source-protocol": "connected"}]}]}
+                ],
+            }
+        ]
+    }
+    outcomes = {
+        protocol: Present(bgp if protocol == "bgp" else {}, Freshness.fresh) for protocol in ["bgp", "ospf", "isis"]
+    }
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        assert await refresh_redistribution_from_outcomes(db, device, outcomes)
+        row = await db.scalar(select(DeviceRedistribution).where(DeviceRedistribution.device_id == device_id))
+        assert row.dest_ref == "64512/placeholder-vrf"
+    response = await adapter_client.get(f"/api/v1/devices/{device_id}/redistribution", headers=AUTH)
+    assert response.status_code == 200
+    assert response.json()["entries"][0]["dest_ref"] == "64512/placeholder-vrf"

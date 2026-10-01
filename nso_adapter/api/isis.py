@@ -6,11 +6,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Annotated
 
 import structlog
 from fastapi import APIRouter, Depends
-from pydantic import AfterValidator, BaseModel
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -319,7 +318,7 @@ class IsisProcessEntry(BaseModel):
     fast_reroute: str | None = None
     microloop_avoidance: bool | None = None
     accepted_at: UtcInstant | None = None
-    redistribution: Annotated[list[RedistributionEntry], AfterValidator(validate_unique_redistribution_sources)] = []
+    redistribution: list[RedistributionEntry] = []
     levels: list[IsisLevelEntry] = []
 
 
@@ -523,6 +522,8 @@ async def put_isis_interface_intent(
     ``accepted_at`` defaults to now if not supplied.  If ``auto_apply`` is
     enabled on the device, an apply job is enqueued after the upsert.
     """
+    for process in body.processes:
+        validate_unique_redistribution_sources(process.redistribution)
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")

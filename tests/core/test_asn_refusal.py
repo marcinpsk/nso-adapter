@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import select
 
 from nso_adapter.core.apply import _reader_compare_expected
-from nso_adapter.core.bgp import _upsert_bgp_data
+from nso_adapter.core.bgp import refresh_bgp_config_for_device
 from nso_adapter.core.generation import _fragment_deletions, _retain_rows
 from nso_adapter.core.projection import snapshot_stream
 from nso_adapter.core.removal import _document_orphans, promotion_removal_context
@@ -55,20 +55,39 @@ def test_reader_compare_refuses_stored_peer():
     assert caught.value.error["detail"] == {"table": "bgp_peer_intent", "row_id": 9, "field": "remote_as"}
 
 
-async def test_refresh_refuses_stored_mirror_and_retains_it(adapter_client):
+async def test_refresh_replaces_invalid_stored_bgp_mirror(adapter_client):
+    class ValidDeviceRead:
+        async def get_device_state_section(self, device_name, section):
+            return {"status": "ok", "router": [{"asn": "64512"}]}
+
     device_id = await seed_device(nso_device_name="placeholder-device")
     async with session() as db:
         device = await db.get(Device, device_id)
-        row = DeviceBgpRouter(device_id=device_id, asn="064512")
-        db.add(row)
+        db.add(DeviceBgpRouter(device_id=device_id, asn="064512"))
         await db.commit()
-        with pytest.raises(AsnRuleViolation) as caught:
-            await _upsert_bgp_data(db, device, [{"asn": "64512"}], "test")
-        assert caught.value.error["detail"]["row_id"] == row.id
-        assert (await db.scalar(select(DeviceBgpRouter))).asn == "064512"
+        response = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "asn_rule_violation"
+        assert await refresh_bgp_config_for_device(db, device, ValidDeviceRead())
+        assert [row.asn for row in (await db.scalars(select(DeviceBgpRouter))).all()] == ["64512"]
     response = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
-    assert response.status_code == 409
-    assert response.json()["error"]["code"] == "asn_rule_violation"
+    assert response.status_code == 200
+    assert [row["asn"] for row in response.json()["routers"]] == ["64512"]
+
+
+async def test_refresh_refuses_invalid_incoming_bgp_and_retains_mirror(adapter_client):
+    class InvalidDeviceRead:
+        async def get_device_state_section(self, device_name, section):
+            return {"status": "ok", "router": [{"asn": "064512"}]}
+
+    device_id = await seed_device(nso_device_name="placeholder-device")
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        db.add(DeviceBgpRouter(device_id=device_id, asn="64512"))
+        await db.commit()
+        with pytest.raises(AsnRuleViolation):
+            await refresh_bgp_config_for_device(db, device, InvalidDeviceRead())
+        assert [row.asn for row in (await db.scalars(select(DeviceBgpRouter))).all()] == ["64512"]
 
 
 async def test_apply_job_surfaces_stored_document_refusal(adapter_client):
@@ -186,7 +205,7 @@ async def test_apply_job_fails_closed_on_invalid_device_read(adapter_client):
     assert job.error["detail"]["table"] == "device_read.bgp"
 
 
-async def test_redistribution_refresh_refuses_stored_violation(adapter_client):
+async def test_redistribution_refresh_replaces_invalid_stored_mirror(adapter_client):
     from nso_adapter.core.redistribution import refresh_redistribution_from_outcomes
     from nso_adapter.nso.read_outcome import Freshness, Present
     from nso_adapter.store.models import DeviceRedistribution
@@ -194,24 +213,101 @@ async def test_redistribution_refresh_refuses_stored_violation(adapter_client):
     device_id = await seed_device(nso_device_name="placeholder-device")
     async with session() as db:
         device = await db.get(Device, device_id)
-        row = DeviceRedistribution(
-            device_id=device_id,
-            dest_protocol="ospf",
-            dest_ref="placeholder-process",
-            source_protocol="bgp",
-            source_ref="064512",
-        )
-        db.add(row)
-        await db.commit()
-        with pytest.raises(AsnRuleViolation) as caught:
-            await refresh_redistribution_from_outcomes(
-                db, device, {protocol: Present({}, Freshness.fresh) for protocol in ["ospf", "isis", "bgp"]}
+        db.add(
+            DeviceRedistribution(
+                device_id=device_id,
+                dest_protocol="ospf",
+                dest_ref="placeholder-process",
+                source_protocol="bgp",
+                source_ref="064512",
             )
-        assert caught.value.error["detail"]["row_id"] == row.id
-        assert (await db.scalar(select(DeviceRedistribution))).source_ref == "064512"
+        )
+        await db.commit()
+        response = await adapter_client.get(f"/api/v1/devices/{device_id}/redistribution", headers=AUTH)
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "asn_rule_violation"
+        ospf = {
+            "instance": [
+                {
+                    "process-id": "placeholder-process",
+                    "redistribute": [{"source-protocol": "bgp", "source-ref": "64512"}],
+                }
+            ]
+        }
+        outcomes = {
+            protocol: Present(ospf if protocol == "ospf" else {}, Freshness.fresh)
+            for protocol in ["ospf", "isis", "bgp"]
+        }
+        assert await refresh_redistribution_from_outcomes(db, device, outcomes)
+        assert [row.source_ref for row in (await db.scalars(select(DeviceRedistribution))).all()] == ["64512"]
     response = await adapter_client.get(f"/api/v1/devices/{device_id}/redistribution", headers=AUTH)
-    assert response.status_code == 409
-    assert response.json()["error"]["code"] == "asn_rule_violation"
+    assert response.status_code == 200
+    assert response.json()["entries"][0]["source_ref"] == "64512"
+
+
+@pytest.mark.parametrize("reason", ["unsupported", "read_error"])
+async def test_redistribution_refresh_keeps_unavailable_partition(adapter_client, reason):
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.redistribution import refresh_redistribution_from_outcomes
+    from nso_adapter.nso.read_outcome import Freshness, Present, Unavailable, UnavailableReason
+    from nso_adapter.store.models import DeviceRedistribution
+
+    device_id = await seed_device(nso_device_name="placeholder-device")
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        db.add(
+            DeviceRedistribution(
+                device_id=device_id,
+                dest_protocol="ospf",
+                dest_ref="placeholder-process",
+                source_protocol="bgp",
+                source_ref="064512",
+            )
+        )
+        await db.commit()
+        outcomes = {protocol: Present({}, Freshness.fresh) for protocol in ["isis", "bgp"]}
+        outcomes["ospf"] = Unavailable(UnavailableReason(reason))
+        with capture_logs() as logs:
+            assert await refresh_redistribution_from_outcomes(db, device, outcomes) == (reason == "unsupported")
+        assert (await db.scalar(select(DeviceRedistribution))).source_ref == "064512"
+        done = next(record for record in logs if record["event"] == "redistribution.refresh.done")
+        assert done["row_count"] == 0
+
+
+async def test_redistribution_refresh_refuses_invalid_incoming_source(adapter_client):
+    from nso_adapter.core.redistribution import refresh_redistribution_from_outcomes
+    from nso_adapter.nso.read_outcome import Freshness, Present
+    from nso_adapter.store.models import DeviceRedistribution
+
+    device_id = await seed_device(nso_device_name="placeholder-device")
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        db.add(
+            DeviceRedistribution(
+                device_id=device_id,
+                dest_protocol="ospf",
+                dest_ref="placeholder-process",
+                source_protocol="bgp",
+                source_ref="64512",
+            )
+        )
+        await db.commit()
+        ospf = {
+            "instance": [
+                {
+                    "process-id": "placeholder-process",
+                    "redistribute": [{"source-protocol": "bgp", "source-ref": "064512"}],
+                }
+            ]
+        }
+        outcomes = {
+            protocol: Present(ospf if protocol == "ospf" else {}, Freshness.fresh)
+            for protocol in ["ospf", "isis", "bgp"]
+        }
+        with pytest.raises(AsnRuleViolation):
+            await refresh_redistribution_from_outcomes(db, device, outcomes)
+        assert (await db.scalar(select(DeviceRedistribution))).source_ref == "64512"
 
 
 def test_detach_only_colliding_prior_rows_refuse_without_retirement():

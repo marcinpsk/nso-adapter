@@ -64,7 +64,8 @@ def asn_row_identity(table: str, row: dict) -> tuple | None:
         if row.get("dest_protocol") == "bgp":
             separator = ":" if table == "redistribution_intent" else "/"
             parts = destination.split(separator, 2)
-            if len(parts) != 3:
+            valid_lengths = (3,) if table == "redistribution_intent" else (2, 3)
+            if len(parts) not in valid_lengths:
                 raise AsnRuleViolation(table, row_id, "dest_ref", destination)
             destination = (checked_asn(parts[0], table, row_id, "dest_ref"), *parts[1:])
         if row.get("source_protocol") == "bgp":

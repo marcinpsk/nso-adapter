@@ -248,7 +248,6 @@ async def _upsert_bgp_data(
 ) -> None:
     """Full-replace: delete existing BGP rows for *device*, then insert fresh ones."""
     validate_bgp_as_numbers(routers)
-    await validate_bgp_mirror(db, device.id)
     await db.execute(delete(DeviceBgpRouter).where(DeviceBgpRouter.device_id == device.id))
 
     now = datetime.now(UTC)
