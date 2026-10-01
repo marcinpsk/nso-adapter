@@ -11,11 +11,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import structlog
-from sqlalchemy import delete, select
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
-from nso_adapter.domain.asn import AsnRuleViolation, checked_asn, validate_asn_rows, validate_source_as_numbers
+from nso_adapter.domain.asn import AsnRuleViolation, checked_asn, validate_source_as_numbers
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import (
@@ -51,22 +51,6 @@ def validate_bgp_as_numbers(routers: list[dict]) -> None:
                     for field in ("remote-as", "local-as"):
                         if peer.get(field) is not None:
                             checked_asn(peer[field], "device_read.bgp", peer_location, field)
-
-
-async def validate_bgp_mirror(db: AsyncSession, device_id: int) -> None:
-    """Refuse invalid stored mirror rows before a read or replacement."""
-    router_ids = select(DeviceBgpRouter.id).where(DeviceBgpRouter.device_id == device_id)
-    scope_ids = select(DeviceBgpScope.id).where(DeviceBgpScope.router_id.in_(router_ids))
-    for model, condition in (
-        (DeviceBgpRouter, DeviceBgpRouter.device_id == device_id),
-        (DeviceBgpPeer, DeviceBgpPeer.scope_id.in_(scope_ids)),
-        (DeviceBgpPeerGroup, DeviceBgpPeerGroup.scope_id.in_(scope_ids)),
-    ):
-        rows = (await db.scalars(select(model).where(condition).order_by(model.id))).all()
-        validate_asn_rows(
-            model.__tablename__,
-            [{column.name: getattr(row, column.name) for column in model.__table__.columns} for row in rows],
-        )
 
 
 def _paf_policy(paf_data: dict) -> dict:

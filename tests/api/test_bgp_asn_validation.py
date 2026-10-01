@@ -231,12 +231,10 @@ async def test_bgp_delete_origin_refuses_malformed_authorized_projection(adapter
         projection = (
             await db.execute(select(DeviceProjectionStream).where(DeviceProjectionStream.stream == "bgp"))
         ).scalar_one()
-        for field in ("authorized_document",):
-            document = deepcopy(getattr(projection, field))
-            assert document
-            if document:
-                document["bgp_router_intent"][0]["asn"] = "064512"
-                setattr(projection, field, document)
+        document = deepcopy(projection.authorized_document)
+        assert document
+        document["bgp_router_intent"][0]["asn"] = "064512"
+        projection.authorized_document = document
         await db.commit()
     response = await adapter_client.put(
         endpoint + "?delete_origin=true", json={"routers": []}, headers=AUTH | push_seq()
