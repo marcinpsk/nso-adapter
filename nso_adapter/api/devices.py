@@ -9,7 +9,7 @@ from uuid import UUID
 
 import structlog
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, IPvAnyAddress, field_validator
 from pydantic_core import PydanticCustomError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -472,7 +472,7 @@ class DeviceProvision(BaseModel):
     provision_attempt_id: UUID
     nso_instance: str
     device_name: str
-    address: str
+    address: IPvAnyAddress
     ned_id: str
     authgroup: str
     netbox_device_id: int | None = None
@@ -480,7 +480,7 @@ class DeviceProvision(BaseModel):
     port: int | None = None
     admin_state: str = "unlocked"
     sync: bool = True
-    oob_ip: str | None = None  # mgmt-IP failover fallback — bootstrap over OOB if primary is unreachable
+    oob_ip: IPvAnyAddress | None = None
 
 
 @router.post(
@@ -501,25 +501,25 @@ async def provision_device(body: DeviceProvision, db: AsyncSession = Depends(get
     """
     from nso_adapter.config import get_config
     from nso_adapter.core.jobs import enqueue_provision_job
-    from nso_adapter.core.provision_attempt import ProvisionAttemptConflict
+    from nso_adapter.core.provision_attempt import ProvisionAttemptConflict, ProvisionJobParams
 
     known = {inst.name for inst in get_config().nso_instances}
     if body.nso_instance not in known:
         raise api_error(422, "validation_error", _UNKNOWN_NSO_INSTANCE_MESSAGE)
 
-    params = {
-        "nso_instance": body.nso_instance,
-        "device_name": body.device_name,
-        "address": body.address,
-        "ned_id": body.ned_id,
-        "authgroup": body.authgroup,
-        "netbox_device_id": body.netbox_device_id,
-        "ned_type": body.ned_type,
-        "port": body.port,
-        "admin_state": body.admin_state,
-        "do_sync": body.sync,
-        "oob_ip": body.oob_ip,
-    }
+    params = ProvisionJobParams(
+        nso_instance=body.nso_instance,
+        device_name=body.device_name,
+        address=body.address,
+        ned_id=body.ned_id,
+        authgroup=body.authgroup,
+        netbox_device_id=body.netbox_device_id,
+        ned_type=body.ned_type,
+        port=body.port,
+        admin_state=body.admin_state,
+        do_sync=body.sync,
+        oob_ip=body.oob_ip,
+    )
     refused = None
     try:
         job, _created = await enqueue_provision_job(body.provision_attempt_id, params, db)

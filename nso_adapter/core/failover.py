@@ -636,6 +636,11 @@ async def _probe_oob(
 # ── Tick orchestrator ─────────────────────────────────────────────────────────
 
 
+def _oob_probe_interval(fo: DeviceFailover, cfg: TickConfig) -> int:
+    """Use the active cadence on OOB and the fallback cadence on primary."""
+    return cfg.failover_primary_probe_interval if fo.active_address == _OOB else cfg.failover_oob_probe_interval
+
+
 async def run_failover_tick(
     device: Device,
     fo: DeviceFailover,
@@ -676,7 +681,7 @@ async def run_failover_tick(
         if primary_due:
             fo.next_primary_probe_at = _next_due(now, cfg.failover_primary_probe_interval, jitter_fraction)
         if oob_due:
-            fo.next_oob_probe_at = _next_due(now, cfg.failover_primary_probe_interval, jitter_fraction)
+            fo.next_oob_probe_at = _next_due(now, _oob_probe_interval(fo, cfg), jitter_fraction)
         return
     if stored_role != fo.active_address and fo.active_address == _OOB:
         # Verify the observed OOB before attempting failback on a later interval.
@@ -698,14 +703,7 @@ async def run_failover_tick(
     if oob_ip is not None and not address_changed and _due(fo.next_oob_probe_at, now):
         ran = await _probe_oob(client, fo, name, cfg, now, primary_ip, oob_ip, job_active, flip_budget)
         if ran:
-            # When OOB is the ACTIVE address the operator is connecting through it, so its
-            # liveness must stay as fresh as a primary probe — use the active (primary)
-            # cadence, not the slow proactive-fallback cadence used while sitting on primary
-            # (which left a device-on-OOB showing "not checked" for up to a full OOB interval).
-            oob_interval = (
-                cfg.failover_primary_probe_interval if fo.active_address == _OOB else cfg.failover_oob_probe_interval
-            )
-            fo.next_oob_probe_at = _next_due(now, oob_interval, jitter_fraction)
+            fo.next_oob_probe_at = _next_due(now, _oob_probe_interval(fo, cfg), jitter_fraction)
 
 
 # ── IP ingestion (plugin → adapter) ───────────────────────────────────────────

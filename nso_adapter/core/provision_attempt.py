@@ -11,9 +11,25 @@ from __future__ import annotations
 
 import uuid
 
-from pydantic import BaseModel
+from pydantic import BaseModel, IPvAnyAddress
 
 from nso_adapter.store.models import Job, JobStatus
+
+
+class ProvisionJobParams(BaseModel):
+    """Share validated parameters between provision admission and execution."""
+
+    nso_instance: str
+    device_name: str
+    address: IPvAnyAddress
+    ned_id: str
+    authgroup: str
+    netbox_device_id: int | None = None
+    ned_type: str | None = None
+    port: int | None = None
+    admin_state: str = "unlocked"
+    do_sync: bool = True
+    oob_ip: IPvAnyAddress | None = None
 
 
 class ProvisionResult(BaseModel):

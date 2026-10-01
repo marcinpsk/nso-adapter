@@ -2202,6 +2202,7 @@
       "DeviceProvision": {
         "properties": {
           "address": {
+            "format": "ipvanyaddress",
             "title": "Address",
             "type": "string"
           },
@@ -2251,6 +2252,7 @@
           "oob_ip": {
             "anyOf": [
               {
+                "format": "ipvanyaddress",
                 "type": "string"
               },
               {

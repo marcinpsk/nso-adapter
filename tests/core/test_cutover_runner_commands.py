@@ -17,6 +17,7 @@ from sqlalchemy import select
 
 from nso_adapter.core.cutover_runner import main
 from nso_adapter.core.jobs import enqueue_job, enqueue_provision_job
+from nso_adapter.core.provision_attempt import ProvisionJobParams
 from nso_adapter.core.worker import run_inspected_generation
 from nso_adapter.store.models import (
     DeploymentGeneration,
@@ -236,8 +237,14 @@ async def test_discard_refuses_and_changes_nothing(maintenance_client, capsys, o
                 await start_job(offender_id)
                 described = "running connect"
             else:
-                params = {"nso_instance": "nso-dev", "device_name": "cutover-discard-onboard"}
-                offender_id = (await enqueue_provision_job(uuid.uuid4(), params, db))[0].id
+                params = {
+                    "nso_instance": "nso-dev",
+                    "device_name": "cutover-discard-onboard",
+                    "address": "198.18.0.1",
+                    "ned_id": "cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+                    "authgroup": "placeholder-authgroup",
+                }
+                offender_id = (await enqueue_provision_job(uuid.uuid4(), ProvisionJobParams(**params), db))[0].id
                 described = "queued provision"
     async with session() as db:
         sync_id = (await enqueue_job(device_id, JobType.sync, db))[0].id

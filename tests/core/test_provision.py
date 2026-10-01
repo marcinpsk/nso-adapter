@@ -5,8 +5,12 @@ orchestrator (create node → fetch-host-keys → unlock → sync-from → map).
 
 from __future__ import annotations
 
+import json
+from ipaddress import ip_address
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from nso_adapter.nso.client import NsoClient
@@ -30,6 +34,82 @@ def _steps(result):
     return {s["step"]: s["status"] for s in result["steps"]}
 
 
+def test_provision_job_context_restores_ip_objects():
+    from nso_adapter.core.provision_attempt import ProvisionJobParams
+
+    params = ProvisionJobParams(
+        nso_instance="nso-dev",
+        device_name="placeholder-device",
+        address=ip_address("2001:DB8:0:0::1"),
+        oob_ip=ip_address("2001:DB8:0:0::2"),
+        ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+        authgroup="placeholder-authgroup",
+    )
+    context = params.model_dump(mode="json")
+    assert context["address"] == "2001:db8::1"
+    assert context["oob_ip"] == "2001:db8::2"
+    restored = ProvisionJobParams.model_validate(context).model_dump()
+    assert restored["address"] == ip_address("2001:db8::1")
+    assert restored["oob_ip"] == ip_address("2001:db8::2")
+
+
+async def test_provision_ip_objects_reach_nso_as_canonical_strings(monkeypatch):
+    from nso_adapter.config import NsoInstanceConfig, SchedulerConfig
+    from nso_adapter.core.onboarding import provision_nso_device
+    from nso_adapter.domain.diagnostics import register_device_ref_key
+
+    monkeypatch.setattr("nso_adapter.domain.diagnostics._device_ref_key", None)
+    register_device_ref_key("placeholder-diagnostic-key")
+    instance = NsoInstanceConfig(
+        name="nso-dev",
+        base_url="https://nso.example.test",
+        username_ref="NSO_USERNAME",
+        password_ref="NSO_PASSWORD",
+    )
+    config = SimpleNamespace(nso_instances=[instance], scheduler=SchedulerConfig(enable_failover=True))
+    monkeypatch.setattr("nso_adapter.core.onboarding.get_config", lambda: config)
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(404)
+        if request.url.path.endswith("/connect"):
+            return httpx.Response(200, json={"tailf-ncs:output": {"result": False}})
+        if request.url.path.endswith("/ssh/fetch-host-keys"):
+            return httpx.Response(
+                200, json={"tailf-ncs:output": {"result": "updated", "fingerprint": "placeholder-fingerprint"}}
+            )
+        return httpx.Response(204)
+
+    client = NsoClient(instance, "placeholder-user", "placeholder-password")
+    client._client = lambda timeout=None: httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url=instance.base_url
+    )
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda name: client)
+
+    result = await provision_nso_device(
+        None,
+        nso_instance="nso-dev",
+        device_name="placeholder-device",
+        address=ip_address("2001:DB8:0:0::1"),
+        oob_ip=ip_address("2001:DB8:0:0::2"),
+        ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+        authgroup="placeholder-authgroup",
+        do_sync=False,
+    )
+
+    assert result["ok"] is True
+    created = [json.loads(request.content) for request in requests if request.method == "PUT"]
+    assert created[0]["tailf-ncs:device"][0]["address"] == "2001:db8::1"
+    changed = [
+        json.loads(request.content)
+        for request in requests
+        if request.method == "PATCH" and "address" in json.loads(request.content)["tailf-ncs:device"][0]
+    ]
+    assert changed == [{"tailf-ncs:device": [{"name": "placeholder-device", "address": "2001:db8::2"}]}]
+
+
 async def test_provision_happy_path(adapter_client_with_nso):
     from nso_adapter.core.onboarding import provision_nso_device
 
@@ -40,7 +120,7 @@ async def test_provision_happy_path(adapter_client_with_nso):
                 db,
                 nso_instance="nso-dev",
                 device_name="new-rtr",
-                address="10.0.0.5",
+                address=ip_address("10.0.0.5"),
                 ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
                 authgroup="network",
                 netbox_device_id=99,
@@ -78,7 +158,7 @@ async def test_provision_derives_netconf_transport_from_ned_id(adapter_client_wi
                 db,
                 nso_instance="nso-dev",
                 device_name="junos-rtr",
-                address="10.0.0.9",
+                address=ip_address("10.0.0.9"),
                 ned_id="juniper-junos-nc-4.19:juniper-junos-nc-4.19",
                 authgroup="network",
             )
@@ -101,7 +181,7 @@ async def test_provision_rejects_transport_contradicting_ned_id(adapter_client_w
                     db,
                     nso_instance="nso-dev",
                     device_name="bad-junos",
-                    address="10.0.0.9",
+                    address=ip_address("10.0.0.9"),
                     ned_id="juniper-junos-nc-4.19",
                     authgroup="network",
                     ned_type="cli",
@@ -119,7 +199,7 @@ async def test_provision_idempotent_existing_device(adapter_client_with_nso):
                 db,
                 nso_instance="nso-dev",
                 device_name="dev-exists",
-                address="1.1.1.1",
+                address=ip_address("198.18.0.1"),
                 ned_id="x",
                 authgroup="network",
             )
@@ -138,7 +218,7 @@ async def test_provision_aborts_on_create_failure(adapter_client_with_nso):
                 db,
                 nso_instance="nso-dev",
                 device_name="bad",
-                address="1.1.1.1",
+                address=ip_address("198.18.0.1"),
                 ned_id="x",
                 authgroup="network",
             )
@@ -157,7 +237,7 @@ async def test_provision_aborts_on_fetch_host_keys_failure(adapter_client_with_n
                 db,
                 nso_instance="nso-dev",
                 device_name="unreach",
-                address="1.1.1.1",
+                address=ip_address("198.18.0.1"),
                 ned_id="x",
                 authgroup="network",
             )
@@ -196,11 +276,11 @@ async def test_oob_bootstrap_fetch_failure_preserves_mapping_without_seeding(ada
                 db,
                 nso_instance="nso-dev",
                 device_name="oob-strand",
-                address="10.0.0.5",
+                address=ip_address("10.0.0.5"),
                 ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
                 authgroup="network",
                 netbox_device_id=999,
-                oob_ip="192.0.2.5",
+                oob_ip=ip_address("192.0.2.5"),
             )
 
     assert res["ok"] is False
@@ -227,7 +307,7 @@ async def test_provision_unlocks_before_fetch_host_keys(adapter_client_with_nso)
                 db,
                 nso_instance="nso-dev",
                 device_name="ordered",
-                address="1.1.1.1",
+                address=ip_address("198.18.0.1"),
                 ned_id="x",
                 authgroup="network",
             )
@@ -247,7 +327,7 @@ async def test_provision_sync_failure_is_nonfatal(adapter_client_with_nso):
                 db,
                 nso_instance="nso-dev",
                 device_name="nosync",
-                address="1.1.1.1",
+                address=ip_address("198.18.0.1"),
                 ned_id="x",
                 authgroup="network",
                 netbox_device_id=77,
@@ -268,7 +348,7 @@ async def test_provision_unknown_instance_raises(adapter_client):
                 db,
                 nso_instance=unknown_instance,
                 device_name="x",
-                address="1.1.1.1",
+                address=ip_address("198.18.0.1"),
                 ned_id="x",
                 authgroup="network",
             )
@@ -293,7 +373,7 @@ async def test_provision_retries_fetch_host_keys_once(adapter_client_with_nso):
                 db,
                 nso_instance="nso-dev",
                 device_name="retry-ok",
-                address="1.1.1.1",
+                address=ip_address("198.18.0.1"),
                 ned_id="x",
                 authgroup="network",
             )
@@ -318,7 +398,7 @@ async def test_provision_fetch_host_keys_fails_after_one_retry(adapter_client_wi
                 db,
                 nso_instance="nso-dev",
                 device_name="retry-bad",
-                address="1.1.1.1",
+                address=ip_address("198.18.0.1"),
                 ned_id="x",
                 authgroup="network",
             )
@@ -344,7 +424,7 @@ async def test_provision_retries_sync_from_once(adapter_client_with_nso):
                 db,
                 nso_instance="nso-dev",
                 device_name="sync-retry",
-                address="1.1.1.1",
+                address=ip_address("198.18.0.1"),
                 ned_id="x",
                 authgroup="network",
             )
