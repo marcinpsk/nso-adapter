@@ -278,6 +278,7 @@ async def _revert_address(
 # Address checks report why the tick cannot proceed.
 _BLOCKED_ADDRESS_UNREADABLE = "address_unreadable"
 _BLOCKED_ACTIVE_OOB_CONFLICT = "active_oob_address_conflict"
+_BLOCKED_STORED_ADDRESS_INVALID = "stored_address_invalid"
 
 
 async def _reconcile_active_address(client: NsoClient, fo: DeviceFailover, name: str) -> bool:
@@ -335,6 +336,17 @@ def _managed_address_role(fo: DeviceFailover, address: str | IPv4Address | IPv6A
     if address == _stored_failover_address(fo, "oob_ip"):
         return _OOB
     return None
+
+
+def _invalid_stored_address_fields(fo: DeviceFailover) -> list[str]:
+    """Identify malformed stored addresses without exposing their values."""
+    invalid = []
+    for field in ("primary_ip", "oob_ip"):
+        try:
+            _stored_failover_address(fo, field)
+        except ValueError:
+            invalid.append(field)
+    return invalid
 
 
 def _coerce_probe(outcome) -> ReachabilityProbe:
@@ -659,9 +671,18 @@ async def run_failover_tick(
     *flip_budget* is exhausted. A budget-skipped flip leaves the address due (retry next tick);
     a probe that ran advances the due-time by the interval plus *jitter_fraction* forward jitter.
     """
+    now = now or _utcnow()
+    invalid_fields = _invalid_stored_address_fields(fo)
+    if invalid_fields:
+        fo.failback_blocked_reason = _BLOCKED_STORED_ADDRESS_INVALID
+        logger.error("failover.stored_address_invalid", **device_fields(device_id=fo.device_id), fields=invalid_fields)
+        if fo.primary_ip is not None:
+            fo.next_primary_probe_at = _next_due(now, cfg.failover_primary_probe_interval, jitter_fraction)
+        if fo.oob_ip is not None:
+            fo.next_oob_probe_at = _next_due(now, _oob_probe_interval(fo, cfg), jitter_fraction)
+        return
     primary_address = _stored_failover_address(fo, "primary_ip")
     oob_address = _stored_failover_address(fo, "oob_ip")
-    now = now or _utcnow()
     name = device.nso_device_name
     # Normalize a freshly-created (not-yet-flushed) row whose column defaults haven't
     # materialized — the scheduler's loaded rows already carry these.
@@ -762,8 +783,9 @@ async def upsert_failover_ips(
         fo = DeviceFailover(device_id=device.id)
         db.add(fo)
 
-    stored_primary = _stored_failover_address(fo, "primary_ip")
-    stored_oob = _stored_failover_address(fo, "oob_ip")
+    invalid_fields = _invalid_stored_address_fields(fo)
+    stored_primary = None if "primary_ip" in invalid_fields else _stored_failover_address(fo, "primary_ip")
+    stored_oob = None if "oob_ip" in invalid_fields else _stored_failover_address(fo, "oob_ip")
     active_oob_conflict = bool(
         fo.active_address == _OOB
         and stored_oob is not None
@@ -792,7 +814,7 @@ async def upsert_failover_ips(
         fo.failback_blocked_reason = None
         changed = True
 
-    if stored_primary != accepted_primary:
+    if "primary_ip" in invalid_fields or stored_primary != accepted_primary:
         fo.primary_ip = accepted_primary_ip
         # The counters described the address that just went away — a new address starts with
         # its full hysteresis budget, exactly as the OOB leg drops oob_healthy below.
@@ -805,7 +827,7 @@ async def upsert_failover_ips(
         if accepted_primary_ip:
             fo.next_primary_probe_at = now
         changed = True
-    if stored_oob != accepted_oob:
+    if "oob_ip" in invalid_fields or stored_oob != accepted_oob:
         fo.oob_ip = accepted_oob_ip
         fo.oob_healthy = None
         fo.oob_health_result = None
@@ -818,4 +840,7 @@ async def upsert_failover_ips(
         if getattr(fo, field) != value:
             setattr(fo, field, value)
             changed = True
+    if fo.failback_blocked_reason == _BLOCKED_STORED_ADDRESS_INVALID and not _invalid_stored_address_fields(fo):
+        fo.failback_blocked_reason = None
+        changed = True
     return changed
