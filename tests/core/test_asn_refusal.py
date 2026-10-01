@@ -70,7 +70,10 @@ def test_reader_compare_refuses_stored_peer():
     assert caught.value.error["detail"] == {"table": "bgp_peer_intent", "row_id": 9, "field": "remote_as"}
 
 
-async def test_refresh_replaces_invalid_stored_bgp_mirror(adapter_client):
+@pytest.mark.parametrize("invalid_row", ["router", "peer", "peer_group"])
+async def test_refresh_replaces_invalid_stored_bgp_mirror(adapter_client, invalid_row):
+    from nso_adapter.store.models import DeviceBgpPeer, DeviceBgpPeerGroup, DeviceBgpScope
+
     class ValidDeviceRead:
         async def get_device_state_section(self, device_name, section):
             return {"status": "ok", "router": [{"asn": "64512"}]}
@@ -78,11 +81,31 @@ async def test_refresh_replaces_invalid_stored_bgp_mirror(adapter_client):
     device_id = await seed_device(nso_device_name="placeholder-device")
     async with session() as db:
         device = await db.get(Device, device_id)
-        db.add(DeviceBgpRouter(device_id=device_id, asn="064512"))
+        router = DeviceBgpRouter(device_id=device_id, asn="064512" if invalid_row == "router" else "64512")
+        db.add(router)
+        await db.flush()
+        if invalid_row != "router":
+            scope = DeviceBgpScope(router_id=router.id, vrf="")
+            db.add(scope)
+            await db.flush()
+            row = (
+                DeviceBgpPeer(scope_id=scope.id, peer_address="198.18.0.1", remote_as="064513")
+                if invalid_row == "peer"
+                else DeviceBgpPeerGroup(scope_id=scope.id, name="placeholder-group", remote_as="064513")
+            )
+            db.add(row)
         await db.commit()
         response = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
         assert response.status_code == 409
         assert response.json()["error"]["code"] == "asn_rule_violation"
+        assert (
+            response.json()["error"]["detail"]["table"]
+            == {
+                "router": "device_bgp_router",
+                "peer": "device_bgp_peer",
+                "peer_group": "device_bgp_peer_group",
+            }[invalid_row]
+        )
         assert await refresh_bgp_config_for_device(db, device, ValidDeviceRead())
         assert [row.asn for row in (await db.scalars(select(DeviceBgpRouter))).all()] == ["64512"]
     response = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
