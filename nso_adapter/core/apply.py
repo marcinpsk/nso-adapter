@@ -1551,6 +1551,17 @@ def _revert_deploying(snapshot: dict) -> None:
         attr_state.sync_state = state
 
 
+async def _rollback_and_revert_deploying(db, snapshot: dict, reg) -> None:
+    """Restore attribute states only while this run owns the claim."""
+    from nso_adapter.core.claim import ClaimRegistration, lock_claim
+
+    await db.rollback()
+    with db.no_autoflush:
+        await lock_claim(db, reg if reg is not None else ClaimRegistration())
+    _revert_deploying(snapshot)
+    await db.commit()
+
+
 async def _finalize_unsent(db, plan: _ApplyPlan, build_errors: dict, *, job_id: int, reg) -> None:
     """Fail the families whose body could not be built. Nothing reached the device."""
     registry = section_registry()
@@ -1739,14 +1750,14 @@ async def _run_document_apply(db, device, client, device_name, job, job_id, now,
             proof_by_section={"interface_config": plan.interface.execution},
             static_route_plan=plan.static_route,
         )
+    except ClaimLostError:
+        raise
     except Exception:
         # An UNEXPECTED error while building the body (before any commit) — a real bug, not a
         # family's own bad intent, which the builder isolates. Revert the attrs just marked
         # 'deploying' so they are not stuck forever, then re-raise so run_apply fails the job
         # with the real error.
-        await db.rollback()
-        _revert_deploying(snapshot)
-        await db.commit()
+        await _rollback_and_revert_deploying(db, snapshot, reg)
         raise
 
     if body.errors:
@@ -1818,10 +1829,10 @@ async def _run_document_apply(db, device, client, device_name, job, job_id, now,
                 stamp_of=plan.sections["static_route"].stamp_of if "static_route" in plan.sections else None,
             )
 
+    except ClaimLostError:
+        raise
     except Exception:
-        await db.rollback()
-        _revert_deploying(snapshot)
-        await db.commit()
+        await _rollback_and_revert_deploying(db, snapshot, reg)
         raise
 
     await _finalize_job(

@@ -44,6 +44,7 @@ _ROOT = pathlib.Path(__file__).resolve().parents[2] / "nso_adapter"
 # their stamping now runs unwrapped, where an exception reaches ``run_apply`` and is re-raised
 # there instead of being swallowed.
 INVENTORY = [
+    ("core/apply.py", "_run_document_apply", "_rollback_and_revert_deploying"),
     ("core/apply.py", "_static_route_device_state", "static_route.device_state_read_failed"),
     ("core/apply.py", "_post_apply_refresh_and_notify", "apply.post_refresh_failed"),
     ("core/apply.py", "run_apply", "apply.unexpected_error"),
@@ -80,6 +81,8 @@ def test_broad_handler_reraises_claim_lost_first(module, function, marker):
     """
     path = _ROOT / module
     matching = [t for t in _handlers(path) if any(_mentions(h, marker) for h in t.handlers)]
+    if function == "_run_document_apply":
+        assert len(matching) == 2
     assert matching, f"no try/except in {module} mentions {marker!r} — did the log event get renamed?"
 
     for try_node in matching:
