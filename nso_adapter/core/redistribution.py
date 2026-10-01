@@ -16,7 +16,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 
 import structlog
-from sqlalchemy import delete, select
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.bgp import validate_bgp_as_numbers
@@ -538,14 +538,6 @@ async def _rebuild_partitions(
     refresh_source: str,
 ) -> list[DeviceRedistribution]:
     """Apply the per-component aggregation (R1-F7): replace / keep-unsupported / keep-failed."""
-    stored = (await db.scalars(select(DeviceRedistribution).where(DeviceRedistribution.device_id == device_id))).all()
-    validate_asn_rows(
-        "device_redistribution",
-        [
-            {column.name: getattr(row, column.name) for column in DeviceRedistribution.__table__.columns}
-            for row in stored
-        ],
-    )
     rebuilt: list[DeviceRedistribution] = []
     for proto, _wire_name, builder in _REDIST_COMPONENTS:
         outcome = outcomes[proto]

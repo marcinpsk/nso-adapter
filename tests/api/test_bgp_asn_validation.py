@@ -205,7 +205,8 @@ async def test_redistribution_source_duplicate_spellings_are_refused(adapter_cli
         f"/api/v1/devices/{device_id}/{endpoint}?store_only=true", json=body, headers=AUTH | push_seq()
     )
     assert_text_free_of(response.text, ["placeholder-device"])
-    assert response.status_code in {409, 422}, response.text
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "conflict"
     async with session() as db:
         assert list((await db.execute(select(RedistributionIntent))).scalars()) == []
 
@@ -388,3 +389,23 @@ async def test_apply_diff_refuses_malformed_frozen_asn(adapter_client, monkeypat
     assert error["code"] == "asn_rule_violation"
     assert error["detail"]["table"] == "bgp_router_intent"
     assert error["detail"]["field"] == "asn"
+
+
+@pytest.mark.parametrize("protocol", ["ospf", "isis"])
+def test_redistribution_duplicates_are_handler_conflicts(protocol):
+    from fastapi import HTTPException
+
+    from nso_adapter.api.isis import IsisInterfaceIntentUpdate
+    from nso_adapter.api.ospf import OspfIntentUpdate
+    from nso_adapter.api.redistribution import validate_unique_redistribution_sources
+
+    _, body = _redistribution_request(protocol, "4200000000")
+    processes = body["instances" if protocol == "ospf" else "processes"]
+    processes[0]["redistribution"].append({"source_protocol": "bgp", "source_ref": "64086.59904"})
+    model = OspfIntentUpdate if protocol == "ospf" else IsisInterfaceIntentUpdate
+    payload = model.model_validate(body)
+    process = payload.instances[0] if protocol == "ospf" else payload.processes[0]
+    with pytest.raises(HTTPException) as caught:
+        validate_unique_redistribution_sources(process.redistribution)
+    assert caught.value.status_code == 409
+    assert caught.value.detail["error"]["code"] == "conflict"

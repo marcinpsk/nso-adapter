@@ -1744,6 +1744,7 @@ async def _run_document_apply(db, device, client, device_name, job, job_id, now,
         # family's own bad intent, which the builder isolates. Revert the attrs just marked
         # 'deploying' so they are not stuck forever, then re-raise so run_apply fails the job
         # with the real error.
+        await db.rollback()
         _revert_deploying(snapshot)
         await db.commit()
         raise
@@ -1756,65 +1757,72 @@ async def _run_document_apply(db, device, client, device_name, job, job_id, now,
         await _finalize_unsent(db, plan, body.errors, job_id=job_id, reg=reg)
         return
 
-    commit_error, verify, offenders, err, msg = await _commit_document(
-        db, client, device, device_name, body, allowed=plan.allowed, job_id=job_id
-    )
-
-    iface_container = section_registry()["interface_config"].container
-    iface_failed = commit_error is not None and iface_container in body.containers
-    attr_outcome = _stamp_attr_atomic(attr_eligible, commit_error, iface_failed, err, msg, now, snapshot)
-    ip_outcome = _stamp_ip_atomic(
-        ip_rows_flat, commit_error, iface_failed, err, msg, now, stamp_of=plan.interface.ip_stamp_of
-    )
-    outcomes, failures = _stamp_batch_sections(plan.sections, offenders, commit_error, err, msg, now)
-    outcomes["attribute"] = attr_outcome[:2]
-    outcomes["ip"] = ip_outcome[:2]
-    if attr_outcome[2]:
-        failures["attribute"] = list(attr_outcome[2])
-    if ip_outcome[2]:
-        failures["ip"] = list(ip_outcome[2])
-
-    # The SEND's own verdict, before reader-compare folds per-row findings into the same
-    # counter: "nothing landed" and "one row of several is missing" are different facts, and
-    # reading the merged counter would make one dropped route block its proven sibling's CAS.
-    sr_key = section_registry()["static_route"].result_keys[0]
-    sr_send_failed = bool(outcomes.get(sr_key, (0, 0))[1])
-
-    # #108: the document rides the same FASTMAP writers — run the post-apply presence check
-    # per family and re-flag any silently-dropped keys. A family the body could not carry is
-    # excluded: it was never pushed, so "not on the device" is not a drop.
-    reader_compare: dict[str, str] = {}
-    reader_compare_unverifiable: dict[str, list[str]] = {}
-    evidence_by_section: dict[str, dict[int, str]] = {}
-    if commit_error is None:
-        reader_compare, reader_compare_unverifiable, evidence_by_section = await _document_reader_compare(
-            client,
-            device,
-            plan.sections,
-            outcomes,
-            failures,
-            job_id=job_id,
-            device_name=device_name,
+    try:
+        commit_error, verify, offenders, err, msg = await _commit_document(
+            db, client, device, device_name, body, allowed=plan.allowed, job_id=job_id
         )
 
-    sr_results = None
-    if plan.static_route is not None:
-        sr_results = await _settle_static_routes(
-            db,
-            device,
-            client,
-            plan.static_route,
-            job_id=job_id,
-            outbox={"verify": verify, "sent_keys": body.sent_route_keys},
-            evidence=evidence_by_section.get("static_route", {}),
-            # One PUT is the replacement: the document either landed or nothing did.
-            put_delivered=commit_error is None,
-            send_failed=sr_send_failed,
-            scope_outcomes=outcomes,
-            scope_failures=failures,
-            reg=reg,
-            stamp_of=plan.sections["static_route"].stamp_of if "static_route" in plan.sections else None,
+        iface_container = section_registry()["interface_config"].container
+        iface_failed = commit_error is not None and iface_container in body.containers
+        attr_outcome = _stamp_attr_atomic(attr_eligible, commit_error, iface_failed, err, msg, now, snapshot)
+        ip_outcome = _stamp_ip_atomic(
+            ip_rows_flat, commit_error, iface_failed, err, msg, now, stamp_of=plan.interface.ip_stamp_of
         )
+        outcomes, failures = _stamp_batch_sections(plan.sections, offenders, commit_error, err, msg, now)
+        outcomes["attribute"] = attr_outcome[:2]
+        outcomes["ip"] = ip_outcome[:2]
+        if attr_outcome[2]:
+            failures["attribute"] = list(attr_outcome[2])
+        if ip_outcome[2]:
+            failures["ip"] = list(ip_outcome[2])
+
+        # The SEND's own verdict, before reader-compare folds per-row findings into the same
+        # counter: "nothing landed" and "one row of several is missing" are different facts, and
+        # reading the merged counter would make one dropped route block its proven sibling's CAS.
+        sr_key = section_registry()["static_route"].result_keys[0]
+        sr_send_failed = bool(outcomes.get(sr_key, (0, 0))[1])
+
+        # #108: the document rides the same FASTMAP writers — run the post-apply presence check
+        # per family and re-flag any silently-dropped keys. A family the body could not carry is
+        # excluded: it was never pushed, so "not on the device" is not a drop.
+        reader_compare: dict[str, str] = {}
+        reader_compare_unverifiable: dict[str, list[str]] = {}
+        evidence_by_section: dict[str, dict[int, str]] = {}
+        if commit_error is None:
+            reader_compare, reader_compare_unverifiable, evidence_by_section = await _document_reader_compare(
+                client,
+                device,
+                plan.sections,
+                outcomes,
+                failures,
+                job_id=job_id,
+                device_name=device_name,
+            )
+
+        sr_results = None
+        if plan.static_route is not None:
+            sr_results = await _settle_static_routes(
+                db,
+                device,
+                client,
+                plan.static_route,
+                job_id=job_id,
+                outbox={"verify": verify, "sent_keys": body.sent_route_keys},
+                evidence=evidence_by_section.get("static_route", {}),
+                # One PUT is the replacement: the document either landed or nothing did.
+                put_delivered=commit_error is None,
+                send_failed=sr_send_failed,
+                scope_outcomes=outcomes,
+                scope_failures=failures,
+                reg=reg,
+                stamp_of=plan.sections["static_route"].stamp_of if "static_route" in plan.sections else None,
+            )
+
+    except Exception:
+        await db.rollback()
+        _revert_deploying(snapshot)
+        await db.commit()
+        raise
 
     await _finalize_job(
         db,

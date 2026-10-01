@@ -464,6 +464,7 @@ async def _apply_projected(
     from nso_adapter.core.redistribution import _REDIST_COMPONENTS, refresh_redistribution_from_outcomes
 
     failed: list[str] = []
+    first_refusal: AsnRuleViolation | None = None
     for name, fn in surfaces:
         spec = layout.spec_by_name[name]
         try:
@@ -491,11 +492,16 @@ async def _apply_projected(
                 )
             if not ok:
                 failed.append(name)
-        except AsnRuleViolation:
-            raise
+        except AsnRuleViolation as exc:
+            logger.warning("sync.surface_refresh_refused", device_id=device.id, surface=name, error=failure_detail(exc))
+            failed.append(name)
+            if first_refusal is None:
+                first_refusal = exc
         except Exception as exc:  # noqa: BLE001 — one surface must not take down the rest
             logger.warning("sync.surface_refresh_failed", device_id=device.id, surface=name, error=failure_detail(exc))
             failed.append(name)
+    if first_refusal is not None:
+        raise first_refusal
     return failed
 
 
