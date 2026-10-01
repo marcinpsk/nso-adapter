@@ -56,7 +56,9 @@
     existing apply or removal runner; `error.detail.streams` maps each stream to its reason).
   - AS content: `asn_rule_violation` (409, stored or device-read AS content violates
     RFC 5396; the detail identifies the stored row or structural device-read location
-    and field without the rejected value). GET `bgp-config` and `redistribution`
+    and field without the rejected value). A refusal from a mirror refresh also lists
+    every surface that failed in that refresh in `error.detail.degraded_surfaces`.
+    GET `bgp-config` and `redistribution`
     return this refusal in the `ErrorEnvelope` model, as do intent writes, Apply,
     and GET `actions/apply-diff`.
   - Per-endpoint: `ambiguous_device` (device lookup matches >1),

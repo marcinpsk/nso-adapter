@@ -32,6 +32,7 @@ from nso_adapter.core.claim import (
     resolve_claim_by_token,
 )
 from nso_adapter.core.families import ALL_FAMILY_KEYS
+from nso_adapter.domain.asn import AsnRuleViolation
 from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.client import failure_detail
 from nso_adapter.store import outcome_store
@@ -822,6 +823,9 @@ async def _initial_mirror_refresh(
     except ClaimLostError:
         # Revocation is not a runner error: recovery already owns the disposition.
         raise
+    except AsnRuleViolation as exc:
+        await db.rollback()
+        logger.warning("device.onboard_mirror.failed", device_id=device_id, error=exc.error)
     except Exception as exc:  # noqa: BLE001 — never fail provisioning on a mirror-read hiccup
         await db.rollback()
         # The mirror read is HTTP against NSO, so the same classification applies here.

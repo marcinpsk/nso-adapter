@@ -2367,7 +2367,72 @@ async def test_projected_asn_refusal_preserves_a_later_surface_refresh(adapter_c
                 "test",
             )
         assert caught.value.error["code"] == "asn_rule_violation"
+        assert caught.value.error["detail"]["degraded_surfaces"] == ["bgp"]
         await db.rollback()
     async with session() as db:
         routes = (await db.scalars(select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device_id))).all()
         assert [(row.prefix, row.next_hop) for row in routes] == [("198.18.0.0/24", "198.18.1.1")]
+
+
+@pytest.mark.parametrize("attrs_available", [False, True])
+@pytest.mark.parametrize("notify_fails", [False, True])
+async def test_sync_asn_refusal_publishes_partial_metadata_and_notifies(
+    db_session: AsyncSession, adapter_client, monkeypatch, attrs_available, notify_fails
+):
+    from nso_adapter.core import importer as imp
+    from nso_adapter.core.refresh_engine import _family_lock
+    from nso_adapter.domain.asn import AsnRuleViolation
+    from tests._secret_discipline import assert_text_free_of
+    from tests.conftest import session
+
+    device = Device(
+        nso_instance="nso-dev",
+        nso_device_name="placeholder-device",
+        ned_id="cisco-ios-cli-6.95",
+        netbox_device_id=42,
+        last_sync_status=LastSyncStatus.succeeded,
+    )
+    db_session.add(device)
+    await db_session.commit()
+    sections = {wire: {"status": "ok"} for wire in _ALL_PROJECTED_WIRES if wire != "interface-attributes"}
+    sections["bgp-config"] = {"status": "ok", "router": [{"asn": "064512"}]}
+    sections["static-route"] = {"status": "error", "error-reason": "placeholder-read-failure"}
+    if not attrs_available:
+        sections["interface-attributes"] = {"status": "error", "error-reason": "placeholder-read-failure"}
+    client = _make_nso_client({"interface": []}, sections=sections)
+    monkeypatch.setattr(imp, "get_nso_client", lambda _: client)
+    nb = AsyncMock(spec=NetboxClient)
+    nb.list_interfaces = AsyncMock(return_value=[])
+    expected = ["bgp", "redistribution", "static_route", "sync_from"]
+    if not attrs_available:
+        expected.insert(1, "interface_attributes")
+    notifications = []
+
+    async def _notify(_device_id):
+        async with session() as db:
+            published = await db.get(Device, device.id)
+            notifications.append(
+                (
+                    _family_lock(device.id, "bgp").locked(),
+                    _family_lock(device.id, "interface_attributes").locked(),
+                    published.last_sync_status,
+                    published.degraded_surfaces,
+                )
+            )
+        if notify_fails:
+            raise RuntimeError("placeholder-notify-failure")
+
+    nb.notify_sync_complete = AsyncMock(side_effect=_notify)
+    monkeypatch.setattr(imp, "get_netbox_client", lambda: nb)
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": False})):
+        with pytest.raises(AsnRuleViolation) as caught:
+            await sync_device(device.id, db_session)
+
+    assert caught.value.error["code"] == "asn_rule_violation"
+    assert caught.value.error["detail"]["degraded_surfaces"] == expected
+    assert_text_free_of(caught.value.error, ["064512"])
+    await db_session.refresh(device)
+    assert device.last_sync_status == LastSyncStatus.partial
+    assert device.degraded_surfaces == expected
+    nb.notify_sync_complete.assert_awaited_once_with(42)
+    assert notifications == [(False, False, LastSyncStatus.partial, expected)]
