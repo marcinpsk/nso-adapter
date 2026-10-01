@@ -7634,6 +7634,7 @@
           "oob_ip": {
             "anyOf": [
               {
+                "format": "ipvanyaddress",
                 "type": "string"
               },
               {
@@ -7645,6 +7646,7 @@
           "primary_ip": {
             "anyOf": [
               {
+                "format": "ipvanyaddress",
                 "type": "string"
               },
               {

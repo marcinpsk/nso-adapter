@@ -18,6 +18,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from ipaddress import IPv4Address, IPv6Address, ip_address
 from typing import TYPE_CHECKING
 
 import structlog
@@ -274,54 +275,64 @@ async def _revert_address(
         )
 
 
-# Why failback cannot proceed, surfaced on the row for the operator.
+# Address checks report why the tick cannot proceed.
 _BLOCKED_ADDRESS_UNREADABLE = "address_unreadable"
 _BLOCKED_ACTIVE_OOB_CONFLICT = "active_oob_address_conflict"
 
 
-async def _is_manual_override(client: NsoClient, fo: DeviceFailover, name: str) -> bool:
-    """Return True when NSO's current address is neither the primary nor the OOB IP.
-
-    An operator (or another system) set it by hand — record it and stop fighting them.
-    """
+async def _reconcile_active_address(client: NsoClient, fo: DeviceFailover, name: str) -> bool:
+    """Read NSO's active role before probing; refuse an unreadable or foreign address."""
     try:
         current = await client.get_address(name)
-    except Exception:
-        return False  # can't tell → don't block the loop
-    if current is None:
+        current_address = ip_address(current) if current is not None else None
+    except Exception as exc:
+        current_address = None
+        logger.warning(
+            "failover.failback_blocked",
+            **device_fields(device_id=fo.device_id),
+            reason=_BLOCKED_ADDRESS_UNREADABLE,
+            error=failure_detail(exc),
+        )
+    if current_address is None:
+        if fo.failback_blocked_reason != _BLOCKED_ACTIVE_OOB_CONFLICT:
+            fo.failback_blocked_reason = _BLOCKED_ADDRESS_UNREADABLE
         return False
-    return current not in (fo.primary_ip, fo.oob_ip)
-
-
-async def _maybe_clear_manual_override(client: NsoClient, fo: DeviceFailover, name: str) -> None:
-    """Clear a stale ``manual_override`` once NSO is back on a managed address.
-
-    The flag is only ever *set* mid-switch (when NSO points at a foreign address), so without
-    this it would linger in the UI until the next switch attempt — even after the operator
-    restored a managed address. Costs one GET, and only while the flag is set.
-    """
-    if not fo.manual_override:
-        return
-    try:
-        current = await client.get_address(name)
-    except Exception:
-        return  # can't tell → leave the flag, retry next tick
-    if current in (fo.primary_ip, fo.oob_ip):
-        fo.manual_override = False
-        role = _managed_address_role(fo, current)
+    if fo.failback_blocked_reason == _BLOCKED_ADDRESS_UNREADABLE:
+        fo.failback_blocked_reason = None
+    role = _managed_address_role(fo, current_address)
+    if role is None:
+        fo.manual_override = True
+        return False
+    if fo.manual_override:
         logger.info(
             "failover.manual_override_cleared",
             **device_fields(device_id=fo.device_id),
-            **({"role": role} if role is not None else {}),
+            role=role,
         )
+    fo.manual_override = False
+    if fo.active_address != role:
+        fo.active_address = role
+        fo.consecutive_failures = 0
+        fo.consecutive_successes = 0
+        logger.info("failover.active_address_reconciled", **device_fields(device_id=fo.device_id), role=role)
+    return True
 
 
-def _managed_address_role(fo: DeviceFailover, address: str | None) -> str | None:
-    if address is None or fo.primary_ip == fo.oob_ip:
+def _stored_failover_address(fo: DeviceFailover, field: str) -> IPv4Address | IPv6Address | None:
+    value = getattr(fo, field)
+    try:
+        return ip_address(value) if value is not None else None
+    except ValueError as exc:
+        raise ValueError(f"Invalid stored failover {field}: {exc}") from exc
+
+
+def _managed_address_role(fo: DeviceFailover, address: str | IPv4Address | IPv6Address | None) -> str | None:
+    if address is None:
         return None
-    if address == fo.primary_ip:
+    address = ip_address(address)
+    if address == _stored_failover_address(fo, "primary_ip"):
         return _PRIMARY
-    if address == fo.oob_ip:
+    if address == _stored_failover_address(fo, "oob_ip"):
         return _OOB
     return None
 
@@ -434,10 +445,11 @@ async def _active_primary_probe(
     fo.consecutive_failures, fo.consecutive_successes = step.failures, step.successes
     if not step.act:
         return True
-    if job_active or await _is_manual_override(client, fo, name):
-        # Don't switch mid-apply or over an operator's manual address — re-arm, retry next interval.
-        fo.manual_override = not job_active
+    if job_active or not await _reconcile_active_address(client, fo, name):
+        # Defer the switch until the device lane and current address are known.
         fo.consecutive_failures = cfg.failover_failure_threshold
+        return True
+    if fo.active_address != _PRIMARY:
         return True
     if not _take_flip(flip_budget):
         # Over the per-tick flip cap — keep armed and retry the switch promptly (next tick).
@@ -468,12 +480,11 @@ async def _failback_flip_probe(
     """
     if job_active:
         return True
-    # One read serves the manual-override decision and the revert target: a
-    # disruptive flip whose way back is unknown must not start, so an unreadable current
-    # address refuses the flip — unlike the non-disruptive checks, where "can't tell"
-    # correctly does not block the loop.
+    # Read the current address for both the override check and the revert target.
     try:
         address_before = await client.get_address(name)
+        if address_before is not None:
+            ip_address(address_before)
     except Exception as exc:
         address_before = None
         logger.warning(
@@ -488,7 +499,7 @@ async def _failback_flip_probe(
         return True  # ran → re-arm normally; retried on the next interval
     if fo.failback_blocked_reason == _BLOCKED_ADDRESS_UNREADABLE:
         fo.failback_blocked_reason = None  # the read recovered; the reason is stale on every branch
-    if address_before not in (fo.primary_ip, fo.oob_ip):
+    if _managed_address_role(fo, address_before) is None:
         fo.manual_override = True
         return True
     if not _take_flip(flip_budget):
@@ -578,7 +589,23 @@ async def _probe_oob(
         raise RuntimeError("proactive OOB flip-probe without a primary address")
     if job_active:
         return True
-    if await _is_manual_override(client, fo, name):
+    try:
+        address_before = await client.get_address(name)
+        if address_before is not None:
+            ip_address(address_before)
+    except Exception as exc:
+        address_before = None
+        logger.warning(
+            "failover.oob_probe_blocked",
+            **device_fields(device_id=fo.device_id),
+            reason=_BLOCKED_ADDRESS_UNREADABLE,
+            error=failure_detail(exc),
+        )
+    if address_before is None:
+        if fo.failback_blocked_reason != _BLOCKED_ACTIVE_OOB_CONFLICT:
+            fo.failback_blocked_reason = _BLOCKED_ADDRESS_UNREADABLE
+        return True
+    if _managed_address_role(fo, address_before) is None:
         fo.manual_override = True
         return True
     if not _take_flip(flip_budget):
@@ -599,8 +626,10 @@ async def _probe_oob(
         fo.oob_health_detail = outcome.detail or None
         fo.oob_health_checked_at = now
     finally:
-        # Always flip back to primary (even if the probe raised) — this was only a health check.
-        await _revert_address(client, name, primary_ip, fo.device_id, role=_PRIMARY)
+        # Restore the address NSO held before this temporary health probe.
+        await _revert_address(
+            client, name, address_before, fo.device_id, role=_managed_address_role(fo, address_before)
+        )
     return True
 
 
@@ -625,6 +654,8 @@ async def run_failover_tick(
     *flip_budget* is exhausted. A budget-skipped flip leaves the address due (retry next tick);
     a probe that ran advances the due-time by the interval plus *jitter_fraction* forward jitter.
     """
+    primary_address = _stored_failover_address(fo, "primary_ip")
+    oob_address = _stored_failover_address(fo, "oob_ip")
     now = now or _utcnow()
     name = device.nso_device_name
     # Normalize a freshly-created (not-yet-flushed) row whose column defaults haven't
@@ -632,16 +663,25 @@ async def run_failover_tick(
     fo.active_address = fo.active_address or _PRIMARY
     fo.consecutive_failures = fo.consecutive_failures or 0
     fo.consecutive_successes = fo.consecutive_successes or 0
-    primary_ip = fo.primary_ip or None
-    oob_ip = fo.oob_ip if fo.oob_ip and fo.oob_ip != primary_ip else None
-    # Active-OOB liveness needs no primary address; everything else does (the plugin can
-    # clear either IP at any time while the row keeps its active_address).
-    if primary_ip is None and not (fo.active_address == _OOB and oob_ip is not None):
+    primary_ip = fo.primary_ip
+    oob_ip = fo.oob_ip if oob_address != primary_address else None
+    if primary_ip is None and oob_ip is None:
         return
-
-    # Drop a stale manual-override flag the moment NSO is back on a managed address (only a GET,
-    # and only while flagged) so the UI doesn't show "manual override" after the operator restores.
-    await _maybe_clear_manual_override(client, fo, name)
+    primary_due = primary_ip is not None and _due(fo.next_primary_probe_at, now)
+    oob_due = oob_ip is not None and _due(fo.next_oob_probe_at, now)
+    if not (primary_due or oob_due or fo.manual_override):
+        return
+    stored_role = fo.active_address
+    if not await _reconcile_active_address(client, fo, name):
+        if primary_due:
+            fo.next_primary_probe_at = _next_due(now, cfg.failover_primary_probe_interval, jitter_fraction)
+        if oob_due:
+            fo.next_oob_probe_at = _next_due(now, cfg.failover_primary_probe_interval, jitter_fraction)
+        return
+    if stored_role != fo.active_address and fo.active_address == _OOB:
+        # Verify the observed OOB before attempting failback on a later interval.
+        fo.next_primary_probe_at = _next_due(now, cfg.failover_primary_probe_interval, jitter_fraction)
+        fo.next_oob_probe_at = now
 
     addr_before = fo.active_address
     if primary_ip is not None and _due(fo.next_primary_probe_at, now):
@@ -679,22 +719,12 @@ async def _get_or_create_failover(db: AsyncSession, device_id: int) -> DeviceFai
     return row
 
 
-async def set_initial_failover_state(
-    db: AsyncSession, device_id: int, primary_ip: str | None, oob_ip: str | None, active_address: str
-) -> DeviceFailover:
-    """Seed a device's failover row at onboarding: the IPs + which address it bootstrapped on.
-
-    Used by reachability-aware provisioning so a fresh device that came up over OOB starts in
-    the ``on_oob`` state (and fails back to primary once the in-band address is up).
-    """
-    fo = await _get_or_create_failover(db, device_id)
-    fo.primary_ip = primary_ip
-    fo.oob_ip = oob_ip
-    fo.active_address = active_address
-    return fo
-
-
-async def upsert_failover_ips(db: AsyncSession, device: Device, primary_ip: str | None, oob_ip: str | None) -> bool:
+async def upsert_failover_ips(
+    db: AsyncSession,
+    device: Device,
+    primary_ip: str | IPv4Address | IPv6Address | None,
+    oob_ip: str | IPv4Address | IPv6Address | None,
+) -> bool:
     """Persist the plugin-sourced primary/OOB IPs onto the device's failover row.
 
     Touches ONLY the IPs and their probe scheduling — never the active address. A CHANGED
@@ -720,6 +750,10 @@ async def upsert_failover_ips(db: AsyncSession, device: Device, primary_ip: str 
     primary role. A distinct reported primary can replace the stored primary as the future
     failback target. The conflict is surfaced on the row. Returns True if anything changed.
     """
+    primary_address = ip_address(primary_ip) if primary_ip is not None else None
+    oob_address = ip_address(oob_ip) if oob_ip is not None else None
+    primary_ip = str(primary_address) if primary_address is not None else None
+    oob_ip = str(oob_address) if oob_address is not None else None
     existing = (
         await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == device.id))
     ).scalar_one_or_none()
@@ -730,11 +764,17 @@ async def upsert_failover_ips(db: AsyncSession, device: Device, primary_ip: str 
         fo = DeviceFailover(device_id=device.id)
         db.add(fo)
 
+    stored_primary = _stored_failover_address(fo, "primary_ip")
+    stored_oob = _stored_failover_address(fo, "oob_ip")
     active_oob_conflict = bool(
-        fo.active_address == _OOB and fo.oob_ip and (oob_ip != fo.oob_ip or primary_ip == fo.oob_ip)
+        fo.active_address == _OOB
+        and stored_oob is not None
+        and (oob_address != stored_oob or primary_address == stored_oob)
     )
-    accepted_primary_ip = fo.primary_ip if active_oob_conflict and primary_ip == fo.oob_ip else primary_ip
-    accepted_oob_ip = fo.oob_ip if active_oob_conflict else oob_ip
+    accepted_primary = stored_primary if active_oob_conflict and primary_address == stored_oob else primary_address
+    accepted_oob = stored_oob if active_oob_conflict else oob_address
+    accepted_primary_ip = str(accepted_primary) if accepted_primary is not None else None
+    accepted_oob_ip = str(accepted_oob) if accepted_oob is not None else None
 
     now = _utcnow()
     changed = False
@@ -754,7 +794,7 @@ async def upsert_failover_ips(db: AsyncSession, device: Device, primary_ip: str 
         fo.failback_blocked_reason = None
         changed = True
 
-    if fo.primary_ip != accepted_primary_ip:
+    if stored_primary != accepted_primary:
         fo.primary_ip = accepted_primary_ip
         # The counters described the address that just went away — a new address starts with
         # its full hysteresis budget, exactly as the OOB leg drops oob_healthy below.
@@ -767,7 +807,7 @@ async def upsert_failover_ips(db: AsyncSession, device: Device, primary_ip: str 
         if accepted_primary_ip:
             fo.next_primary_probe_at = now
         changed = True
-    if fo.oob_ip != accepted_oob_ip:
+    if stored_oob != accepted_oob:
         fo.oob_ip = accepted_oob_ip
         fo.oob_healthy = None
         fo.oob_health_result = None
@@ -776,4 +816,8 @@ async def upsert_failover_ips(db: AsyncSession, device: Device, primary_ip: str 
         if accepted_oob_ip:
             fo.next_oob_probe_at = now
         changed = True
+    for field, value in (("primary_ip", accepted_primary_ip), ("oob_ip", accepted_oob_ip)):
+        if getattr(fo, field) != value:
+            setattr(fo, field, value)
+            changed = True
     return changed

@@ -171,15 +171,13 @@ async def test_provision_aborts_on_fetch_host_keys_failure(adapter_client_with_n
     client.sync_from.assert_not_awaited()
 
 
-async def test_provision_seeds_failover_when_oob_bootstrap_then_fetch_fails(adapter_client_with_nso, monkeypatch):
-    """If the OOB bootstrap flipped NSO to the OOB address and fetch-host-keys then fails,
-    the device must still get a DeviceFailover row (active=oob) so the failover loop can fail
-    it back once in-band recovers — not be left stranded on OOB, unmanaged (s3-6)."""
+async def test_oob_bootstrap_fetch_failure_preserves_mapping_without_seeding(adapter_client_with_nso, monkeypatch):
+    """Host-key failure preserves the mapping; scope ingestion creates the failover row."""
     from sqlalchemy import select
 
     from nso_adapter.config import get_config
     from nso_adapter.core.onboarding import provision_nso_device
-    from nso_adapter.store.models import ActiveAddress, Device, DeviceFailover
+    from nso_adapter.store.models import Device, DeviceFailover
 
     monkeypatch.setattr(get_config().scheduler, "enable_failover", True)
 
@@ -210,14 +208,12 @@ async def test_provision_seeds_failover_when_oob_bootstrap_then_fetch_fails(adap
     # The bootstrap flipped NSO onto the OOB address (primary probed unreachable).
     client.set_address.assert_awaited_once_with("oob-strand", "192.0.2.5")
 
-    # A DeviceFailover row must exist so the loop manages + fails it back to primary.
+    # The plugin supplies failover IPs through scope ingestion after mapping.
     async with session() as db:
         dev = (await db.execute(select(Device).where(Device.nso_device_name == "oob-strand"))).scalar_one_or_none()
         assert dev is not None, "adapter mapping not created — failover can't manage the OOB-pinned device"
         fo = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == dev.id))).scalar_one_or_none()
-        assert fo is not None, "device stranded on OOB with no failover row"
-        assert fo.active_address == ActiveAddress.oob.value
-        assert fo.oob_ip == "192.0.2.5"
+        assert fo is None
 
 
 async def test_provision_unlocks_before_fetch_host_keys(adapter_client_with_nso):

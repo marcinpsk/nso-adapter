@@ -559,15 +559,10 @@ def _utcnow_aware():
 
 
 async def _due_failover_device_ids(db, now) -> list[int]:
-    """Device IDs with a due primary- or OOB-probe (linked + an address the tick can act on).
-
-    Pre-filtering in SQL keeps the tick from spinning up a session/task per not-due device, so
-    this must mirror ``run_failover_tick``'s own gate: a device SITTING on OOB keeps its
-    liveness with no primary IP at all, and each leg is only due when its own address exists.
-    """
+    """Select linked devices with a due configured address, regardless of the stored role."""
     from sqlalchemy import and_, or_, select
 
-    from nso_adapter.store.models import ActiveAddress, Device, DeviceFailover
+    from nso_adapter.store.models import Device, DeviceFailover
 
     has_primary = DeviceFailover.primary_ip.is_not(None)
     has_oob = DeviceFailover.oob_ip.is_not(None)
@@ -576,7 +571,7 @@ async def _due_failover_device_ids(db, now) -> list[int]:
         .join(DeviceFailover, DeviceFailover.device_id == Device.id)
         .where(
             Device.netbox_device_id.is_not(None),
-            or_(has_primary, and_(DeviceFailover.active_address == ActiveAddress.oob.value, has_oob)),
+            or_(has_primary, has_oob),
             or_(
                 and_(
                     has_primary,
