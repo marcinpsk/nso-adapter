@@ -42,6 +42,46 @@ def test_asn_refusal_accumulates_sorted_degraded_surfaces_without_rejected_value
     assert_text_free_of(refusal.error, ["064512"])
 
 
+@pytest.mark.parametrize("other_row_id", [None, "router[1]"])
+def test_asn_refusal_classifier_preserves_only_the_authored_envelope(other_row_id):
+    from nso_adapter.domain.asn import asn_refusal_detail
+
+    refusal = AsnRuleViolation(
+        "device_read.bgp", "router[0]", "asn", "placeholder-rejected-AS", other_row_id=other_row_id
+    )
+    refusal.include_degraded_surfaces(["redistribution", "bgp"])
+    classified = asn_refusal_detail(refusal)
+    assert_text_free_of(classified, ["placeholder-rejected-AS"])
+    assert classified == refusal.error
+    assert classified["detail"]["degraded_surfaces"] == ["bgp", "redistribution"]
+    if other_row_id is not None:
+        assert classified["detail"]["other_row_id"] == other_row_id
+
+
+@pytest.mark.parametrize("exception_kind", ["unrelated", "http", "decoder", "subclass"])
+def test_asn_refusal_classifier_rejects_untrusted_exception_shapes(exception_kind):
+    import httpx
+
+    from nso_adapter.domain.asn import asn_refusal_detail
+
+    class UntrustedRefusal(AsnRuleViolation):
+        pass
+
+    request = httpx.Request("GET", "https://nso.example.test/placeholder-secret")
+    exceptions = {
+        "unrelated": ValueError("placeholder-secret"),
+        "http": httpx.HTTPStatusError(
+            "placeholder-secret", request=request, response=httpx.Response(500, request=request)
+        ),
+        "decoder": UnicodeDecodeError("utf-8", b"placeholder-secret", 0, 1, "placeholder-secret"),
+        "subclass": UntrustedRefusal("placeholder-table", 1, "asn", "placeholder-secret"),
+    }
+    with pytest.raises(TypeError) as caught:
+        asn_refusal_detail(exceptions[exception_kind])
+    assert_text_free_of(caught.value, ["placeholder-secret"])
+    assert str(caught.value) == "exc must be an AsnRuleViolation"
+
+
 async def test_projection_refuses_stored_router(adapter_client):
     device_id = await seed_device(nso_device_name="placeholder-device")
     async with session() as db:
@@ -367,6 +407,8 @@ def test_detach_only_colliding_prior_rows_refuse_without_retirement():
 
 
 async def test_comprehensive_refresh_surfaces_the_typed_refusal(adapter_client):
+    from structlog.testing import capture_logs
+
     from nso_adapter.core.importer import refresh_all_surfaces_for_device
     from tests.core.test_importer import _ALL_PROJECTED_WIRES
 
@@ -380,14 +422,23 @@ async def test_comprehensive_refresh_surfaces_the_typed_refusal(adapter_client):
     device_id = await seed_device(nso_device_name="placeholder-device")
     async with session() as db:
         device = await db.get(Device, device_id)
-        with pytest.raises(AsnRuleViolation) as caught:
+        with capture_logs() as logs, pytest.raises(AsnRuleViolation) as caught:
             await refresh_all_surfaces_for_device(db, device, InvalidDeviceRead())
         assert caught.value.error["code"] == "asn_rule_violation"
         assert caught.value.error["detail"]["degraded_surfaces"] == ["bgp", "redistribution", "static_route"]
+    refusals = [record for record in logs if record["event"] == "sync.surface_refresh_refused"]
+    assert_text_free_of(refusals, ["064512"])
+    assert {record["surface"] for record in refusals} == {"bgp", "redistribution"}
+    for record in refusals:
+        assert record["error"]["code"] == "asn_rule_violation"
+        assert record["error"]["detail"]["field"] == "asn"
+        assert record["error"]["detail"]["row_id"] == "router[0]"
 
 
 @pytest.mark.parametrize("caller", ["apply", "sse"])
 async def test_partial_refresh_commits_config_before_notifying(adapter_client, monkeypatch, caller):
+    from structlog.testing import capture_logs
+
     from nso_adapter.core import importer as imp
     from nso_adapter.core.apply import _post_apply_refresh_and_notify
     from nso_adapter.main import _DeviceRefreshCoalescer
@@ -419,16 +470,27 @@ async def test_partial_refresh_commits_config_before_notifying(adapter_client, m
     client = InvalidDeviceRead()
     monkeypatch.setattr(imp, "get_nso_client", lambda _: client)
     monkeypatch.setattr(imp, "get_netbox_client", NetBoxNotification)
-    if caller == "apply":
-        async with session() as db:
-            await _post_apply_refresh_and_notify(db, device_id)
-    else:
-        tasks = set()
-        coalescer = _DeviceRefreshCoalescer({"nso-dev": client}, tasks, None)
-        coalescer.trigger(device_id, "nso-dev", 42)
-        await asyncio.gather(*tasks)
+    with capture_logs() as logs:
+        if caller == "apply":
+            async with session() as db:
+                await _post_apply_refresh_and_notify(db, device_id)
+        else:
+            tasks = set()
+            coalescer = _DeviceRefreshCoalescer({"nso-dev": client}, tasks, None)
+            coalescer.trigger(device_id, "nso-dev", 42)
+            await asyncio.gather(*tasks)
 
     assert notifications == [(42, [("Vlan42", 42)])]
+    event = "apply.post_refresh_failed" if caller == "apply" else "sse.coalesced_refresh_failed"
+    refusal = next(record for record in logs if record["event"] == event)
+    assert_text_free_of(refusal, ["064512"])
+    assert refusal["error"]["code"] == "asn_rule_violation"
+    assert refusal["error"]["detail"] == {
+        "table": "device_read.bgp",
+        "row_id": "router[0]",
+        "field": "asn",
+        "degraded_surfaces": ["bgp", "redistribution"],
+    }
 
 
 @pytest.mark.parametrize("caller", ["onboard", "apply"])

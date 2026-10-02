@@ -32,7 +32,7 @@ from nso_adapter.core.refresh_engine import (
     run_family_refresh_from_outcome,
 )
 from nso_adapter.core.sync_state import compute_sync_state
-from nso_adapter.domain.asn import AsnRuleViolation
+from nso_adapter.domain.asn import AsnRuleViolation, asn_refusal_detail
 from nso_adapter.domain.models import Interface, InterfaceAttr
 from nso_adapter.nso import actions as nso_actions
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError, failure_detail
@@ -493,7 +493,9 @@ async def _apply_projected(
             if not ok:
                 failed.append(name)
         except AsnRuleViolation as exc:
-            logger.warning("sync.surface_refresh_refused", device_id=device.id, surface=name, error=failure_detail(exc))
+            logger.warning(
+                "sync.surface_refresh_refused", device_id=device.id, surface=name, error=asn_refusal_detail(exc)
+            )
             failed.append(name)
             if first_refusal is None:
                 first_refusal = exc

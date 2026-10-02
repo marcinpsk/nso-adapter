@@ -41,6 +41,7 @@ _RULES = Path(__file__).resolve().parents[2] / ".opengrep" / "nso-rules.yaml"
 _IMPORTER = Path(__file__).resolve().parents[2] / "nso_adapter" / "core" / "importer.py"
 _NSO_CLIENT = Path(__file__).resolve().parents[2] / "nso_adapter" / "nso" / "client.py"
 _NETBOX_CLIENT = Path(__file__).resolve().parents[2] / "nso_adapter" / "bindings" / "netbox" / "client.py"
+_ASN = Path(__file__).resolve().parents[2] / "nso_adapter" / "domain" / "asn.py"
 _GUARDED_LOG_SINKS = (
     Path(__file__).resolve().parents[2] / "nso_adapter" / "main.py",
     *(
@@ -60,7 +61,7 @@ _GUARDED_LOG_SINKS = (
 
 #: One-argument callables whose result is an approved closed classification for a log field.
 #: Every name here has its definition pinned below, so widening this set is a reviewed act.
-_APPROVED_CLASSIFIERS = frozenset({"failure_detail", "http_status_of", "rejection_detail"})
+_APPROVED_CLASSIFIERS = frozenset({"failure_detail", "http_status_of", "rejection_detail", "asn_refusal_detail"})
 
 
 def _is_closed_exception_classification(value: ast.expr) -> bool:
@@ -1189,6 +1190,16 @@ def test_importer_never_logs_raw_exception_text() -> None:
     assert _raw_log_exception_renderers(_IMPORTER.read_text(encoding="utf-8")) == []
 
 
+@pytest.mark.parametrize("alias", [False, True])
+def test_raw_exception_log_guard_accepts_classified_asn_refusals(alias) -> None:
+    source = "try:\n    work()\nexcept AsnRuleViolation as caught:\n"
+    if alias:
+        source += '    detail = asn_refusal_detail(caught)\n    logger.warning("event", detail=detail)\n'
+    else:
+        source += '    logger.warning("event", error=asn_refusal_detail(caught))\n'
+    assert _raw_log_exception_renderers(source) == []
+
+
 def test_guarded_modules_never_log_raw_exception_text() -> None:
     violations = {
         path.name: _raw_log_exception_renderers(path.read_text(encoding="utf-8"))
@@ -1198,6 +1209,9 @@ def test_guarded_modules_never_log_raw_exception_text() -> None:
     assert violations == {}
     assert _formatter_definition_ast(_NETBOX_CLIENT.read_text(encoding="utf-8"), "rejection_detail") == (
         _APPROVED_REJECTION_DETAIL_AST
+    )
+    assert _formatter_definition_ast(_ASN.read_text(encoding="utf-8"), "asn_refusal_detail") == (
+        _APPROVED_ASN_REFUSAL_DETAIL_AST
     )
     unapproved_refs = {}
     for path in (_IMPORTER, *_GUARDED_LOG_SINKS):
@@ -1428,6 +1442,22 @@ def rejection_detail(body: object) -> str:
     return "unparsed"
 '''
 _APPROVED_REJECTION_DETAIL_AST = _formatter_definition_ast(_APPROVED_REJECTION_DETAIL, "rejection_detail")
+
+
+_APPROVED_ASN_REFUSAL_DETAIL = '''\
+def asn_refusal_detail(exc: AsnRuleViolation) -> dict:
+    """Approved formatter contract."""
+    if type(exc) is not AsnRuleViolation:
+        raise TypeError("exc must be an AsnRuleViolation")
+    return exc.error
+'''
+_APPROVED_ASN_REFUSAL_DETAIL_AST = _formatter_definition_ast(_APPROVED_ASN_REFUSAL_DETAIL, "asn_refusal_detail")
+
+
+@pytest.mark.parametrize("property_name", ["value", "args", "__dict__"])
+def test_asn_refusal_formatter_guard_rejects_unclassified_exception_properties(property_name) -> None:
+    candidate = _APPROVED_ASN_REFUSAL_DETAIL.replace("return exc.error", f"return exc.{property_name}")
+    assert _formatter_definition_ast(candidate, "asn_refusal_detail") != _APPROVED_ASN_REFUSAL_DETAIL_AST
 
 
 def test_failure_detail_reads_only_closed_exception_properties() -> None:

@@ -73,7 +73,7 @@ from nso_adapter.core.request_flags import (
 )
 from nso_adapter.core.scheduler import start_scheduler, stop_scheduler
 from nso_adapter.core.worker import start_workers, stop_workers
-from nso_adapter.domain.asn import AsnRuleViolation
+from nso_adapter.domain.asn import AsnRuleViolation, asn_refusal_detail
 from nso_adapter.notifications.persistent_subscriber import persistent_subscriber
 from nso_adapter.notifications.sse_subscriber import SSESubscriber
 from nso_adapter.nso.client import NsoClient, failure_detail
@@ -287,7 +287,7 @@ class _DeviceRefreshCoalescer:
             try:
                 await refresh_all_surfaces_for_device(db, device, client, refresh_source="notification", atomic=False)
             except AsnRuleViolation as exc:
-                logger.warning("sse.coalesced_refresh_failed", device_id=device_id, error=failure_detail(exc))
+                logger.warning("sse.coalesced_refresh_failed", device_id=device_id, error=asn_refusal_detail(exc))
         # Notify AFTER the refresh and BEFORE the dirty check (codex R1-F5 ordering): the
         # plugin reconciles the refreshed mirror; failures are swallowed (best-effort).
         nb_client = get_netbox_client()

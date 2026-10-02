@@ -45,6 +45,13 @@ class AsnRuleViolation(Exception):
         detail["degraded_surfaces"] = sorted(set(detail.get("degraded_surfaces", [])) | set(surfaces))
 
 
+def asn_refusal_detail(exc: AsnRuleViolation) -> dict:
+    """Return the authored refusal envelope without rejected AS content."""
+    if type(exc) is not AsnRuleViolation:
+        raise TypeError("exc must be an AsnRuleViolation")
+    return exc.error
+
+
 def checked_asn(value: object, table: str, row_id: object, field: str) -> int:
     """Parse an AS value or refuse it at its content boundary."""
     try:
