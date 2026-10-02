@@ -11,6 +11,7 @@ is deterministic — the real HTTP round-trip is covered separately in test_fail
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from ipaddress import ip_address
 
 import pytest
 from structlog.testing import capture_logs
@@ -109,6 +110,141 @@ async def _tick(device, fo, client, cfg, *, now, job_active=False, primary_due=T
     fo.next_primary_probe_at = None if primary_due else now + timedelta(days=1)
     fo.next_oob_probe_at = None if oob_due else now + timedelta(days=1)
     await run_failover_tick(device, fo, client, cfg, now=now, job_active=job_active)
+
+
+async def test_tick_reconciles_bootstrapped_oob_before_probing(monkeypatch):
+    cfg = SchedulerConfig()
+    calls = _stub_probe(monkeypatch, reachable=True)
+    fo = _failover_row(consecutive_successes=cfg.failover_success_threshold - 1)
+    client = FakeNso(address="192.0.2.5")
+
+    await _tick(_device(), fo, client, cfg, now=_BASE, oob_due=True)
+
+    assert client.address == "192.0.2.5"
+    assert fo.active_address == "oob"
+    assert fo.last_probe_target == "oob"
+    assert fo.last_probe_result == "ok"
+    assert calls["n"] == 1
+    assert client.calls == []
+    assert fo.consecutive_successes == 0
+
+
+async def test_tick_reconciles_primary_before_probing(monkeypatch):
+    _stub_probe(monkeypatch, reachable=True)
+    fo = _failover_row(active="oob")
+    client = FakeNso()
+
+    await _tick(_device(), fo, client, SchedulerConfig(), now=_BASE)
+
+    assert fo.active_address == "primary"
+    assert fo.last_probe_target == "primary"
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("reachable", [True, False])
+async def test_tick_shared_address_monitors_primary_without_fallback(monkeypatch, reachable):
+    calls = _stub_probe(monkeypatch, reachable=reachable)
+    fo = DeviceFailover(
+        device_id=1, primary_ip="198.18.0.1", oob_ip="198.18.0.1", active_address="oob", consecutive_failures=2
+    )
+    client = FakeNso(address="198.18.0.1")
+
+    await _tick(_device(), fo, client, SchedulerConfig(), now=_BASE, oob_due=True)
+
+    assert fo.active_address == "primary"
+    assert fo.manual_override is False
+    assert fo.last_probe_target == "primary"
+    assert fo.last_probe_result == ("ok" if reachable else "unreachable")
+    assert calls["n"] == 1
+    assert client.calls == []
+
+
+async def test_tick_foreign_address_skips_all_probes_and_flips(monkeypatch):
+    calls = _stub_probe(monkeypatch, reachable=True)
+    fo = _failover_row()
+    client = FakeNso(address="203.0.113.7")
+
+    await _tick(_device(), fo, client, SchedulerConfig(), now=_BASE, oob_due=True)
+
+    assert fo.manual_override is True
+    assert calls["n"] == 0
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("active", ["primary", "oob"])
+@pytest.mark.parametrize("missing", [False, True])
+async def test_tick_unreadable_address_skips_all_probes_and_flips(monkeypatch, active, missing):
+    calls = _stub_probe(monkeypatch, reachable=False)
+    fo = _failover_row(active=active, consecutive_failures=2)
+    client = _MissingAddressNso() if missing else _UnreadableAddressNso()
+
+    await _tick(_device(), fo, client, SchedulerConfig(), now=_BASE, oob_due=True)
+
+    assert fo.failback_blocked_reason == "address_unreadable"
+    assert calls["n"] == 0
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("invalid_fields", [("primary_ip",), ("oob_ip",), ("primary_ip", "oob_ip")])
+@pytest.mark.parametrize("active", ["primary", "oob"])
+async def test_tick_invalid_stored_address_defers_without_io(monkeypatch, invalid_fields, active):
+    cfg = SchedulerConfig()
+    probes = _stub_probe(monkeypatch, reachable=True)
+    fo = _failover_row(active=active, consecutive_failures=2, consecutive_successes=4)
+    for field in invalid_fields:
+        setattr(fo, field, "not-an-ip")
+    client = FakeNso()
+
+    with capture_logs() as logs:
+        await _tick(_device(), fo, client, cfg, now=_BASE, oob_due=True)
+
+    assert fo.failback_blocked_reason == "stored_address_invalid"
+    assert fo.next_primary_probe_at == _BASE + timedelta(minutes=cfg.failover_primary_probe_interval)
+    interval = cfg.failover_primary_probe_interval if active == "oob" else cfg.failover_oob_probe_interval
+    assert fo.next_oob_probe_at == _BASE + timedelta(minutes=interval)
+    assert fo.active_address == active
+    assert (fo.consecutive_failures, fo.consecutive_successes) == (2, 4)
+    assert probes["n"] == 0
+    assert client.calls == []
+    assert logs == [
+        {
+            "event": "failover.stored_address_invalid",
+            "log_level": "error",
+            "device_id": 1,
+            "fields": list(invalid_fields),
+        }
+    ]
+
+
+@pytest.mark.parametrize("invalid_field", ["primary_ip", "oob_ip"])
+async def test_tick_invalid_stored_address_schedules_only_configured_fields(monkeypatch, invalid_field):
+    cfg = SchedulerConfig()
+    probes = _stub_probe(monkeypatch, reachable=True)
+    fo = DeviceFailover(device_id=1, primary_ip=None, oob_ip=None, active_address="primary")
+    setattr(fo, invalid_field, "not-an-ip")
+    client = FakeNso()
+
+    await run_failover_tick(_device(), fo, client, cfg, now=_BASE, jitter_fraction=0.25)
+
+    due_field = "next_primary_probe_at" if invalid_field == "primary_ip" else "next_oob_probe_at"
+    absent_due_field = "next_oob_probe_at" if invalid_field == "primary_ip" else "next_primary_probe_at"
+    interval = cfg.failover_primary_probe_interval if invalid_field == "primary_ip" else cfg.failover_oob_probe_interval
+    assert _BASE + timedelta(minutes=interval) <= getattr(fo, due_field) <= _BASE + timedelta(minutes=interval * 1.25)
+    assert getattr(fo, absent_due_field) is None
+    assert fo.failback_blocked_reason == "stored_address_invalid"
+    assert probes["n"] == 0
+    assert client.calls == []
+
+
+async def test_oob_health_probe_restores_observed_address(monkeypatch):
+    _stub_probe(monkeypatch, reachable=True)
+    fo = _failover_row()
+    client = FakeNso(address="192.0.2.5")
+
+    await failover._probe_oob(client, fo, "ra1", SchedulerConfig(), _BASE, fo.primary_ip, fo.oob_ip, False, None)
+
+    assert client.address == "192.0.2.5"
+    assert client.calls[-2:] == [("set_address", "192.0.2.5"), ("disconnect",)]
 
 
 async def test_failover_after_failure_threshold(monkeypatch):
@@ -411,6 +547,11 @@ class _UnreadableAddressNso(FakeNso):
         raise RuntimeError("get boom")
 
 
+class _MissingAddressNso(FakeNso):
+    async def get_address(self, name):
+        return None
+
+
 async def test_failback_flip_reverts_to_the_pre_flip_address_when_oob_equals_primary(monkeypatch):
     """``oob_ip == primary_ip`` normalizes to "no OOB" while the row still reads active=oob.
 
@@ -422,7 +563,7 @@ async def test_failback_flip_reverts_to_the_pre_flip_address_when_oob_equals_pri
     fo = _failover_row(active=ActiveAddress.oob.value, oob="10.0.0.1")
     client = FakeNso(address="10.0.0.1")
 
-    await _tick(dev, fo, client, cfg, now=_BASE)
+    await failover._failback_flip_probe(client, fo, dev.nso_device_name, cfg, _BASE, fo.primary_ip, False, None)
 
     assert all(c[1] is not None for c in _set_address_calls(client))  # never PATCH a null address
     assert _set_address_calls(client)[-1] == ("set_address", "10.0.0.1")  # back to the pre-flip address
@@ -438,7 +579,7 @@ async def test_failback_flip_reverts_to_the_pre_flip_address_when_oob_ip_cleared
     fo = _failover_row(active=ActiveAddress.oob.value, oob=None)
     client = FakeNso(address="10.0.0.1")  # NSO drifted onto the primary while the row says OOB
 
-    await _tick(dev, fo, client, cfg, now=_BASE)
+    await failover._failback_flip_probe(client, fo, dev.nso_device_name, cfg, _BASE, fo.primary_ip, False, None)
 
     assert all(c[1] is not None for c in _set_address_calls(client))
     assert _set_address_calls(client)[-1] == ("set_address", "10.0.0.1")
@@ -478,17 +619,13 @@ async def test_failback_flip_flags_manual_override_when_oob_ip_cleared(monkeypat
 
 
 class _FlakyNso(FakeNso):
-    """A client whose side calls (disconnect/sync-from/get-address) all raise — the switch
-    must still complete (these are best-effort / non-blocking)."""
+    """Disconnect and sync errors do not prevent an address switch."""
 
     async def disconnect(self, name):
         raise RuntimeError("no live session")
 
     async def sync_from(self, name):
         raise RuntimeError("sync boom")
-
-    async def get_address(self, name):
-        raise RuntimeError("get boom")
 
 
 async def test_switch_tolerates_flaky_side_calls(monkeypatch, debug_logs):
@@ -497,7 +634,7 @@ async def test_switch_tolerates_flaky_side_calls(monkeypatch, debug_logs):
     dev, fo, client = _device(), _failover_row(), _FlakyNso()
     for i in range(cfg.failover_failure_threshold):
         await _tick(dev, fo, client, cfg, now=_BASE + timedelta(minutes=3 * i))
-    # switched despite disconnect/sync-from/get-address all raising
+    # The known address permits switching despite disconnect and sync errors.
     assert fo.active_address == ActiveAddress.oob.value
     assert client.address == "192.0.2.5"
     events = {
@@ -541,14 +678,14 @@ def _stub_actions_probe(monkeypatch, reachable):
 async def test_bootstrap_disabled_returns_primary(monkeypatch):
     _enable_failover(monkeypatch, enabled=False)
     client = FakeNso()
-    active, step = await _bootstrap_address(client, "ra1", "10.0.0.1", "192.0.2.5")
+    active, step = await _bootstrap_address(client, "ra1", ip_address("10.0.0.1"), ip_address("192.0.2.5"))
     assert active == ActiveAddress.primary.value and step is None
     assert client.calls == []
 
 
 async def test_bootstrap_no_oob_returns_primary(monkeypatch):
     _enable_failover(monkeypatch, enabled=True)
-    active, step = await _bootstrap_address(FakeNso(), "ra1", "10.0.0.1", None)
+    active, step = await _bootstrap_address(FakeNso(), "ra1", ip_address("10.0.0.1"), None)
     assert active == ActiveAddress.primary.value and step is None
 
 
@@ -556,7 +693,7 @@ async def test_bootstrap_primary_reachable_stays_primary(monkeypatch):
     _enable_failover(monkeypatch, enabled=True)
     _stub_actions_probe(monkeypatch, reachable=True)
     client = FakeNso()
-    active, step = await _bootstrap_address(client, "ra1", "10.0.0.1", "192.0.2.5")
+    active, step = await _bootstrap_address(client, "ra1", ip_address("10.0.0.1"), ip_address("192.0.2.5"))
     assert active == ActiveAddress.primary.value
     assert client.calls == []  # never changed the address
     assert step["status"] == "primary"
@@ -566,7 +703,7 @@ async def test_bootstrap_primary_unreachable_switches_to_oob(monkeypatch):
     _enable_failover(monkeypatch, enabled=True)
     _stub_actions_probe(monkeypatch, reachable=False)
     client = FakeNso()
-    active, step = await _bootstrap_address(client, "ra1", "10.0.0.1", "192.0.2.5")
+    active, step = await _bootstrap_address(client, "ra1", ip_address("10.0.0.1"), ip_address("192.0.2.5"))
     assert active == ActiveAddress.oob.value
     assert ("set_address", "192.0.2.5") in client.calls
     assert client.address == "192.0.2.5"
@@ -758,7 +895,7 @@ async def test_failback_flip_reverts_to_the_address_nso_actually_had(monkeypatch
     fo = _failover_row(active="oob", oob="192.0.2.5")
     _stub_probe(monkeypatch, False)
 
-    await _tick(_device(), fo, client, SchedulerConfig(), now=_BASE)
+    await failover._failback_flip_probe(client, fo, "ra1", SchedulerConfig(), _BASE, fo.primary_ip, False, None)
 
     sets = [c for c in client.calls if c[0] == "set_address"]
     assert sets[-1] == ("set_address", "10.0.0.1"), "revert must restore what NSO had, not invent a move"
@@ -907,3 +1044,75 @@ async def test_revert_failure_diagnostic_omits_an_unknown_role():
     assert record["device_id"] == 17
     assert_keys_absent(record, ["role"])
     assert_records_free_of([record], ["placeholder-device", "198.18.0.10"])
+
+
+async def test_bootstrap_skips_equivalent_ipv6_oob(monkeypatch):
+    _enable_failover(monkeypatch, enabled=True)
+    _stub_actions_probe(monkeypatch, reachable=False)
+    client = FakeNso(address="2001:db8::1")
+    role, step = await _bootstrap_address(client, "ra1", ip_address("2001:db8::1"), ip_address("2001:DB8::1"))
+    assert (role, step) == ("primary", None)
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("active", ["primary", "oob"])
+@pytest.mark.parametrize("address", ["2001:DB8::1", "invalid"])
+async def test_flip_probe_checks_parsed_nso_address(monkeypatch, active, address):
+    calls = _stub_probe(monkeypatch, reachable=True)
+    fo = _failover_row(active=active)
+    fo.primary_ip = "2001:db8::1" if active == "primary" else "2001:db8::2"
+    fo.oob_ip = "2001:db8::1" if active == "oob" else "2001:db8::2"
+
+    class ChangingReadNso(FakeNso):
+        reads = 0
+
+        async def get_address(self, name):
+            self.reads += 1
+            self.address = "2001:db8::1" if self.reads == 1 else address
+            return self.address
+
+    client = ChangingReadNso()
+    fo.manual_override = False
+    await _tick(
+        _device(),
+        fo,
+        client,
+        SchedulerConfig(),
+        now=_BASE,
+        primary_due=active == "oob",
+        oob_due=active == "primary",
+    )
+    assert fo.manual_override is False
+    if address == "invalid":
+        assert fo.failback_blocked_reason == "address_unreadable"
+        assert calls["n"] == 0
+        assert client.calls == []
+    else:
+        assert calls["n"] == 1
+        assert client.address == address
+
+
+async def test_tick_deduplicates_equivalent_ipv6_slots(monkeypatch):
+    calls = _stub_probe(monkeypatch, reachable=True)
+    fo = _failover_row(oob="2001:DB8::1")
+    fo.primary_ip = "2001:db8::1"
+    client = FakeNso(address=fo.primary_ip)
+    await _tick(_device(), fo, client, SchedulerConfig(), now=_BASE, oob_due=True)
+    assert calls["n"] == 1
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("active", ["primary", "oob"])
+@pytest.mark.parametrize("unreadable", [False, True])
+async def test_reconcile_failure_uses_the_oob_role_probe_interval(monkeypatch, active, unreadable):
+    cfg = SchedulerConfig(failover_primary_probe_interval=2, failover_oob_probe_interval=17)
+    calls = _stub_probe(monkeypatch, reachable=True)
+    fo = _failover_row(active=active)
+    client = _UnreadableAddressNso() if unreadable else FakeNso(address="198.18.0.9")
+
+    await _tick(_device(), fo, client, cfg, now=_BASE, primary_due=False, oob_due=True)
+
+    interval = cfg.failover_primary_probe_interval if active == "oob" else cfg.failover_oob_probe_interval
+    assert fo.next_oob_probe_at == _BASE + timedelta(minutes=interval)
+    assert calls["n"] == 0
+    assert client.calls == []

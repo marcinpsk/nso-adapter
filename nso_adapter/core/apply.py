@@ -46,6 +46,7 @@ from nso_adapter.core.static_route_plan import (
     hydrate_static_route_apply_plan,
     recorded_static_route_apply_mode,
 )
+from nso_adapter.domain.asn import AsnRuleViolation, validate_asn_rows
 from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.apply import NsoApplyError
 from nso_adapter.nso.client import failure_detail
@@ -806,6 +807,8 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
         reason = _apply_error_summary(exc)
         logger.warning("apply_diff.failed", **device_fields(device_id=device_id), error=reason)
         return ApplyPreview({PREVIEW_KEY: f"!! preview unavailable: {reason}"}, *identity)
+    except AsnRuleViolation:
+        raise
     except Exception as exc:  # noqa: BLE001 — the preview must never fail hard
         internal = internal_error(exc)
         logger.warning("apply_diff.failed", **device_fields(device_id=device_id), error=internal["message"])
@@ -1364,6 +1367,8 @@ async def _document_reader_compare(
             continue
         try:
             preps[section] = await _reader_compare_prepare(section, apply_rows.sent, apply_rows.ned_id)
+        except AsnRuleViolation:
+            raise
         except Exception as exc:  # noqa: BLE001 — a family's translation must never fail the apply
             logger.warning(
                 "apply.reader_compare_error",
@@ -1422,6 +1427,8 @@ async def _document_reader_compare(
                     device_id=device.id,
                     stamp_of=sections[section].stamp_of,
                 )
+            except AsnRuleViolation:
+                raise
             except Exception as exc:  # noqa: BLE001 — a read-side glitch never fails a good commit
                 logger.warning(
                     "apply.reader_compare_error",
@@ -1433,12 +1440,15 @@ async def _document_reader_compare(
                 n_ok, n_failed, fails, status, evidence = s_ok, 0, [], "error", {}
         reader_compare[section] = status
         evidence_by_section[section] = evidence
-        if unverifiable:
-            reader_compare_unverifiable[section] = unverifiable
+        reader_compare_unverifiable[section] = unverifiable
         if n_failed:
             outcomes[key] = (n_ok, n_failed)
             failures.setdefault(key, []).extend(fails)
-    return reader_compare, reader_compare_unverifiable, evidence_by_section
+    return (
+        reader_compare,
+        {key: values for key, values in reader_compare_unverifiable.items() if values},
+        evidence_by_section,
+    )
 
 
 class _SectionApply(NamedTuple):
@@ -1541,6 +1551,17 @@ def _revert_deploying(snapshot: dict) -> None:
         attr_state.sync_state = state
 
 
+async def _rollback_and_revert_deploying(db, snapshot: dict, reg) -> None:
+    """Restore attribute states only while this run owns the claim."""
+    from nso_adapter.core.claim import ClaimRegistration, lock_claim
+
+    await db.rollback()
+    with db.no_autoflush:
+        await lock_claim(db, reg if reg is not None else ClaimRegistration())
+    _revert_deploying(snapshot)
+    await db.commit()
+
+
 async def _finalize_unsent(db, plan: _ApplyPlan, build_errors: dict, *, job_id: int, reg) -> None:
     """Fail the families whose body could not be built. Nothing reached the device."""
     registry = section_registry()
@@ -1604,6 +1625,8 @@ async def _commit_document(
         blocked = True
     except NsoApplyError as exc:
         commit_error = exc
+    except AsnRuleViolation:
+        raise
     except Exception as exc:  # noqa: BLE001 — surface as a job-level failure
         # The TYPE only: exception text can carry credentials (a RESTCONF error echoes the
         # request, an httpx error its headers) and this payload is persisted on every row.
@@ -1727,13 +1750,14 @@ async def _run_document_apply(db, device, client, device_name, job, job_id, now,
             proof_by_section={"interface_config": plan.interface.execution},
             static_route_plan=plan.static_route,
         )
+    except ClaimLostError:
+        raise
     except Exception:
         # An UNEXPECTED error while building the body (before any commit) — a real bug, not a
         # family's own bad intent, which the builder isolates. Revert the attrs just marked
         # 'deploying' so they are not stuck forever, then re-raise so run_apply fails the job
         # with the real error.
-        _revert_deploying(snapshot)
-        await db.commit()
+        await _rollback_and_revert_deploying(db, snapshot, reg)
         raise
 
     if body.errors:
@@ -1744,65 +1768,72 @@ async def _run_document_apply(db, device, client, device_name, job, job_id, now,
         await _finalize_unsent(db, plan, body.errors, job_id=job_id, reg=reg)
         return
 
-    commit_error, verify, offenders, err, msg = await _commit_document(
-        db, client, device, device_name, body, allowed=plan.allowed, job_id=job_id
-    )
-
-    iface_container = section_registry()["interface_config"].container
-    iface_failed = commit_error is not None and iface_container in body.containers
-    attr_outcome = _stamp_attr_atomic(attr_eligible, commit_error, iface_failed, err, msg, now, snapshot)
-    ip_outcome = _stamp_ip_atomic(
-        ip_rows_flat, commit_error, iface_failed, err, msg, now, stamp_of=plan.interface.ip_stamp_of
-    )
-    outcomes, failures = _stamp_batch_sections(plan.sections, offenders, commit_error, err, msg, now)
-    outcomes["attribute"] = attr_outcome[:2]
-    outcomes["ip"] = ip_outcome[:2]
-    if attr_outcome[2]:
-        failures["attribute"] = list(attr_outcome[2])
-    if ip_outcome[2]:
-        failures["ip"] = list(ip_outcome[2])
-
-    # The SEND's own verdict, before reader-compare folds per-row findings into the same
-    # counter: "nothing landed" and "one row of several is missing" are different facts, and
-    # reading the merged counter would make one dropped route block its proven sibling's CAS.
-    sr_key = section_registry()["static_route"].result_keys[0]
-    sr_send_failed = bool(outcomes.get(sr_key, (0, 0))[1])
-
-    # #108: the document rides the same FASTMAP writers — run the post-apply presence check
-    # per family and re-flag any silently-dropped keys. A family the body could not carry is
-    # excluded: it was never pushed, so "not on the device" is not a drop.
-    reader_compare: dict[str, str] = {}
-    reader_compare_unverifiable: dict[str, list[str]] = {}
-    evidence_by_section: dict[str, dict[int, str]] = {}
-    if commit_error is None:
-        reader_compare, reader_compare_unverifiable, evidence_by_section = await _document_reader_compare(
-            client,
-            device,
-            plan.sections,
-            outcomes,
-            failures,
-            job_id=job_id,
-            device_name=device_name,
+    try:
+        commit_error, verify, offenders, err, msg = await _commit_document(
+            db, client, device, device_name, body, allowed=plan.allowed, job_id=job_id
         )
 
-    sr_results = None
-    if plan.static_route is not None:
-        sr_results = await _settle_static_routes(
-            db,
-            device,
-            client,
-            plan.static_route,
-            job_id=job_id,
-            outbox={"verify": verify, "sent_keys": body.sent_route_keys},
-            evidence=evidence_by_section.get("static_route", {}),
-            # One PUT is the replacement: the document either landed or nothing did.
-            put_delivered=commit_error is None,
-            send_failed=sr_send_failed,
-            scope_outcomes=outcomes,
-            scope_failures=failures,
-            reg=reg,
-            stamp_of=plan.sections["static_route"].stamp_of if "static_route" in plan.sections else None,
+        iface_container = section_registry()["interface_config"].container
+        iface_failed = commit_error is not None and iface_container in body.containers
+        attr_outcome = _stamp_attr_atomic(attr_eligible, commit_error, iface_failed, err, msg, now, snapshot)
+        ip_outcome = _stamp_ip_atomic(
+            ip_rows_flat, commit_error, iface_failed, err, msg, now, stamp_of=plan.interface.ip_stamp_of
         )
+        outcomes, failures = _stamp_batch_sections(plan.sections, offenders, commit_error, err, msg, now)
+        outcomes["attribute"] = attr_outcome[:2]
+        outcomes["ip"] = ip_outcome[:2]
+        if attr_outcome[2]:
+            failures["attribute"] = list(attr_outcome[2])
+        if ip_outcome[2]:
+            failures["ip"] = list(ip_outcome[2])
+
+        # The SEND's own verdict, before reader-compare folds per-row findings into the same
+        # counter: "nothing landed" and "one row of several is missing" are different facts, and
+        # reading the merged counter would make one dropped route block its proven sibling's CAS.
+        sr_key = section_registry()["static_route"].result_keys[0]
+        sr_send_failed = bool(outcomes.get(sr_key, (0, 0))[1])
+
+        # #108: the document rides the same FASTMAP writers — run the post-apply presence check
+        # per family and re-flag any silently-dropped keys. A family the body could not carry is
+        # excluded: it was never pushed, so "not on the device" is not a drop.
+        reader_compare: dict[str, str] = {}
+        reader_compare_unverifiable: dict[str, list[str]] = {}
+        evidence_by_section: dict[str, dict[int, str]] = {}
+        if commit_error is None:
+            reader_compare, reader_compare_unverifiable, evidence_by_section = await _document_reader_compare(
+                client,
+                device,
+                plan.sections,
+                outcomes,
+                failures,
+                job_id=job_id,
+                device_name=device_name,
+            )
+
+        sr_results = None
+        if plan.static_route is not None:
+            sr_results = await _settle_static_routes(
+                db,
+                device,
+                client,
+                plan.static_route,
+                job_id=job_id,
+                outbox={"verify": verify, "sent_keys": body.sent_route_keys},
+                evidence=evidence_by_section.get("static_route", {}),
+                # One PUT is the replacement: the document either landed or nothing did.
+                put_delivered=commit_error is None,
+                send_failed=sr_send_failed,
+                scope_outcomes=outcomes,
+                scope_failures=failures,
+                reg=reg,
+                stamp_of=plan.sections["static_route"].stamp_of if "static_route" in plan.sections else None,
+            )
+
+    except ClaimLostError:
+        raise
+    except Exception:
+        await _rollback_and_revert_deploying(db, snapshot, reg)
+        raise
 
     await _finalize_job(
         db,
@@ -1839,6 +1870,27 @@ def _unrenderable_community_list(row, ned_id: str | None) -> bool:
     return len(community_dialect_for(ned_id).unrepresentable_members(sorted(members))) == len(members)
 
 
+def _validate_reader_as_numbers(rows) -> None:
+    """Refuse invalid stored AS values before reader key comparison."""
+    from nso_adapter.store import models as m
+
+    tables: dict[str, list[dict]] = {}
+    for row in rows:
+        model = type(row)
+        if hasattr(model, "__table__"):
+            tables.setdefault(model.__tablename__, []).append(
+                {column.name: getattr(row, column.name) for column in model.__table__.columns}
+            )
+        if isinstance(row, m.BgpRouterIntent):
+            for scope in row.scopes:
+                for peer in scope.peers:
+                    tables.setdefault("bgp_peer_intent", []).append(
+                        {column.name: getattr(peer, column.name) for column in peer.__table__.columns}
+                    )
+    for table, records in tables.items():
+        validate_asn_rows(table, records)
+
+
 def _reader_compare_expected(section: str, rows, ned_id: str | None = None) -> list[tuple[Any, str, tuple]]:
     """(intent row, YANG-list label, key tuple) for every checkable intended object (#108).
 
@@ -1853,6 +1905,7 @@ def _reader_compare_expected(section: str, rows, ned_id: str | None = None) -> l
     from nso_adapter.core.removal import _ROUTE_POLICY_FAMILY_LISTS
     from nso_adapter.store import models as m
 
+    _validate_reader_as_numbers(rows)
     verify = section_registry()[section].verify
     if isinstance(verify, NoComparison):
         return []
@@ -1976,12 +2029,13 @@ def _reader_compare_walk(
     from nso_adapter.core.removal import _norm_key, _reader_keys
 
     present = {gl.label: _reader_keys(scope, section, gl) for gl in lists}
+    guards = {gl.label: gl for gl in lists}
     row_by_id: dict[int, Any] = {}
     missing: dict[int, list[str]] = {}
     evidence: dict[int, str] = {}
     for row, label, key in translated:
         pk = getattr(row, "id", None)
-        if _norm_key(key) in present.get(label, set()):
+        if _norm_key(key, scope, guards[label]) in present.get(label, set()):
             # setdefault, never a plain assignment: a row can contribute several grains
             # (an IS-IS interface per address family), and one present grain must not
             # overwrite a sibling grain already found missing.
@@ -2363,7 +2417,10 @@ async def _post_apply_refresh_and_notify(db: AsyncSession, device_id: int) -> No
         if device is None:
             return
         client = get_nso_client(device.nso_instance)
-        await refresh_routing_surfaces_for_device(db, device, client, refresh_source="apply")
+        try:
+            await refresh_routing_surfaces_for_device(db, device, client, refresh_source="apply")
+        except AsnRuleViolation as exc:
+            logger.warning("apply.post_refresh_failed", device_id=device_id, error=exc.error)
         await refresh_config_surfaces_for_device(db, device, client, refresh_source="apply")
         await db.commit()
         nb_client = get_netbox_client()
@@ -2372,6 +2429,8 @@ async def _post_apply_refresh_and_notify(db: AsyncSession, device_id: int) -> No
     except ClaimLostError:
         # Revocation is not a runner error: recovery already owns the disposition.
         raise
+    except AsnRuleViolation as exc:
+        logger.warning("apply.post_refresh_failed", device_id=device_id, error=exc.error)
     except Exception as exc:  # noqa: BLE001 — best-effort; never fail an already-finalized Apply
         logger.warning("apply.post_refresh_failed", device_id=device_id, error=failure_detail(exc))
 
@@ -2402,7 +2461,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -
             # §4.6's single transaction exists to prevent. Nothing further is written, the
             # post-apply refresh is skipped, and claim recovery decides (G38).
             raise
-        except JobError as exc:
+        except (JobError, AsnRuleViolation) as exc:
             logger.warning("apply.refused", job_id=job_id, device_id=device_id, code=exc.error["code"])
             await db.rollback()
             if await _write_terminal(db, job_id, JobStatus.failed, None, exc.error, reg):

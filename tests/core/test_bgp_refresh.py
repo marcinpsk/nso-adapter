@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import pytest
 from sqlalchemy import select
 
+from nso_adapter.domain.asn import AsnRuleViolation
 from tests.conftest import seed_device, session
 
 
@@ -306,18 +308,17 @@ class _FakeNso:
         return {"status": "ok", **self._entry}
 
 
-async def test_router_without_asn_is_skipped(adapter_client):
-    """A router entry with a blank asn is skipped; valid routers still import."""
+async def test_router_without_asn_is_rejected(adapter_client):
+    """A router entry with a blank AS number fails validation."""
     from nso_adapter.core.bgp import _upsert_bgp_data
-    from nso_adapter.store.models import Device, DeviceBgpRouter
+    from nso_adapter.store.models import Device
 
     device_id = await seed_device(nso_device_name="bgp-noasn", netbox_device_id=890)
     routers = [{"asn": "", "scope": []}, {"asn": "65100", "scope": []}]
     async with session() as db:
         device = await db.get(Device, device_id)
-        await _upsert_bgp_data(db, device, routers, "test")
-        rows = (await db.execute(select(DeviceBgpRouter))).scalars().all()
-        assert [r.asn for r in rows] == ["65100"]  # asn-less router skipped
+        with pytest.raises(AsnRuleViolation, match="violates RFC 5396"):
+            await _upsert_bgp_data(db, device, routers, "test")
 
 
 async def test_malformed_entries_are_skipped(adapter_client):

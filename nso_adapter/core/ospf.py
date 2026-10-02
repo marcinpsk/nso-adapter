@@ -15,6 +15,7 @@ from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.domain.asn import validate_source_as_numbers
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceOspfInstance, DeviceOspfInterface
@@ -30,6 +31,9 @@ async def _upsert_ospf_data(
     refresh_source: str,
 ) -> None:
     """Full-replace: delete existing OSPF rows for *device*, then insert fresh ones."""
+    for index, entry in enumerate(instances):
+        validate_source_as_numbers(as_list(entry.get("redistribute")), "device_read.ospf", f"instance[{index}]")
+
     await db.execute(delete(DeviceOspfInstance).where(DeviceOspfInstance.device_id == device.id))
     await db.execute(delete(DeviceOspfInterface).where(DeviceOspfInterface.device_id == device.id))
 

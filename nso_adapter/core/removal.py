@@ -40,8 +40,10 @@ from nso_adapter.core.request_flags import (
     STORE_ONLY_PROVENANCE,
     request_marking,
 )
+from nso_adapter.domain.asn import AsnRuleViolation, checked_asn, validate_asn_rows, validate_source_as_numbers
 from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.client import failure_detail
+from nso_adapter.nso.shape import as_list
 
 logger = structlog.get_logger(__name__)
 
@@ -259,28 +261,49 @@ def lost_content(before, after) -> bool:
     return False
 
 
-def _norm_key(key) -> tuple[str, ...]:
+def _norm_key(key, scope: str, guard_list: _GuardList) -> tuple[str, ...]:
     """Normalize a key (scalar or sequence) to a tuple of strings.
 
     NSO JSON may carry ints (vlan-id) where the store/trigger has ints or strings,
     and compound keys round-trip through JSON job context as arrays — string tuples
     make all three sources comparable.
+    BGP AS key parts use the canonical uint32 value in decimal notation.
     """
     parts = key if isinstance(key, (list, tuple)) else (key,)
-    return tuple("" if p is None else str(p) for p in parts)
+    fields = ((guard_list.parent_key,) if guard_list.parent_key else ()) + guard_list.keys
+    return tuple(
+        str(checked_asn(p, "removal_context.bgp", guard_list.label, fields[i]))
+        if scope == "bgp" and i < len(fields) and fields[i] in {"asn", "remote-as", "local-as"}
+        else ""
+        if p is None
+        else str(p)
+        for i, p in enumerate(parts)
+    )
 
 
-def _leaf_keys(entry: dict, guard_list: _GuardList) -> set[tuple[str, ...]]:
+def _leaf_keys(scope: str, entry: dict, guard_list: _GuardList) -> set[tuple[str, ...]]:
     """Collect the key tuples of *guard_list*'s leaf entries under *entry*."""
+    if scope == "bgp":
+        from nso_adapter.core.bgp import validate_bgp_as_numbers
+
+        validate_bgp_as_numbers(entry.get("router") or [])
+    elif scope in {"ospf", "isis"}:
+        for name in ("process-config", "instance" if scope == "ospf" else "process"):
+            for index, parent in enumerate(as_list(entry.get(name))):
+                validate_source_as_numbers(
+                    as_list(parent.get("redistribute")),
+                    f"device_read.{scope}",
+                    f"{name}[{index}]",
+                )
     if guard_list.presence:
         assert guard_list.parent_key is not None
-        return {
+        keys: set[tuple[str, ...]] = {
             (str(parent[guard_list.parent_key]),)
             for parent in entry.get(guard_list.path[0]) or []
             if guard_list.path[1] in parent
         }
-    if guard_list.parent_key is not None:
-        return {
+    elif guard_list.parent_key is not None:
+        keys = {
             (
                 str(parent[guard_list.parent_key]),
                 *((str(child),) if guard_list.scalar else tuple(str(child[k]) for k in guard_list.keys)),
@@ -288,10 +311,12 @@ def _leaf_keys(entry: dict, guard_list: _GuardList) -> set[tuple[str, ...]]:
             for parent in entry.get(guard_list.path[0]) or []
             for child in parent.get(guard_list.path[1]) or []
         }
-    level = [entry]
-    for name in guard_list.path:
-        level = [child for node in level for child in (node.get(name) or [])]
-    return {tuple(str(e.get(f, "")) for f in guard_list.keys) for e in level}
+    else:
+        level = [entry]
+        for name in guard_list.path:
+            level = [child for node in level for child in (node.get(name) or [])]
+        keys = {tuple(str(e.get(f, "")) for f in guard_list.keys) for e in level}
+    return {_norm_key(key, scope, guard_list) for key in keys}
 
 
 def _removed_context(scope: str, context: dict) -> dict[str, list]:
@@ -340,7 +365,7 @@ def _reader_keys(scope: str, entry: dict, guard_list: _GuardList) -> set[tuple[s
     path = _READER_LIST_PATHS.get((scope, guard_list.label))
     if path is not None:
         guard_list = guard_list._replace(path=path)
-    return _leaf_keys(entry, guard_list)
+    return _leaf_keys(scope, entry, guard_list)
 
 
 # (scope, guard-list label) pairs whose intent key and export key live in DIFFERENT
@@ -499,7 +524,7 @@ async def _residue_after_removal(client, device, scope: str, context: dict) -> t
     keymaps: dict[str, dict[tuple, tuple]] = {}
     unverifiable: list[str] = []
     for guard_list in guard_lists:
-        keys = {_norm_key(k) for k in removed.get(guard_list.label, [])}
+        keys = {_norm_key(k, scope, guard_list) for k in removed.get(guard_list.label, [])}
         if not keys:
             continue
         keymap = await _export_key_map(scope, guard_list.label, keys, context)
@@ -550,6 +575,8 @@ async def _record_residue(
     """
     try:
         residue, unverifiable = await _residue_after_removal(client, device, scope, context)
+    except AsnRuleViolation:
+        raise
     except Exception as exc:  # noqa: BLE001 — the check must never fail the removal
         # Metadata only: any exception from the reader can repeat what the server said.
         logger.warning(
@@ -607,8 +634,8 @@ def _document_orphans(current: dict, containers: dict[str, dict], allowed: dict[
         body = containers.get(container) or {}
         permitted_by_label = allowed.get(section) or {}
         for guard_list in guard_lists:
-            permitted = {_norm_key(key) for key in permitted_by_label.get(guard_list.label, [])}
-            orphan = sorted(_leaf_keys(live, guard_list) - _leaf_keys(body, guard_list) - permitted)
+            permitted = {_norm_key(key, section, guard_list) for key in permitted_by_label.get(guard_list.label, [])}
+            orphan = sorted(_leaf_keys(section, live, guard_list) - _leaf_keys(section, body, guard_list) - permitted)
             if orphan:
                 orphans[f"{section}/{guard_list.label}"] = [list(key) for key in orphan]
     return orphans
@@ -2017,6 +2044,10 @@ async def promotion_removal_context(
     """
     if scope not in valid_removal_scopes():  # pragma: no cover - caller validates first
         raise ValueError(f"Unknown removal scope {scope!r}")
+
+    for tables in (removed_rows, replacement_rows or {}):
+        for table, rows in tables.items():
+            validate_asn_rows(table, rows)
 
     removed: dict[str, list] = {}
     interfaces: list[str] | None = None

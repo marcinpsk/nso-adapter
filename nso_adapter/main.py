@@ -26,6 +26,7 @@ from nso_adapter.api.errors import (
     api_error,
     api_error_handler,
     apply_unexecutable_handler,
+    asn_rule_violation_handler,
     framework_http_error_handler,
     projection_gone_handler,
     promotion_provenance_handler,
@@ -72,6 +73,7 @@ from nso_adapter.core.request_flags import (
 )
 from nso_adapter.core.scheduler import start_scheduler, stop_scheduler
 from nso_adapter.core.worker import start_workers, stop_workers
+from nso_adapter.domain.asn import AsnRuleViolation, asn_refusal_detail
 from nso_adapter.notifications.persistent_subscriber import persistent_subscriber
 from nso_adapter.notifications.sse_subscriber import SSESubscriber
 from nso_adapter.nso.client import NsoClient, failure_detail
@@ -282,7 +284,10 @@ class _DeviceRefreshCoalescer:
             device = await db.get(Device, device_id)  # RE-FETCH by id — never a foreign session's row
             if device is None:
                 return
-            await refresh_all_surfaces_for_device(db, device, client, refresh_source="notification", atomic=False)
+            try:
+                await refresh_all_surfaces_for_device(db, device, client, refresh_source="notification", atomic=False)
+            except AsnRuleViolation as exc:
+                logger.warning("sse.coalesced_refresh_failed", device_id=device_id, error=asn_refusal_detail(exc))
         # Notify AFTER the refresh and BEFORE the dirty check (codex R1-F5 ordering): the
         # plugin reconciles the refreshed mirror; failures are swallowed (best-effort).
         nb_client = get_netbox_client()
@@ -496,6 +501,7 @@ def create_app(*, lifespan_context: Callable[[FastAPI], AbstractAsyncContextMana
         openapi_url="/openapi.json" if api_docs else None,
     )
     app.add_exception_handler(ApiError, api_error_handler)
+    app.add_exception_handler(AsnRuleViolation, asn_rule_violation_handler)
     app.add_exception_handler(StarletteHTTPException, framework_http_error_handler)
     app.add_exception_handler(RequestValidationError, validation_error_handler)
     app.add_exception_handler(DeviceProjectionGone, projection_gone_handler)

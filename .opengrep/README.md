@@ -54,9 +54,16 @@ values in every positional or structured log field. It covers `nso_adapter/main.
 `bindings/netbox/client.py`, `bindings/netbox/mapper.py`, `bindings/netbox/writer.py`,
 `notifications/sse_subscriber.py`, `notifications/persistent_subscriber.py`, and the
 outcome bookkeeping logs in `refresh_engine.py` and `redistribution.py`. These logs
-must use `failure_detail` so an HTTP exception cannot repeat a request URL or server
-text. The behavioral and AST regressions in `tests/core/test_importer_failure_sinks.py`
+use `failure_detail` for generic exceptions so an HTTP failure cannot repeat a request URL
+or server text. The behavioral and AST regressions in `tests/core/test_importer_failure_sinks.py`
 remain authoritative for the classification contract and complete Python syntax.
+`asn_refusal_detail` preserves the domain-owned redacted envelope for an exact
+`AsnRuleViolation`. Its runtime type check rejects unrelated exceptions and subclasses.
+The AST guard pins its executable definition. Raw exception fields remain rejected.
+`nso-asn-refusal-truncated-diagnostic` rejects generic classification of a caught
+`AsnRuleViolation` when the result reaches a log field or argument, including aliases.
+The rule recognizes the explicit catch name. It distinguishes nested generic catches
+that bind the same variable from references to the outer ASN refusal.
 The pre-commit AST guard scans guarded modules for exception aliases after
 context-manager exits. Its control-flow model tracks conditional and later
 assignments that OpenGrep cannot classify reliably.

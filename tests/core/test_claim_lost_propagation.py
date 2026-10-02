@@ -44,6 +44,7 @@ _ROOT = pathlib.Path(__file__).resolve().parents[2] / "nso_adapter"
 # their stamping now runs unwrapped, where an exception reaches ``run_apply`` and is re-raised
 # there instead of being swallowed.
 INVENTORY = [
+    ("core/apply.py", "_run_document_apply", "_rollback_and_revert_deploying"),
     ("core/apply.py", "_static_route_device_state", "static_route.device_state_read_failed"),
     ("core/apply.py", "_post_apply_refresh_and_notify", "apply.post_refresh_failed"),
     ("core/apply.py", "run_apply", "apply.unexpected_error"),
@@ -54,7 +55,6 @@ INVENTORY = [
     ("core/jobs.py", "_run_connect", "job.connect.failed"),
     ("core/jobs.py", "_run_provision", "job.provision.failed"),
     ("core/onboarding.py", "_initial_mirror_refresh", "device.onboard_mirror.failed"),
-    ("core/onboarding.py", "_seed_onboarding_failover", "failover_seed"),
     ("core/refresh_engine.py", None, "outcome.read_record_failed"),
     ("core/refresh_engine.py", None, "outcome.result_record_failed"),
 ]
@@ -80,7 +80,14 @@ def test_broad_handler_reraises_claim_lost_first(module, function, marker):
     placed after ``except Exception`` never runs.
     """
     path = _ROOT / module
-    matching = [t for t in _handlers(path) if any(_mentions(h, marker) for h in t.handlers)]
+    matching = [
+        t
+        for t in _handlers(path)
+        if any(_mentions(h, marker) for h in t.handlers)
+        and any(h.type is None or ast.unparse(h.type) == "Exception" for h in t.handlers)
+    ]
+    if function == "_run_document_apply":
+        assert len(matching) == 2
     assert matching, f"no try/except in {module} mentions {marker!r} — did the log event get renamed?"
 
     for try_node in matching:
@@ -103,6 +110,39 @@ def test_broad_handler_reraises_claim_lost_first(module, function, marker):
         assert any(isinstance(stmt, ast.Raise) for stmt in handler.body), (
             f"{module}:{marker} catches ClaimLostError without re-raising it"
         )
+
+
+@pytest.mark.parametrize(
+    ("source", "refuses"),
+    [
+        (
+            "try:\n"
+            "    try:\n"
+            "        refresh()\n"
+            "    except AsnRuleViolation:\n"
+            "        marker()\n"
+            "except ClaimLostError:\n"
+            "    raise\n"
+            "except Exception:\n"
+            "    marker()\n",
+            False,
+        ),
+        ("try:\n    refresh()\nexcept AsnRuleViolation:\n    marker()\n", True),
+        ("try:\n    refresh()\nexcept Exception:\n    marker()\n", True),
+        (
+            "try:\n    refresh()\nexcept Exception:\n    marker()\nexcept ClaimLostError:\n    raise\n",
+            True,
+        ),
+    ],
+)
+def test_claim_loss_guard_selects_broad_handlers(tmp_path, monkeypatch, source, refuses):
+    monkeypatch.setattr(f"{__name__}._ROOT", tmp_path)
+    (tmp_path / "handler.py").write_text(source)
+    if refuses:
+        with pytest.raises(AssertionError):
+            test_broad_handler_reraises_claim_lost_first("handler.py", "refresh", "marker")
+    else:
+        test_broad_handler_reraises_claim_lost_first("handler.py", "refresh", "marker")
 
 
 # ── behavioral: the helpers that can be driven without a live NSO ────────────

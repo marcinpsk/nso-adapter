@@ -15,6 +15,7 @@ from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.domain.asn import AsnRuleViolation, checked_asn, validate_source_as_numbers
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import (
@@ -29,6 +30,27 @@ from nso_adapter.store.models import (
 )
 
 logger = structlog.get_logger(__name__)
+
+
+def validate_bgp_as_numbers(routers: list[dict]) -> None:
+    """Refuse malformed AS numbers before materialization or device verification."""
+    seen: dict[int, str] = {}
+    for index, router in enumerate(as_list(routers)):
+        location = f"router[{index}]"
+        identity = checked_asn(router.get("asn"), "device_read.bgp", location, "asn")
+        if identity in seen:
+            raise AsnRuleViolation("device_read.bgp", location, "asn", router.get("asn"), other_row_id=seen[identity])
+        seen[identity] = location
+        for scope_index, scope in enumerate(as_list(router.get("scope"))):
+            scope_location = f"{location}.scope[{scope_index}]"
+            for af in as_list(scope.get("address-family")):
+                validate_source_as_numbers(as_list(af.get("redistribute")), "device_read.bgp", scope_location)
+            for kind in ("peer", "peer-group"):
+                for peer_index, peer in enumerate(as_list(scope.get(kind))):
+                    peer_location = f"{scope_location}.{kind}[{peer_index}]"
+                    for field in ("remote-as", "local-as"):
+                        if peer.get(field) is not None:
+                            checked_asn(peer[field], "device_read.bgp", peer_location, field)
 
 
 def _paf_policy(paf_data: dict) -> dict:
@@ -209,14 +231,13 @@ async def _upsert_bgp_data(
     refresh_source: str,
 ) -> None:
     """Full-replace: delete existing BGP rows for *device*, then insert fresh ones."""
+    validate_bgp_as_numbers(routers)
     await db.execute(delete(DeviceBgpRouter).where(DeviceBgpRouter.device_id == device.id))
 
     now = datetime.now(UTC)
 
     for router_data in routers:
         asn = str(router_data.get("asn", ""))
-        if not asn:
-            continue
         router = DeviceBgpRouter(
             device_id=device.id,
             asn=asn,

@@ -6,20 +6,41 @@ from __future__ import annotations
 
 import structlog
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_read_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409, RESP_422_VALIDATION, api_error
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import iso_z, latest_refreshed
+from nso_adapter.domain.asn import redistribution_source_identity, validate_asn_rows
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device, DeviceRedistribution
 
 logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/devices", tags=["redistribution"])
+
+
+class RedistributionSourceModel(BaseModel):
+    """Shared source instance boundary for every redistribution intent writer."""
+
+    source_protocol: str
+    source_ref: str = Field(default="", validate_default=True)
+
+    @field_validator("source_ref")
+    @classmethod
+    def validate_source_as_number(cls, value: str, info: ValidationInfo) -> str:
+        redistribution_source_identity(info.data.get("source_protocol", ""), value)
+        return value
+
+
+def validate_unique_redistribution_sources(entries: list) -> None:
+    """Refuse repeated source identities within one redistribution destination."""
+    keys = [(e.source_protocol, redistribution_source_identity(e.source_protocol, e.source_ref)) for e in entries]
+    if len(keys) != len(set(keys)):
+        raise api_error(409, "conflict", "Redistribution sources must have unique AS numbers or instance references")
 
 
 class RedistributionOut(BaseModel):
@@ -47,7 +68,7 @@ class RedistributionConfigOut(BaseModel):
     dependencies=[Depends(verify_token)],
     response_model=RedistributionConfigOut,
     response_model_exclude_unset=True,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409, **RESP_422_VALIDATION},
 )
 async def get_redistribution(device_id: int, db: AsyncSession = Depends(get_read_db)):
     """Return all redistribution statements cached from NSO for *device_id*.
@@ -75,6 +96,10 @@ async def get_redistribution(device_id: int, db: AsyncSession = Depends(get_read
         )
     )
     rows = result.scalars().all()
+    validate_asn_rows(
+        "device_redistribution",
+        [{column.name: getattr(row, column.name) for column in DeviceRedistribution.__table__.columns} for row in rows],
+    )
 
     if not rows:
         return {

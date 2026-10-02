@@ -12,6 +12,7 @@ import asyncio
 import time
 import uuid
 from contextlib import suppress
+from ipaddress import IPv4Address, IPv6Address
 from typing import Any
 
 import structlog
@@ -31,6 +32,7 @@ from nso_adapter.core.claim import (
     resolve_claim_by_token,
 )
 from nso_adapter.core.families import ALL_FAMILY_KEYS
+from nso_adapter.domain.asn import AsnRuleViolation
 from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.client import failure_detail
 from nso_adapter.store import outcome_store
@@ -107,7 +109,9 @@ _READ_MIRROR_ROOTS = (
 #: The failures whose message the adapter WROTE: it names the failure and repeats nothing
 #: the server said. Every other exception is classified by its type alone. A decode of a
 #: malformed answer carries the server's bytes, and a store failure carries the statement.
-async def _bootstrap_address(client, device_name: str, primary: str, oob_ip: str | None) -> tuple[str, dict | None]:
+async def _bootstrap_address(
+    client, device_name: str, primary: IPv4Address | IPv6Address, oob_ip: IPv4Address | IPv6Address | None
+) -> tuple[str, dict | None]:
     """Reachability-aware initial management address.
 
     When failover is enabled and a fresh device's primary IP is unreachable but its OOB IP
@@ -115,7 +119,7 @@ async def _bootstrap_address(client, device_name: str, primary: str, oob_ip: str
     back to primary once the in-band address comes up). Returns ``(active_address, step|None)``.
     """
     cfg = get_config().scheduler
-    if not (cfg.enable_failover and oob_ip and oob_ip != primary):
+    if not (cfg.enable_failover and oob_ip is not None and oob_ip != primary):
         return ActiveAddress.primary.value, None
     from nso_adapter.nso.actions import probe_reachable
 
@@ -123,7 +127,7 @@ async def _bootstrap_address(client, device_name: str, primary: str, oob_ip: str
     if reachable:
         return ActiveAddress.primary.value, {"step": "failover_bootstrap", "status": "primary"}
     try:
-        await client.set_address(device_name, oob_ip)
+        await client.set_address(device_name, str(oob_ip))
         await client.disconnect(device_name)
     except Exception as exc:
         return ActiveAddress.primary.value, {
@@ -382,8 +386,7 @@ async def _onboard_under_claim(
 ) -> Device:
     """Map the device with its claim already held, and leave the claim held.
 
-    Provision keeps doing device work after this returns — the failover seed and the
-    comprehensive mirror fill — so the window from the mapping to the end of that work is
+    Provision fills the read mirror after this returns, so the window from mapping to completion is
     exactly where a rival sync, failover tick or teardown used to interleave on a device
     that had just become visible with no claim.
 
@@ -619,7 +622,7 @@ async def provision_nso_device(
     *,
     nso_instance: str,
     device_name: str,
-    address: str,
+    address: IPv4Address | IPv6Address,
     ned_id: str,
     authgroup: str,
     netbox_device_id: int | None = None,
@@ -627,7 +630,7 @@ async def provision_nso_device(
     port: int | None = None,
     admin_state: str = "unlocked",
     do_sync: bool = True,
-    oob_ip: str | None = None,
+    oob_ip: IPv4Address | IPv6Address | None = None,
     reg: ClaimRegistration | None = None,
     job_id: int | None = None,
 ) -> dict:
@@ -689,7 +692,7 @@ async def provision_nso_device(
         if await client.device_exists(device_name):
             _step("create", "exists")
         else:
-            await client.create_device(device_name, address, ned_id, authgroup, ned_type=device_type, port=port)
+            await client.create_device(device_name, str(address), ned_id, authgroup, ned_type=device_type, port=port)
             _step("create", "ok", f"device-type={device_type}")
     except Exception as exc:
         _step("create", "failed", failure=failure_detail(exc))
@@ -719,17 +722,13 @@ async def provision_nso_device(
         _step("fetch_host_keys", "ok")
     except Exception as exc:
         _step("fetch_host_keys", "failed", failure=failure_detail(exc))
-        # If the bootstrap pinned NSO to the OOB address, don't strand the device: map it and
-        # seed the failover row so the loop can fail it back to primary once in-band recovers.
+        # Preserve the mapping when host-key retrieval fails after OOB bootstrap.
         if active_address == ActiveAddress.oob.value:
-            device_id = await _map_and_seed_failover(
+            device_id = await _map_provisioned_device(
                 db,
                 nso_instance,
                 device_name,
                 netbox_device_id,
-                address,
-                oob_ip,
-                active_address,
                 steps,
                 reg=reg,
                 job_id=job_id,
@@ -747,16 +746,12 @@ async def provision_nso_device(
         except Exception as exc:
             _step("sync_from", "failed", failure=failure_detail(exc))
 
-    # 5-6. adapter mapping row (so the read pipeline manages it henceforth) + failover row
-    #      (IPs + bootstrapped address) so the failover loop can manage it.
-    device_id = await _map_and_seed_failover(
+    # Create the adapter mapping so the read pipeline can manage the device.
+    device_id = await _map_provisioned_device(
         db,
         nso_instance,
         device_name,
         netbox_device_id,
-        address,
-        oob_ip,
-        active_address,
         steps,
         reg=reg,
         job_id=job_id,
@@ -828,34 +823,28 @@ async def _initial_mirror_refresh(
     except ClaimLostError:
         # Revocation is not a runner error: recovery already owns the disposition.
         raise
+    except AsnRuleViolation as exc:
+        await db.rollback()
+        logger.warning("device.onboard_mirror.failed", device_id=device_id, error=exc.error)
     except Exception as exc:  # noqa: BLE001 — never fail provisioning on a mirror-read hiccup
         await db.rollback()
         # The mirror read is HTTP against NSO, so the same classification applies here.
         logger.warning("device.onboard_mirror.failed", device_id=device_id, error=failure_detail(exc))
 
 
-async def _map_and_seed_failover(
+async def _map_provisioned_device(
     db: AsyncSession,
     nso_instance: str,
     device_name: str,
     netbox_device_id: int | None,
-    address: str,
-    oob_ip: str | None,
-    active_address: str,
     steps: list[dict],
     *,
     reg: ClaimRegistration | None = None,
     job_id: int | None = None,
 ) -> int | None:
-    """Create the adapter mapping row and seed the failover row; return the device_id or None.
+    """Create the adapter mapping and return its ID when a NetBox device is supplied.
 
-    Shared by the happy path and the OOB-bootstrap failure recovery so a device NSO was pinned
-    to its OOB address is always handed to the failover loop — never stranded on OOB with no
-    DeviceFailover row to fail it back once the in-band address recovers.
-
-    A :class:`ClaimUnavailableError` from the mapping propagates: the provision fails
-    retryably rather than continuing into the post-map phase unserialized. Nothing has been
-    written to the device at that point, on any branch.
+    Claim acquisition failures propagate before the post-map refresh.
     """
     device_id = None
     if netbox_device_id is not None:
@@ -874,40 +863,7 @@ async def _map_and_seed_failover(
             )
         except LookupError as exc:
             steps.append({"step": "adapter_mapping", "status": "exists", "failure": failure_detail(exc)})
-    fo_seed = await _seed_onboarding_failover(db, device_id, address, oob_ip, active_address, reg=reg)
-    if fo_seed:
-        steps.append(fo_seed)
     return device_id
-
-
-async def _seed_onboarding_failover(
-    db: AsyncSession,
-    device_id: int | None,
-    primary: str,
-    oob_ip: str | None,
-    active_address: str,
-    *,
-    reg: ClaimRegistration | None = None,
-) -> dict | None:
-    """Seed the failover row at onboarding (when enabled). Returns a step dict, or None."""
-    if not (get_config().scheduler.enable_failover and device_id is not None and (oob_ip or primary)):
-        return None
-    from nso_adapter.core.failover import set_initial_failover_state
-
-    try:
-        await _guard(db, reg)  # device state, committed below: guarded like every other write
-        await set_initial_failover_state(db, device_id, primary, oob_ip, active_address)
-        await db.commit()
-        return {"step": "failover_seed", "status": "ok", "detail": active_address}
-    except ClaimLostError:
-        # Revocation is not a runner error: recovery already owns the disposition.
-        raise
-    except Exception as exc:
-        # Best-effort means the STEP is reported and provisioning continues — but the failed
-        # transaction has to go, or the mirror refresh and the runner's terminal write both
-        # die of PendingRollbackError on a device that mapped perfectly well.
-        await db.rollback()
-        return {"step": "failover_seed", "status": "failed", "failure": failure_detail(exc)}
 
 
 async def rekey_device(

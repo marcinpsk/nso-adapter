@@ -22,6 +22,7 @@ from typing import Annotated
 
 from fastapi import Header, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.errors import api_error, push_conflict_error
@@ -136,6 +137,20 @@ async def begin_delivery(db: AsyncSession, device_id: int, delivery: IntentDeliv
     from nso_adapter.core.generation import note_write
 
     await note_write(db, device_id, delivery.stream, push_seq=delivery.push_seq)
+    from nso_adapter.core.projection import fragment_tables, rows_by_intent_identity, snapshot_stream
+    from nso_adapter.store.models import DeviceProjectionStream
+
+    if delivery.stream in {"bgp", "ospf", "isis"}:
+        await snapshot_stream(db, device_id, delivery.stream)
+    projection = await db.scalar(
+        select(DeviceProjectionStream).where(
+            DeviceProjectionStream.device_id == device_id, DeviceProjectionStream.stream == delivery.stream
+        )
+    )
+    if projection is not None:
+        tables = fragment_tables(projection.authorized_document)
+        for table in tables:
+            rows_by_intent_identity(tables, table)
     return await admit_or_replay(db, device_id, delivery)
 
 

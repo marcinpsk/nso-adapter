@@ -801,7 +801,13 @@ async def test_run_provision_marks_failed_even_when_session_poisoned(adapter_cli
             status=JobStatus.running,
             coalescible=False,
             run_attempt=1,
-            context={"nso_instance": "nso-dev", "device_name": "prov-poison"},
+            context={
+                "address": "198.18.0.1",
+                "ned_id": "cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+                "authgroup": "placeholder-authgroup",
+                "nso_instance": "nso-dev",
+                "device_name": "prov-poison",
+            },
         )
         db.add(j)
         await db.commit()
@@ -839,7 +845,13 @@ async def _queue_provision_job(device_name: str, *, provision_attempt_id: uuid.U
             status=JobStatus.running,
             coalescible=False,
             run_attempt=1,
-            context={"nso_instance": "nso-dev", "device_name": device_name},
+            context={
+                "address": "198.18.0.1",
+                "ned_id": "cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+                "authgroup": "placeholder-authgroup",
+                "nso_instance": "nso-dev",
+                "device_name": device_name,
+            },
         )
         db.add(j)
         await db.commit()

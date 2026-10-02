@@ -2202,6 +2202,7 @@
       "DeviceProvision": {
         "properties": {
           "address": {
+            "format": "ipvanyaddress",
             "title": "Address",
             "type": "string"
           },
@@ -2251,6 +2252,7 @@
           "oob_ip": {
             "anyOf": [
               {
+                "format": "ipvanyaddress",
                 "type": "string"
               },
               {
@@ -2350,6 +2352,7 @@
               "not_implemented",
               "nso_commit_failed",
               "apply_unexecutable",
+              "asn_rule_violation",
               "ambiguous_device",
               "bad_request",
               "community_not_found",
@@ -7633,6 +7636,7 @@
           "oob_ip": {
             "anyOf": [
               {
+                "format": "ipvanyaddress",
                 "type": "string"
               },
               {
@@ -7644,6 +7648,7 @@
           "primary_ip": {
             "anyOf": [
               {
+                "format": "ipvanyaddress",
                 "type": "string"
               },
               {
@@ -10247,6 +10252,16 @@
             },
             "description": "Device not found"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -11065,6 +11080,16 @@
               }
             },
             "description": "Device not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Conflict"
           },
           "422": {
             "content": {
@@ -13361,6 +13386,16 @@
               }
             },
             "description": "Device not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Conflict"
           },
           "422": {
             "content": {

@@ -17,6 +17,7 @@ import pytest
 
 from nso_adapter.core.community_dialect import community_dialect_for
 from nso_adapter.core.projection import InterfaceExecution
+from nso_adapter.domain.asn import AsnRuleViolation
 from nso_adapter.nso import apply as apply_mod
 from nso_adapter.nso.apply import (
     NsoApplyError,
@@ -848,6 +849,59 @@ def test_bgp_asn_asdot_notation_round_trips():
     assert routers[0]["asn"] == 1 * 65536 + 100
 
 
+@pytest.mark.parametrize(
+    ("router_asn", "redist_asn"),
+    [("64086.59904", "4200000000"), ("4200000000", "64086.59904")],
+)
+def test_bgp_redistribution_joins_equivalent_as_numbers(router_asn, redist_asn):
+    from nso_adapter.store.models import BgpAfIntent, BgpScopeIntent
+
+    router = BgpRouterIntent(
+        asn=router_asn,
+        scopes=[
+            BgpScopeIntent(
+                vrf="",
+                address_families=[BgpAfIntent(af="ipv4-unicast")],
+                peers=[],
+            )
+        ],
+    )
+    redist = RedistributionIntent(
+        dest_protocol="bgp",
+        dest_ref=f"{redist_asn}::ipv4-unicast",
+        source_protocol="connected",
+        source_ref="",
+    )
+    routers = _bgp_body([router], [redist])["router"]
+    assert len(routers) == 1
+    assert routers[0]["asn"] == 4200000000
+    assert routers[0]["scope"][0]["address-family"] == [
+        {
+            "afi": "ipv4-unicast",
+            "redistribute": [{"source-protocol": "connected", "source-ref": ""}],
+        }
+    ]
+
+
+@pytest.mark.parametrize("asn", ["-1", "4294967296", "65536.0", "0.65536", "1.-1", "1.2.3"])
+def test_bgp_writer_rejects_invalid_as_number(asn):
+    with pytest.raises(AsnRuleViolation, match="violates RFC 5396") as caught:
+        _bgp_body([BgpRouterIntent(asn=asn)])
+    assert caught.value.error["code"] == "asn_rule_violation"
+
+
+@pytest.mark.parametrize("dest_ref", ["invalid", "invalid::ipv4-unicast", "65536.0::ipv4-unicast"])
+def test_bgp_writer_rejects_invalid_redistribution_destination(dest_ref):
+    redist = RedistributionIntent(
+        dest_protocol="bgp",
+        dest_ref=dest_ref,
+        source_protocol="connected",
+        source_ref="",
+    )
+    with pytest.raises(AsnRuleViolation):
+        _bgp_body([], [redist])
+
+
 def test_bgp_sends_an_accepted_router_id():
     """An accepted global router-id is emitted as the `router-id` leaf (sibling of asn)."""
     router_out = _bgp_body([BgpRouterIntent(asn="65100", router_id="10.255.0.1")])["router"][0]
@@ -863,12 +917,14 @@ def test_bgp_omits_the_router_id_when_unset():
 
 
 def test_bgp_invalid_asn_raises_a_clean_error():
-    """A non-numeric ASN raises a descriptive NsoApplyError, not an opaque ValueError."""
+    """A stored non-numeric ASN produces a typed refusal without echoing the value."""
+    from nso_adapter.domain.asn import AsnRuleViolation
     from tests._secret_discipline import assert_chain_free_of
 
     asn = "placeholder-invalid-asn"
-    with pytest.raises(NsoApplyError, match="ASN") as caught:
-        _bgp_body([BgpRouterIntent(asn=asn)])
+    with pytest.raises(AsnRuleViolation, match="violates RFC 5396") as caught:
+        _bgp_body([BgpRouterIntent(id=7, asn=asn)])
+    assert caught.value.error["detail"] == {"table": "bgp_router_intent", "row_id": 7, "field": "asn"}
     assert_chain_free_of(caught.value, [asn])
 
 
@@ -1618,3 +1674,43 @@ async def test_the_document_preview_honours_the_cli_outformat():
     assert "dry-run=cli" in url, "the preview must ask NSO for the NED-uniform tree diff"
     assert "dry-run=native" not in url
     assert delta == "+ description uplink"
+
+
+@pytest.mark.parametrize("field", ["remote_as", "local_as"])
+def test_bgp_peer_asdot_is_encoded_as_asplain(field):
+    from nso_adapter.store.models import BgpPeerIntent, BgpScopeIntent
+
+    peer = BgpPeerIntent(peer_address="198.18.0.1", enabled=True, peer_address_families=[], **{field: "64086.59904"})
+    router = BgpRouterIntent(asn="64512", scopes=[BgpScopeIntent(vrf="", peers=[peer], address_families=[])])
+    emitted = _bgp_body([router])["router"][0]["scope"][0]["peer"][0]
+    assert emitted[field.replace("_", "-")] == "4200000000"
+
+
+@pytest.mark.parametrize("field", ["remote_as", "local_as"])
+@pytest.mark.parametrize("value", ["invalid", "", "-1", "4294967296", "65536.0", "0.65536", "1.-1"])
+def test_bgp_peer_malformed_as_is_rejected(field, value):
+    from nso_adapter.store.models import BgpPeerIntent, BgpScopeIntent
+
+    peer = BgpPeerIntent(peer_address="198.18.0.1", enabled=True, peer_address_families=[], **{field: value})
+    router = BgpRouterIntent(asn="64512", scopes=[BgpScopeIntent(vrf="", peers=[peer], address_families=[])])
+    with pytest.raises(AsnRuleViolation, match="violates RFC 5396") as caught:
+        _bgp_body([router])
+    assert caught.value.error["code"] == "asn_rule_violation"
+
+
+@pytest.mark.parametrize("protocol", ["bgp", "isis"])
+@pytest.mark.parametrize("source_ref", ["064520", " 64512", "65536.1x", ""])
+def test_redistribution_writer_refuses_malformed_source_as(protocol, source_ref):
+    row = RedistributionIntent(
+        dest_protocol=protocol,
+        dest_ref="64512::ipv4-unicast" if protocol == "bgp" else "placeholder-process",
+        source_protocol="bgp",
+        source_ref=source_ref,
+    )
+    with pytest.raises(AsnRuleViolation, match="violates RFC 5396"):
+        if protocol == "bgp":
+            _bgp_body([], [row])
+        else:
+            build_isis_process_payload(
+                [IsisProcessIntent(process_tag="placeholder-process")], redistribution_rows=[row]
+            )

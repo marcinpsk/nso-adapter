@@ -54,6 +54,13 @@
     failed; `error.detail.attributes` lists the failed ones), and
     `apply_unexecutable` (409, a selected stream cannot be delivered faithfully by its
     existing apply or removal runner; `error.detail.streams` maps each stream to its reason).
+  - AS content: `asn_rule_violation` (409, stored or device-read AS content violates
+    RFC 5396; the detail identifies the stored row or structural device-read location
+    and field without the rejected value). A refusal from a mirror refresh also lists
+    every surface that failed in that refresh in `error.detail.degraded_surfaces`.
+    GET `bgp-config` and `redistribution`
+    return this refusal in the `ErrorEnvelope` model, as do intent writes, Apply,
+    and GET `actions/apply-diff`.
   - Per-endpoint: `ambiguous_device` (device lookup matches >1),
     `bad_request` (malformed action parameter), `community_not_found`
     (SNMP harvest), `harvest_unsupported_ned`, `invalid_vault_ref`
@@ -1041,7 +1048,7 @@ Controlled by `NSO_ADAPTER_RECONCILE_COMMIT` (default `keep-non-service-config`;
 `discard-non-service-config` to prune; `""`/`off` for a plain commit — same observed
 result as keep on this NSO).
 
-### `GET /api/v1/devices/{id}/actions/apply-diff` → `200 | 404`
+### `GET /api/v1/devices/{id}/actions/apply-diff` → `200 | 404 | 409`
 
 Preview the **native device diff** the next Apply would push (NSO
 `?dry-run=native&reconcile=keep-non-service-config`; nothing is committed — the
@@ -1057,6 +1064,8 @@ One document is one transaction, so there is ONE delta: `diffs` carries a single
 included. An empty `diffs` means the device already holds the document. Where no preview can
 be rendered (no generation to deploy, an inconclusive dry-run, a body the adapter could not
 build), that one entry carries a `!! preview unavailable: <reason>` line instead of a delta.
+Malformed AS content in the frozen document returns a 409 `asn_rule_violation`
+`ErrorEnvelope` instead of a preview-unavailable entry.
 `outformat=cli` renders NSO's NED-uniform `+`/`-` tree diff instead of device-native config.
 
 ```json
@@ -1878,7 +1887,7 @@ Field notes:
 - `circuit_type`, `network_type`, `metric`: omitted from response when `null` (device default applies).
 - `passive`: always present; `true` when the interface is in the process passive-interface list.
 
-### `PUT /api/v1/devices/{id}/isis-interface-intent` → `200 | 404`
+### `PUT /api/v1/devices/{id}/isis-interface-intent` → `200 | 404 | 409`
 
 Push (full-replace) the IS-IS intent (interfaces **and** processes) for this device.
 The `isis-reconciler` NSO service reads both blocks:
@@ -1947,7 +1956,7 @@ is enqueued automatically.
 
 ## BGP (M15/M16)
 
-### `GET /api/v1/devices/{id}/bgp-config` → `200 | 404`
+### `GET /api/v1/devices/{id}/bgp-config` → `200 | 404 | 409`
 
 Return the BGP config read-mirror for this device (populated from NSO via the
 `network-state-export` package callpoint `bgp-config-cp`).
@@ -2022,7 +2031,7 @@ as `null`:
 
 ---
 
-### `PUT /api/v1/devices/{id}/bgp-intent` → `200 | 404`
+### `PUT /api/v1/devices/{id}/bgp-intent` → `200 | 404 | 409`
 
 Push (full-replace) the BGP intent snapshot for this device.  The `bgp-reconciler`
 NSO service reads this intent and writes IOS BGP router/scope/peer configuration.
@@ -2157,7 +2166,7 @@ configuration as last observed from NSO.
 list passthrough (the plugin stores it verbatim). `last_refreshed_at` on the OSPF
 endpoint is the raw datetime (no `Z` suffix, unlike BGP/ISIS).
 
-### `PUT /api/v1/devices/{id}/ospf-intent` → `200 | 404`
+### `PUT /api/v1/devices/{id}/ospf-intent` → `200 | 404 | 409`
 
 Push OSPF intent for this device.  Full-replace semantics: instances and
 interfaces not present in the payload are removed from the intent store.
@@ -2212,7 +2221,7 @@ redistribution are reverted on the device via an async removal job (see
 
 ## Redistribution (M20)
 
-### `GET /api/v1/devices/{id}/redistribution` → `200`
+### `GET /api/v1/devices/{id}/redistribution` → `200 | 404 | 409`
 
 Return all redistribution statements cached from NSO for this device (the flat
 read-mirror; the same data also appears nested under the BGP/OSPF/ISIS intent PUTs).
@@ -2461,7 +2470,7 @@ Nested-bag key sets (snake_case): **instance level** = `level`, `default_metric`
 `priority`, `admin_group_exclude`, `admin_group_include_any`, `admin_group_include_all`.
 `process_tag` / `af` are strings; `settings` is an opaque EAV `{key: value}` bag.
 
-### `PUT /api/v1/devices/{id}/isis-flex-algo-intent` → `200 | 404`
+### `PUT /api/v1/devices/{id}/isis-flex-algo-intent` → `200 | 404 | 409`
 
 IS-IS Flex-Algorithm intent, keyed `(process_tag, algo_id)`. Standard
 *intent-mirror PUT* (see box below). `admin_group_*` are comma-joined

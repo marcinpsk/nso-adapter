@@ -892,7 +892,7 @@ async def test_bgp_container_carries_the_router_scope_peer_tree():
     assert sc["address-family"][0]["redistribute"] == [{"source-protocol": "connected", "source-ref": ""}]
     p = sc["peer"][0]
     assert p["peer-address"] == "192.0.2.1"
-    assert p["remote-as"] == 65001 and p["peer-group"] == "UPSTREAM" and p["password"] == "s3c"
+    assert p["remote-as"] == "65001" and p["peer-group"] == "UPSTREAM" and p["password"] == "s3c"
     assert p["peer-address-family"][0] == {"afi": "ipv4-unicast", "enabled": True, "routemap-in": "RM-IN"}
 
 

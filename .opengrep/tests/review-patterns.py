@@ -47,6 +47,42 @@ def classified_rejection_bodies(logger, body, rejection_detail):
     logger.warning("netbox.bulk_patch.row_rejected", error=rejection_detail(body))
 
 
+def classified_asn_refusals(logger):
+    try:
+        work()
+    except AsnRuleViolation as caught:
+        # ok: nso-outcome-raw-exception-renderer, nso-outcome-raw-exception-alias-renderer
+        logger.warning("sync.surface_refresh_refused", error=asn_refusal_detail(caught))
+        classified = asn_refusal_detail(caught)
+        # ok: nso-outcome-raw-exception-alias-renderer
+        logger.warning("sync.surface_refresh_refused", detail=classified)
+        # ruleid: nso-outcome-raw-exception-renderer, nso-outcome-raw-exception-alias-renderer
+        logger.warning("sync.surface_refresh_refused", error=caught.error)
+        # ruleid: nso-outcome-raw-exception-alias-renderer
+        logger.warning("sync.surface_refresh_refused", detail=caught.value)
+
+
+def truncated_asn_refusals(logger):
+    try:
+        work()
+    except AsnRuleViolation as caught:
+        # ruleid: nso-asn-refusal-truncated-diagnostic
+        logger.warning("sync.surface_refresh_refused", error=failure_detail(caught))
+        classified = failure_detail(caught)
+        # ruleid: nso-asn-refusal-truncated-diagnostic
+        logger.warning("sync.surface_refresh_refused", detail=classified)
+        try:
+            work()
+        except Exception as unrelated:
+            # ruleid: nso-asn-refusal-truncated-diagnostic
+            logger.warning("sync.surface_refresh_refused", detail=failure_detail(caught))
+        try:
+            work()
+        except Exception as caught:
+            # ok: nso-asn-refusal-truncated-diagnostic
+            logger.warning("sync.surface_refresh_failed", error=failure_detail(caught))
+
+
 def aliased_outcome_error(logger, failure_detail, http_status_of):
     try:
         work()

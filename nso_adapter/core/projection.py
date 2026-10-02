@@ -45,6 +45,7 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
+from nso_adapter.domain.asn import asn_row_identity, checked_asn, validate_asn_rows
 from nso_adapter.nso.apply import (
     INTERFACE_ATTRIBUTE_LEAVES,
     encode_bfd,
@@ -761,7 +762,16 @@ def _row_identity(spec: _Spec, row: dict, identities_by_id: dict[Any, dict[Any, 
                     f"{spec.model.__tablename__} row references missing {spec.parent.__tablename__} id {parent_id!r}"
                 )
             parent_identity = found
-    return (*parent_identity, *(row.get(field) for field in _identity_fields(spec)))
+    values = [row.get(field) for field in _identity_fields(spec)]
+    canonical = asn_row_identity(spec.model.__tablename__, row)
+    if spec.model is BgpRouterIntent:
+        assert canonical is not None
+        values = [str(canonical[0])]
+    elif spec.model is RedistributionIntent:
+        assert canonical is not None
+        values[_identity_fields(spec).index("dest_ref")] = canonical[1]
+        values[_identity_fields(spec).index("source_ref")] = canonical[3]
+    return (*parent_identity, *values)
 
 
 def _identity_indexes(fragment: dict[str, list[dict]], specs: tuple[_Spec, ...]) -> dict[Any, dict[tuple, dict]]:
@@ -771,6 +781,7 @@ def _identity_indexes(fragment: dict[str, list[dict]], specs: tuple[_Spec, ...])
     for spec in specs:
         indexed: dict[tuple, dict] = {}
         by_id: dict[Any, tuple] = {}
+        validate_asn_rows(spec.model.__tablename__, fragment.get(spec.model.__tablename__, []))
         for row in fragment.get(spec.model.__tablename__, []):
             identity = _row_identity(spec, row, identities_by_id)
             if identity in indexed:
@@ -823,7 +834,19 @@ def projection_row_state(table: str, row: dict) -> dict:
     excluded = {"id", "device_id", "accepted_at", *APPLY_BOOKKEEPING_COLUMNS}
     if spec.parent is not None:
         excluded.add(_fk_column(spec.model, spec.parent).name)
-    return {key: value for key, value in row.items() if key not in excluded}
+    state = {key: value for key, value in row.items() if key not in excluded}
+    if spec.model is BgpRouterIntent:
+        state["asn"] = checked_asn(state["asn"], table, row.get("id"), "asn")
+    elif spec.model is BgpPeerIntent:
+        for field in ("remote_as", "local_as"):
+            if state.get(field) is not None:
+                state[field] = checked_asn(state[field], table, row.get("id"), field)
+    elif spec.model is RedistributionIntent:
+        canonical = asn_row_identity(table, row)
+        assert canonical is not None
+        state["dest_ref"] = canonical[1]
+        state["source_ref"] = canonical[3]
+    return state
 
 
 def _scope_ids(model: Any, device_id: int):
@@ -1346,6 +1369,8 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
         raise ValueError(f"document does not carry section {section!r}")
     section_context(document, section)
     tables = document[section] or {}
+    for table, records in fragment_tables(tables).items():
+        validate_asn_rows(table, records)
     allowed_models = {spec.model for spec in _SECTION_REGISTRY[section].tables}
     rows: dict[type, list] = {}
     row_records: dict[type, list[tuple[dict, object]]] = {}
@@ -1447,7 +1472,10 @@ async def snapshot_stream(db: AsyncSession, device_id: int, stream: str) -> dict
     """
     if stream not in projection_streams():
         raise ValueError(f"unknown projection stream {stream!r}")
-    return {spec.model.__tablename__: await _rows_for(db, device_id, spec) for spec in _stream_tables()[stream]}
+    tables = {spec.model.__tablename__: await _rows_for(db, device_id, spec) for spec in _stream_tables()[stream]}
+    for table, rows in tables.items():
+        validate_asn_rows(table, rows)
+    return tables
 
 
 __all__ = [

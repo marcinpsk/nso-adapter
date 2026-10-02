@@ -7,9 +7,11 @@ real store (the only mock is the NSO HTTP boundary, spec-bound to NsoClient)."""
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, patch
 
 import httpx
+import pytest
 from sqlalchemy import select
 
 from nso_adapter.nso.client import NsoClient
@@ -75,6 +77,25 @@ async def test_provision_dedup_same_device_returns_same_job(adapter_client_with_
     assert first.status_code == 202 and second.status_code == 202
     assert first.json()["job_id"] == second.json()["job_id"]
     assert len(await _active_provision_jobs()) == 1, "must not enqueue a second provision for the same device"
+
+
+async def test_provision_retry_matches_equivalent_ipv6_addresses(adapter_client_with_nso):
+    first = await adapter_client_with_nso.post(
+        "/api/v1/devices/provision",
+        json={**_PROVISION_BODY, "address": "2001:DB8:0:0::1", "oob_ip": "2001:DB8:0:0::2"},
+        headers=AUTH,
+    )
+    retry = await adapter_client_with_nso.post(
+        "/api/v1/devices/provision",
+        json={**_PROVISION_BODY, "address": "2001:db8::1", "oob_ip": "2001:db8::2"},
+        headers=AUTH,
+    )
+
+    assert first.status_code == retry.status_code == 202
+    assert first.json()["job_id"] == retry.json()["job_id"]
+    (job,) = await _active_provision_jobs()
+    assert job.context["address"] == "2001:db8::1"
+    assert job.context["oob_ip"] == "2001:db8::2"
 
 
 async def test_provision_unknown_instance_returns_422(adapter_client):
@@ -224,3 +245,69 @@ async def test_provision_step_detail_keeps_the_ADAPTER_AUTHORED_host_key_refusal
     assert job.result["ok"] is False
     step = next(s for s in job.result["steps"] if s["step"] == "fetch_host_keys")
     assert "did not report a stored key" in step["failure"], "the authored refusal is the diagnostic"
+
+
+@pytest.mark.parametrize("field,value", [("address", "nso-host.example"), ("oob_ip", "10.0.0.1/24")])
+async def test_provision_rejects_non_ip_hosts_before_admission(adapter_client_with_nso, field, value):
+    response = await adapter_client_with_nso.post(
+        "/api/v1/devices/provision", json={**_PROVISION_BODY, field: value}, headers=AUTH
+    )
+    assert response.status_code == 422, response.text
+    assert await _active_provision_jobs() == []
+
+
+@pytest.mark.parametrize("field,value", [("address", "nso-host.example"), ("oob_ip", "10.0.0.1/24")])
+def test_provision_model_refuses_non_ip_hosts(field, value):
+    from pydantic import ValidationError
+
+    from nso_adapter.api.devices import DeviceProvision
+
+    with pytest.raises(ValidationError):
+        DeviceProvision.model_validate({**_PROVISION_BODY, field: value})
+
+
+@pytest.mark.parametrize("address,oob_ip", [("198.18.0.1", "198.18.0.2"), ("2001:db8:0:0::1", "2001:db8::2")])
+async def test_provision_canonical_ip_hosts_run_from_stored_context(adapter_client_with_nso, address, oob_ip):
+    from ipaddress import ip_address
+
+    from nso_adapter.core.importer import get_nso_client
+    from nso_adapter.core.jobs import _JOB_RUNNERS
+
+    response = await adapter_client_with_nso.post(
+        "/api/v1/devices/provision",
+        json={**_PROVISION_BODY, "address": address, "oob_ip": oob_ip, "sync": False},
+        headers=AUTH,
+    )
+    assert response.status_code == 202, response.text
+    job_id = int(response.json()["job_id"])
+    (job,) = await _active_provision_jobs()
+    assert job.context["address"] == str(ip_address(address))
+    assert job.context["oob_ip"] == str(ip_address(oob_ip))
+    async with session() as db:
+        stored = await db.get(Job, job_id)
+        stored.context = {**stored.context, "address": address, "oob_ip": oob_ip}
+        await db.commit()
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(404)
+        if request.url.path.endswith("/ssh/fetch-host-keys"):
+            return httpx.Response(
+                200, json={"tailf-ncs:output": {"result": "updated", "fingerprint": "placeholder-fingerprint"}}
+            )
+        return httpx.Response(204)
+
+    nso = get_nso_client("nso-dev")
+    nso._client = lambda timeout=None: httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="https://nso.example.test"
+    )
+    await start_job(job_id)
+    await _JOB_RUNNERS[JobType.provision](job_id, None)
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        assert job.result["ok"] is True
+    created = [json.loads(request.content) for request in requests if request.method == "PUT"]
+    assert created[0]["tailf-ncs:device"][0]["address"] == str(ip_address(address))

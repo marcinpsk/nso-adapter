@@ -233,7 +233,17 @@ async def test_a_cancelled_runs_requeue_cannot_touch_a_successor(adapter_client)
     from nso_adapter.store.models import Job, JobStatus, JobType
 
     await seed_device(nso_device_name="s1-cancelled", netbox_device_id=9904)
-    job_id = await _queue(None, JobType.provision, context={"nso_instance": "nso-dev", "device_name": "s1-cancelled"})
+    job_id = await _queue(
+        None,
+        JobType.provision,
+        context={
+            "address": "198.18.0.1",
+            "ned_id": "cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+            "authgroup": "placeholder-authgroup",
+            "nso_instance": "nso-dev",
+            "device_name": "s1-cancelled",
+        },
+    )
 
     claimed = await worker_mod._claim_next_job()
     assert claimed is not None and claimed[0] == job_id
@@ -273,7 +283,17 @@ async def test_a_device_busy_provision_cannot_terminalize_a_successor_run(adapte
     from nso_adapter.store.models import Job, JobStatus, JobType
 
     await seed_device(nso_device_name="s1-busy", netbox_device_id=9910)
-    job_id = await _queue(None, JobType.provision, context={"nso_instance": "nso-dev", "device_name": "s1-busy"})
+    job_id = await _queue(
+        None,
+        JobType.provision,
+        context={
+            "address": "198.18.0.1",
+            "ned_id": "cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+            "authgroup": "placeholder-authgroup",
+            "nso_instance": "nso-dev",
+            "device_name": "s1-busy",
+        },
+    )
 
     claimed = await worker_mod._claim_next_job()
     assert claimed is not None and claimed[0] == job_id

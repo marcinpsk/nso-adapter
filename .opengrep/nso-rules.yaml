@@ -360,6 +360,7 @@ rules:
           - pattern: logger.$LEVEL(..., error=$ERROR, ...)
           - pattern-not: logger.$LEVEL(..., error=failure_detail($EXCEPTION), ...)
           - pattern-not: logger.$LEVEL(..., error=rejection_detail($BODY), ...)
+          - pattern-not: logger.$LEVEL(..., error=asn_refusal_detail($EXCEPTION), ...)
       - patterns:
           - pattern-either:
               - pattern: logger.$LEVEL(..., detail=$EXCEPTION, ...)
@@ -399,6 +400,29 @@ rules:
       - pattern: type(...).__name__
       - pattern: http_status_of(...)
       - pattern: rejection_detail(...)
+      - pattern: asn_refusal_detail(...)
+    pattern-sinks:
+      - patterns:
+          - pattern: logger.$LEVEL(..., $FIELD=$DETAIL, ...)
+          - focus-metavariable: $DETAIL
+      - patterns:
+          - pattern: logger.$LEVEL(..., $DETAIL, ...)
+          - focus-metavariable: $DETAIL
+  - id: nso-asn-refusal-truncated-diagnostic
+    languages: [python]
+    severity: ERROR
+    message: Preserve the structured ASN refusal with asn_refusal_detail.
+    mode: taint
+    paths:
+      include: [nso_adapter/**, review-patterns.py]
+    pattern-sources:
+      - patterns:
+          - pattern-inside: |
+              try:
+                ...
+              except AsnRuleViolation as $EXCEPTION:
+                ...
+          - pattern: failure_detail($EXCEPTION)
     pattern-sinks:
       - patterns:
           - pattern: logger.$LEVEL(..., $FIELD=$DETAIL, ...)

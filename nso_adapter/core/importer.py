@@ -32,6 +32,7 @@ from nso_adapter.core.refresh_engine import (
     run_family_refresh_from_outcome,
 )
 from nso_adapter.core.sync_state import compute_sync_state
+from nso_adapter.domain.asn import AsnRuleViolation, asn_refusal_detail
 from nso_adapter.domain.models import Interface, InterfaceAttr
 from nso_adapter.nso import actions as nso_actions
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError, failure_detail
@@ -463,6 +464,7 @@ async def _apply_projected(
     from nso_adapter.core.redistribution import _REDIST_COMPONENTS, refresh_redistribution_from_outcomes
 
     failed: list[str] = []
+    first_refusal: AsnRuleViolation | None = None
     for name, fn in surfaces:
         spec = layout.spec_by_name[name]
         try:
@@ -490,9 +492,19 @@ async def _apply_projected(
                 )
             if not ok:
                 failed.append(name)
+        except AsnRuleViolation as exc:
+            logger.warning(
+                "sync.surface_refresh_refused", device_id=device.id, surface=name, error=asn_refusal_detail(exc)
+            )
+            failed.append(name)
+            if first_refusal is None:
+                first_refusal = exc
         except Exception as exc:  # noqa: BLE001 — one surface must not take down the rest
             logger.warning("sync.surface_refresh_failed", device_id=device.id, surface=name, error=failure_detail(exc))
             failed.append(name)
+    if first_refusal is not None:
+        first_refusal.include_degraded_surfaces(failed)
+        raise first_refusal
     return failed
 
 
@@ -1209,6 +1221,7 @@ async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False,
     else:
         surfaces = _routing_surfaces(cfg)
 
+    refusal: AsnRuleViolation | None = None
     # Attributes and every generic surface consume one projected supplier result while
     # the complete deterministic family-lock set remains held.
     async with _projected_batch(
@@ -1227,19 +1240,25 @@ async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False,
             nb_client,
             refresh_source="sync",
         )
-        degraded = await _apply_projected(
-            db,
-            device,
-            client,
-            surfaces,
-            "sync",
-            layout,
-            projection,
-        )
+        try:
+            degraded = await _apply_projected(
+                db,
+                device,
+                client,
+                surfaces,
+                "sync",
+                layout,
+                projection,
+            )
+        except AsnRuleViolation as exc:
+            refusal = exc
+            degraded = list(exc.error["detail"]["degraded_surfaces"])
         if not attrs.available:
             degraded.append("interface_attributes")
         if not sync_from_ok:
             degraded.append("sync_from")
+        if refusal is not None:
+            refusal.include_degraded_surfaces(degraded)
 
         # Publish final device metadata before releasing the common locks, so an older
         # sync cannot resume and overwrite a newer sync's status.
@@ -1264,6 +1283,9 @@ async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False,
             await nb_client.notify_sync_complete(device.netbox_device_id)
         except Exception as exc:
             logger.warning("netbox.sync_complete_notify_failed", device_id=device_id, error=failure_detail(exc))
+
+    if refusal is not None:
+        raise refusal
 
     summary = {
         "interfaces_written": attrs.interfaces_written,

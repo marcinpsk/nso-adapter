@@ -710,3 +710,53 @@ async def test_setting_a_scalar_that_was_unset_queues_nothing(adapter_client):
     )
     assert resp.status_code == 200
     assert await _removal_job(device_id) is None
+
+
+@pytest.mark.parametrize(
+    ("old_asn", "new_asn"),
+    [("64086.59904", "4200000000"), ("4200000000", "64086.59904")],
+)
+@pytest.mark.parametrize("cleared_field", [None, "router_id", "route_map", "metric"])
+async def test_put_bgp_notation_change_preserves_identity_and_detects_clears(
+    adapter_client,
+    old_asn,
+    new_asn,
+    cleared_field,
+):
+    from nso_adapter.store.models import BgpRouterIntent, RedistributionIntent
+
+    device_id = await seed_device(nso_device_name="placeholder-device", netbox_device_id=1)
+    endpoint = f"/api/v1/devices/{device_id}/bgp-intent"
+    entry = {"source_protocol": "connected", "source_ref": "", "route_map": "placeholder-map", "metric": 100}
+    before = _router_with_redist([entry], asn=old_asn)
+    before["router_id"] = "198.18.0.1"
+    response = await adapter_client.put(endpoint, json={"routers": [before]}, headers=AUTH | push_seq())
+    assert response.status_code == 200
+    assert await _removal_job(device_id) is None
+    async with session() as db:
+        original_id = (await db.execute(select(RedistributionIntent.id))).scalar_one()
+
+    after_entry = {**entry}
+    if cleared_field in {"route_map", "metric"}:
+        after_entry[cleared_field] = None
+    after = _router_with_redist([after_entry], asn=new_asn)
+    after["router_id"] = None if cleared_field == "router_id" else "198.18.0.1"
+    response = await adapter_client.put(endpoint, json={"routers": [after]}, headers=AUTH | push_seq())
+    assert response.status_code == 200
+    job = await _removal_job(device_id)
+    if cleared_field is None:
+        assert job is None
+    else:
+        assert job is not None
+        assert job.context.get("removed", {}) == {}
+        assert job.context.get("detach") is not True
+        assert job.context.get("retract_deferred") is not True
+    async with session() as db:
+        redistribution = (await db.execute(select(RedistributionIntent))).scalar_one()
+        assert redistribution.id == original_id
+        assert redistribution.dest_ref == f"{new_asn}::ipv4-unicast"
+        assert redistribution.route_map == after_entry["route_map"]
+        assert redistribution.metric == after_entry["metric"]
+        router = (await db.execute(select(BgpRouterIntent))).scalar_one()
+        assert router.asn == new_asn
+        assert router.router_id == after["router_id"]

@@ -126,7 +126,17 @@ async def _t3_run_connect_success() -> tuple[int, int]:
 async def _t4_run_provision_success() -> tuple[int, int]:
     """``core/jobs.py`` ``_run_provision`` success — the only writer that SETS a device_id."""
     device_id = await seed_device(nso_device_name="inv-t4", netbox_device_id=8304)
-    job_id = await _running_job(None, JobType.provision, context={"nso_instance": "nso-dev", "device_name": "inv-t4"})
+    job_id = await _running_job(
+        None,
+        JobType.provision,
+        context={
+            "address": "198.18.0.1",
+            "ned_id": "cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+            "authgroup": "placeholder-authgroup",
+            "nso_instance": "nso-dev",
+            "device_name": "inv-t4",
+        },
+    )
     reg = await _claim_for(device_id, job_id)
 
     async def _ok_provision(_db, **_params):
@@ -538,7 +548,17 @@ async def test_device_null_provision_failure_is_exempt(adapter_client):
     It is terminal and device-less. A device-scoped cursor cannot reach it, and there is no
     counter to allocate from.
     """
-    job_id = await _running_job(None, JobType.provision, context={"nso_instance": "nso-dev", "device_name": "inv-fail"})
+    job_id = await _running_job(
+        None,
+        JobType.provision,
+        context={
+            "address": "198.18.0.1",
+            "ned_id": "cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+            "authgroup": "placeholder-authgroup",
+            "nso_instance": "nso-dev",
+            "device_name": "inv-fail",
+        },
+    )
 
     async def _boom_provision(_db, **_params):
         raise RuntimeError("nso unreachable")

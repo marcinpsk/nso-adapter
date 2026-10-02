@@ -12,13 +12,14 @@ from __future__ import annotations
 import json
 
 import httpx
+import pytest
 from sqlalchemy import select
 
 from nso_adapter.core import scheduler as sched
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.models import ActiveAddress, Device, DeviceFailover, FailoverConfig
 from tests._secret_discipline import assert_keys_absent
-from tests.conftest import session
+from tests.conftest import AUTH, session
 
 
 class _NsoSim:
@@ -85,6 +86,18 @@ def _client_for(sim: _NsoSim) -> NsoClient:
     return client
 
 
+def _client_for_devices(sims: dict[str, _NsoSim]) -> NsoClient:
+    def _route(request):
+        name = request.url.path.split("device=", 1)[1].split("/", 1)[0]
+        return sims[name].handler(request)
+
+    client = _client_for(next(iter(sims.values())))
+    client._client = lambda timeout=None: httpx.AsyncClient(
+        transport=httpx.MockTransport(_route), base_url="http://nso-dev:8080"
+    )
+    return client
+
+
 async def _seed(primary="10.0.0.1", oob="192.0.2.5", active="primary") -> int:
     async with session() as db:
         dev = Device(nso_instance="nso-dev", nso_device_name="ra1", netbox_device_id=42)
@@ -104,6 +117,153 @@ async def _arm_and_load(device_id: int) -> DeviceFailover:
         await db.refresh(row)
         db.expunge(row)
         return row
+
+
+@pytest.mark.parametrize("invalid_field", ["primary_ip", "oob_ip"])
+async def test_scheduler_defers_invalid_stored_address(adapter_client, monkeypatch, invalid_field):
+    from datetime import UTC, datetime
+
+    sim = _NsoSim(address="198.18.0.1")
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+    device_id = await _seed(primary="198.18.0.1", oob="198.18.0.2")
+    now = datetime.now(UTC)
+    async with session() as db:
+        row = await db.scalar(select(DeviceFailover).where(DeviceFailover.device_id == device_id))
+        setattr(row, invalid_field, "not-an-ip")
+        await db.commit()
+        assert device_id in await sched._due_failover_device_ids(db, now)
+
+    await sched._scheduled_failover_probe()
+
+    async with session() as db:
+        row = await db.scalar(select(DeviceFailover).where(DeviceFailover.device_id == device_id))
+        assert row.failback_blocked_reason == "stored_address_invalid"
+        assert row.next_primary_probe_at > now
+        assert row.next_oob_probe_at > now
+        assert device_id not in await sched._due_failover_device_ids(db, datetime.now(UTC))
+    assert sim.patches == []
+    assert sim.connects == 0
+
+
+@pytest.mark.parametrize("invalid_field", ["primary_ip", "oob_ip"])
+@pytest.mark.parametrize("active", ["primary", "oob"])
+@pytest.mark.parametrize("remove", [False, True])
+async def test_upsert_repairs_invalid_stored_address(adapter_client, invalid_field, active, remove):
+    from datetime import UTC, datetime
+
+    from nso_adapter.core.failover import upsert_failover_ips
+
+    device_id = await _seed(primary="198.18.0.1", oob="198.18.0.2", active=active)
+    far = datetime(2099, 1, 1, tzinfo=UTC)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        row = await db.scalar(select(DeviceFailover).where(DeviceFailover.device_id == device_id))
+        setattr(row, invalid_field, "not-an-ip")
+        row.failback_blocked_reason = "stored_address_invalid"
+        row.next_primary_probe_at = row.next_oob_probe_at = far
+        row.consecutive_failures = 2
+        row.consecutive_successes = 4
+        row.last_probe_result = "unreachable"
+        row.oob_healthy = False
+        row.oob_health_result = "unreachable"
+        await db.commit()
+        primary = None if remove and invalid_field == "primary_ip" else "198.18.0.1"
+        oob = None if remove and invalid_field == "oob_ip" else "198.18.0.2"
+
+        assert await upsert_failover_ips(db, device, primary, oob)
+        await db.commit()
+        await db.refresh(row)
+
+        assert (row.primary_ip, row.oob_ip) == (primary, oob)
+        assert row.failback_blocked_reason is None
+        assert row.active_address == active
+        if invalid_field == "primary_ip":
+            assert (row.consecutive_failures, row.consecutive_successes) == (0, 0)
+            assert row.last_probe_result is None
+            if not remove:
+                assert row.next_primary_probe_at < far
+            assert row.next_oob_probe_at == far
+        else:
+            assert row.oob_healthy is None
+            assert row.oob_health_result is None
+            if not remove:
+                assert row.next_oob_probe_at < far
+            assert row.next_primary_probe_at == far
+
+
+async def test_plugin_scope_preserves_bootstrapped_oob(adapter_client_with_nso, monkeypatch):
+    sim = _NsoSim(address="192.0.2.5")
+    sim.reachable_addrs = {"192.0.2.5"}
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+
+    response = await adapter_client_with_nso.post(
+        "/api/v1/devices",
+        json={"nso_instance": "nso-dev", "nso_device_name": "ra1", "netbox_device_id": 42},
+        headers=AUTH,
+    )
+    assert response.status_code == 201
+    device_id = response.json()["id"]
+    response = await adapter_client_with_nso.put(
+        f"/api/v1/devices/{device_id}/scope",
+        json={"attributes": ["description"], "primary_ip": "10.0.0.1", "oob_ip": "192.0.2.5"},
+        headers=AUTH,
+    )
+    assert response.status_code == 200
+    assert (await _load(device_id)).active_address == "primary"
+
+    await sched._scheduled_failover_probe()
+
+    row = await _load(device_id)
+    assert "10.0.0.1" not in sim.patches
+    assert sim.address == "192.0.2.5"
+    assert row.active_address == "oob"
+    assert row.last_probe_target == "oob"
+    assert row.last_probe_result == "ok"
+
+    from nso_adapter.config import get_config
+
+    sim.reachable_addrs.add("10.0.0.1")
+    threshold = get_config().scheduler.failover_success_threshold
+    for _ in range(threshold - 1):
+        await _arm(device_id)
+        await sched._scheduled_failover_probe()
+        assert (await _load(device_id)).active_address == "oob"
+        assert sim.address == "192.0.2.5"
+    await _arm(device_id)
+    await sched._scheduled_failover_probe()
+    assert (await _load(device_id)).active_address == "primary"
+    assert sim.address == "10.0.0.1"
+
+
+async def test_scheduler_reconciles_oob_only_row_with_default_primary_role(adapter_client, monkeypatch):
+    from datetime import UTC, datetime
+
+    sim = _NsoSim(address="198.18.0.5")
+    sim.reachable_addrs = {"198.18.0.5"}
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+    async with session() as db:
+        dev = Device(nso_instance="nso-dev", nso_device_name="ra1", netbox_device_id=42)
+        db.add(dev)
+        await db.flush()
+        device_id = dev.id
+        db.add(DeviceFailover(device_id=device_id, primary_ip=None, oob_ip="198.18.0.5"))
+        await db.commit()
+        assert device_id in await sched._due_failover_device_ids(db, datetime.now(UTC))
+
+    assert (await _load(device_id)).active_address == "primary"
+    await sched._scheduled_failover_probe()
+
+    row = await _load(device_id)
+    assert row.active_address == "oob"
+    assert row.manual_override is False
+    assert row.last_probe_target == "oob"
+    assert row.last_probe_result == "ok"
+    assert row.next_oob_probe_at is not None
+    assert sim.connects == 1
+    assert sim.patches == []
 
 
 async def test_fresh_device_fails_over_to_oob_then_back(adapter_client, monkeypatch):
@@ -155,19 +315,22 @@ async def test_unlinked_device_is_ignored(adapter_client, monkeypatch):
 
 
 async def test_ingestion_helpers_seed_and_upsert_ips(adapter_client):
-    """set_initial_failover_state seeds a row; upsert_failover_ips changes ONLY the IPs.
+    """IP ingestion changes IPs without changing the active role.
 
     ONLY the IPs — the ACTIVE address in particular is never touched. The per-address probe
     verdicts (counters, last probe) are a different matter: see the reset test below.
     """
-    from nso_adapter.core.failover import set_initial_failover_state, upsert_failover_ips
+    from nso_adapter.core.failover import upsert_failover_ips
 
     async with session() as db:
         dev = Device(nso_instance="nso-dev", nso_device_name="up1", netbox_device_id=55)
         db.add(dev)
         await db.flush()
 
-        fo = await set_initial_failover_state(db, dev.id, "10.0.0.1", "192.0.2.5", ActiveAddress.oob.value)
+        fo = DeviceFailover(
+            device_id=dev.id, primary_ip="10.0.0.1", oob_ip="192.0.2.5", active_address=ActiveAddress.oob.value
+        )
+        db.add(fo)
         await db.commit()
         assert (fo.primary_ip, fo.oob_ip, fo.active_address) == ("10.0.0.1", "192.0.2.5", "oob")
 
@@ -197,13 +360,16 @@ async def test_a_changed_primary_does_not_inherit_the_old_addresss_failure_count
     first probe of the NEW address flipped the device to OOB the moment it so much as
     blipped. The hysteresis had already been spent on an address that no longer exists.
     """
-    from nso_adapter.core.failover import set_initial_failover_state, upsert_failover_ips
+    from nso_adapter.core.failover import upsert_failover_ips
 
     async with session() as db:
         dev = Device(nso_instance="nso-dev", nso_device_name="reset1", netbox_device_id=58)
         db.add(dev)
         await db.flush()
-        fo = await set_initial_failover_state(db, dev.id, "10.0.0.1", "192.0.2.9", ActiveAddress.primary.value)
+        fo = DeviceFailover(
+            device_id=dev.id, primary_ip="10.0.0.1", oob_ip="192.0.2.9", active_address=ActiveAddress.primary.value
+        )
+        db.add(fo)
         fo.consecutive_failures = 2  # the old primary is all but declared dead
         fo.last_probe_result = "fail"
         await db.commit()
@@ -226,13 +392,16 @@ async def test_upsert_new_oob_rearms_probe_schedule(adapter_client):
     verdict is stale for the new one → reset. The primary schedule is untouched."""
     from datetime import UTC, datetime
 
-    from nso_adapter.core.failover import set_initial_failover_state, upsert_failover_ips
+    from nso_adapter.core.failover import upsert_failover_ips
 
     async with session() as db:
         dev = Device(nso_instance="nso-dev", nso_device_name="rearm1", netbox_device_id=57)
         db.add(dev)
         await db.flush()
-        fo = await set_initial_failover_state(db, dev.id, "10.0.0.1", None, ActiveAddress.primary.value)
+        fo = DeviceFailover(
+            device_id=dev.id, primary_ip="10.0.0.1", oob_ip=None, active_address=ActiveAddress.primary.value
+        )
+        db.add(fo)
         far = datetime(2099, 1, 1, tzinfo=UTC)
         fo.next_oob_probe_at = far
         fo.next_primary_probe_at = far
@@ -253,13 +422,16 @@ async def test_upsert_new_oob_rearms_probe_schedule(adapter_client):
 async def test_upsert_new_primary_rearms_primary_probe_only(adapter_client):
     from datetime import UTC, datetime
 
-    from nso_adapter.core.failover import set_initial_failover_state, upsert_failover_ips
+    from nso_adapter.core.failover import upsert_failover_ips
 
     async with session() as db:
         dev = Device(nso_instance="nso-dev", nso_device_name="rearm2", netbox_device_id=58)
         db.add(dev)
         await db.flush()
-        fo = await set_initial_failover_state(db, dev.id, "10.0.0.1", "192.0.2.5", ActiveAddress.primary.value)
+        fo = DeviceFailover(
+            device_id=dev.id, primary_ip="10.0.0.1", oob_ip="192.0.2.5", active_address=ActiveAddress.primary.value
+        )
+        db.add(fo)
         far = datetime(2099, 1, 1, tzinfo=UTC)
         fo.next_oob_probe_at = far
         fo.next_primary_probe_at = far
@@ -378,9 +550,12 @@ async def test_live_db_threshold_drives_failover(adapter_client, monkeypatch):
 
 async def test_concurrency_probes_all_due_devices(adapter_client, monkeypatch):
     """One tick probes every due device (each on its own session, gathered under the semaphore)."""
-    sim = _NsoSim()
-    sim.always_reachable = True  # address-agnostic up, so the shared sim serves all devices
-    client = _client_for(sim)
+    addresses = {"ra1": "10.0.0.1", "rb1": "10.0.1.1", "rc1": "10.0.2.1"}
+    sims = {name: _NsoSim(address=address) for name, address in addresses.items()}
+    for sim in sims.values():
+        sim.reachable_addrs = {sim.address}
+
+    client = _client_for_devices(sims)
     monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
     ids = [
         await _seed_extra("ra1", 42, "10.0.0.1", "192.0.2.5"),
@@ -392,21 +567,23 @@ async def test_concurrency_probes_all_due_devices(adapter_client, monkeypatch):
 
     await sched._scheduled_failover_probe()
 
-    assert sim.connects == 3  # all three probed in the one tick (one cheap connect each)
+    assert all(sim.connects == 1 for sim in sims.values())
     for did in ids:
         assert (await _load(did)).next_primary_probe_at is not None  # each advanced (staggered)
 
 
-async def test_flip_budget_caps_flips_across_tick(adapter_client, monkeypatch):
-    """max_flips_per_tick=1 lets only one of two OOB devices run its (disruptive) failback flip."""
-    sim = _NsoSim()
-    sim.always_reachable = True  # primary "recovered" for both
-    client = _client_for(sim)
+@pytest.mark.parametrize("limit", [1, 2])
+async def test_flip_budget_caps_flips_across_tick(adapter_client, monkeypatch, limit):
+    """Only devices with flip budget can probe primary and commit failback."""
+    sims = {"fa1": _NsoSim(address="192.0.2.5"), "fb1": _NsoSim(address="192.0.2.6")}
+    for sim in sims.values():
+        sim.reachable_addrs = {"10.0.0.1", "10.0.0.2"}
+    client = _client_for_devices(sims)
     monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
     a_id = await _seed_extra("fa1", 51, "10.0.0.1", "192.0.2.5", active="oob")
     b_id = await _seed_extra("fb1", 52, "10.0.0.2", "192.0.2.6", active="oob")
-    # success_threshold=1 → a single good flip-probe commits failback; budget=1 → only one flips.
-    await _seed_config(success_threshold=1, max_flips_per_tick=1)
+    # One successful primary probe commits failback when budget permits the flip.
+    await _seed_config(success_threshold=1, max_flips_per_tick=limit)
     # Only the failback (primary) probe is due — keep the OOB liveness out so the count is exact.
     await _arm(a_id, primary_due=True, oob_due=False)
     await _arm(b_id, primary_due=True, oob_due=False)
@@ -414,8 +591,11 @@ async def test_flip_budget_caps_flips_across_tick(adapter_client, monkeypatch):
     await sched._scheduled_failover_probe()
 
     actives = sorted([(await _load(a_id)).active_address, (await _load(b_id)).active_address])
-    assert actives == [ActiveAddress.oob.value, ActiveAddress.primary.value]  # exactly one failed back
-    assert sim.connects == 1  # the budget-skipped device never even probed
+    assert actives == ["oob"] * (2 - limit) + ["primary"] * limit
+    assert sum(sim.connects for sim in sims.values()) == limit
+    assert sum(len(sim.patches) for sim in sims.values()) == limit
+    rows = [await _load(device_id) for device_id in (a_id, b_id)]
+    assert all(not row.manual_override for row in rows)
 
 
 async def test_failback_flip_reverts_to_oob_when_probe_blows_up(adapter_client, monkeypatch):
@@ -593,13 +773,16 @@ async def test_upsert_retains_active_oob_and_accepts_distinct_primary(adapter_cl
     """
     from structlog.testing import capture_logs
 
-    from nso_adapter.core.failover import set_initial_failover_state, upsert_failover_ips
+    from nso_adapter.core.failover import upsert_failover_ips
 
     async with session() as db:
         dev = Device(nso_instance="nso-dev", nso_device_name="up-oob-clear", netbox_device_id=56)
         db.add(dev)
         await db.flush()
-        await set_initial_failover_state(db, dev.id, "10.0.0.1", "192.0.2.5", ActiveAddress.oob.value)
+        fo = DeviceFailover(
+            device_id=dev.id, primary_ip="10.0.0.1", oob_ip="192.0.2.5", active_address=ActiveAddress.oob.value
+        )
+        db.add(fo)
         await db.commit()
 
         with capture_logs() as logs:
@@ -648,3 +831,101 @@ async def test_upsert_retains_active_oob_and_accepts_distinct_primary(adapter_cl
         await db.commit()
         assert changed is True
         assert (fo.oob_ip, fo.failback_blocked_reason) == ("192.0.2.9", None)
+
+
+@pytest.mark.parametrize("field", ["primary_ip", "oob_ip"])
+@pytest.mark.parametrize("address", ["", "198.18.0.1/32", " 198.18.0.1"])
+async def test_stored_invalid_address_fails_closed(adapter_client, monkeypatch, debug_logs, field, address):
+    from datetime import UTC, datetime
+
+    sim = _NsoSim(address="198.18.0.1")
+    sim.always_reachable = True
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+    device_id = await _seed(
+        primary=address if field == "primary_ip" else None,
+        oob=address if field == "oob_ip" else None,
+    )
+
+    await sched._scheduled_failover_probe()
+
+    errors = [entry for entry in debug_logs if entry["event"] == "failover.stored_address_invalid"]
+    assert len(errors) == 1
+    assert errors[0] == {
+        "event": "failover.stored_address_invalid",
+        "log_level": "error",
+        "device_id": device_id,
+        "fields": [field],
+    }
+    assert sim.connects == 0
+    assert sim.patches == []
+    row = await _load(device_id)
+    assert getattr(row, field) == address
+    assert row.failback_blocked_reason == "stored_address_invalid"
+    async with session() as db:
+        assert device_id not in await sched._due_failover_device_ids(db, datetime.now(UTC))
+
+
+@pytest.mark.parametrize("role", ["primary", "oob"])
+@pytest.mark.parametrize("address", ["2001:DB8::1", "2001:0db8:0000:0000:0000:0000:0000:0001"])
+async def test_scheduler_monitors_equivalent_ipv6_address(adapter_client, monkeypatch, role, address):
+    sim = _NsoSim(address=address)
+    sim.always_reachable = True
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+    device_id = await _seed(
+        primary="2001:db8::1" if role == "primary" else None,
+        oob="2001:db8::1" if role == "oob" else None,
+    )
+    await sched._scheduled_failover_probe()
+    row = await _load(device_id)
+    assert row.active_address == role
+    assert row.manual_override is False
+    assert row.last_probe_target == role
+    assert row.last_probe_result == "ok"
+    assert sim.connects == 1
+    assert sim.patches == []
+
+
+async def test_scheduler_keeps_mapped_ipv6_foreign_to_ipv4(adapter_client, monkeypatch):
+    # No vendor has been observed to report the mapped form.
+    sim = _NsoSim(address="::ffff:198.18.0.1")
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+    device_id = await _seed(primary="198.18.0.1", oob=None)
+    await sched._scheduled_failover_probe()
+    assert (await _load(device_id)).manual_override is True
+    assert sim.connects == 0
+    assert sim.patches == []
+
+
+@pytest.mark.parametrize("address", ["", "invalid", "198.18.0.1/32", " 198.18.0.1"])
+async def test_scheduler_treats_invalid_nso_address_as_unreadable(adapter_client, monkeypatch, address):
+    sim = _NsoSim(address=address)
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+    device_id = await _seed(primary="198.18.0.1", oob=None)
+    await sched._scheduled_failover_probe()
+    row = await _load(device_id)
+    assert row.failback_blocked_reason == "address_unreadable"
+    assert row.manual_override is False
+    assert sim.connects == 0
+    assert sim.patches == []
+
+
+async def test_ingestion_preserves_verdicts_for_equivalent_ipv6_addresses(adapter_client):
+    from nso_adapter.core.failover import upsert_failover_ips
+
+    device_id = await _seed(primary="2001:DB8::1", oob="2001:0db8:0:0:0:0:0:2", active="oob")
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        fo = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == device_id))).scalar_one()
+        fo.consecutive_successes = 2
+        fo.oob_healthy = True
+        assert await upsert_failover_ips(db, device, "2001:db8::1", "2001:DB8::2") is True
+        await db.commit()
+    row = await _load(device_id)
+    assert (row.primary_ip, row.oob_ip) == ("2001:db8::1", "2001:db8::2")
+    assert row.failback_blocked_reason is None
+    assert row.consecutive_successes == 2
+    assert row.oob_healthy is True
