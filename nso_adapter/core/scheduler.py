@@ -13,6 +13,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from nso_adapter.config import get_config
 from nso_adapter.domain.diagnostics import device_fields
+from nso_adapter.nso.client import failure_detail
 
 logger = structlog.get_logger(__name__)
 _scheduler: AsyncIOScheduler | None = None
@@ -158,11 +159,14 @@ async def _scheduled_scope_reconcile() -> None:
                     )
                     await offboard_device(db, device)
                 else:
-                    await set_scope(db, device, plugin_rec.attributes)
+                    # Validate addresses before set_scope commits the device transaction.
                     await upsert_failover_ips(db, device, plugin_rec.primary_ip, plugin_rec.oob_ip)
+                    await set_scope(db, device, plugin_rec.attributes)
                 await db.commit()
             except Exception as exc:
-                logger.warning("scheduler.scope_reconcile.device_failed", device_id=device_id, error=repr(exc))
+                logger.warning(
+                    "scheduler.scope_reconcile.device_failed", device_id=device_id, error=failure_detail(exc)
+                )
                 await db.rollback()
 
 

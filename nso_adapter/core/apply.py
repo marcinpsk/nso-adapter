@@ -2417,7 +2417,10 @@ async def _post_apply_refresh_and_notify(db: AsyncSession, device_id: int) -> No
         if device is None:
             return
         client = get_nso_client(device.nso_instance)
-        await refresh_routing_surfaces_for_device(db, device, client, refresh_source="apply")
+        try:
+            await refresh_routing_surfaces_for_device(db, device, client, refresh_source="apply")
+        except AsnRuleViolation as exc:
+            logger.warning("apply.post_refresh_failed", device_id=device_id, error=exc.error)
         await refresh_config_surfaces_for_device(db, device, client, refresh_source="apply")
         await db.commit()
         nb_client = get_netbox_client()

@@ -284,7 +284,10 @@ class _DeviceRefreshCoalescer:
             device = await db.get(Device, device_id)  # RE-FETCH by id — never a foreign session's row
             if device is None:
                 return
-            await refresh_all_surfaces_for_device(db, device, client, refresh_source="notification", atomic=False)
+            try:
+                await refresh_all_surfaces_for_device(db, device, client, refresh_source="notification", atomic=False)
+            except AsnRuleViolation as exc:
+                logger.warning("sse.coalesced_refresh_failed", device_id=device_id, error=failure_detail(exc))
         # Notify AFTER the refresh and BEFORE the dirty check (codex R1-F5 ordering): the
         # plugin reconciles the refreshed mirror; failures are swallowed (best-effort).
         nb_client = get_netbox_client()

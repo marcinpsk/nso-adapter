@@ -317,6 +317,47 @@ async def test_scope_reconcile_persists_failover_ips(adapter_client, monkeypatch
         assert fo.oob_ip == "192.0.2.5"
 
 
+@pytest.mark.parametrize("field", ["primary_ip", "oob_ip"])
+@pytest.mark.parametrize("address", ["198.18.0.1/24", ""])
+async def test_scope_reconcile_rolls_back_invalid_address_and_continues(adapter_client, monkeypatch, field, address):
+    import httpx
+
+    from nso_adapter.store.models import DeviceFailover
+    from tests.conftest import seed_device
+
+    invalid_id = await seed_device(nso_device_name="placeholder-invalid", netbox_device_id=42)
+    valid_id = await seed_device(nso_device_name="placeholder-valid", netbox_device_id=43)
+    async with session() as db:
+        db.add(DeviceFailover(device_id=invalid_id, primary_ip="198.18.0.10", oob_ip="198.18.0.11"))
+        await db.commit()
+    records = [
+        {"device": 42, "managed_attributes": ["enabled"], "primary_ip": "198.18.0.12", field: address},
+        {"device": 43, "managed_attributes": ["enabled"], "primary_ip": "198.18.0.13"},
+    ]
+    client = NetboxClient("https://netbox.example.test", "placeholder-token")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=records))
+    ) as http:
+        client._http = http
+        monkeypatch.setattr("nso_adapter.core.importer.get_netbox_client", lambda: client)
+        with capture_logs() as logs:
+            await sched._scheduled_scope_reconcile()
+
+    refused = next(record for record in logs if record["event"] == "scheduler.scope_reconcile.device_failed")
+    assert refused["device_id"] == invalid_id
+    assert refused["error"] == "ValueError"
+
+    async with session() as db:
+        fo = await db.scalar(select(DeviceFailover).where(DeviceFailover.device_id == invalid_id))
+        assert (fo.primary_ip, fo.oob_ip) == ("198.18.0.10", "198.18.0.11")
+        retained = (await db.scalars(select(ManagedScope.attribute).where(ManagedScope.device_id == invalid_id))).all()
+        assert retained == ["description"]
+        refreshed = (await db.scalars(select(ManagedScope.attribute).where(ManagedScope.device_id == valid_id))).all()
+        assert refreshed == ["enabled"]
+        valid = await db.scalar(select(DeviceFailover).where(DeviceFailover.device_id == valid_id))
+        assert valid.primary_ip == "198.18.0.13"
+
+
 @pytest.mark.anyio
 async def test_scope_reconcile_isolates_one_device_failure(adapter_client, monkeypatch):
     """One device raising (FK/constraint/etc.) must not abort the whole tick and skip every

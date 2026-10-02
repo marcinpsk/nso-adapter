@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Stored AS violations refuse work without changing authority or mirrors."""
 
+import asyncio
 from copy import deepcopy
 
 import pytest
@@ -383,6 +384,51 @@ async def test_comprehensive_refresh_surfaces_the_typed_refusal(adapter_client):
             await refresh_all_surfaces_for_device(db, device, InvalidDeviceRead())
         assert caught.value.error["code"] == "asn_rule_violation"
         assert caught.value.error["detail"]["degraded_surfaces"] == ["bgp", "redistribution", "static_route"]
+
+
+@pytest.mark.parametrize("caller", ["apply", "sse"])
+async def test_partial_refresh_commits_config_before_notifying(adapter_client, monkeypatch, caller):
+    from nso_adapter.core import importer as imp
+    from nso_adapter.core.apply import _post_apply_refresh_and_notify
+    from nso_adapter.main import _DeviceRefreshCoalescer
+    from nso_adapter.store.models import DeviceSvi
+    from tests.core.test_importer import _ALL_PROJECTED_WIRES
+
+    class InvalidDeviceRead:
+        async def get_device_state_doc(self, device_name):
+            sections = {wire: {"status": "ok"} for wire in _ALL_PROJECTED_WIRES}
+            sections["bgp-config"] = {"status": "ok", "router": [{"asn": "064512"}]}
+            sections["svi"] = {
+                "status": "ok",
+                "interface": [{"interface-name": "Vlan42", "vlan-id": 42}],
+            }
+            return sections
+
+        async def run_device_state_read(self, device_name, wire_names, *, timeout):
+            return {"atomic": True, **await self.get_device_state_doc(device_name)}
+
+    device_id = await seed_device(nso_device_name="placeholder-device", netbox_device_id=42)
+    notifications = []
+
+    class NetBoxNotification:
+        async def notify_sync_complete(self, netbox_device_id):
+            async with session() as db:
+                rows = (await db.scalars(select(DeviceSvi).where(DeviceSvi.device_id == device_id))).all()
+                notifications.append((netbox_device_id, [(row.interface_name, row.vlan_id) for row in rows]))
+
+    client = InvalidDeviceRead()
+    monkeypatch.setattr(imp, "get_nso_client", lambda _: client)
+    monkeypatch.setattr(imp, "get_netbox_client", NetBoxNotification)
+    if caller == "apply":
+        async with session() as db:
+            await _post_apply_refresh_and_notify(db, device_id)
+    else:
+        tasks = set()
+        coalescer = _DeviceRefreshCoalescer({"nso-dev": client}, tasks, None)
+        coalescer.trigger(device_id, "nso-dev", 42)
+        await asyncio.gather(*tasks)
+
+    assert notifications == [(42, [("Vlan42", 42)])]
 
 
 @pytest.mark.parametrize("caller", ["onboard", "apply"])
