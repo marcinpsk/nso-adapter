@@ -80,7 +80,12 @@ def test_broad_handler_reraises_claim_lost_first(module, function, marker):
     placed after ``except Exception`` never runs.
     """
     path = _ROOT / module
-    matching = [t for t in _handlers(path) if any(_mentions(h, marker) for h in t.handlers)]
+    matching = [
+        t
+        for t in _handlers(path)
+        if any(_mentions(h, marker) for h in t.handlers)
+        and any(h.type is None or ast.unparse(h.type) == "Exception" for h in t.handlers)
+    ]
     if function == "_run_document_apply":
         assert len(matching) == 2
     assert matching, f"no try/except in {module} mentions {marker!r} — did the log event get renamed?"
@@ -105,6 +110,39 @@ def test_broad_handler_reraises_claim_lost_first(module, function, marker):
         assert any(isinstance(stmt, ast.Raise) for stmt in handler.body), (
             f"{module}:{marker} catches ClaimLostError without re-raising it"
         )
+
+
+@pytest.mark.parametrize(
+    ("source", "refuses"),
+    [
+        (
+            "try:\n"
+            "    try:\n"
+            "        refresh()\n"
+            "    except AsnRuleViolation:\n"
+            "        marker()\n"
+            "except ClaimLostError:\n"
+            "    raise\n"
+            "except Exception:\n"
+            "    marker()\n",
+            False,
+        ),
+        ("try:\n    refresh()\nexcept AsnRuleViolation:\n    marker()\n", True),
+        ("try:\n    refresh()\nexcept Exception:\n    marker()\n", True),
+        (
+            "try:\n    refresh()\nexcept Exception:\n    marker()\nexcept ClaimLostError:\n    raise\n",
+            True,
+        ),
+    ],
+)
+def test_claim_loss_guard_selects_broad_handlers(tmp_path, monkeypatch, source, refuses):
+    monkeypatch.setattr(f"{__name__}._ROOT", tmp_path)
+    (tmp_path / "handler.py").write_text(source)
+    if refuses:
+        with pytest.raises(AssertionError):
+            test_broad_handler_reraises_claim_lost_first("handler.py", "refresh", "marker")
+    else:
+        test_broad_handler_reraises_claim_lost_first("handler.py", "refresh", "marker")
 
 
 # ── behavioral: the helpers that can be driven without a live NSO ────────────
