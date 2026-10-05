@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.core.bgp import validate_bgp_as_numbers
 from nso_adapter.core.cancelsafe import await_uncancellable
 from nso_adapter.core.refresh_engine import classify_envelope_family_read
-from nso_adapter.domain.asn import checked_asn, validate_asn_rows, validate_source_as_numbers
+from nso_adapter.domain.asn import checked_device_source_ref, validate_asn_rows, validate_source_as_numbers
 from nso_adapter.nso.client import NsoClient, failure_detail
 from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
@@ -72,7 +72,7 @@ def _build_rows(
     for entry in as_list(redist_list):
         src_proto = str(entry.get("source-protocol", "")).strip()
         if src_proto == "bgp":
-            checked_asn(entry.get("source-ref", ""), "device_read.redistribution", location, "source-ref")
+            checked_device_source_ref(entry.get("source-ref", ""), "device_read.redistribution", location, "source-ref")
         src_ref = str(entry.get("source-ref", ""))
         if src_proto != "bgp":
             src_ref = src_ref.strip()

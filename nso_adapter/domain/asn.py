@@ -27,6 +27,11 @@ def redistribution_source_identity(protocol: str, reference: str) -> str:
     return str(parse_asn(reference)) if protocol == "bgp" else reference
 
 
+def checked_device_source_ref(value: object, table: str, row_id: object, field: str) -> str:
+    """Return a device-read BGP source as asplain; Junos and TiMOS report a source without an AS as ""."""
+    return "" if value == "" else str(checked_asn(value, table, row_id, field))
+
+
 class AsnRuleViolation(Exception):
     """Refuse invalid AS content with its stored row or device-read location."""
 
@@ -81,7 +86,8 @@ def asn_row_identity(table: str, row: dict) -> tuple | None:
                 raise AsnRuleViolation(table, row_id, "dest_ref", destination)
             destination = (checked_asn(parts[0], table, row_id, "dest_ref"), *parts[1:])
         if row.get("source_protocol") == "bgp":
-            source = checked_asn(source, table, row_id, "source_ref")
+            check = checked_device_source_ref if table == "device_redistribution" else checked_asn
+            source = check(source, table, row_id, "source_ref")
         return (row.get("dest_protocol"), destination, row.get("source_protocol"), source)
     return None
 
@@ -103,12 +109,12 @@ def validate_asn_rows(table: str, rows: list[dict]) -> None:
 
 
 def validate_source_as_numbers(entries: list[dict], table: str, row_id: object) -> None:
-    """Refuse malformed or colliding BGP sources within one destination."""
+    """Refuse malformed or colliding device-read BGP sources within one destination."""
     seen: dict[int, object] = {}
     for entry in entries:
-        if entry.get("source-protocol") != "bgp":
-            continue
         value = entry.get("source-ref", "")
+        if entry.get("source-protocol") != "bgp" or value == "":
+            continue
         identity = checked_asn(value, table, row_id, "source-ref")
         if identity in seen and seen[identity] != value:
             raise AsnRuleViolation(table, row_id, "source-ref", value)
