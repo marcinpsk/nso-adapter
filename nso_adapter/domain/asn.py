@@ -125,7 +125,8 @@ def validate_asn_rows(table: str, rows: list[dict], *, ned_id: object = _NO_NED_
     for row in rows:
         identity = asn_row_identity(table, row)
         if table == "redistribution_intent" and row.get("source_protocol") == "bgp" and ned_id is not _NO_NED_CONTEXT:
-            assert ned_id is None or isinstance(ned_id, str)
+            if ned_id is not None and not isinstance(ned_id, str):
+                raise TypeError("ned_id must be a string or None")
             checked_intent_source_ref(row.get("source_ref", ""), ned_id)
         if identity is None:
             continue
