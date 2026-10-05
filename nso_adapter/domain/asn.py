@@ -84,8 +84,7 @@ def checked_asn(value: object, table: str, row_id: object, field: str) -> int:
 def checked_intent_source_ref(value: str, ned_id: str | None) -> str:
     """Return the canonical BGP source AS, or an empty source on Junos and TiMOS."""
     if value == "":
-        family = "timos" if ned_id and ned_id.startswith("timos-nc") else ned_family(ned_id or "")
-        if family in _SOURCE_WITHOUT_AS_FAMILIES:
+        if ned_family(ned_id or "") in _SOURCE_WITHOUT_AS_FAMILIES:
             return ""
         raise BgpSourceAsRequired(ned_id)
     return str(checked_asn(value, "redistribution_intent", None, "source_ref"))
