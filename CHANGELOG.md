@@ -2,6 +2,70 @@
 
 <!-- version list -->
 
+## v1.9.1 (2026-10-02)
+
+### Bug Fixes
+
+- Continue partial refresh and validate scope addresses before commit
+  ([`34a7390`](https://github.com/marcinpsk/nso-adapter/commit/34a7390de56820aab69d1dae58dd1ca193bdeb6e))
+
+- Preserve structured ASN refusal diagnostics in refresh logs
+  ([`76c3092`](https://github.com/marcinpsk/nso-adapter/commit/76c3092f68d30c196e6af4b3437785cda478ff5f))
+
+- **apply**: Revert deploying states only while the run owns the claim
+  ([`dcec9da`](https://github.com/marcinpsk/nso-adapter/commit/dcec9dafaec767fce4a113e07224de37746fa653))
+
+- **bgp**: Compare AS numbers as RFC 5396 values, refuse every other spelling
+  ([`6480b50`](https://github.com/marcinpsk/nso-adapter/commit/6480b50401867faac7af945ef89a3e6d8c967557))
+
+- **bgp**: Recover from AS refusals without stuck or stale state
+  ([`51c245e`](https://github.com/marcinpsk/nso-adapter/commit/51c245ec69f04fdfbef3b0a4cd4356c714f895de))
+
+- **failover**: Block a malformed stored address and let the scope write repair it
+  ([`812fc92`](https://github.com/marcinpsk/nso-adapter/commit/812fc9227ff40c3715c8f98c20376a473a65bb41))
+
+- **failover**: Take the active address role from NSO, revert to what NSO had
+  ([`7cfead1`](https://github.com/marcinpsk/nso-adapter/commit/7cfead19cdc0ce759811671079987cad0676e888))
+
+- **failover**: Type management addresses as IPs, OOB interval by role
+  ([`07c8487`](https://github.com/marcinpsk/nso-adapter/commit/07c848704fb34122e956018606e980d6991a7181))
+
+- **sync**: Keep the failed-surface list when a mirror refresh refuses AS content
+  ([`6c146e7`](https://github.com/marcinpsk/nso-adapter/commit/6c146e7668fd105e483cfe689c40c829481a9e72))
+
+### Chores
+
+- **ci**: Bump the actions group with 2 updates
+  ([`a6dcbbe`](https://github.com/marcinpsk/nso-adapter/commit/a6dcbbef12ed7b5c312a2cc8997b4a058e8baae8))
+
+- **deps**: Bump watchfiles in the python-minor-patch group
+  ([`ed01aae`](https://github.com/marcinpsk/nso-adapter/commit/ed01aae296cd98179239c8f20a72a67a3871fd86))
+
+- **license**: Adopt REUSE and check every file with reuse lint
+  ([`49a31f9`](https://github.com/marcinpsk/nso-adapter/commit/49a31f9c4b48c2865eefa1bd438e21807372adc4))
+
+- **license**: Require the SPDX header on empty Python files too
+  ([`2ebb7c8`](https://github.com/marcinpsk/nso-adapter/commit/2ebb7c8340354ec8daa37c02dcadc2a04f9bf670))
+
+- **license**: Require the SPDX header on every Python file
+  ([`b4be319`](https://github.com/marcinpsk/nso-adapter/commit/b4be3199eb2ebfbe09ce4bdd146b67bcb5d302cf))
+
+### Documentation
+
+- **api**: List 409 on the AS-bearing intent PUT headings
+  ([`3f7109f`](https://github.com/marcinpsk/nso-adapter/commit/3f7109fdf84733f0d51db4da61efc570fb09042b))
+
+### Refactoring
+
+- **bgp**: Remove unused mirror validation and simplify refusal setup
+  ([`a1ef132`](https://github.com/marcinpsk/nso-adapter/commit/a1ef132f82a0cf1e8de1b8ad7f9b96e424e1536b))
+
+### Testing
+
+- Distinguish narrow refusal handlers in the claim loss guard
+  ([`3a8978d`](https://github.com/marcinpsk/nso-adapter/commit/3a8978d0ad57ef8ab1cde94d258087713d799f01))
+
+
 ## v1.9.0 (2026-09-29)
 
 ### Bug Fixes
