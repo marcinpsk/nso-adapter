@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import select
 
 from nso_adapter.store.models import Device, JobStatus, RedistributionIntent
+from tests._secret_discipline import assert_text_free_of
 from tests.api.test_bgp_asn_validation import _redistribution_request
 from tests.conftest import AUTH, push_seq, seed_device, session
 from tests.core.test_action_apply_promotion import _apply
@@ -86,6 +87,7 @@ async def test_empty_source_put_is_conditioned_on_resolved_ned(adapter_client, p
     response = await adapter_client.put(
         f"/api/v1/devices/{device_id}/{endpoint}?store_only=true", json=body, headers=AUTH | push_seq()
     )
+    assert_text_free_of(response.text, ["placeholder-device", "placeholder-process"])
     async with session() as db:
         rows = (await db.scalars(select(RedistributionIntent))).all()
     if ned_id in _ALLOWED_NEDS:
@@ -110,6 +112,7 @@ async def test_nonempty_source_schema_is_unchanged(adapter_client, protocol, ned
     response = await adapter_client.put(
         f"/api/v1/devices/{device_id}/{endpoint}?store_only=true", json=body, headers=AUTH | push_seq()
     )
+    assert_text_free_of(response.text, ["placeholder-device", "placeholder-process"])
     assert response.status_code == (200 if source_ref == "64512" else 422), response.text
 
 
@@ -123,6 +126,7 @@ async def test_duplicate_empty_source_is_an_atomic_conflict(adapter_client, prot
     response = await adapter_client.put(
         f"/api/v1/devices/{device_id}/{endpoint}?store_only=true", json=body, headers=AUTH | push_seq()
     )
+    assert_text_free_of(response.text, ["placeholder-device", "placeholder-process"])
     assert response.status_code == 409, response.text
     assert response.json()["error"]["code"] == "conflict"
     async with session() as db:
@@ -137,6 +141,7 @@ async def test_live_ned_change_refuses_empty_source_before_images(adapter_client
     endpoint, body = _redistribution_request(protocol, "")
     url = f"/api/v1/devices/{device_id}/{endpoint}?store_only=true"
     accepted = await adapter_client.put(url, json=body, headers=AUTH | push_seq(1))
+    assert_text_free_of(accepted.text, ["placeholder-device", "placeholder-process"])
     assert accepted.status_code == 200, accepted.text
     await _set_ned(device_id, "cisco-ios-cli-6.95")
     if operation == "replacement":
@@ -144,6 +149,7 @@ async def test_live_ned_change_refuses_empty_source_before_images(adapter_client
     elif operation == "deletion":
         _entries(protocol, body).clear()
     refused = await adapter_client.put(url, json=body, headers=AUTH | push_seq(1 if operation == "replay" else 2))
+    assert_text_free_of(refused.text, ["placeholder-device", "placeholder-process"])
     assert refused.status_code == 409, refused.text
     assert refused.json()["error"]["code"] == "bgp_source_as_required"
     async with session() as db:
@@ -172,6 +178,7 @@ async def test_empty_source_lifecycle_preserves_frozen_payload(adapter_client, p
     endpoint, body = _redistribution_request(protocol, "")
     url = f"/api/v1/devices/{device_id}/{endpoint}"
     response = await adapter_client.put(url, json=body, headers=AUTH | push_seq(1))
+    assert_text_free_of(response.text, ["placeholder-device", "placeholder-process"])
     assert response.status_code == 200, response.text
     replay = await adapter_client.put(url, json=body, headers=AUTH | push_seq(1))
     assert replay.content == response.content
@@ -192,6 +199,7 @@ async def test_empty_source_lifecycle_preserves_frozen_payload(adapter_client, p
         json={"generation_id": generation.id},
         headers=AUTH,
     )
+    assert_text_free_of(retry.text, ["placeholder-device", "placeholder-process"])
     assert retry.status_code == 202, retry.text
     await _set_ned(device_id, "cisco-ios-cli-6.95")
     retried = await job_row(await run_head(device_id, client))
@@ -203,6 +211,7 @@ async def test_empty_source_lifecycle_preserves_frozen_payload(adapter_client, p
     flush = await adapter_client.post(
         f"/api/v1/devices/{device_id}/actions/force-removal", json={"scope": protocol}, headers=AUTH
     )
+    assert_text_free_of(flush.text, ["placeholder-device", "placeholder-process"])
     assert flush.status_code == 202, flush.text
     rebuilt = await _drain_writes(device_id, "placeholder-device")
     assert rebuilt
@@ -215,7 +224,8 @@ async def test_empty_source_lifecycle_preserves_frozen_payload(adapter_client, p
     for seq, source_ref in [(2, "0.64512"), (3, "64512"), (4, "")]:
         _, replacement = _redistribution_request(protocol, source_ref)
         changed = await adapter_client.put(url, json=replacement, headers=AUTH | push_seq(seq))
-        assert changed.status_code == 200, changed.text
+        assert_text_free_of(changed.text, ["placeholder-device", "placeholder-process"])
+        assert changed.status_code == 200
         async with session() as db:
             stored = await db.scalar(select(RedistributionIntent))
             assert stored.source_ref == source_ref
@@ -224,7 +234,8 @@ async def test_empty_source_lifecycle_preserves_frozen_payload(adapter_client, p
             elif seq == 3:
                 assert stored.id == canonical_row_id
         applied = await _apply(adapter_client, device_id, {protocol: seq})
-        assert applied.status_code in (200, 202), applied.text
+        assert_text_free_of(applied.text, ["placeholder-device", "placeholder-process"])
+        assert applied.status_code in (200, 202)
         writes = await _drain_writes(device_id, "placeholder-device")
         assert writes
         assert list(_wire_sources(writes[-1]["instance"])) == ["64512" if source_ref else ""]
@@ -234,8 +245,10 @@ async def test_empty_source_lifecycle_preserves_frozen_payload(adapter_client, p
     deletion = deepcopy(body)
     _entries(protocol, deletion).clear()
     deleted = await adapter_client.put(url, json=deletion, headers=AUTH | push_seq(5))
+    assert_text_free_of(deleted.text, ["placeholder-device", "placeholder-process"])
     assert deleted.status_code == 200, deleted.text
     applied = await _apply(adapter_client, device_id, {protocol: 5})
+    assert_text_free_of(applied.text, ["placeholder-device", "placeholder-process"])
     assert applied.status_code in (200, 202), applied.text
     writes = await _drain_writes(device_id, "placeholder-device")
     assert writes and list(_wire_sources(writes[-1]["instance"])) == []
@@ -253,6 +266,7 @@ async def test_ios_frozen_section_refuses_empty_source_before_send(adapter_clien
     await _set_ned(device_id, "cisco-ios-cli-6.95")
     endpoint, body = _redistribution_request(protocol, "64512")
     response = await adapter_client.put(f"/api/v1/devices/{device_id}/{endpoint}", json=body, headers=AUTH | push_seq())
+    assert_text_free_of(response.text, ["placeholder-device", "placeholder-process"])
     assert response.status_code == 200, response.text
     async with session() as db:
         generation = await db.scalar(select(DeploymentGeneration))
