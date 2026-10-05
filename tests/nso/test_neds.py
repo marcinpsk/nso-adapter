@@ -35,6 +35,13 @@ def test_ned_family_junos_evo():
     assert ned_family("juniper-junos-evo-nc-24.4") == "junos"
 
 
+def test_ned_family_timos():
+    from nso_adapter.nso.neds import ned_family
+
+    assert ned_family("timos-nc-23.10") == "timos"
+    assert ned_family("timos-nc") == "timos"
+
+
 def test_ned_family_unknown_returns_none():
     from nso_adapter.nso.neds import ned_family
 

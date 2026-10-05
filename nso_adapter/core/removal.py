@@ -44,6 +44,7 @@ from nso_adapter.domain.asn import AsnRuleViolation, checked_asn, validate_asn_r
 from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.client import failure_detail
 from nso_adapter.nso.shape import as_list
+from nso_adapter.store.models import Device
 
 logger = structlog.get_logger(__name__)
 
@@ -2045,9 +2046,10 @@ async def promotion_removal_context(
     if scope not in valid_removal_scopes():  # pragma: no cover - caller validates first
         raise ValueError(f"Unknown removal scope {scope!r}")
 
+    ned_id = await db.scalar(select(Device.ned_id).where(Device.id == device_id))
     for tables in (removed_rows, replacement_rows or {}):
         for table, rows in tables.items():
-            validate_asn_rows(table, rows)
+            validate_asn_rows(table, rows, ned_id=ned_id)
 
     removed: dict[str, list] = {}
     interfaces: list[str] | None = None

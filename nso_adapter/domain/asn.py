@@ -2,6 +2,11 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Canonical AS number identities."""
 
+from nso_adapter.nso.neds import ned_family
+
+_SOURCE_WITHOUT_AS_FAMILIES = frozenset({"junos", "timos"})
+_NO_NED_CONTEXT = object()
+
 
 def parse_asn(asn: object) -> int:
     """Return a uint32 AS number from asplain or asdot notation."""
@@ -24,7 +29,7 @@ def parse_asn(asn: object) -> int:
 
 def redistribution_source_identity(protocol: str, reference: str) -> str:
     """Compare a BGP source instance by AS number and other instances by their reference."""
-    return str(parse_asn(reference)) if protocol == "bgp" else reference
+    return str(parse_asn(reference)) if protocol == "bgp" and reference != "" else reference
 
 
 def checked_device_source_ref(value: object, table: str, row_id: object, field: str) -> str:
@@ -50,9 +55,19 @@ class AsnRuleViolation(Exception):
         detail["degraded_surfaces"] = sorted(set(detail.get("degraded_surfaces", [])) | set(surfaces))
 
 
+class BgpSourceAsRequired(AsnRuleViolation):
+    """Refuse a BGP source without an AS on a NED that requires one."""
+
+    def __init__(self, ned_id: str | None):
+        super().__init__("redistribution_intent", None, "source_ref", "")
+        message = f"{ned_id or 'no learned NED'}: BGP redistribution requires the source AS"
+        self.args = (message,)
+        self.error = {"code": "bgp_source_as_required", "message": message, "detail": {"ned_id": ned_id}}
+
+
 def asn_refusal_detail(exc: AsnRuleViolation) -> dict:
     """Return the authored refusal envelope without rejected AS content."""
-    if type(exc) is not AsnRuleViolation:
+    if type(exc) not in (AsnRuleViolation, BgpSourceAsRequired):
         raise TypeError("exc must be an AsnRuleViolation")
     return exc.error
 
@@ -64,6 +79,15 @@ def checked_asn(value: object, table: str, row_id: object, field: str) -> int:
     except ValueError:
         refused = AsnRuleViolation(table, row_id, field, value)
     raise refused
+
+
+def checked_intent_source_ref(value: str, ned_id: str | None) -> str:
+    """Return the canonical BGP source AS, or an empty source on Junos and TiMOS."""
+    if value == "":
+        if ned_family(ned_id or "") in _SOURCE_WITHOUT_AS_FAMILIES:
+            return ""
+        raise BgpSourceAsRequired(ned_id)
+    return str(checked_asn(value, "redistribution_intent", None, "source_ref"))
 
 
 def asn_row_identity(table: str, row: dict) -> tuple | None:
@@ -86,17 +110,23 @@ def asn_row_identity(table: str, row: dict) -> tuple | None:
                 raise AsnRuleViolation(table, row_id, "dest_ref", destination)
             destination = (checked_asn(parts[0], table, row_id, "dest_ref"), *parts[1:])
         if row.get("source_protocol") == "bgp":
-            check = checked_device_source_ref if table == "device_redistribution" else checked_asn
-            source = check(source, table, row_id, "source_ref")
+            if table == "device_redistribution":
+                source = checked_device_source_ref(source, table, row_id, "source_ref")
+            elif source != "":
+                source = checked_asn(source, table, row_id, "source_ref")
         return (row.get("dest_protocol"), destination, row.get("source_protocol"), source)
     return None
 
 
-def validate_asn_rows(table: str, rows: list[dict]) -> None:
+def validate_asn_rows(table: str, rows: list[dict], *, ned_id: object = _NO_NED_CONTEXT) -> None:
     """Refuse malformed values and colliding canonical AS identities."""
     seen: dict[tuple, dict] = {}
     for row in rows:
         identity = asn_row_identity(table, row)
+        if table == "redistribution_intent" and row.get("source_protocol") == "bgp" and ned_id is not _NO_NED_CONTEXT:
+            if ned_id is not None and not isinstance(ned_id, str):
+                raise TypeError("ned_id must be a string or None")
+            checked_intent_source_ref(row.get("source_ref", ""), ned_id)
         if identity is None:
             continue
         previous = seen.get(identity)

@@ -1699,7 +1699,7 @@ def test_bgp_peer_malformed_as_is_rejected(field, value):
 
 
 @pytest.mark.parametrize("protocol", ["bgp", "isis"])
-@pytest.mark.parametrize("source_ref", ["064520", " 64512", "65536.1x", ""])
+@pytest.mark.parametrize("source_ref", ["064520", " 64512", "65536.1x"])
 def test_redistribution_writer_refuses_malformed_source_as(protocol, source_ref):
     row = RedistributionIntent(
         dest_protocol=protocol,

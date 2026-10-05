@@ -1447,7 +1447,7 @@ _APPROVED_REJECTION_DETAIL_AST = _formatter_definition_ast(_APPROVED_REJECTION_D
 _APPROVED_ASN_REFUSAL_DETAIL = '''\
 def asn_refusal_detail(exc: AsnRuleViolation) -> dict:
     """Approved formatter contract."""
-    if type(exc) is not AsnRuleViolation:
+    if type(exc) not in (AsnRuleViolation, BgpSourceAsRequired):
         raise TypeError("exc must be an AsnRuleViolation")
     return exc.error
 '''

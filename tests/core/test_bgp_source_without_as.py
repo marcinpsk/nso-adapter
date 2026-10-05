@@ -55,11 +55,10 @@ async def test_redistribution_refresh_stores_and_serves_bgp_source_without_as(ad
     assert response.json()["entries"][0]["source_ref"] == ""
 
 
-def test_identity_accepts_bgp_source_without_as_only_on_device_reads():
+def test_identity_accepts_bgp_source_without_as_on_reads_and_intent():
     row = {"id": 1, "dest_protocol": "isis", "dest_ref": "core", "source_protocol": "bgp", "source_ref": ""}
     assert asn_row_identity("device_redistribution", row) == ("isis", "core", "bgp", "")
-    with pytest.raises(AsnRuleViolation):
-        asn_row_identity("redistribution_intent", row)
+    assert asn_row_identity("redistribution_intent", row) == ("isis", "core", "bgp", "")
 
 
 @pytest.mark.parametrize("rejected", ["064512", " ", "4294967296"])

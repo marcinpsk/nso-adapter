@@ -61,6 +61,16 @@
     GET `bgp-config` and `redistribution`
     return this refusal in the `ErrorEnvelope` model, as do intent writes, Apply,
     and GET `actions/apply-diff`.
+  - BGP source intent: `bgp_source_as_required` (409, the device's NED requires
+    a source AS for BGP redistribution). IS-IS, OSPF and BGP intent PUTs accept
+    an empty BGP `source_ref` only on Junos and TiMOS. The refusal names the
+    NED id, or `no learned NED` when it is missing. A non-empty invalid AS
+    still returns 422 at the request schema. Encoders enforce the same rule
+    with the section's frozen NED id.
+    Live-NED validation precedes receipt replay and checks intent before-images.
+    If the device changes from Junos/TiMOS to a NED that requires a source AS,
+    an existing empty BGP source can block replay, replacement and deletion
+    with this 409. Frozen generation retry still uses the original NED.
   - Per-endpoint: `ambiguous_device` (device lookup matches >1),
     `bad_request` (malformed action parameter), `community_not_found`
     (SNMP harvest), `harvest_unsupported_ned`, `invalid_vault_ref`

@@ -1870,7 +1870,7 @@ def _unrenderable_community_list(row, ned_id: str | None) -> bool:
     return len(community_dialect_for(ned_id).unrepresentable_members(sorted(members))) == len(members)
 
 
-def _validate_reader_as_numbers(rows) -> None:
+def _validate_reader_as_numbers(rows, ned_id: str | None) -> None:
     """Refuse invalid stored AS values before reader key comparison."""
     from nso_adapter.store import models as m
 
@@ -1888,7 +1888,7 @@ def _validate_reader_as_numbers(rows) -> None:
                         {column.name: getattr(peer, column.name) for column in peer.__table__.columns}
                     )
     for table, records in tables.items():
-        validate_asn_rows(table, records)
+        validate_asn_rows(table, records, ned_id=ned_id)
 
 
 def _reader_compare_expected(section: str, rows, ned_id: str | None = None) -> list[tuple[Any, str, tuple]]:
@@ -1905,7 +1905,7 @@ def _reader_compare_expected(section: str, rows, ned_id: str | None = None) -> l
     from nso_adapter.core.removal import _ROUTE_POLICY_FAMILY_LISTS
     from nso_adapter.store import models as m
 
-    _validate_reader_as_numbers(rows)
+    _validate_reader_as_numbers(rows, ned_id)
     verify = section_registry()[section].verify
     if isinstance(verify, NoComparison):
         return []
