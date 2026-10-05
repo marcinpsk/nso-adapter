@@ -20,7 +20,7 @@ from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.redistribution import RedistributionSourceModel, validate_unique_redistribution_sources
 from nso_adapter.api.timestamps import iso_z, latest_refreshed
 from nso_adapter.core.removal import is_cleared
-from nso_adapter.domain.asn import redistribution_source_identity
+from nso_adapter.domain.asn import checked_intent_source_ref, redistribution_source_identity
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
     Device,
@@ -366,6 +366,10 @@ async def put_ospf_intent(
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
+
+    for _, entry in _iter_ospf_redistribution(payload.instances):
+        if entry.source_protocol == "bgp":
+            checked_intent_source_ref(entry.source_ref, device.ned_id)
 
     # Every accepted write records its projection revision, store-only and
     # auto-apply-off included, and takes the device's projection lock before anything is

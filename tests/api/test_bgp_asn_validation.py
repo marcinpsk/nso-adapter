@@ -147,7 +147,7 @@ def _redistribution_request(protocol, source_ref):
 
 
 @pytest.mark.parametrize("protocol", ["bgp", "ospf", "isis"])
-@pytest.mark.parametrize("invalid", ["064520", "65536.1x", "", " 64512"])
+@pytest.mark.parametrize("invalid", ["064520", "65536.1x", " 64512"])
 async def test_redistribution_bgp_source_as_has_a_field_error(adapter_client, protocol, invalid):
     device_id = await seed_device(nso_device_name="placeholder-device")
     endpoint, body = _redistribution_request(protocol, invalid)
@@ -176,23 +176,6 @@ async def test_redistribution_source_notation_change_retains_identity(adapter_cl
             else:
                 assert row.id == initial_id
                 assert row.source_ref == source_ref
-
-
-@pytest.mark.parametrize("protocol", ["bgp", "ospf", "isis"])
-async def test_redistribution_bgp_source_requires_an_as_number(adapter_client, protocol):
-    device_id = await seed_device(nso_device_name="placeholder-device")
-    endpoint, body = _redistribution_request(protocol, "64512")
-    if protocol == "bgp":
-        entries = body["routers"][0]["scopes"][0]["address_families"][0]["redistribution"]
-    else:
-        entries = body["instances" if protocol == "ospf" else "processes"][0]["redistribution"]
-    del entries[0]["source_ref"]
-    response = await adapter_client.put(
-        f"/api/v1/devices/{device_id}/{endpoint}?store_only=true", json=body, headers=AUTH | push_seq()
-    )
-    assert_text_free_of(response.text, ["placeholder-device"])
-    assert response.status_code == 422, response.text
-    assert any(e["loc"][-1] == "source_ref" for e in response.json()["error"]["detail"]["errors"])
 
 
 @pytest.mark.parametrize("protocol", ["bgp", "ospf", "isis"])

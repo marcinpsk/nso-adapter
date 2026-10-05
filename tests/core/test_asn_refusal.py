@@ -95,9 +95,11 @@ async def test_projection_refuses_stored_router(adapter_client):
         assert caught.value.error["detail"] == {"table": "bgp_router_intent", "row_id": row.id, "field": "asn"}
 
 
-async def test_removal_context_refuses_stored_router():
-    with pytest.raises(AsnRuleViolation) as caught:
-        await promotion_removal_context(None, 1, "bgp", {"bgp_router_intent": [{"id": 7, "asn": "064512"}]})
+async def test_removal_context_refuses_stored_router(adapter_client):
+    device_id = await seed_device(nso_device_name="placeholder-device")
+    async with session() as db:
+        with pytest.raises(AsnRuleViolation) as caught:
+            await promotion_removal_context(db, device_id, "bgp", {"bgp_router_intent": [{"id": 7, "asn": "064512"}]})
     assert caught.value.error["detail"]["row_id"] == 7
 
 
