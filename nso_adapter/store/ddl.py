@@ -113,3 +113,27 @@ def job_coalescible_immutability_drop_ddl() -> tuple[str, ...]:
         f"DROP TRIGGER IF EXISTS {JOB_COALESCIBLE_IMMUTABLE_TRIGGER} ON jobs",
         f"DROP FUNCTION IF EXISTS {_JOB_COALESCIBLE_FUNCTION}()",
     )
+
+
+def observation_immutability_ddl() -> tuple[str, ...]:
+    return (
+        """
+CREATE OR REPLACE FUNCTION read_observation_reject_update() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION USING
+        ERRCODE = 'integrity_constraint_violation',
+        MESSAGE = 'read_observation is immutable: updates are refused';
+END;
+$$ LANGUAGE plpgsql;
+""".strip(),
+        "DROP TRIGGER IF EXISTS read_observation_immutable ON read_observation",
+        "CREATE TRIGGER read_observation_immutable BEFORE UPDATE ON read_observation "
+        "FOR EACH ROW EXECUTE FUNCTION read_observation_reject_update()",
+    )
+
+
+def observation_immutability_drop_ddl() -> tuple[str, ...]:
+    return (
+        "DROP TRIGGER IF EXISTS read_observation_immutable ON read_observation",
+        "DROP FUNCTION IF EXISTS read_observation_reject_update()",
+    )

@@ -52,6 +52,16 @@ def two_databases(pg_provisioner):
 _PARENT = "CREATE TABLE parent (id INTEGER PRIMARY KEY)"
 
 
+def test_snapshot_discriminates_observation_immutability(two_databases):
+    from nso_adapter.store.ddl import observation_immutability_ddl
+
+    (db_a, db_b), snapshot_of = two_databases
+    table = "CREATE TABLE read_observation (id INTEGER PRIMARY KEY)"
+    protected = snapshot_of(db_a, [table, *observation_immutability_ddl()])
+    unprotected = snapshot_of(db_b, [table])
+    assert protected != unprotected
+
+
 def test_snapshot_discriminates_fk_ondelete(two_databases):
     """CASCADE vs the default restrictive action must not compare equal (B9).
 

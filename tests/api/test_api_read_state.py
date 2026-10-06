@@ -14,6 +14,7 @@ import pytest
 
 from nso_adapter.api.timestamps import iso_z
 from nso_adapter.core.families import ALL_FAMILY_KEYS, FAMILIES_VERSION
+from nso_adapter.domain.observation import observe_family
 from nso_adapter.nso.read_outcome import Freshness, Present, Unavailable, UnavailableReason
 from nso_adapter.store import outcome_store
 from nso_adapter.store.meta import get_store_incarnation
@@ -25,7 +26,16 @@ _AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 async def _terminalize(device_id: int, family: str, outcome, *, result: str, succeeded: bool, rows: int | None = 0):
     async with session() as db:
         attempt_id = await outcome_store.record_read_outcome(db, device_id, family, outcome, refresh_source="poll")
-        await outcome_store.record_result(db, attempt_id, result=result, succeeded=succeeded, row_count=rows)
+        await outcome_store.record_result(
+            db,
+            attempt_id,
+            result=result,
+            succeeded=succeeded,
+            row_count=rows,
+            observation=observe_family(family, outcome.data)
+            if isinstance(outcome, Present) and result == "replaced"
+            else None,
+        )
         return attempt_id
 
 
