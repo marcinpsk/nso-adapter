@@ -48,6 +48,7 @@ ErrorCode = Literal[
     "nso_commit_failed",
     "apply_unexecutable",
     "asn_rule_violation",
+    "bgp_source_as_required",
     # per-endpoint
     "ambiguous_device",
     "bad_request",

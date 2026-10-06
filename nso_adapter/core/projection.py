@@ -73,6 +73,7 @@ from nso_adapter.store.models import (
     BgpRouterIntent,
     BgpScopeIntent,
     DbInterface,
+    Device,
     InterfaceAttrState,
     InterfaceIntent,
     InterfaceIpIntent,
@@ -1367,10 +1368,10 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
     """
     if section not in document:
         raise ValueError(f"document does not carry section {section!r}")
-    section_context(document, section)
+    context = section_context(document, section)
     tables = document[section] or {}
     for table, records in fragment_tables(tables).items():
-        validate_asn_rows(table, records)
+        validate_asn_rows(table, records, ned_id=context["ned_id"])
     allowed_models = {spec.model for spec in _SECTION_REGISTRY[section].tables}
     rows: dict[type, list] = {}
     row_records: dict[type, list[tuple[dict, object]]] = {}
@@ -1473,8 +1474,9 @@ async def snapshot_stream(db: AsyncSession, device_id: int, stream: str) -> dict
     if stream not in projection_streams():
         raise ValueError(f"unknown projection stream {stream!r}")
     tables = {spec.model.__tablename__: await _rows_for(db, device_id, spec) for spec in _stream_tables()[stream]}
+    ned_id = await db.scalar(select(Device.ned_id).where(Device.id == device_id))
     for table, rows in tables.items():
-        validate_asn_rows(table, rows)
+        validate_asn_rows(table, rows, ned_id=ned_id)
     return tables
 
 

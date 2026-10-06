@@ -11,6 +11,7 @@ _NED_FAMILY_MAP: dict[str, str] = {
     "cisco-nx-cli": "nxos",
     "juniper-junos-nc": "junos",
     "juniper-junos-evo-nc": "junos",
+    "timos-nc": "timos",
 }
 
 
@@ -19,7 +20,7 @@ def ned_family(ned_id: str) -> str | None:
 
     Used to derive a short ``platform`` label from the NED ID returned by NSO.
     Examples: ``"cisco-ios-cli-6.95"`` → ``"ios"``,
-    ``"juniper-junos-nc-4.1"`` → ``"junos"``, ``"nokia-sros-nc-22.10"`` → ``None``.
+    ``"juniper-junos-nc-4.1"`` → ``"junos"``, ``"timos-nc-23.10"`` → ``"timos"``, ``"nokia-sros-nc-22.10"`` → ``None``.
     A bare prefix with no version suffix (``"cisco-ios-cli"``) also matches.
     """
     for prefix, family in _NED_FAMILY_MAP.items():

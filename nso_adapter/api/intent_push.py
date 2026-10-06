@@ -35,6 +35,7 @@ from nso_adapter.core.request_flags import (
     MIN_PUSH_SEQ,
     STORE_ONLY,
 )
+from nso_adapter.domain.asn import validate_asn_rows
 
 _PUSH_SEQ_HEADER = Header(
     alias="X-Push-Seq",
@@ -138,7 +139,7 @@ async def begin_delivery(db: AsyncSession, device_id: int, delivery: IntentDeliv
 
     await note_write(db, device_id, delivery.stream, push_seq=delivery.push_seq)
     from nso_adapter.core.projection import fragment_tables, rows_by_intent_identity, snapshot_stream
-    from nso_adapter.store.models import DeviceProjectionStream
+    from nso_adapter.store.models import Device, DeviceProjectionStream
 
     if delivery.stream in {"bgp", "ospf", "isis"}:
         await snapshot_stream(db, device_id, delivery.stream)
@@ -149,7 +150,9 @@ async def begin_delivery(db: AsyncSession, device_id: int, delivery: IntentDeliv
     )
     if projection is not None:
         tables = fragment_tables(projection.authorized_document)
+        ned_id = await db.scalar(select(Device.ned_id).where(Device.id == device_id))
         for table in tables:
+            validate_asn_rows(table, tables[table], ned_id=ned_id)
             rows_by_intent_identity(tables, table)
     return await admit_or_replay(db, device_id, delivery)
 

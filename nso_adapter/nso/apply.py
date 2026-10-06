@@ -25,7 +25,7 @@ import structlog
 
 from nso_adapter.core.community_dialect import UNREPRESENTABLE, CommunityDialect, community_dialect_for
 from nso_adapter.core.isis_canon import isis_level
-from nso_adapter.domain.asn import asn_row_identity, checked_asn, validate_asn_rows
+from nso_adapter.domain.asn import asn_row_identity, checked_asn, checked_intent_source_ref, validate_asn_rows
 from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.client import DEVICE_INTENT_PATH, DEVICE_INTENT_ROOT, NsoClient, _url_key
 from nso_adapter.nso.nso_json import boundary_safe_dumps
@@ -716,17 +716,13 @@ def build_subif_interfaces(subif_intent_rows: list) -> list[dict]:
     return interfaces
 
 
-def _redistribute_entry(row) -> dict:
+def _redistribute_entry(row, ned_id: str | None) -> dict:
     """One ``redistribute`` entry; route-map/metric/metric-type emitted only when set.
 
     Shared by the IS-IS and OSPF process payloads — both group ``RedistributionIntent``
     rows by their destination process and nest this identical entry shape.
     """
-    source_ref = (
-        str(checked_asn(row.source_ref, "redistribution_intent", getattr(row, "id", None), "source_ref"))
-        if row.source_protocol == "bgp"
-        else row.source_ref
-    )
+    source_ref = checked_intent_source_ref(row.source_ref, ned_id) if row.source_protocol == "bgp" else row.source_ref
     entry: dict = {"source-protocol": row.source_protocol, "source-ref": source_ref}
     if row.route_map:
         entry["route-map"] = row.route_map
@@ -802,6 +798,8 @@ def build_isis_process_payload(
     redistribution_rows: list | None = None,
     flex_algo_rows: list | None = None,
     level_rows: list | None = None,
+    *,
+    ned_id: str | None = None,
 ) -> list[dict]:
     """Build the isis-reconciler ``process-config`` payload from store rows.
 
@@ -811,7 +809,7 @@ def build_isis_process_payload(
     """
     redist_by_proc: dict[str, list[dict]] = {}
     for row in redistribution_rows or []:
-        redist_by_proc.setdefault(row.dest_ref, []).append(_redistribute_entry(row))
+        redist_by_proc.setdefault(row.dest_ref, []).append(_redistribute_entry(row, ned_id))
 
     processes: list[dict[str, Any]] = [
         _isis_process_entry(row, redist_by_proc.get(row.process_tag or "", [])) for row in isis_process_rows or []
@@ -891,13 +889,9 @@ def build_isis_interface_payload(isis_intent_rows: list | None) -> list[dict]:
     return interfaces
 
 
-def _bgp_redistribute_entry(row) -> dict:
+def _bgp_redistribute_entry(row, ned_id: str | None) -> dict:
     """One BGP AF ``redistribute`` entry; route-map/metric emitted only when set."""
-    source_ref = (
-        str(checked_asn(row.source_ref, "redistribution_intent", getattr(row, "id", None), "source_ref"))
-        if row.source_protocol == "bgp"
-        else row.source_ref
-    )
+    source_ref = checked_intent_source_ref(row.source_ref, ned_id) if row.source_protocol == "bgp" else row.source_ref
     entry: dict = {"source-protocol": row.source_protocol, "source-ref": source_ref}
     if row.route_map:
         entry["route-map"] = row.route_map
@@ -1092,8 +1086,7 @@ class SectionExecution(NamedTuple):
 #: One section's rows as an encoder reads them: table name -> the document's rows.
 SectionRows = Mapping[str, list[Any]]
 
-#: What to hand an encoder that reads no execution facts at all. Only ``route_policy``
-#: (NED-conditioned) and ``interface_config`` (proof-fed) read the argument.
+#: What to hand an encoder that reads no execution facts at all.
 _CONTEXT_FREE_EXECUTION = SectionExecution(None, community_dialect_for(None))
 
 
@@ -1299,6 +1292,7 @@ def encode_isis(rows: SectionRows, execution: SectionExecution) -> dict:
         rows["redistribution_intent"],
         rows["isis_flex_algo_intent"],
         rows["isis_level_intent"],
+        ned_id=execution.ned_id,
     )
     interfaces = build_isis_interface_payload(rows["isis_interface_intent"])
     body: dict = {}
@@ -1324,13 +1318,13 @@ def encode_bgp(rows: SectionRows, execution: SectionExecution) -> dict:
         }
         for row in rows["redistribution_intent"]
     ]
-    validate_asn_rows("redistribution_intent", redistribution)
+    validate_asn_rows("redistribution_intent", redistribution, ned_id=execution.ned_id)
     redist_by_af: dict[tuple[int, str, str], list[dict]] = {}
     for row, record in zip(rows["redistribution_intent"], redistribution, strict=True):
         identity = asn_row_identity("redistribution_intent", record)
         assert identity is not None
         asn, vrf, af = identity[1]
-        redist_by_af.setdefault((asn, vrf, af), []).append(_bgp_redistribute_entry(row))
+        redist_by_af.setdefault((asn, vrf, af), []).append(_bgp_redistribute_entry(row, execution.ned_id))
 
     routers: list[dict] = []
     router_by_asn: dict[int, dict] = {}
@@ -1434,7 +1428,7 @@ def encode_ospf(rows: SectionRows, execution: SectionExecution) -> dict:
     """
     redist_by_proc: dict[str, list[dict]] = {}
     for row in rows["redistribution_intent"]:
-        redist_by_proc.setdefault(row.dest_ref, []).append(_redistribute_entry(row))
+        redist_by_proc.setdefault(row.dest_ref, []).append(_redistribute_entry(row, execution.ned_id))
 
     processes = [
         _ospf_process_entry(row, redist_by_proc.get(str(row.process_id), [])) for row in rows["ospf_instance_intent"]

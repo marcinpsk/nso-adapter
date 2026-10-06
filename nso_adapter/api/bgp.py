@@ -28,7 +28,12 @@ from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.redistribution import RedistributionSourceModel
 from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.core.removal import is_cleared
-from nso_adapter.domain.asn import parse_asn, redistribution_source_identity, validate_asn_rows
+from nso_adapter.domain.asn import (
+    checked_intent_source_ref,
+    parse_asn,
+    redistribution_source_identity,
+    validate_asn_rows,
+)
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
     BgpAfIntent,
@@ -660,6 +665,10 @@ async def put_bgp_intent(
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
+
+    for _, entry in _iter_redistribution(body.routers):
+        if entry.source_protocol == "bgp":
+            checked_intent_source_ref(entry.source_ref, device.ned_id)
 
     # Every accepted write records its projection revision, store-only and
     # auto-apply-off included, and takes the device's projection lock before anything is
