@@ -97,7 +97,7 @@ def _utcnow() -> datetime:
 def _attrs_to_interface_list(data: dict | None, *, device_id: int) -> list[Interface]:
     """Convert NSO package interface-attributes oper-data to domain Interface objects.
 
-    Skips malformed entries (missing ``interface-name``) with a warning log.
+    Skips unprojectable entries with a warning log that names the entry index and reason.
     Returns an empty list if *data* is None or has no ``interface`` key.
     """
     projection = project_interface_attributes(data)
@@ -106,7 +106,8 @@ def _attrs_to_interface_list(data: dict | None, *, device_id: int) -> list[Inter
             "interface_attributes.entry_skipped",
             device_id=device_id,
             family="interface-attributes",
-            missing_field="interface-name",
+            index=invalid.index,
+            reason=invalid.reason,
         )
     result = []
     for entry in projection.interfaces:

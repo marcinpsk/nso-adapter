@@ -810,3 +810,13 @@ rules:
         - review-patterns.py
     patterns:
       - pattern: int(...)
+  - id: nso-observation-wire-bool-coercion
+    languages: [python]
+    severity: ERROR
+    message: Pass the wire value to the strict model; bool(value) reads a device string "false" as True and hides it from unprojectable.
+    paths:
+      include:
+        - nso_adapter/domain/observation.py
+        - review-patterns.py
+    patterns:
+      - pattern: bool($ENTRY.get(...))

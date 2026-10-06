@@ -134,7 +134,7 @@ def _project_addresses(entries: object, index: int) -> tuple[list[InterfaceIpAdd
                     address=address,
                     prefix_length=extract_prefix_length(address),
                     family=entry.get("family") or "ipv4",
-                    secondary=bool(entry.get("secondary", False)),
+                    secondary=False if entry.get("secondary") is None else entry.get("secondary"),
                     vrf=entry.get("vrf") or "",
                 )
             )

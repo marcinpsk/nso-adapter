@@ -138,7 +138,8 @@ def test_attrs_to_interface_list_skips_a_non_mapping_entry():
     skipped = [log for log in logs if log["event"] == "interface_attributes.entry_skipped"]
     assert len(skipped) == 1
     assert skipped[0]["device_id"] == 7
-    assert skipped[0]["missing_field"] == "interface-name"
+    assert skipped[0]["index"] == 0
+    assert skipped[0]["reason"] == "missing or invalid interface-name"
 
 
 def test_attrs_to_interface_list_skips_a_bare_scalar_singleton():
@@ -237,7 +238,8 @@ async def test_a_MALFORMED_attrs_entry_puts_no_payload_in_the_record(db_session:
             "log_level": "warning",
             "device_id": device.id,
             "family": "interface-attributes",
-            "missing_field": "interface-name",
+            "index": 1,
+            "reason": "missing or invalid interface-name",
         }
     ]
     assert_records_free_of(logs, ["placeholder-server-text"])

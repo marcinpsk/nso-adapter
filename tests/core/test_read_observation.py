@@ -12,6 +12,7 @@ from datetime import datetime
 import httpx
 import pytest
 from sqlalchemy import event, select, text
+from structlog.testing import capture_logs
 
 from nso_adapter.config import NsoInstanceConfig
 from nso_adapter.core import importer
@@ -574,16 +575,51 @@ async def test_invalid_address_remains_visible_in_observation(adapter_client, mo
     ]
 
 
+async def test_non_boolean_secondary_is_unprojectable(adapter_client, monkeypatch):
+    device_id = await seed_device(nso_device_name="observation-device")
+    entries = [
+        {
+            "interface-name": "port0",
+            "address": [
+                {"address": "198.18.0.1/24", "secondary": "false"},
+                {"address": "198.18.0.2/24", "secondary": None},
+                {"address": "198.18.0.3/24"},
+            ],
+        }
+    ]
+    await publish(device_id, "ip", DeviceReadNso(entries), monkeypatch)
+    body = await read_family(adapter_client, device_id, "ip")
+    document = body["observation"]["document"]
+    assert document["interfaces"] == body["interfaces"]
+    assert [(item["address"], item["secondary"]) for item in document["interfaces"][0]["addresses"]] == [
+        ("198.18.0.2/24", False),
+        ("198.18.0.3/24", False),
+    ]
+    assert document["unprojectable"] == [{"index": 0, "reason": "address[0]: invalid secondary"}]
+
+
 @pytest.mark.parametrize("seam", ["sync", "drift"])
 async def test_invalid_attribute_is_unprojectable(adapter_client, monkeypatch, seam):
     device_id = await seed_device(nso_device_name="observation-device")
     entries = [{"interface-name": "port0", "enabled": "false"}, {"interface-name": "port1", "enabled": None}]
-    await publish(device_id, seam, DeviceReadNso(entries), monkeypatch)
+    with capture_logs() as logs:
+        await publish(device_id, seam, DeviceReadNso(entries), monkeypatch)
     body = await read_family(adapter_client, device_id, seam)
     document = body["observation"]["document"]
     assert [entry["name"] for entry in document["interfaces"]] == ["port1"]
     assert document["interfaces"][0]["enabled"] is None
     assert document["unprojectable"] == [{"index": 0, "reason": "invalid enabled"}]
+    skipped = [record for record in logs if record["event"] == "interface_attributes.entry_skipped"]
+    assert skipped == [
+        {
+            "event": "interface_attributes.entry_skipped",
+            "log_level": "warning",
+            "device_id": device_id,
+            "family": "interface-attributes",
+            "index": 0,
+            "reason": "invalid enabled",
+        }
+    ]
 
 
 @pytest.mark.parametrize("seam", ["sync", "ip"])
