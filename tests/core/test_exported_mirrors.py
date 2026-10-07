@@ -167,3 +167,21 @@ def test_unknown_values_are_available_to_mirrors_only():
     assert entry_payload(projected.interfaces[0])["vendor-extension"] == payload["interface"][0]["vendor-extension"]
     observed = observe_family("switchport", payload)
     assert "placeholder-unknown-value" not in observed.document.model_dump_json()
+
+
+@pytest.mark.anyio
+async def test_unknown_json_fields_preserve_isis_mirror(adapter_client):
+    from nso_adapter.core.isis import _upsert_isis_data
+
+    segment_routing = {"enabled": True, "srgb": {"lower-bound": 16000, "secret": "placeholder-unknown-value"}}
+    payload = {"process": [{"process-tag": "CORE", "segment-routing": segment_routing}]}
+    device_id = await seed_device(nso_device_name="unknown-field-fixture")
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        await _upsert_isis_data(db, device, payload["process"], [], "poll")
+        await db.flush()
+        row = await db.scalar(select(DeviceIsisProcess).where(DeviceIsisProcess.device_id == device_id))
+        assert row.segment_routing == segment_routing
+    observed = observe_family("isis", payload)
+    assert observed.document.unprojectable[0].reason == "process[0].segment_routing[0]: unsupported fields: srgb"
+    assert "placeholder-unknown-value" not in observed.document.model_dump_json()
