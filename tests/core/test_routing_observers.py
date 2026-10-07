@@ -497,8 +497,6 @@ def test_isis_unknown_nested_srgb_has_value_free_indexed_diagnostic():
     ],
 )
 def test_observed_credentials_keep_missing_null_empty_and_key_distinct(family, collection, identity, secret):
-    from nso_adapter.secrets.refs import secret_fingerprint
-
     results = []
     for fields in ({}, {secret: None}, {secret: ""}, {secret: "placeholder-key"}):
         entry = identity | fields
@@ -519,9 +517,9 @@ def test_observed_credentials_keep_missing_null_empty_and_key_distinct(family, c
     assert results[0][f"{key}_present"] is None and f"{key}_present" not in results[0]["present"]
     assert results[1][f"{key}_present"] is None and f"{key}_present" in results[1]["present"]
     assert results[2][f"{key}_present"] is False
-    assert results[2][f"{key}_fingerprint"] == secret_fingerprint("")
+    assert all(f"{key}_fingerprint" not in result for result in results)
     assert results[3][f"{key}_present"] is True
-    assert results[3][f"{key}_fingerprint"] == secret_fingerprint("placeholder-key")
+    assert key in observation.coverage.not_comparable
 
 
 def test_presence_only_exports_do_not_claim_key_comparison():
@@ -543,13 +541,11 @@ def test_presence_only_exports_do_not_claim_key_comparison():
             ]
         },
     )
-    assert "password_fingerprint" in bgp.coverage.not_comparable
+    assert "password" in bgp.coverage.not_comparable
     isis = observe_family(
         "isis", {"process": [{"process-tag": "CORE", "area-auth-present": True, "domain-auth-present": True}]}
     )
-    assert {"area_auth_key_fingerprint", "domain_auth_key_fingerprint", "hello_auth_key", "level.auth_key"} <= set(
-        isis.coverage.not_comparable
-    )
+    assert {"area_auth_key", "domain_auth_key", "hello_auth_key", "level.auth_key"} <= set(isis.coverage.not_comparable)
     assert "auth_key" in observe_family("ospf", {}).coverage.not_comparable
     assert {"auth_secret", "priv_secret"} <= set(observe_family("snmp", {}).coverage.not_comparable)
 
@@ -563,8 +559,6 @@ def test_presence_only_exports_do_not_claim_key_comparison():
     ],
 )
 def test_credential_metadata_is_derived_and_never_trusted_from_export(family, key, metadata):
-    from nso_adapter.secrets.refs import secret_fingerprint
-
     for supplied_key in ({}, {key: "placeholder-key"}):
         entry = {metadata: "placeholder-injected-secret", **supplied_key}
         if family == "bgp":
@@ -590,6 +584,45 @@ def test_credential_metadata_is_derived_and_never_trusted_from_export(family, ke
         assert observed.document.unprojectable
         assert metadata in observed.document.unprojectable[0].reason
         row = observed.document.routers[0].scope[0].peer[0] if family == "bgp" else observed.document.processes[0]
-        assert getattr(row, metadata.replace("-", "_")) == (
-            secret_fingerprint("placeholder-key") if supplied_key else None
-        )
+        assert metadata.replace("-", "_") not in row.model_dump()
+        assert getattr(row, f"{key.replace('-', '_')}_present") is (True if supplied_key else None)
+
+
+@pytest.mark.parametrize(
+    "family,location,key",
+    [
+        ("isis", "interface", "hello-auth-key"),
+        ("isis", "process-level", "auth-key"),
+        ("isis", "interface-level", "auth-key"),
+        ("ospf", "interface", "auth-key"),
+    ],
+)
+def test_auth_keys_are_presence_only_and_keep_wire_states(family, location, key):
+    from tests._secret_discipline import assert_text_free_of
+
+    results = []
+    for fields in ({}, {key: None}, {key: ""}, {key: "$8$secret=="}):
+        interface = {"interface-name": "Gi0/1", **({"af": "ipv4"} if family == "isis" else {"process-id": "1"})}
+        if location == "process-level":
+            payload = {"process": [{"process-tag": "CORE", "level": [{"level": 2, **fields}]}]}
+        elif location == "interface-level":
+            payload = {"interface": [{**interface, "level": [{"level": 2, **fields}]}]}
+        else:
+            payload = {"interface": [{**interface, **fields}]}
+        observed = observe_family(family, payload)
+        assert observed.document.unprojectable == []
+        rows = observed.document.processes if location == "process-level" else observed.document.interfaces
+        row = rows[0].level[0] if location.endswith("level") else rows[0]
+        document = row.model_dump()
+        assert key.replace("-", "_") not in document
+        assert not any("fingerprint" in name for name in document)
+        assert_text_free_of(observed.document.model_dump_json(), ["$8$secret=="])
+        coverage_key = "level.auth_key" if location.endswith("level") else key.replace("-", "_")
+        assert coverage_key in observed.coverage.not_comparable
+        results.append(document)
+    field = f"{key.replace('-', '_')}_present"
+    assert results[0][field] is None and field not in results[0]["present"]
+    assert results[1][field] is None and field in results[1]["present"]
+    assert results[2][field] is False
+    assert results[3][field] is True
+    assert len({str(result) for result in results}) == 4

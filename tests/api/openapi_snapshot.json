@@ -1201,18 +1201,6 @@
             ],
             "title": "Local As"
           },
-          "password_fingerprint": {
-            "anyOf": [
-              {
-                "pattern": "^[0-9a-f]{16}$",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Password Fingerprint"
-          },
           "password_present": {
             "anyOf": [
               {
@@ -5773,6 +5761,17 @@
             ],
             "title": "Frr Protection"
           },
+          "hello_auth_key_present": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hello Auth Key Present"
+          },
           "hello_auth_present": {
             "anyOf": [
               {
@@ -6289,6 +6288,17 @@
       },
       "IsisLevelEntry-Output": {
         "properties": {
+          "auth_key_present": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auth Key Present"
+          },
           "auth_present": {
             "anyOf": [
               {
@@ -6861,18 +6871,6 @@
       },
       "IsisProcessEntry-Output": {
         "properties": {
-          "area_auth_key_fingerprint": {
-            "anyOf": [
-              {
-                "pattern": "^[0-9a-f]{16}$",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Area Auth Key Fingerprint"
-          },
           "area_auth_key_present": {
             "anyOf": [
               {
@@ -6916,18 +6914,6 @@
               }
             ],
             "title": "Distance"
-          },
-          "domain_auth_key_fingerprint": {
-            "anyOf": [
-              {
-                "pattern": "^[0-9a-f]{16}$",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Domain Auth Key Fingerprint"
           },
           "domain_auth_key_present": {
             "anyOf": [
@@ -10476,6 +10462,17 @@
               }
             ],
             "title": "Area Id"
+          },
+          "auth_key_present": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auth Key Present"
           },
           "auth_present": {
             "anyOf": [

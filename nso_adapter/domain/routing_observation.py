@@ -10,7 +10,6 @@ from nso_adapter.core.community_dialect import community_dialect_for
 from nso_adapter.core.isis_canon import isis_level
 from nso_adapter.domain.asn import parse_asn
 from nso_adapter.domain.read_projection import DeviceEntry, UnprojectableEntry, project_entries
-from nso_adapter.secrets.refs import SECRET_FINGERPRINT_PATTERN, secret_fingerprint
 
 
 class CredentialEntry(DeviceEntry):
@@ -21,8 +20,7 @@ class CredentialEntry(DeviceEntry):
                 continue
             value = getattr(self, name)
             setattr(self, f"{name}_present", None if value is None else bool(value))
-            setattr(self, f"{name}_fingerprint", None if value is None else secret_fingerprint(value))
-            self.present = sorted((set(self.present) - {name}) | {f"{name}_present", f"{name}_fingerprint"})
+            self.present = sorted((set(self.present) - {name}) | {f"{name}_present"})
         return self
 
 
@@ -51,7 +49,6 @@ class BgpPeerEntry(CredentialEntry):
     ttl: int | None = None
     password: str | None = Field(default=None, exclude=True)
     password_present: bool | None = None
-    password_fingerprint: str | None = Field(default=None, pattern=SECRET_FINGERPRINT_PATTERN)
     source: str | None = None
     description: str | None = None
     bfd_enabled: bool | None = None
@@ -137,7 +134,8 @@ class IsisSettingEntry(DeviceEntry):
     value: str | None = None
 
 
-class IsisLevelEntry(DeviceEntry):
+class IsisLevelEntry(CredentialEntry):
+    credentials = ("auth_key",)
     identity = ("level",)
 
     level: int
@@ -148,6 +146,8 @@ class IsisLevelEntry(DeviceEntry):
     disabled: bool | None = None
     auth_type: str | None = None
     auth_present: bool | None = None
+    auth_key: str | None = Field(default=None, exclude=True)
+    auth_key_present: bool | None = None
     metric: int | None = None
     hello_interval: int | None = None
     hello_multiplier: int | None = None
@@ -232,12 +232,10 @@ class IsisProcessEntry(CredentialEntry):
     area_auth_present: bool | None = None
     area_auth_key: str | None = Field(default=None, exclude=True)
     area_auth_key_present: bool | None = None
-    area_auth_key_fingerprint: str | None = Field(default=None, pattern=SECRET_FINGERPRINT_PATTERN)
     domain_auth_type: str | None = None
     domain_auth_present: bool | None = None
     domain_auth_key: str | None = Field(default=None, exclude=True)
     domain_auth_key_present: bool | None = None
-    domain_auth_key_fingerprint: str | None = Field(default=None, pattern=SECRET_FINGERPRINT_PATTERN)
     spf_initial_wait: int | None = None
     spf_max_wait: int | None = None
     lsp_initial_wait: int | None = None
@@ -269,7 +267,8 @@ class IsisProcessEntry(CredentialEntry):
         return isis_level(value)
 
 
-class IsisInterfaceEntry(DeviceEntry):
+class IsisInterfaceEntry(CredentialEntry):
+    credentials = ("hello_auth_key",)
     identity = ("interface_name", "af")
     children = {"setting": IsisSettingEntry, "level": IsisLevelEntry, "prefix_sid": IsisPrefixSidEntry}
 
@@ -283,6 +282,8 @@ class IsisInterfaceEntry(DeviceEntry):
     bound_port: str | None = None
     hello_auth_type: str | None = None
     hello_auth_present: bool | None = None
+    hello_auth_key: str | None = Field(default=None, exclude=True)
+    hello_auth_key_present: bool | None = None
     bfd_enabled: bool | None = None
     frr_enabled: bool | None = None
     frr_protection: str | None = None
@@ -339,7 +340,8 @@ class OspfInstanceEntry(DeviceEntry):
     area: list[OspfAreaEntry] | None = None
 
 
-class OspfInterfaceEntry(DeviceEntry):
+class OspfInterfaceEntry(CredentialEntry):
+    credentials = ("auth_key",)
     identity = ("interface_name", "process_id")
 
     interface_name: str
@@ -351,6 +353,8 @@ class OspfInterfaceEntry(DeviceEntry):
     network_type: str | None = None
     auth_type: str | None = None
     auth_present: bool | None = None
+    auth_key: str | None = Field(default=None, exclude=True)
+    auth_key_present: bool | None = None
     bfd_enabled: bool | None = None
 
 

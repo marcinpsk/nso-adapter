@@ -240,7 +240,10 @@ async def test_redistribution_rejects_malformed_asn_on_duplicate_destination(
 
 
 @pytest.mark.parametrize("family,path", FAMILY_ENDPOINTS + [("redistribution", "redistribution")])
-async def test_observation_json_never_contains_credentials(adapter_client, family, path):
+@pytest.mark.parametrize(
+    "placeholder", ["placeholder-observation-secret", "$8$secret=="], ids=["plaintext", "arcos-ciphertext"]
+)
+async def test_observation_json_never_contains_credentials(adapter_client, family, path, placeholder):
     import json
     from copy import deepcopy
 
@@ -250,7 +253,6 @@ async def test_observation_json_never_contains_credentials(adapter_client, famil
     from tests.core.test_service_observers import READ_PAYLOADS
     from tests.fixtures.switching_read_payloads import SWITCHING_READ_PAYLOADS
 
-    placeholder = "placeholder-observation-secret"
     payload = deepcopy({**READ_PAYLOADS, **SWITCHING_READ_PAYLOADS}.get(family, {}))
     payload["unsupported-credential"] = placeholder
     if family == "bgp":
@@ -262,6 +264,10 @@ async def test_observation_json_never_contains_credentials(adapter_client, famil
                 }
             ]
         }
+        if placeholder == "$8$secret==":
+            from tests.fixtures.routing_read_payloads import BGP_ARCOS_CIPHERTEXT_READ
+
+            payload = deepcopy(BGP_ARCOS_CIPHERTEXT_READ)
     elif family == "isis":
         payload = {
             "process": [
@@ -270,13 +276,36 @@ async def test_observation_json_never_contains_credentials(adapter_client, famil
                     "area-auth-key": placeholder,
                     "domain-auth-key": placeholder,
                     "area-auth-present": True,
+                    "level": [{"level": 2, "auth-key": placeholder}],
                 }
-            ]
+            ],
+            "interface": [
+                {
+                    "interface-name": "Gi0/1",
+                    "af": "ipv4",
+                    "process-tag": "CORE",
+                    "hello-auth-key": placeholder,
+                    "level": [{"level": 2, "auth-key": placeholder}],
+                }
+            ],
         }
-    elif family in ("ospf", "route_policy"):
-        from tests.fixtures.routing_read_payloads import OSPF_INSTANCES_READ, ROUTE_POLICY_COMMUNITIES_READ
+    elif family == "ospf":
+        from tests.fixtures.routing_read_payloads import OSPF_INSTANCES_READ
 
-        payload = deepcopy({"instance": OSPF_INSTANCES_READ} if family == "ospf" else ROUTE_POLICY_COMMUNITIES_READ)
+        payload = {
+            "instance": deepcopy(OSPF_INSTANCES_READ),
+            "interface": [
+                {
+                    "interface-name": "Gi0/1",
+                    "process-id": "1",
+                    "auth-key": placeholder,
+                }
+            ],
+        }
+    elif family == "route_policy":
+        from tests.fixtures.routing_read_payloads import ROUTE_POLICY_COMMUNITIES_READ
+
+        payload = deepcopy(ROUTE_POLICY_COMMUNITIES_READ)
         next(iter(payload.values()))[0]["credential"] = placeholder
     elif family == "redistribution":
         payload = {
@@ -326,13 +355,24 @@ async def test_observation_json_never_contains_credentials(adapter_client, famil
     if family == "bgp":
         peer = observation["document"]["routers"][0]["scope"][0]["peer"][0]
         assert peer["password_present"] is True
-        assert peer["password_fingerprint"] == secret_fingerprint(placeholder)
+        assert "password_fingerprint" not in peer
+        assert "password" in observation["coverage"]["not_comparable"]
         assert_text_contains(response.json()["routers"][0]["scopes"][0]["peers"][0]["password"], [placeholder])
     elif family == "isis":
         process = observation["document"]["processes"][0]
         assert process["area_auth_key_present"] is True
-        assert process["area_auth_key_fingerprint"] == secret_fingerprint(placeholder)
-        assert process["domain_auth_key_fingerprint"] == secret_fingerprint(placeholder)
+        assert "area_auth_key_fingerprint" not in process
+        assert "domain_auth_key_fingerprint" not in process
+        assert {"area_auth_key", "domain_auth_key"} <= set(observation["coverage"]["not_comparable"])
+        assert process["domain_auth_key_present"] is True
+        assert process["level"][0]["auth_key_present"] is True
+        interface = observation["document"]["interfaces"][0]
+        assert interface["hello_auth_key_present"] is True
+        assert interface["level"][0]["auth_key_present"] is True
+        assert {"hello_auth_key", "level.auth_key"} <= set(observation["coverage"]["not_comparable"])
+    elif family == "ospf":
+        assert observation["document"]["interfaces"][0]["auth_key_present"] is True
+        assert "auth_key" in observation["coverage"]["not_comparable"]
 
 
 async def test_ospf_redistribution_keeps_same_process_in_two_vrfs(adapter_client):

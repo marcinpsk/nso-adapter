@@ -286,21 +286,16 @@ def _coverage(*models: type[BaseModel]) -> list[str]:
     )
 
 
-def _not_comparable(family: str, document: ObservationPayload) -> list[str]:
-    gaps = set()
-    if isinstance(document, BgpDocument):
-        for router in document.routers or []:
-            for scope in router.scope or []:
-                if any(peer.password_fingerprint is None for peer in scope.peer or []):
-                    gaps.add("password_fingerprint")
-    if isinstance(document, IsisDocument):
-        gaps.update(("hello_auth_key", "level.auth_key"))
-        for process in document.processes or []:
-            for name in ("area_auth_key", "domain_auth_key"):
-                if getattr(process, f"{name}_fingerprint") is None:
-                    gaps.add(f"{name}_fingerprint")
+def _not_comparable(family: str) -> list[str]:
+    gaps: set[str] = set()
+    if family == "bgp":
+        gaps.update(BgpPeerEntry.credentials)
+    if family == "isis":
+        gaps.update(IsisProcessEntry.credentials)
+        gaps.update(IsisInterfaceEntry.credentials)
+        gaps.update(f"level.{name}" for name in IsisLevelEntry.credentials)
     if family == "ospf":
-        gaps.add("auth_key")
+        gaps.update(OspfInterfaceEntry.credentials)
     if family == "snmp":
         gaps.update(("auth_secret", "priv_secret"))
     return sorted(gaps)
@@ -315,9 +310,7 @@ def _observer(
         return ObservationDocument(
             family=family,
             document=document,
-            coverage=ObservationCoverage(
-                attributes=sorted(attributes), not_comparable=_not_comparable(family, document)
-            ),
+            coverage=ObservationCoverage(attributes=sorted(attributes), not_comparable=_not_comparable(family)),
         )
 
     return observe

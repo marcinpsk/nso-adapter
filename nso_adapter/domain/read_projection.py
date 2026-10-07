@@ -138,9 +138,7 @@ def entry_payload(entry: DeviceEntry) -> dict:
         for name in type(entry).model_fields
         if name != "present"
         and name in entry.model_fields_set
-        and not any(
-            name == f"{secret}_{suffix}" for secret in entry.credentials for suffix in ("present", "fingerprint")
-        )
+        and not any(name == f"{secret}_present" for secret in entry.credentials)
     }
 
 
@@ -167,9 +165,7 @@ def _input_values(item: dict, model: type[DeviceEntry]) -> tuple[dict, list[str]
     conflicts = []
     supported = set(EXCLUDED_WIRE_FIELDS.get(model.__name__, ()))
     for name, field in model.model_fields.items():
-        if name == "present" or any(
-            name == f"{secret}_{suffix}" for secret in model.credentials for suffix in ("present", "fingerprint")
-        ):
+        if name == "present" or any(name == f"{secret}_present" for secret in model.credentials):
             continue
         wire = str(field.validation_alias or name)
         candidates = model.wire_aliases.get(name, (wire,))
