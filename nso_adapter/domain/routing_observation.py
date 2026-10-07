@@ -212,6 +212,7 @@ class IsisPrefixSidEntry(DeviceEntry):
 
 
 class IsisProcessEntry(CredentialEntry):
+    integers = ("reference_bandwidth",)
     credentials = ("area_auth_key", "domain_auth_key")
     identity = ("process_tag",)
     children = {

@@ -367,6 +367,37 @@ async def test_ospf_redistribution_keeps_same_process_in_two_vrfs(adapter_client
     assert observation["document"]["unprojectable"] == []
 
 
+@pytest.mark.parametrize("bandwidth", ["0", "400000", "9007199254740993"])
+async def test_isis_wire_uint64_keeps_process_in_mirror_and_observation(adapter_client, bandwidth):
+    from sqlalchemy import select
+
+    from nso_adapter.store.models import DeviceIsisProcess
+
+    device_id = await seed_device(nso_device_name="bandwidth-fixture")
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        spec = importer.projectable_spec("isis")
+        await run_family_refresh_from_outcome(
+            db,
+            device,
+            spec,
+            Present({"process": [{"process-tag": "CORE", "reference-bandwidth": 100}]}, Freshness.fresh),
+        )
+        await run_family_refresh_from_outcome(
+            db,
+            device,
+            spec,
+            Present({"process": [{"process-tag": "CORE", "reference-bandwidth": bandwidth}]}, Freshness.fresh),
+        )
+        rows = (await db.scalars(select(DeviceIsisProcess).where(DeviceIsisProcess.device_id == device_id))).all()
+        assert [(row.process_tag, row.reference_bandwidth) for row in rows] == [("CORE", int(bandwidth))]
+    response = await adapter_client.get(f"/api/v1/devices/{device_id}/isis-interfaces", headers=AUTH)
+    assert response.status_code == 200
+    observed = assert_publication(response.json(), "isis")
+    assert observed["document"]["processes"][0]["reference_bandwidth"] == int(bandwidth)
+    assert observed["document"]["unprojectable"] == []
+
+
 DROPPED_ENTRY_COLLECTIONS = {
     "lag": "lag",
     "bfd": "interface",
