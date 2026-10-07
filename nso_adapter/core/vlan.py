@@ -54,11 +54,12 @@ async def _upsert_vlans(
     seen: set[int] = set()
     now = _now()
     projection = project_vlans(data)
-    if projection.unprojectable:
-        if "conflicting collection aliases" in projection.unprojectable[0].reason:
+    invalid = [item for item in projection.unprojectable if item.blocks_materialization]
+    if invalid:
+        if "conflicting collection aliases" in invalid[0].reason:
             raise ValueError("vlan-database has conflicting collection aliases")
         vlans = as_list(data["vlan"] if "vlan" in data else data.get("vlans"))
-        raw = vlans[projection.unprojectable[0].index]
+        raw = vlans[invalid[0].index]
         raw_vlan_id = raw.get("vlan-id", raw.get("vlan_id")) if isinstance(raw, dict) else None
         raise ValueError(
             f"a vlan-database item for device {device.id} carries a vlan-id of type "
@@ -132,11 +133,12 @@ async def _upsert_switchports(
     seen: set[str] = set()
     now = _now()
     projection = project_switchports(data)
-    if projection.unprojectable:
-        if "conflicting collection aliases" in projection.unprojectable[0].reason:
+    invalid = [item for item in projection.unprojectable if item.blocks_materialization]
+    if invalid:
+        if "conflicting collection aliases" in invalid[0].reason:
             raise ValueError("switchport has conflicting collection aliases")
         interfaces = as_list(data["interface"] if "interface" in data else data.get("interfaces"))
-        raw = interfaces[projection.unprojectable[0].index]
+        raw = interfaces[invalid[0].index]
         if isinstance(raw, dict):
             tagged = raw["tagged-vlans"] if "tagged-vlans" in raw else raw.get("tagged_vlans")
             parse_vlan_string(tagged)

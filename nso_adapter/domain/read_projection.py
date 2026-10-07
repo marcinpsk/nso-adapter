@@ -12,8 +12,17 @@ from pydantic import AliasGenerator, BaseModel, ConfigDict, Field, PrivateAttr, 
 
 from nso_adapter.nso.shape import as_list, require_vlan_id, wire_int
 
-# These fields belong to another projection of the same exported inventory.
-EXCLUDED_WIRE_FIELDS: dict[str, tuple[str, ...]] = {}
+# Exporter fields outside each observation projection.
+ISIS_PROCESS_EXCLUDED_FIELDS = ("sr-enabled", "sr-node-msd")
+EXCLUDED_WIRE_FIELDS: dict[str, tuple[str, ...]] = {
+    "VlanEntry": ("source",),
+    "SwitchportEntry": ("source",),
+    "SviEntry": ("source",),
+    "SubinterfaceEntry": ("source",),
+    "LagTopologyEntry": ("vpc-sensitive",),
+    "IsisProcessEntry": ISIS_PROCESS_EXCLUDED_FIELDS,
+    "IsisDestination": ISIS_PROCESS_EXCLUDED_FIELDS,
+}
 
 
 class UnprojectableEntry(BaseModel):
@@ -21,6 +30,11 @@ class UnprojectableEntry(BaseModel):
 
     index: int
     reason: str
+    _coverage_gap: bool = PrivateAttr(default=False)
+
+    @property
+    def blocks_materialization(self) -> bool:
+        return not self._coverage_gap
 
 
 class ObservationCoverage(BaseModel):
@@ -39,6 +53,7 @@ class DeviceEntry(BaseModel):
 
     present: list[str] = Field(default_factory=list)
     _source_index: int = PrivateAttr(default=0)
+    _unmodeled_fields: dict[str, object] = PrivateAttr(default_factory=dict)
     identity: ClassVar[tuple[str, ...]] = ()
     identity_defaults: ClassVar[dict[str, str | int]] = {}
     children: ClassVar[dict[str, type[DeviceEntry]]] = {}
@@ -66,12 +81,15 @@ def observation_payload(model: ModelT) -> ModelT:  # noqa: UP047
             changes[name] = observation_payload(value)
         elif isinstance(value, list) and any(isinstance(item, BaseModel) for item in value):
             changes[name] = [observation_payload(item) if isinstance(item, BaseModel) else item for item in value]
-    return model.model_copy(update=changes)
+    observed = model.model_copy(update=changes)
+    if isinstance(observed, DeviceEntry):
+        observed._unmodeled_fields = {}
+    return observed
 
 
 def entry_payload(entry: DeviceEntry) -> dict:
-    """Return projected wire fields for a mirror, without presence metadata."""
-    return {
+    """Return mirror wire fields, including unmodeled values, without metadata."""
+    return entry._unmodeled_fields | {
         str(type(entry).model_fields[name].validation_alias or name): _wire_value(getattr(entry, name))
         for name in type(entry).model_fields
         if name != "present"
@@ -185,9 +203,11 @@ def project_entries(  # noqa: UP047
             continue
         values, present, conflicts, unsupported = _input_values(item, model)
         if unsupported:
-            invalid.append(
-                UnprojectableEntry(index=index, reason=f"{location}: unsupported fields: " + ", ".join(unsupported))
+            diagnostic = UnprojectableEntry(
+                index=index, reason=f"{location}: unsupported fields: " + ", ".join(unsupported)
             )
+            diagnostic._coverage_gap = True
+            invalid.append(diagnostic)
         if conflicts:
             invalid.append(
                 UnprojectableEntry(index=index, reason=f"{location}: conflicting aliases for " + ", ".join(conflicts))
@@ -199,6 +219,7 @@ def project_entries(  # noqa: UP047
             invalid.append(UnprojectableEntry(index=index, reason=f"{location}: {problem}"))
             continue
         entry._source_index = index
+        entry._unmodeled_fields = {name: item[name] for name in unsupported}
         key = _entry_key(entry)
         if key in seen:
             invalid.append(UnprojectableEntry(index=index, reason=f"{location}: duplicate identity"))

@@ -29,7 +29,8 @@ async def _upsert_svi(db: AsyncSession, device: Device, interfaces: list[dict], 
     now = datetime.now(UTC)
     await db.execute(delete(DeviceSvi).where(DeviceSvi.device_id == device.id))
     projection = project_svis({"interface": interfaces})
-    if projection.unprojectable:
+    invalid = [item for item in projection.unprojectable if item.blocks_materialization]
+    if invalid:
         raise ValueError("svi item has invalid vlan-id or interface-name")
     for item in projection.interfaces or []:
         db.add(

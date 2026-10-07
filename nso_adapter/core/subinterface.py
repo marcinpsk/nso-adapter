@@ -29,8 +29,9 @@ async def _upsert_subinterface(db: AsyncSession, device: Device, interfaces: lis
     now = datetime.now(UTC)
     await db.execute(delete(DeviceSubinterface).where(DeviceSubinterface.device_id == device.id))
     projection = project_subinterfaces({"interface": interfaces})
-    if projection.unprojectable:
-        raw = interfaces[projection.unprojectable[0].index]
+    invalid = [item for item in projection.unprojectable if item.blocks_materialization]
+    if invalid:
+        raw = interfaces[invalid[0].index]
         if isinstance(raw, dict) and isinstance(raw.get("dot1q-vlan"), bool):
             raise TypeError("subinterface item has a boolean dot1q-vlan")
         raise ValueError("subinterface item has invalid dot1q-vlan or interface-name")
