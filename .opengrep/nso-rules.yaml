@@ -820,3 +820,13 @@ rules:
         - review-patterns.py
     patterns:
       - pattern: bool($ENTRY.get(...))
+  - id: nso-observation-wire-or-default
+    languages: [python]
+    severity: ERROR
+    message: Default only None (or "") and pass every other wire value to the strict model; `value or default` turns 0 or false into the default and hides the entry from unprojectable.
+    paths:
+      include:
+        - nso_adapter/domain/observation.py
+        - review-patterns.py
+    patterns:
+      - pattern: $ENTRY.get(...) or $DEFAULT

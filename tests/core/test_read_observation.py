@@ -598,6 +598,40 @@ async def test_non_boolean_secondary_is_unprojectable(adapter_client, monkeypatc
     assert document["unprojectable"] == [{"index": 0, "reason": "address[0]: invalid secondary"}]
 
 
+async def test_non_string_ip_fields_are_unprojectable(adapter_client, monkeypatch):
+    device_id = await seed_device(nso_device_name="observation-device")
+    entries = [
+        {
+            "interface-name": "port0",
+            "address": [
+                {"address": "198.18.0.1/24", "family": 0},
+                {"address": "198.18.0.2/24", "vrf": False},
+                {"address": "198.18.0.3/24", "family": None, "vrf": None},
+                {"address": "198.18.0.4/24", "family": ""},
+            ],
+        },
+        {"interface-name": "port1", "bound-port": 0, "address": [{"address": "198.18.1.1/24"}]},
+        {"interface-name": "port2", "bound-port": "", "address": [{"address": "198.18.2.1/24"}]},
+    ]
+    await publish(device_id, "ip", DeviceReadNso(entries), monkeypatch)
+    body = await read_family(adapter_client, device_id, "ip")
+    document = body["observation"]["document"]
+    assert document["interfaces"] == body["interfaces"]
+    assert [(item["interface"], item["bound_port"]) for item in document["interfaces"]] == [
+        ("port0", None),
+        ("port2", None),
+    ]
+    assert [(item["address"], item["family"], item["vrf"]) for item in document["interfaces"][0]["addresses"]] == [
+        ("198.18.0.3/24", "ipv4", ""),
+        ("198.18.0.4/24", "ipv4", ""),
+    ]
+    assert document["unprojectable"] == [
+        {"index": 0, "reason": "address[0]: invalid family"},
+        {"index": 0, "reason": "address[1]: invalid vrf"},
+        {"index": 1, "reason": "invalid bound_port"},
+    ]
+
+
 @pytest.mark.parametrize("seam", ["sync", "drift"])
 async def test_invalid_attribute_is_unprojectable(adapter_client, monkeypatch, seam):
     device_id = await seed_device(nso_device_name="observation-device")

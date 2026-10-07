@@ -683,3 +683,11 @@ def observation_wire_bool_coercion(entry):
     # ok: nso-observation-wire-bool-coercion
     enabled = entry.get("enabled")
     return secondary, enabled
+
+
+def observation_wire_or_default(entry):
+    # ruleid: nso-observation-wire-or-default
+    vrf = entry.get("vrf") or ""
+    # ok: nso-observation-wire-or-default
+    family = "ipv4" if entry.get("family") in (None, "") else entry.get("family")
+    return vrf, family

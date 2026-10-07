@@ -133,9 +133,9 @@ def _project_addresses(entries: object, index: int) -> tuple[list[InterfaceIpAdd
                 InterfaceIpAddressEntry(
                     address=address,
                     prefix_length=extract_prefix_length(address),
-                    family=entry.get("family") or "ipv4",
+                    family="ipv4" if entry.get("family") in (None, "") else entry.get("family"),
                     secondary=False if entry.get("secondary") is None else entry.get("secondary"),
-                    vrf=entry.get("vrf") or "",
+                    vrf="" if entry.get("vrf") is None else entry.get("vrf"),
                 )
             )
         except ValidationError as exc:
@@ -156,7 +156,11 @@ def project_interface_ips(interfaces_data: list) -> InterfaceIpDocument:
         unprojectable.extend(invalid_addresses)
         try:
             interfaces.append(
-                InterfaceIpEntry(interface=name, bound_port=entry.get("bound-port") or None, addresses=addresses)
+                InterfaceIpEntry(
+                    interface=name,
+                    bound_port=None if entry.get("bound-port") in (None, "") else entry.get("bound-port"),
+                    addresses=addresses,
+                )
             )
         except ValidationError as exc:
             unprojectable.append(_invalid_entry(index, exc))
