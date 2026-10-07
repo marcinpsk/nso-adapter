@@ -2,6 +2,39 @@
 
 <!-- version list -->
 
+## v1.9.3 (2026-10-06)
+
+### Bug Fixes
+
+- **asn**: Allow BGP source intent without an AS on Junos and TiMOS
+  ([`c668413`](https://github.com/marcinpsk/nso-adapter/commit/c668413de2b5e6f2753e96a45496401dae648bea))
+
+- **asn**: Raise TypeError for a non-string NED id
+  ([`9063860`](https://github.com/marcinpsk/nso-adapter/commit/90638609aa1b9c5d8f6be7d28a6448d86df4f206))
+
+- **neds**: Classify the TiMOS NED as the timos family
+  ([`1bc7514`](https://github.com/marcinpsk/nso-adapter/commit/1bc7514264ad5c1e982be41dd7f13281d784fd11))
+
+### Testing
+
+- **asn**: Check source refusal responses before diagnostics
+  ([`9870cc5`](https://github.com/marcinpsk/nso-adapter/commit/9870cc5a55a2dff9a7f69f1301535845c8f2e6d4))
+
+
+## v1.9.2 (2026-10-05)
+
+### Chores
+
+- **deps**: Bump ruff
+  ([`472560b`](https://github.com/marcinpsk/nso-adapter/commit/472560ba121dcb859257eb153ef4dbcf1599c3de))
+
+- **deps**: Bump urllib3 from 2.7.0 to 2.8.0
+  ([`0bc0753`](https://github.com/marcinpsk/nso-adapter/commit/0bc07531c5dbe0a4810de5a3fcf4877a545a1aa4))
+
+- **deps**: Bump virtualenv from 21.5.0 to 21.7.13
+  ([`480dc61`](https://github.com/marcinpsk/nso-adapter/commit/480dc617d41313aee1643208acb6c28dfae0d450))
+
+
 ## v1.9.1 (2026-10-02)
 
 ### Bug Fixes
