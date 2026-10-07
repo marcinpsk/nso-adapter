@@ -97,7 +97,7 @@ async def test_engine_publishes_mirror_and_phase_two_in_one_commit(
     real_stage_result = outcome_store.stage_result
     visible_during_phase_two: list[list[str]] = []
 
-    async def _observe_then_stage(db, row, *, result, succeeded, row_count, publish_payload=None):
+    async def _observe_then_stage(db, row, *, result, succeeded, row_count, publish_payload=None, observation=None):
         visible_during_phase_two.append(await _fresh_prefixes(device_id))
         return await real_stage_result(
             db,
@@ -106,6 +106,7 @@ async def test_engine_publishes_mirror_and_phase_two_in_one_commit(
             succeeded=succeeded,
             row_count=row_count,
             publish_payload=publish_payload,
+            observation=observation,
         )
 
     monkeypatch.setattr(outcome_store, "stage_result", _observe_then_stage)

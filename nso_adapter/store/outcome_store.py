@@ -38,13 +38,14 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import structlog
-from sqlalchemy import func, select, text
+from sqlalchemy import and_, delete, func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.families import ALL_FAMILY_KEYS
+from nso_adapter.domain.observation import OBSERVERS, ObservationDocument, digest_document
 from nso_adapter.nso.read_outcome import AbsentAuthoritative, Present, ReadOutcome, Unavailable
-from nso_adapter.store.models import Device, RefreshOutcome, RefreshOutcomePointer
+from nso_adapter.store.models import Device, ReadObservation, RefreshOutcome, RefreshOutcomePointer
 
 logger = structlog.get_logger(__name__)
 _FAMILY_ORDINAL = {family: index + 1 for index, family in enumerate(ALL_FAMILY_KEYS)}
@@ -114,6 +115,7 @@ async def record_result(
     succeeded: bool,
     row_count: int | None = None,
     publish_payload: bool | None = None,
+    observation: ObservationDocument | None = None,
 ) -> bool | None:
     """Phase 2: terminalize *attempt_id*, advance the per-(device, family) pointer, and commit.
 
@@ -134,6 +136,7 @@ async def record_result(
         succeeded=succeeded,
         row_count=row_count,
         publish_payload=publish_payload,
+        observation=observation,
     )
     await db.commit()
     return selected
@@ -165,6 +168,7 @@ async def stage_result(
     succeeded: bool,
     row_count: int | None,
     publish_payload: bool | None = None,
+    observation: ObservationDocument | None = None,
 ) -> bool:
     """Stage terminal truth + pointer without committing; return whether it selected the pointer.
 
@@ -173,6 +177,20 @@ async def stage_result(
     """
     if publish_payload is None:
         publish_payload = result in {"replaced", "cleared"}
+    if row.family not in OBSERVERS:
+        if observation is not None:
+            raise ValueError(f"{row.family}: this family has no observation observer")
+    elif publish_payload and observation is None:
+        raise ValueError(f"{row.family}: payload publication requires an observation")
+    if observation is not None:
+        if observation.family != row.family:
+            raise ValueError("observation family does not match the publishing family")
+        if publish_payload and (
+            not succeeded
+            or result not in {"replaced", "cleared"}
+            or row.read_outcome not in {"present", "absent_authoritative"}
+        ):
+            raise ValueError("observation publication requires a successful authoritative read")
     current_epoch = await db.scalar(select(Device.source_epoch).where(Device.id == row.device_id))
     current_attempt = await db.scalar(
         select(RefreshOutcomePointer.attempt_id).where(
@@ -191,20 +209,36 @@ async def stage_result(
     if superseded:
         return False
 
-    await db.execute(
+    selected = await db.scalar(
         _pointer_advance_stmt(
             row.device_id,
             row.family,
             row.id,
             publish_payload=publish_payload,
-        )
+        ).returning(RefreshOutcomePointer.attempt_id)
     )
-    selected = await db.scalar(
-        select(RefreshOutcomePointer.attempt_id).where(
-            RefreshOutcomePointer.device_id == row.device_id,
-            RefreshOutcomePointer.family == row.family,
+    if selected == row.id and publish_payload and observation is not None:
+        document = observation.document.model_dump(mode="json")
+        db.add(
+            ReadObservation(
+                device_id=row.device_id,
+                family=row.family,
+                revision=row.id,
+                source_epoch=row.source_epoch,
+                digest=digest_document(document),
+                coverage=observation.coverage.model_dump(mode="json"),
+                document=document,
+                observed_at=row.started_at,
+            )
         )
-    )
+        await db.flush()
+        await db.execute(
+            delete(ReadObservation).where(
+                ReadObservation.device_id == row.device_id,
+                ReadObservation.family == row.family,
+                ReadObservation.revision != row.id,
+            )
+        )
     return selected == row.id
 
 
@@ -256,6 +290,38 @@ def _pointer_advance_stmt(
 
 
 # ── S4 read accessors (the pointer join the API serves) ──────────────────────────────────
+
+
+async def get_current_publication(
+    db: AsyncSession, device_id: int, family: str, *, source_epoch: int
+) -> tuple[RefreshOutcome | None, ReadObservation | None]:
+    """Read the latest attempt and its published observation in one snapshot."""
+    result = (
+        await db.execute(
+            select(RefreshOutcome, RefreshOutcomePointer.payload_revision, ReadObservation)
+            .join(RefreshOutcomePointer, RefreshOutcomePointer.attempt_id == RefreshOutcome.id)
+            .outerjoin(
+                ReadObservation,
+                and_(
+                    ReadObservation.device_id == RefreshOutcomePointer.device_id,
+                    ReadObservation.family == RefreshOutcomePointer.family,
+                    ReadObservation.revision == RefreshOutcomePointer.payload_revision,
+                    ReadObservation.source_epoch == source_epoch,
+                ),
+            )
+            .where(
+                RefreshOutcomePointer.device_id == device_id,
+                RefreshOutcomePointer.family == family,
+            )
+        )
+    ).one_or_none()
+    if result is None:
+        return None, None
+    row, payload_revision, observation = result
+    if payload_revision is not None and observation is None:
+        raise RuntimeError("published read payload has no matching observation")
+    row.payload_revision = payload_revision
+    return row, observation
 
 
 async def get_current_outcome(db: AsyncSession, device_id: int, family: str) -> RefreshOutcome | None:

@@ -34,6 +34,7 @@ from nso_adapter.core.refresh_engine import (
 from nso_adapter.core.sync_state import compute_sync_state
 from nso_adapter.domain.asn import AsnRuleViolation, asn_refusal_detail
 from nso_adapter.domain.models import Interface, InterfaceAttr
+from nso_adapter.domain.observation import observe_family, project_interface_attributes
 from nso_adapter.nso import actions as nso_actions
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError, failure_detail
 from nso_adapter.nso.read_outcome import (  # noqa: F401 — Present used below
@@ -50,7 +51,6 @@ from nso_adapter.nso.read_outcome import (  # noqa: F401 — Present used below
     read_failure_from_exception,
     section_absence_code,
 )
-from nso_adapter.nso.shape import as_list
 from nso_adapter.store.db import execute_dml
 from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import (
@@ -97,40 +97,35 @@ def _utcnow() -> datetime:
 def _attrs_to_interface_list(data: dict | None, *, device_id: int) -> list[Interface]:
     """Convert NSO package interface-attributes oper-data to domain Interface objects.
 
-    Skips malformed entries (missing ``interface-name``) with a warning log.
+    Skips unprojectable entries with a warning log that names the entry index and reason.
     Returns an empty list if *data* is None or has no ``interface`` key.
     """
-    if data is None:
-        return []
+    projection = project_interface_attributes(data)
+    for invalid in projection.unprojectable:
+        logger.warning(
+            "interface_attributes.entry_skipped",
+            device_id=device_id,
+            family="interface-attributes",
+            index=invalid.index,
+            reason=invalid.reason,
+        )
     result = []
-    for entry in as_list(data.get("interface")):
-        # as_list keeps whatever the NED emitted, including a bare scalar singleton.
-        name = entry.get("interface-name") if isinstance(entry, dict) else None
-        if not name:
-            # The entry is the device's own data and can carry any leaf the NED emits, so
-            # the record names the field that is missing and the read it came from.
-            logger.warning(
-                "interface_attributes.entry_skipped",
-                device_id=device_id,
-                family="interface-attributes",
-                missing_field="interface-name",
-            )
-            continue
+    for entry in projection.interfaces:
         result.append(
             Interface(
-                name=name,
+                name=entry.name,
                 nso=InterfaceAttr(
-                    description=entry.get("description"),
-                    enabled=entry.get("enabled"),
+                    description=entry.description,
+                    enabled=entry.enabled,
                 ),
                 netbox=InterfaceAttr(description=None, enabled=None),
                 # M27R: pass through the logical-interface modeling fields (empty for
                 # physical ports / Cisco / Junos).
-                parent_binding=entry.get("parent-binding") or None,
-                kind=entry.get("kind") or None,
-                encap_tag=entry.get("encap-tag") or None,
-                vrf=entry.get("vrf") or None,
-                service=entry.get("service") or None,
+                parent_binding=entry.parent_binding or None,
+                kind=entry.kind or None,
+                encap_tag=entry.encap_tag or None,
+                vrf=entry.vrf or None,
+                service=entry.service or None,
             )
         )
     return result
@@ -1156,6 +1151,9 @@ async def _consume_interface_attributes(
                     succeeded=True,
                     row_count=interfaces_written,
                     publish_payload=True,
+                    observation=observe_family(
+                        "interface_attributes", outcome.data if isinstance(outcome, Present) else {}
+                    ),
                 )
                 if not selected:
                     await savepoint.rollback()
@@ -1447,6 +1445,9 @@ async def _detect_drift_attributes(
         succeeded=isinstance(attrs_outcome, Present),
         row_count=changes_detected if isinstance(attrs_outcome, Present) else None,
         publish_payload=isinstance(attrs_outcome, Present),
+        observation=observe_family("interface_attributes", attrs_outcome.data)
+        if isinstance(attrs_outcome, Present)
+        else None,
     )
     await db.commit()
     return changes_detected, nb_client

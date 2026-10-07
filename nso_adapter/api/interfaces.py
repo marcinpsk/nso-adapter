@@ -10,7 +10,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, RESP_500_INTERNAL, api_error
+from nso_adapter.api.observation import InterfaceAttributesObservationOut
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import iso_z
 from nso_adapter.store import outcome_store
@@ -126,6 +127,7 @@ class InterfacesDocOut(BaseModel):
 
     device_id: int
     read_state: FamilyReadState
+    observation: InterfaceAttributesObservationOut | None
     interfaces: list[InterfaceOut]
 
 
@@ -133,7 +135,7 @@ class InterfacesDocOut(BaseModel):
     "/{device_id}/interfaces-doc",
     dependencies=[Depends(verify_token)],
     response_model=InterfacesDocOut,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION, **RESP_500_INTERNAL},
 )
 async def get_interfaces_doc(device_id: int, db: AsyncSession = Depends(get_read_db)):
     device = await db.get(Device, device_id)
@@ -141,12 +143,14 @@ async def get_interfaces_doc(device_id: int, db: AsyncSession = Depends(get_read
         raise api_error(404, "not_found", "Device not found")
 
     # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
-    read_state = read_state_payload(
-        await outcome_store.get_current_outcome(db, device_id, "interface_attributes"), source_epoch=device.source_epoch
+    outcome, observation = await outcome_store.get_current_publication(
+        db, device_id, "interface_attributes", source_epoch=device.source_epoch
     )
+    read_state = read_state_payload(outcome, source_epoch=device.source_epoch)
     return {
         "device_id": device_id,
         "read_state": read_state,
+        "observation": observation,
         "interfaces": await _assemble_interfaces(db, device_id),
     }
 

@@ -19,7 +19,7 @@ from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "read_state", "interfaces"}
+TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "read_state", "observation", "interfaces"}
 IFACE_KEYS = {"interface", "bound_port", "addresses"}
 ADDR_KEYS = {"address", "prefix_length", "family", "secondary", "vrf"}
 

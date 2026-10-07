@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.cancelsafe import await_uncancellable
 from nso_adapter.core.claim import ClaimLostError
+from nso_adapter.domain.observation import observe_family
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError, failure_detail
 from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
@@ -442,6 +443,7 @@ async def _materialize_guarded(
             succeeded=True,
             row_count=row_count,
             publish_payload=True,
+            observation=observe_family(spec.name, outcome.data if isinstance(outcome, Present) else {}),
         )
         if not selected:
             await savepoint.rollback()

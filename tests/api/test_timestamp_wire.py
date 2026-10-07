@@ -122,7 +122,16 @@ async def test_family_get_serializes_every_timestamp_as_iso_z(adapter_client, no
         attempt_id = await outcome_store.record_read_outcome(
             db, device_id, "interface_attributes", Present({"i": []}, Freshness.fresh), refresh_source="poll"
         )
-        await outcome_store.record_result(db, attempt_id, result="replaced", succeeded=True, row_count=1)
+        from nso_adapter.domain.observation import observe_family
+
+        await outcome_store.record_result(
+            db,
+            attempt_id,
+            result="replaced",
+            succeeded=True,
+            row_count=1,
+            observation=observe_family("interface_attributes", {}),
+        )
 
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}/interfaces-doc", headers=_AUTH)
     assert resp.status_code == 200, resp.text
@@ -131,6 +140,7 @@ async def test_family_get_serializes_every_timestamp_as_iso_z(adapter_client, no
     assert set(found) == {
         "read_state.read_at",
         "read_state.incarnation_born",
+        "observation.observed_at",
         "interfaces[0].attrs.description.last_apply_at",
     }
     for path, value in found.items():
