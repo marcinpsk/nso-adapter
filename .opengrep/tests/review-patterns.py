@@ -675,3 +675,19 @@ def wire_int_coercion(item, wire_int):
     # ok: nso-wire-int-coercion
     untagged = wire_int(item.get("untagged-vlan"))
     return vid, mtu, untagged
+
+
+def observation_wire_bool_coercion(entry):
+    # ruleid: nso-observation-wire-bool-coercion
+    secondary = bool(entry.get("secondary", False))
+    # ok: nso-observation-wire-bool-coercion
+    enabled = entry.get("enabled")
+    return secondary, enabled
+
+
+def observation_wire_or_default(entry):
+    # ruleid: nso-observation-wire-or-default
+    vrf = entry.get("vrf") or ""
+    # ok: nso-observation-wire-or-default
+    family = "ipv4" if entry.get("family") in (None, "") else entry.get("family")
+    return vrf, family

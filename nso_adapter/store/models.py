@@ -38,7 +38,11 @@ from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from nso_adapter.core.request_flags import PENDING_CLEAR_PROVENANCES, REMOVAL_MARKINGS
-from nso_adapter.store.ddl import generation_immutability_ddl, job_coalescible_immutability_ddl
+from nso_adapter.store.ddl import (
+    generation_immutability_ddl,
+    job_coalescible_immutability_ddl,
+    observation_immutability_ddl,
+)
 
 
 class Base(DeclarativeBase):
@@ -3004,3 +3008,26 @@ class RefreshOutcomePointer(Base):
     # attempts advance attempt_id but deliberately preserve this value.
     payload_revision: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
+
+
+class ReadObservation(Base):
+    """Immutable device document for one successful family publication."""
+
+    __tablename__ = "read_observation"
+    __table_args__ = (UniqueConstraint("device_id", "family", "revision", name="uq_read_observation_revision"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    family: Mapped[str] = mapped_column(String(32), nullable=False)
+    revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    coverage: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    document: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+for _statement in observation_immutability_ddl():
+    event.listen(ReadObservation.__table__, "after_create", DDL(_statement))

@@ -3458,6 +3458,218 @@
         "title": "InterfaceAttrOut",
         "type": "object"
       },
+      "InterfaceAttributesDocument": {
+        "properties": {
+          "interfaces": {
+            "items": {
+              "$ref": "#/components/schemas/InterfaceAttributesEntry"
+            },
+            "title": "Interfaces",
+            "type": "array"
+          },
+          "unprojectable": {
+            "items": {
+              "$ref": "#/components/schemas/UnprojectableEntry"
+            },
+            "title": "Unprojectable",
+            "type": "array"
+          }
+        },
+        "required": [
+          "interfaces",
+          "unprojectable"
+        ],
+        "title": "InterfaceAttributesDocument",
+        "type": "object"
+      },
+      "InterfaceAttributesEntry": {
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "encap_tag": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Encap Tag"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "parent_binding": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Binding"
+          },
+          "service": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Service"
+          },
+          "vrf": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vrf"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "enabled",
+          "kind",
+          "parent_binding",
+          "encap_tag",
+          "vrf",
+          "service"
+        ],
+        "title": "InterfaceAttributesEntry",
+        "type": "object"
+      },
+      "InterfaceAttributesObservationOut": {
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/ObservationCoverage"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/InterfaceAttributesDocument"
+          },
+          "family": {
+            "const": "interface_attributes",
+            "title": "Family",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "source_epoch",
+          "digest",
+          "observed_at",
+          "coverage",
+          "family",
+          "document"
+        ],
+        "title": "InterfaceAttributesObservationOut",
+        "type": "object"
+      },
+      "InterfaceIpAddressEntry": {
+        "properties": {
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "family": {
+            "title": "Family",
+            "type": "string"
+          },
+          "prefix_length": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Length"
+          },
+          "secondary": {
+            "title": "Secondary",
+            "type": "boolean"
+          },
+          "vrf": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vrf"
+          }
+        },
+        "required": [
+          "address",
+          "prefix_length",
+          "family",
+          "secondary",
+          "vrf"
+        ],
+        "title": "InterfaceIpAddressEntry",
+        "type": "object"
+      },
       "InterfaceIpAddressOut": {
         "properties": {
           "address": {
@@ -3498,6 +3710,63 @@
         "title": "InterfaceIpAddressOut",
         "type": "object"
       },
+      "InterfaceIpDocument": {
+        "properties": {
+          "interfaces": {
+            "items": {
+              "$ref": "#/components/schemas/InterfaceIpEntry"
+            },
+            "title": "Interfaces",
+            "type": "array"
+          },
+          "unprojectable": {
+            "items": {
+              "$ref": "#/components/schemas/UnprojectableEntry"
+            },
+            "title": "Unprojectable",
+            "type": "array"
+          }
+        },
+        "required": [
+          "interfaces",
+          "unprojectable"
+        ],
+        "title": "InterfaceIpDocument",
+        "type": "object"
+      },
+      "InterfaceIpEntry": {
+        "properties": {
+          "addresses": {
+            "items": {
+              "$ref": "#/components/schemas/InterfaceIpAddressEntry"
+            },
+            "title": "Addresses",
+            "type": "array"
+          },
+          "bound_port": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bound Port"
+          },
+          "interface": {
+            "title": "Interface",
+            "type": "string"
+          }
+        },
+        "required": [
+          "interface",
+          "bound_port",
+          "addresses"
+        ],
+        "title": "InterfaceIpEntry",
+        "type": "object"
+      },
       "InterfaceIpEntryOut": {
         "properties": {
           "addresses": {
@@ -3531,6 +3800,50 @@
         "title": "InterfaceIpEntryOut",
         "type": "object"
       },
+      "InterfaceIpObservationOut": {
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/ObservationCoverage"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/InterfaceIpDocument"
+          },
+          "family": {
+            "const": "interface_ip",
+            "title": "Family",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "source_epoch",
+          "digest",
+          "observed_at",
+          "coverage",
+          "family",
+          "document"
+        ],
+        "title": "InterfaceIpObservationOut",
+        "type": "object"
+      },
       "InterfaceIpsOut": {
         "properties": {
           "device_id": {
@@ -3555,6 +3868,16 @@
             ],
             "title": "Last Refreshed At"
           },
+          "observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InterfaceIpObservationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "read_state": {
             "$ref": "#/components/schemas/FamilyReadState"
           },
@@ -3567,6 +3890,7 @@
           "device_id",
           "refresh_source",
           "read_state",
+          "observation",
           "interfaces"
         ],
         "title": "InterfaceIpsOut",
@@ -3870,6 +4194,16 @@
             "title": "Interfaces",
             "type": "array"
           },
+          "observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InterfaceAttributesObservationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "read_state": {
             "$ref": "#/components/schemas/FamilyReadState"
           }
@@ -3877,6 +4211,7 @@
         "required": [
           "device_id",
           "read_state",
+          "observation",
           "interfaces"
         ],
         "title": "InterfacesDocOut",
@@ -6329,6 +6664,22 @@
           "reachable"
         ],
         "title": "NsoInstanceOut",
+        "type": "object"
+      },
+      "ObservationCoverage": {
+        "properties": {
+          "attributes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Attributes",
+            "type": "array"
+          }
+        },
+        "required": [
+          "attributes"
+        ],
+        "title": "ObservationCoverage",
         "type": "object"
       },
       "OspfConfigOut": {
@@ -9204,6 +9555,24 @@
         "title": "SwitchportOut",
         "type": "object"
       },
+      "UnprojectableEntry": {
+        "properties": {
+          "index": {
+            "title": "Index",
+            "type": "integer"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "index",
+          "reason"
+        ],
+        "title": "UnprojectableEntry",
+        "type": "object"
+      },
       "ValidationError": {
         "properties": {
           "ctx": {
@@ -11858,6 +12227,16 @@
               }
             },
             "description": "Request validation failed (envelope shape)"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal adapter invariant failed"
           }
         },
         "security": [
@@ -12165,6 +12544,16 @@
               }
             },
             "description": "Request validation failed (envelope shape)"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal adapter invariant failed"
           }
         },
         "security": [

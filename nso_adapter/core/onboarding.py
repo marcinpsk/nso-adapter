@@ -75,6 +75,7 @@ _NETBOX_DEVICE_ID_CONSTRAINT = "uq_device_netbox_device_id"
 
 
 _READ_MIRROR_ROOTS = (
+    "read_observation",
     "interfaces",
     "lag_interface",
     "lag_bundle_config",

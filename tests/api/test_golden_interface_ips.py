@@ -102,6 +102,7 @@ async def test_interface_ips_golden_body(adapter_client):
         "last_refreshed_at": "2026-06-01T10:00:00Z",
         "refresh_source": "poll",
         "read_state": _SYNTH_READ_STATE,
+        "observation": None,
         "interfaces": [
             {
                 "interface": "GE0/0",
@@ -138,5 +139,6 @@ async def test_interface_ips_golden_empty(adapter_client):
         "last_refreshed_at": None,
         "refresh_source": "never",
         "read_state": _SYNTH_READ_STATE,
+        "observation": None,
         "interfaces": [],
     }

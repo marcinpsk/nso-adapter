@@ -77,6 +77,43 @@ def test_openapi_matches_committed_snapshot(openapi_schema):
         )
 
 
+@pytest.mark.parametrize(
+    ("response_name", "observation_name", "family", "document_name"),
+    [
+        (
+            "InterfacesDocOut",
+            "InterfaceAttributesObservationOut",
+            "interface_attributes",
+            "InterfaceAttributesDocument",
+        ),
+        ("InterfaceIpsOut", "InterfaceIpObservationOut", "interface_ip", "InterfaceIpDocument"),
+    ],
+)
+def test_family_observation_schema_is_typed(openapi_schema, response_name, observation_name, family, document_name):
+    schemas = openapi_schema["components"]["schemas"]
+    response = schemas[response_name]
+    assert "observation" in response["required"]
+    assert response["properties"]["observation"]["anyOf"] == [
+        {"$ref": f"#/components/schemas/{observation_name}"},
+        {"type": "null"},
+    ]
+    observation = schemas[observation_name]
+    assert set(observation["required"]) == {
+        "family",
+        "revision",
+        "source_epoch",
+        "digest",
+        "observed_at",
+        "coverage",
+        "document",
+    }
+    assert observation["properties"]["family"]["const"] == family
+    assert observation["properties"]["digest"]["pattern"] == "^[0-9a-f]{64}$"
+    assert observation["properties"]["observed_at"]["format"] == "date-time"
+    assert observation["properties"]["document"]["$ref"] == f"#/components/schemas/{document_name}"
+    assert "observation" not in schemas["InterfaceOut"]["properties"]
+
+
 def test_generation_actions_document_the_generation_cas(openapi_schema):
     schemas = openapi_schema["components"]["schemas"]
     assert schemas["BarrierActionIn"]["required"] == ["generation_id"]

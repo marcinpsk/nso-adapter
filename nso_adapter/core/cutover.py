@@ -222,6 +222,10 @@ _KEEP_SCHEMA = {
     "redistribution_intent": frozenset(
         "id device_id dest_protocol dest_ref source_protocol source_ref route_map metric metric_type accepted_at last_apply_at last_apply_error".split()
     ),
+    # Device observations do not authorize aggregate writes.
+    "read_observation": frozenset(
+        "id device_id family revision source_epoch digest coverage document observed_at".split()
+    ),
     # Mirror diagnostics, including read_failures, do not authorize writes.
     "refresh_outcome": frozenset(
         "id device_id family refresh_source source_epoch read_outcome read_reason freshness read_failures started_at result succeeded row_count completed_at".split()

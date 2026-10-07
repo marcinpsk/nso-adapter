@@ -16,6 +16,7 @@ from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.domain.observation import project_interface_ips
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, InterfaceIpAddress
@@ -33,27 +34,20 @@ async def _upsert_ip_addresses(
     await db.execute(delete(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device.id))
 
     now = datetime.now(UTC)
-    for iface in interfaces_data:
-        iface_name = iface.get("interface-name", "")
-        bound_port = iface.get("bound-port") or None  # None for non-Nokia or unbound
-        for addr_entry in as_list(iface.get("address")):
-            address = addr_entry.get("address", "")
-            # `or default` (not `.get(k, default)`): the export can carry an explicit null,
-            # and None would violate these NOT-NULL columns (vrf is also in the dedup unique).
-            vrf = addr_entry.get("vrf") or ""
-            family = addr_entry.get("family") or "ipv4"
-            secondary = addr_entry.get("secondary", False)
-            if not address:
-                continue
+    projection = project_interface_ips(interfaces_data)
+    for invalid in projection.unprojectable:
+        logger.warning("interface_ip.entry_skipped", device_id=device.id, index=invalid.index, reason=invalid.reason)
+    for iface in projection.interfaces:
+        for address in iface.addresses:
             db.add(
                 InterfaceIpAddress(
                     device_id=device.id,
-                    interface_name=iface_name,
-                    address=address,
-                    vrf=vrf,
-                    family=family,
-                    secondary=bool(secondary),
-                    bound_port=bound_port,
+                    interface_name=iface.interface,
+                    address=address.address,
+                    vrf=address.vrf,
+                    family=address.family,
+                    secondary=address.secondary,
+                    bound_port=iface.bound_port,
                     last_refreshed_at=now,
                     refresh_source=refresh_source,
                 )
