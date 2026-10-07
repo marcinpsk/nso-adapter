@@ -16,8 +16,9 @@ from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.domain.switching_observation import project_subinterfaces
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.shape import as_list, require_vlan_id, wire_int
+from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceSubinterface
 
 logger = structlog.get_logger(__name__)
@@ -27,21 +28,21 @@ async def _upsert_subinterface(db: AsyncSession, device: Device, interfaces: lis
     """Full-replace the device's dot1q subinterface rows (the materializer)."""
     now = datetime.now(UTC)
     await db.execute(delete(DeviceSubinterface).where(DeviceSubinterface.device_id == device.id))
-    for item in interfaces:
-        name = item.get("interface-name")
-        if not name:
-            continue
-        dot1q = item.get("dot1q-vlan")
-        if dot1q is None:
-            raise ValueError(f"subinterface {name} has no dot1q-vlan")
+    projection = project_subinterfaces({"interface": interfaces})
+    if projection.unprojectable:
+        raw = interfaces[projection.unprojectable[0].index]
+        if isinstance(raw, dict) and isinstance(raw.get("dot1q-vlan"), bool):
+            raise TypeError("subinterface item has a boolean dot1q-vlan")
+        raise ValueError("subinterface item has invalid dot1q-vlan or interface-name")
+    for item in projection.interfaces or []:
         db.add(
             DeviceSubinterface(
                 device_id=device.id,
-                interface_name=name,
-                parent_interface=item.get("parent-interface") or None,
-                dot1q_vlan=require_vlan_id(wire_int(dot1q), "subinterface", name, "dot1q-vlan"),
-                sub_type=item.get("type") or "subinterface",
-                vrf=item.get("vrf") or None,
+                interface_name=item.interface_name,
+                parent_interface=item.parent_interface or None,
+                dot1q_vlan=item.dot1q_vlan,
+                sub_type=item.type or "subinterface",
+                vrf=item.vrf or None,
                 last_refreshed_at=now,
                 refresh_source=refresh_source,
             )

@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
+from nso_adapter.api.observation import SnmpObservationOut
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant, iso_z, latest_refreshed
 from nso_adapter.store import outcome_store
@@ -77,6 +78,7 @@ class SnmpConfigOut(BaseModel):
     v3_users: list[SnmpV3UserOut]
     hosts: list[SnmpHostOut]
     system_info: SnmpSystemInfoOut | None
+    observation: SnmpObservationOut | None
 
 
 @router.get(
@@ -91,9 +93,10 @@ async def get_snmp_config(device_id: int, db: AsyncSession = Depends(get_read_db
         raise api_error(404, "not_found", "Device not found")
 
     # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
-    read_state = read_state_payload(
-        await outcome_store.get_current_outcome(db, device_id, "snmp"), source_epoch=device.source_epoch
+    outcome, observation = await outcome_store.get_current_publication(
+        db, device_id, "snmp", source_epoch=device.source_epoch
     )
+    read_state = read_state_payload(outcome, source_epoch=device.source_epoch)
 
     communities_result = await db.execute(select(SnmpCommunity).where(SnmpCommunity.device_id == device_id))
     communities = communities_result.scalars().all()
@@ -121,6 +124,7 @@ async def get_snmp_config(device_id: int, db: AsyncSession = Depends(get_read_db
             "last_refreshed_at": None,
             "refresh_source": "never",
             "read_state": read_state,
+            "observation": observation,
             "communities": [],
             "v3_users": [],
             "hosts": [],
@@ -134,6 +138,7 @@ async def get_snmp_config(device_id: int, db: AsyncSession = Depends(get_read_db
         "last_refreshed_at": iso_z(latest.last_refreshed_at),
         "refresh_source": latest.refresh_source,
         "read_state": read_state,
+        "observation": observation,
         "communities": [{"community_hash": c.community_hash, "access": c.access, "acl": c.acl} for c in communities],
         "v3_users": [
             {

@@ -92,6 +92,7 @@ async def test_snmp_golden_body(adapter_client):
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/snmp-config", headers=AUTH)).json()
 
     assert body == {
+        "observation": None,
         "device_id": device_id,
         "last_refreshed_at": "2026-06-01T10:00:00Z",
         "refresh_source": "poll",
@@ -131,6 +132,7 @@ async def test_snmp_golden_nulls(adapter_client):
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/snmp-config", headers=AUTH)).json()
 
     assert body == {
+        "observation": None,
         "device_id": device_id,
         "last_refreshed_at": "2026-06-01T10:00:00Z",
         "refresh_source": "poll",
@@ -148,6 +150,7 @@ async def test_snmp_golden_empty(adapter_client):
     await pin_store_incarnation()
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/snmp-config", headers=AUTH)).json()
     assert body == {
+        "observation": None,
         "device_id": device_id,
         "last_refreshed_at": None,
         "refresh_source": "never",

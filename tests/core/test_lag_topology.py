@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
@@ -16,6 +17,7 @@ from nso_adapter.core.lag_topology import (
 )
 from nso_adapter.store.models import Device, LagInterface, LagMember
 from tests.conftest import seed_device, session
+from tests.fixtures.switching_read_payloads import SWITCHING_READ_PAYLOADS
 
 
 @asynccontextmanager
@@ -69,14 +71,7 @@ async def test_refresh_lag_topology_happy(adapter_client):
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "device-name": "sw03",
-            "lag": [
-                {
-                    "name": "Port-channel1",
-                    "lag-id": 1,
-                    "member": [{"interface-name": "GigabitEthernet0/1", "mode": "active"}],
-                },
-                {"name": "Port-channel2", "lag-id": 2, "member": []},
-            ],
+            **deepcopy(SWITCHING_READ_PAYLOADS["lag"]),
         }
 
         await refresh_lag_topology_for_device(db, device, nso_client, refresh_source="poll")

@@ -11,6 +11,7 @@ from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.domain.service_observation import project_bfd
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceBfdInterface
@@ -27,22 +28,18 @@ async def _upsert_bfd_data(
     """Full-replace: delete existing BFD-interface rows for *device*, then insert fresh."""
     await db.execute(delete(DeviceBfdInterface).where(DeviceBfdInterface.device_id == device.id))
     now = datetime.now(UTC)
-    seen: set[str] = set()
-    for iface in interfaces:
-        name = iface.get("interface-name", "")
-        if not name or name in seen:
-            continue
-        seen.add(name)
+    document = project_bfd({"interface": interfaces})
+    for iface in document.interfaces or []:
         db.add(
             DeviceBfdInterface(
                 device_id=device.id,
-                interface_name=name,
-                bound_port=iface.get("bound-port") or None,
-                min_tx=iface.get("min-tx"),
-                min_rx=iface.get("min-rx"),
-                multiplier=iface.get("multiplier"),
-                micro_bfd=bool(iface.get("micro-bfd", False)),
-                enabled=bool(iface.get("enabled", True)),
+                interface_name=iface.interface_name,
+                bound_port=iface.bound_port or None,
+                min_tx=iface.min_tx,
+                min_rx=iface.min_rx,
+                multiplier=iface.multiplier,
+                micro_bfd=bool(iface.micro_bfd),
+                enabled=bool(iface.enabled) if "enabled" in iface.present else True,
                 last_refreshed_at=now,
                 refresh_source=refresh_source,
             )

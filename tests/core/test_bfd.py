@@ -5,12 +5,14 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from copy import deepcopy
 
 from sqlalchemy import select
 
 from nso_adapter.core.bfd import _upsert_bfd_data
 from nso_adapter.store.models import Device, DeviceBfdInterface
 from tests.conftest import seed_device, session
+from tests.fixtures.family_read_payloads import BFD_INTERFACE_READ_PAYLOAD
 
 
 @asynccontextmanager
@@ -26,25 +28,7 @@ async def test_bfd_interfaces_mirrored(adapter_client):
     """Timers + micro-BFD + bound-port are stored; micro vs normal preserved."""
     device_id = await seed_device(nso_device_name="bfd-dev", netbox_device_id=970)
     async with _device_session(device_id) as (db, device):
-        interfaces = [
-            {
-                "interface-name": "ae10",
-                "min-tx": 300,
-                "min-rx": 300,
-                "multiplier": 3,
-                "micro-bfd": True,
-                "enabled": True,
-            },
-            {
-                "interface-name": "lag-99",
-                "bound-port": "lag-99",
-                "min-tx": 100,
-                "min-rx": 100,
-                "multiplier": 3,
-                "micro-bfd": False,
-                "enabled": True,
-            },
-        ]
+        interfaces = deepcopy(BFD_INTERFACE_READ_PAYLOAD["interface"])
         await _upsert_bfd_data(db, device, interfaces, "test")
         rows = {
             r.interface_name: r

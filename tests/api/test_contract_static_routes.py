@@ -21,7 +21,7 @@ from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "read_state", "routes"}
+TOP_KEYS = {"observation", "device_id", "last_refreshed_at", "refresh_source", "read_state", "routes"}
 ROUTE_REQUIRED_KEYS = {"vrf", "prefix", "next_hop"}
 ROUTE_OPTIONAL_KEYS = {"interface_next_hop", "metric", "permanent", "tag", "name"}
 
@@ -83,6 +83,7 @@ async def test_static_routes_contract(adapter_client):
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/static-routes", headers=AUTH)).json()
     assert set(body.keys()) == TOP_KEYS
+    assert body["observation"] is None
     routes = {r["prefix"]: r for r in body["routes"]}
     assert set(routes["10.0.0.0/8"].keys()) == ROUTE_REQUIRED_KEYS | ROUTE_OPTIONAL_KEYS
     assert set(routes["0.0.0.0/0"].keys()) == ROUTE_REQUIRED_KEYS  # optionals omitted
@@ -94,4 +95,5 @@ async def test_static_routes_no_data_shape(adapter_client):
     device_id = await seed_device(nso_device_name="sr-ct-empty", netbox_device_id=7971)
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/static-routes", headers=AUTH)).json()
     assert set(body.keys()) == TOP_KEYS
+    assert body["observation"] is None
     assert body["routes"] == [] and body["refresh_source"] == "never"

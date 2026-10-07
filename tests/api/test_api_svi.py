@@ -22,6 +22,7 @@ async def test_svi_returns_seeded_rows(adapter_client):
     assert body.pop("read_state")["outcome"] == "unavailable"
     assert body == {
         "device_id": device_id,
+        "observation": None,
         "interfaces": [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi", "vrf": "MGMT", "source": "svi"}],
     }
 

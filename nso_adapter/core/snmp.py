@@ -16,6 +16,7 @@ from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.domain.service_observation import project_snmp
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
 from nso_adapter.secrets.refs import require_secret_fingerprint
@@ -43,53 +44,52 @@ async def _upsert_snmp_config(
 ) -> None:
     """Full-replace all SNMP rows for *device* from *entry*."""
     now = datetime.now(UTC)
-    communities = [(require_secret_fingerprint(comm.get("name")), comm) for comm in as_list(entry.get("community"))]
+    for comm in as_list(entry.get("community")):
+        require_secret_fingerprint(comm.get("name") if isinstance(comm, dict) else None)
+    document = project_snmp(entry)
 
     await _delete_snmp_rows(db, device)
 
-    # as_list guards the RESTCONF singleton-rendered-as-bare-dict case for each child list.
-    for community_hash, comm in communities:
+    for comm in document.communities or []:
         db.add(
             SnmpCommunity(
                 device_id=device.id,
-                community_hash=community_hash,
-                access=comm.get("access", "RO"),
-                acl=comm.get("acl") or None,
+                community_hash=comm.name,
+                access=comm.access if "access" in comm.present else "RO",
+                acl=comm.acl or None,
                 last_refreshed_at=now,
                 refresh_source=refresh_source,
             )
         )
 
-    for user in as_list(entry.get("v3-user")):
+    for user in document.users or []:
         db.add(
             SnmpV3User(
                 device_id=device.id,
-                username=user.get("username", ""),
-                has_auth_secret=bool(user.get("has-auth-secret", False)),
-                has_priv_secret=bool(user.get("has-priv-secret", False)),
+                username=user.username,
+                has_auth_secret=bool(user.has_auth_secret),
+                has_priv_secret=bool(user.has_priv_secret),
                 last_refreshed_at=now,
                 refresh_source=refresh_source,
             )
         )
 
-    for host in as_list(entry.get("host")):
+    for host in document.hosts or []:
         db.add(
             SnmpHost(
                 device_id=device.id,
-                address=host.get("address", ""),
-                version=host.get("version") or None,
-                notify_type=host.get("notify-type") or None,
-                port=host.get("port") or None,
-                # v3 hosts only — the export gates it on version, precisely so a v1/v2c host's
-                # community string (the same NED field) can never arrive here (CR-P16).
-                username=host.get("user") or None,
+                address=host.address,
+                version=host.version or None,
+                notify_type=host.notify_type or None,
+                port=host.port or None,
+                username=host.user or None,
                 last_refreshed_at=now,
                 refresh_source=refresh_source,
             )
         )
 
-    location = entry.get("location") or None
-    contact = entry.get("contact") or None
+    location = document.system.location or None
+    contact = document.system.contact or None
     if location or contact:
         db.add(
             SnmpSystemInfo(

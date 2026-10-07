@@ -18,7 +18,7 @@ from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-TOP_KEYS = {"device_id", "read_state", "services"}
+TOP_KEYS = {"observation", "device_id", "read_state", "services"}
 SERVICE_KEYS = {"service_name", "service_type", "service_id", "saps"}
 SAP_KEYS = {"sap_id", "port", "outer_tag", "inner_tag"}
 
@@ -46,6 +46,7 @@ async def test_l2_services_contract(adapter_client):
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/l2-services", headers=AUTH)).json()
     assert set(body.keys()) == TOP_KEYS
+    assert body["observation"] is None
     svc = body["services"][0]
     assert set(svc.keys()) == SERVICE_KEYS
     assert svc["service_type"] == "epipe"
@@ -59,4 +60,5 @@ async def test_l2_services_no_data_shape(adapter_client):
     device_id = await seed_device(nso_device_name="l2svc-ct-empty", netbox_device_id=7996)
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/l2-services", headers=AUTH)).json()
     assert set(body.keys()) == TOP_KEYS
+    assert body["observation"] is None
     assert body["services"] == []

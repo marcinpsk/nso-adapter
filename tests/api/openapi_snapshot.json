@@ -412,6 +412,16 @@
             ],
             "title": "Last Refreshed At"
           },
+          "observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BfdObservationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "read_state": {
             "$ref": "#/components/schemas/FamilyReadState"
           },
@@ -424,12 +434,52 @@
           "device_id",
           "refresh_source",
           "read_state",
-          "interfaces"
+          "interfaces",
+          "observation"
         ],
         "title": "BfdConfigOut",
         "type": "object"
       },
-      "BfdEntry": {
+      "BfdDocument": {
+        "properties": {
+          "interfaces": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BfdEntry-Output"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interfaces"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "unprojectable": {
+            "items": {
+              "$ref": "#/components/schemas/UnprojectableEntry"
+            },
+            "title": "Unprojectable",
+            "type": "array"
+          }
+        },
+        "required": [
+          "interfaces",
+          "present",
+          "unprojectable"
+        ],
+        "title": "BfdDocument",
+        "type": "object"
+      },
+      "BfdEntry-Input": {
         "properties": {
           "accepted_at": {
             "anyOf": [
@@ -492,11 +542,97 @@
         "title": "BfdEntry",
         "type": "object"
       },
+      "BfdEntry-Output": {
+        "properties": {
+          "bound_port": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bound Port"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "interface_name": {
+            "title": "Interface Name",
+            "type": "string"
+          },
+          "micro_bfd": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Micro Bfd"
+          },
+          "min_rx": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min Rx"
+          },
+          "min_tx": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min Tx"
+          },
+          "multiplier": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Multiplier"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          }
+        },
+        "required": [
+          "interface_name"
+        ],
+        "title": "BfdEntry",
+        "type": "object"
+      },
       "BfdIntentUpdate": {
         "properties": {
           "interfaces": {
             "items": {
-              "$ref": "#/components/schemas/BfdEntry"
+              "$ref": "#/components/schemas/BfdEntry-Input"
             },
             "title": "Interfaces",
             "type": "array"
@@ -573,6 +709,50 @@
           "enabled"
         ],
         "title": "BfdInterfaceOut",
+        "type": "object"
+      },
+      "BfdObservationOut": {
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/ObservationCoverage"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/BfdDocument"
+          },
+          "family": {
+            "const": "bfd",
+            "title": "Family",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "source_epoch",
+          "digest",
+          "observed_at",
+          "coverage",
+          "family",
+          "document"
+        ],
+        "title": "BfdObservationOut",
         "type": "object"
       },
       "BgpAfModel": {
@@ -3896,7 +4076,46 @@
         "title": "InterfaceIpsOut",
         "type": "object"
       },
-      "InterfaceMtuEntry": {
+      "InterfaceMtuDocument": {
+        "properties": {
+          "interfaces": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/InterfaceMtuEntry-Output"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interfaces"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "unprojectable": {
+            "items": {
+              "$ref": "#/components/schemas/UnprojectableEntry"
+            },
+            "title": "Unprojectable",
+            "type": "array"
+          }
+        },
+        "required": [
+          "present",
+          "interfaces",
+          "unprojectable"
+        ],
+        "title": "InterfaceMtuDocument",
+        "type": "object"
+      },
+      "InterfaceMtuEntry-Input": {
         "properties": {
           "accepted_at": {
             "anyOf": [
@@ -3946,6 +4165,70 @@
               }
             ],
             "title": "Mtu"
+          }
+        },
+        "required": [
+          "interface_name"
+        ],
+        "title": "InterfaceMtuEntry",
+        "type": "object"
+      },
+      "InterfaceMtuEntry-Output": {
+        "properties": {
+          "bound_port": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bound Port"
+          },
+          "interface_name": {
+            "title": "Interface Name",
+            "type": "string"
+          },
+          "ip_mtu": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ip Mtu"
+          },
+          "mpls_mtu": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mpls Mtu"
+          },
+          "mtu": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mtu"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
           }
         },
         "required": [
@@ -4012,7 +4295,7 @@
         "properties": {
           "interfaces": {
             "items": {
-              "$ref": "#/components/schemas/InterfaceMtuEntry"
+              "$ref": "#/components/schemas/InterfaceMtuEntry-Input"
             },
             "title": "Interfaces",
             "type": "array"
@@ -4022,6 +4305,50 @@
           "interfaces"
         ],
         "title": "InterfaceMtuIntentUpdate",
+        "type": "object"
+      },
+      "InterfaceMtuObservationOut": {
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/ObservationCoverage"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/InterfaceMtuDocument"
+          },
+          "family": {
+            "const": "interface_mtu",
+            "title": "Family",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "source_epoch",
+          "digest",
+          "observed_at",
+          "coverage",
+          "family",
+          "document"
+        ],
+        "title": "InterfaceMtuObservationOut",
         "type": "object"
       },
       "InterfaceMtuOut": {
@@ -4037,6 +4364,16 @@
             "title": "Interfaces",
             "type": "array"
           },
+          "observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InterfaceMtuObservationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "read_state": {
             "$ref": "#/components/schemas/FamilyReadState"
           }
@@ -4044,7 +4381,8 @@
         "required": [
           "device_id",
           "read_state",
-          "interfaces"
+          "interfaces",
+          "observation"
         ],
         "title": "InterfaceMtuOut",
         "type": "object"
@@ -5607,7 +5945,7 @@
         "title": "JobTriggerOut",
         "type": "object"
       },
-      "L2SapEntry": {
+      "L2SapEntry-Input": {
         "properties": {
           "accepted_at": {
             "anyOf": [
@@ -5669,11 +6007,64 @@
         "title": "L2SapEntry",
         "type": "object"
       },
+      "L2SapEntry-Output": {
+        "properties": {
+          "inner_tag": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inner Tag"
+          },
+          "outer_tag": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Outer Tag"
+          },
+          "port": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Port"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "sap_id": {
+            "title": "Sap Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sap_id"
+        ],
+        "title": "L2SapEntry",
+        "type": "object"
+      },
       "L2SapIntentUpdate": {
         "properties": {
           "saps": {
             "items": {
-              "$ref": "#/components/schemas/L2SapEntry"
+              "$ref": "#/components/schemas/L2SapEntry-Input"
             },
             "title": "Saps",
             "type": "array"
@@ -5727,6 +6118,145 @@
         "title": "L2SapOut",
         "type": "object"
       },
+      "L2ServiceDocument": {
+        "properties": {
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "services": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/L2ServiceEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Services"
+          },
+          "unprojectable": {
+            "items": {
+              "$ref": "#/components/schemas/UnprojectableEntry"
+            },
+            "title": "Unprojectable",
+            "type": "array"
+          }
+        },
+        "required": [
+          "services",
+          "present",
+          "unprojectable"
+        ],
+        "title": "L2ServiceDocument",
+        "type": "object"
+      },
+      "L2ServiceEntry": {
+        "properties": {
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "saps": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/L2SapEntry-Output"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Saps"
+          },
+          "service_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Service Id"
+          },
+          "service_name": {
+            "title": "Service Name",
+            "type": "string"
+          },
+          "service_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Service Type"
+          }
+        },
+        "required": [
+          "service_name"
+        ],
+        "title": "L2ServiceEntry",
+        "type": "object"
+      },
+      "L2ServiceObservationOut": {
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/ObservationCoverage"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/L2ServiceDocument"
+          },
+          "family": {
+            "const": "l2_service",
+            "title": "Family",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "source_epoch",
+          "digest",
+          "observed_at",
+          "coverage",
+          "family",
+          "document"
+        ],
+        "title": "L2ServiceObservationOut",
+        "type": "object"
+      },
       "L2ServiceOut": {
         "properties": {
           "saps": {
@@ -5771,6 +6301,16 @@
             "title": "Device Id",
             "type": "integer"
           },
+          "observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/L2ServiceObservationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "read_state": {
             "$ref": "#/components/schemas/FamilyReadState"
           },
@@ -5785,7 +6325,8 @@
         "required": [
           "device_id",
           "read_state",
-          "services"
+          "services",
+          "observation"
         ],
         "title": "L2ServicesOut",
         "type": "object"
@@ -6003,6 +6544,237 @@
         "title": "LagConfigApplyRequest",
         "type": "object"
       },
+      "LagConfigDocument": {
+        "properties": {
+          "bundles": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/LagConfigEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bundles"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "unprojectable": {
+            "items": {
+              "$ref": "#/components/schemas/UnprojectableEntry"
+            },
+            "title": "Unprojectable",
+            "type": "array"
+          }
+        },
+        "required": [
+          "present",
+          "bundles",
+          "unprojectable"
+        ],
+        "title": "LagConfigDocument",
+        "type": "object"
+      },
+      "LagConfigEntry": {
+        "properties": {
+          "admin_key": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Admin Key"
+          },
+          "lag_id": {
+            "title": "Lag Id",
+            "type": "integer"
+          },
+          "member": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/LagConfigMemberEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Member"
+          },
+          "min_links": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min Links"
+          },
+          "name": {
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "system_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "System Id"
+          },
+          "system_priority": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "System Priority"
+          },
+          "timer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timer"
+          },
+          "vpc_sensitive": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vpc Sensitive"
+          }
+        },
+        "required": [
+          "name",
+          "lag_id"
+        ],
+        "title": "LagConfigEntry",
+        "type": "object"
+      },
+      "LagConfigMemberEntry": {
+        "properties": {
+          "interface_name": {
+            "title": "Interface Name",
+            "type": "string"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode"
+          },
+          "port_priority": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Port Priority"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          }
+        },
+        "required": [
+          "interface_name"
+        ],
+        "title": "LagConfigMemberEntry",
+        "type": "object"
+      },
+      "LagConfigObservationOut": {
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/ObservationCoverage"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/LagConfigDocument"
+          },
+          "family": {
+            "const": "lag_config",
+            "title": "Family",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "source_epoch",
+          "digest",
+          "observed_at",
+          "coverage",
+          "family",
+          "document"
+        ],
+        "title": "LagConfigObservationOut",
+        "type": "object"
+      },
       "LagConfigOut": {
         "properties": {
           "bundles": {
@@ -6027,6 +6799,16 @@
             ],
             "title": "Last Refreshed At"
           },
+          "observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LagConfigObservationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "read_state": {
             "$ref": "#/components/schemas/FamilyReadState"
           },
@@ -6039,7 +6821,8 @@
           "device_id",
           "refresh_source",
           "read_state",
-          "bundles"
+          "bundles",
+          "observation"
         ],
         "title": "LagConfigOut",
         "type": "object"
@@ -6085,6 +6868,37 @@
         "title": "LagMemberApply",
         "type": "object"
       },
+      "LagMemberEntry": {
+        "properties": {
+          "interface_name": {
+            "title": "Interface Name",
+            "type": "string"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          }
+        },
+        "required": [
+          "interface_name"
+        ],
+        "title": "LagMemberEntry",
+        "type": "object"
+      },
       "LagMemberOut": {
         "properties": {
           "interface_name": {
@@ -6118,6 +6932,85 @@
           "interface_name"
         ],
         "title": "LagMemberOut",
+        "type": "object"
+      },
+      "LagTopologyDocument": {
+        "properties": {
+          "bundles": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/LagTopologyEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bundles"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "unprojectable": {
+            "items": {
+              "$ref": "#/components/schemas/UnprojectableEntry"
+            },
+            "title": "Unprojectable",
+            "type": "array"
+          }
+        },
+        "required": [
+          "present",
+          "bundles",
+          "unprojectable"
+        ],
+        "title": "LagTopologyDocument",
+        "type": "object"
+      },
+      "LagTopologyEntry": {
+        "properties": {
+          "lag_id": {
+            "title": "Lag Id",
+            "type": "integer"
+          },
+          "member": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/LagMemberEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Member"
+          },
+          "name": {
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "lag_id"
+        ],
+        "title": "LagTopologyEntry",
         "type": "object"
       },
       "LagTopologyLagOut": {
@@ -6164,6 +7057,50 @@
         "title": "LagTopologyMemberOut",
         "type": "object"
       },
+      "LagTopologyObservationOut": {
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/ObservationCoverage"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/LagTopologyDocument"
+          },
+          "family": {
+            "const": "lag",
+            "title": "Family",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "source_epoch",
+          "digest",
+          "observed_at",
+          "coverage",
+          "family",
+          "document"
+        ],
+        "title": "LagTopologyObservationOut",
+        "type": "object"
+      },
       "LagTopologyOut": {
         "properties": {
           "device_id": {
@@ -6188,6 +7125,16 @@
             ],
             "title": "Last Refreshed At"
           },
+          "observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LagTopologyObservationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "read_state": {
             "$ref": "#/components/schemas/FamilyReadState"
           },
@@ -6200,7 +7147,8 @@
           "device_id",
           "refresh_source",
           "read_state",
-          "lags"
+          "lags",
+          "observation"
         ],
         "title": "LagTopologyOut",
         "type": "object"
@@ -6361,6 +7309,16 @@
               }
             ]
           },
+          "observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LoggingObservationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "read_state": {
             "$ref": "#/components/schemas/FamilyReadState"
           },
@@ -6373,12 +7331,63 @@
           "device_id",
           "refresh_source",
           "read_state",
-          "hosts"
+          "hosts",
+          "observation"
         ],
         "title": "LoggingConfigOut",
         "type": "object"
       },
-      "LoggingHostEntry": {
+      "LoggingDocument": {
+        "properties": {
+          "hosts": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/LoggingHostEntry-Output"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hosts"
+          },
+          "local_levels": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LoggingLevelsEntry"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "unprojectable": {
+            "items": {
+              "$ref": "#/components/schemas/UnprojectableEntry"
+            },
+            "title": "Unprojectable",
+            "type": "array"
+          }
+        },
+        "required": [
+          "hosts",
+          "local_levels",
+          "present",
+          "unprojectable"
+        ],
+        "title": "LoggingDocument",
+        "type": "object"
+      },
+      "LoggingHostEntry-Input": {
         "properties": {
           "accepted_at": {
             "anyOf": [
@@ -6431,6 +7440,92 @@
             "default": "",
             "title": "Vrf",
             "type": "string"
+          }
+        },
+        "required": [
+          "address"
+        ],
+        "title": "LoggingHostEntry",
+        "type": "object"
+      },
+      "LoggingHostEntry-Output": {
+        "properties": {
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "facility": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Facility"
+          },
+          "port": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Port"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "severity": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Severity"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
+          },
+          "transport": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transport"
+          },
+          "vrf": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vrf"
           }
         },
         "required": [
@@ -6523,7 +7618,7 @@
         "properties": {
           "hosts": {
             "items": {
-              "$ref": "#/components/schemas/LoggingHostEntry"
+              "$ref": "#/components/schemas/LoggingHostEntry-Input"
             },
             "title": "Hosts",
             "type": "array"
@@ -6543,6 +7638,96 @@
           "hosts"
         ],
         "title": "LoggingIntentUpdate",
+        "type": "object"
+      },
+      "LoggingLevelsEntry": {
+        "properties": {
+          "console_severity": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Console Severity"
+          },
+          "module_severity": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Module Severity"
+          },
+          "monitor_severity": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Monitor Severity"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          }
+        },
+        "title": "LoggingLevelsEntry",
+        "type": "object"
+      },
+      "LoggingObservationOut": {
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/ObservationCoverage"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/LoggingDocument"
+          },
+          "family": {
+            "const": "logging",
+            "title": "Family",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "source_epoch",
+          "digest",
+          "observed_at",
+          "coverage",
+          "family",
+          "document"
+        ],
+        "title": "LoggingObservationOut",
         "type": "object"
       },
       "NedPackageOut": {
@@ -6673,6 +7858,13 @@
               "type": "string"
             },
             "title": "Attributes",
+            "type": "array"
+          },
+          "not_comparable": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Not Comparable",
             "type": "array"
           }
         },
@@ -8133,7 +9325,7 @@
         "title": "SecretWriteRequest",
         "type": "object"
       },
-      "SnmpCommunityEntry": {
+      "SnmpCommunityEntry-Input": {
         "properties": {
           "accepted_at": {
             "anyOf": [
@@ -8181,6 +9373,59 @@
           "label",
           "vault_ref",
           "access"
+        ],
+        "title": "SnmpCommunityEntry",
+        "type": "object"
+      },
+      "SnmpCommunityEntry-Output": {
+        "properties": {
+          "access": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Access"
+          },
+          "acl": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Acl"
+          },
+          "has_secret": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Has Secret"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name"
         ],
         "title": "SnmpCommunityEntry",
         "type": "object"
@@ -8246,6 +9491,16 @@
             ],
             "title": "Last Refreshed At"
           },
+          "observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SnmpObservationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "read_state": {
             "$ref": "#/components/schemas/FamilyReadState"
           },
@@ -8278,12 +9533,86 @@
           "communities",
           "v3_users",
           "hosts",
-          "system_info"
+          "system_info",
+          "observation"
         ],
         "title": "SnmpConfigOut",
         "type": "object"
       },
-      "SnmpHostEntry": {
+      "SnmpDocument": {
+        "properties": {
+          "communities": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/SnmpCommunityEntry-Output"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Communities"
+          },
+          "hosts": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/SnmpHostEntry-Output"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hosts"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "system": {
+            "$ref": "#/components/schemas/SnmpSystemEntry"
+          },
+          "unprojectable": {
+            "items": {
+              "$ref": "#/components/schemas/UnprojectableEntry"
+            },
+            "title": "Unprojectable",
+            "type": "array"
+          },
+          "users": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/SnmpUserEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Users"
+          }
+        },
+        "required": [
+          "communities",
+          "users",
+          "hosts",
+          "system",
+          "present",
+          "unprojectable"
+        ],
+        "title": "SnmpDocument",
+        "type": "object"
+      },
+      "SnmpHostEntry-Input": {
         "properties": {
           "accepted_at": {
             "anyOf": [
@@ -8347,6 +9676,70 @@
           "version",
           "notify_type",
           "community_or_user"
+        ],
+        "title": "SnmpHostEntry",
+        "type": "object"
+      },
+      "SnmpHostEntry-Output": {
+        "properties": {
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "notify_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Notify Type"
+          },
+          "port": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Port"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "user": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "address"
         ],
         "title": "SnmpHostEntry",
         "type": "object"
@@ -8455,7 +9848,7 @@
           "communities": {
             "default": [],
             "items": {
-              "$ref": "#/components/schemas/SnmpCommunityEntry"
+              "$ref": "#/components/schemas/SnmpCommunityEntry-Input"
             },
             "title": "Communities",
             "type": "array"
@@ -8463,7 +9856,7 @@
           "hosts": {
             "default": [],
             "items": {
-              "$ref": "#/components/schemas/SnmpHostEntry"
+              "$ref": "#/components/schemas/SnmpHostEntry-Input"
             },
             "title": "Hosts",
             "type": "array"
@@ -8488,6 +9881,85 @@
           }
         },
         "title": "SnmpIntentUpdate",
+        "type": "object"
+      },
+      "SnmpObservationOut": {
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/ObservationCoverage"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/SnmpDocument"
+          },
+          "family": {
+            "const": "snmp",
+            "title": "Family",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "source_epoch",
+          "digest",
+          "observed_at",
+          "coverage",
+          "family",
+          "document"
+        ],
+        "title": "SnmpObservationOut",
+        "type": "object"
+      },
+      "SnmpSystemEntry": {
+        "properties": {
+          "contact": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contact"
+          },
+          "location": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Location"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          }
+        },
+        "title": "SnmpSystemEntry",
         "type": "object"
       },
       "SnmpSystemInfoEntry": {
@@ -8560,6 +10032,48 @@
           "contact"
         ],
         "title": "SnmpSystemInfoOut",
+        "type": "object"
+      },
+      "SnmpUserEntry": {
+        "properties": {
+          "has_auth_secret": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Has Auth Secret"
+          },
+          "has_priv_secret": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Has Priv Secret"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "username": {
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "username"
+        ],
+        "title": "SnmpUserEntry",
         "type": "object"
       },
       "SnmpV3UserEntry": {
@@ -8679,7 +10193,46 @@
         "title": "SnmpV3UserOut",
         "type": "object"
       },
-      "StaticRouteEntry": {
+      "StaticRouteDocument": {
+        "properties": {
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "routes": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/StaticRouteEntry-Output"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Routes"
+          },
+          "unprojectable": {
+            "items": {
+              "$ref": "#/components/schemas/UnprojectableEntry"
+            },
+            "title": "Unprojectable",
+            "type": "array"
+          }
+        },
+        "required": [
+          "routes",
+          "present",
+          "unprojectable"
+        ],
+        "title": "StaticRouteDocument",
+        "type": "object"
+      },
+      "StaticRouteEntry-Input": {
         "properties": {
           "accepted_at": {
             "anyOf": [
@@ -8798,6 +10351,114 @@
         "required": [
           "prefix",
           "next_hop"
+        ],
+        "title": "StaticRouteEntry",
+        "type": "object"
+      },
+      "StaticRouteEntry-Output": {
+        "properties": {
+          "interface_next_hop": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interface Next Hop"
+          },
+          "metric": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metric"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "next_hop": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Hop"
+          },
+          "next_hop_vrf": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Hop Vrf"
+          },
+          "permanent": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Permanent"
+          },
+          "prefix": {
+            "title": "Prefix",
+            "type": "string"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "tag": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tag"
+          },
+          "vrf": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vrf"
+          }
+        },
+        "required": [
+          "prefix"
         ],
         "title": "StaticRouteEntry",
         "type": "object"
@@ -8942,7 +10603,7 @@
           },
           "routes": {
             "items": {
-              "$ref": "#/components/schemas/StaticRouteEntry"
+              "$ref": "#/components/schemas/StaticRouteEntry-Input"
             },
             "title": "Routes",
             "type": "array"
@@ -8953,6 +10614,50 @@
           "deleted_routes"
         ],
         "title": "StaticRouteIntentUpdate",
+        "type": "object"
+      },
+      "StaticRouteObservationOut": {
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/ObservationCoverage"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/StaticRouteDocument"
+          },
+          "family": {
+            "const": "static_route",
+            "title": "Family",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "source_epoch",
+          "digest",
+          "observed_at",
+          "coverage",
+          "family",
+          "document"
+        ],
+        "title": "StaticRouteObservationOut",
         "type": "object"
       },
       "StaticRouteOut": {
@@ -9062,6 +10767,16 @@
             ],
             "title": "Last Refreshed At"
           },
+          "observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StaticRouteObservationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "read_state": {
             "$ref": "#/components/schemas/FamilyReadState"
           },
@@ -9081,7 +10796,8 @@
           "device_id",
           "refresh_source",
           "read_state",
-          "routes"
+          "routes",
+          "observation"
         ],
         "title": "StaticRoutesOut",
         "type": "object"
@@ -9149,7 +10865,46 @@
         "title": "StoredIntentResult",
         "type": "object"
       },
-      "SubinterfaceEntry": {
+      "SubinterfaceDocument": {
+        "properties": {
+          "interfaces": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/SubinterfaceEntry-Output"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interfaces"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "unprojectable": {
+            "items": {
+              "$ref": "#/components/schemas/UnprojectableEntry"
+            },
+            "title": "Unprojectable",
+            "type": "array"
+          }
+        },
+        "required": [
+          "present",
+          "interfaces",
+          "unprojectable"
+        ],
+        "title": "SubinterfaceDocument",
+        "type": "object"
+      },
+      "SubinterfaceEntry-Input": {
         "properties": {
           "accepted_at": {
             "anyOf": [
@@ -9187,6 +10942,64 @@
             "default": "",
             "title": "Vrf",
             "type": "string"
+          }
+        },
+        "required": [
+          "interface_name",
+          "dot1q_vlan"
+        ],
+        "title": "SubinterfaceEntry",
+        "type": "object"
+      },
+      "SubinterfaceEntry-Output": {
+        "properties": {
+          "dot1q_vlan": {
+            "title": "Dot1Q Vlan",
+            "type": "integer"
+          },
+          "interface_name": {
+            "title": "Interface Name",
+            "type": "string"
+          },
+          "parent_interface": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Interface"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Type"
+          },
+          "vrf": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vrf"
           }
         },
         "required": [
@@ -9245,7 +11058,7 @@
         "properties": {
           "interfaces": {
             "items": {
-              "$ref": "#/components/schemas/SubinterfaceEntry"
+              "$ref": "#/components/schemas/SubinterfaceEntry-Input"
             },
             "title": "Interfaces",
             "type": "array"
@@ -9255,6 +11068,50 @@
           "interfaces"
         ],
         "title": "SubinterfaceIntentUpdate",
+        "type": "object"
+      },
+      "SubinterfaceObservationOut": {
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/ObservationCoverage"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/SubinterfaceDocument"
+          },
+          "family": {
+            "const": "subinterface",
+            "title": "Family",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "source_epoch",
+          "digest",
+          "observed_at",
+          "coverage",
+          "family",
+          "document"
+        ],
+        "title": "SubinterfaceObservationOut",
         "type": "object"
       },
       "SubinterfaceOut": {
@@ -9270,6 +11127,16 @@
             "title": "Interfaces",
             "type": "array"
           },
+          "observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SubinterfaceObservationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "read_state": {
             "$ref": "#/components/schemas/FamilyReadState"
           }
@@ -9277,12 +11144,52 @@
         "required": [
           "device_id",
           "read_state",
-          "interfaces"
+          "interfaces",
+          "observation"
         ],
         "title": "SubinterfaceOut",
         "type": "object"
       },
-      "SviEntry": {
+      "SviDocument": {
+        "properties": {
+          "interfaces": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/SviEntry-Output"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interfaces"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "unprojectable": {
+            "items": {
+              "$ref": "#/components/schemas/UnprojectableEntry"
+            },
+            "title": "Unprojectable",
+            "type": "array"
+          }
+        },
+        "required": [
+          "present",
+          "interfaces",
+          "unprojectable"
+        ],
+        "title": "SviDocument",
+        "type": "object"
+      },
+      "SviEntry-Input": {
         "properties": {
           "accepted_at": {
             "anyOf": [
@@ -9315,6 +11222,53 @@
             "default": "",
             "title": "Vrf",
             "type": "string"
+          }
+        },
+        "required": [
+          "interface_name",
+          "vlan_id"
+        ],
+        "title": "SviEntry",
+        "type": "object"
+      },
+      "SviEntry-Output": {
+        "properties": {
+          "interface_name": {
+            "title": "Interface Name",
+            "type": "string"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Type"
+          },
+          "vlan_id": {
+            "title": "Vlan Id",
+            "type": "integer"
+          },
+          "vrf": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vrf"
           }
         },
         "required": [
@@ -9361,7 +11315,7 @@
         "properties": {
           "interfaces": {
             "items": {
-              "$ref": "#/components/schemas/SviEntry"
+              "$ref": "#/components/schemas/SviEntry-Input"
             },
             "title": "Interfaces",
             "type": "array"
@@ -9371,6 +11325,50 @@
           "interfaces"
         ],
         "title": "SviIntentUpdate",
+        "type": "object"
+      },
+      "SviObservationOut": {
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/ObservationCoverage"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/SviDocument"
+          },
+          "family": {
+            "const": "svi",
+            "title": "Family",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "source_epoch",
+          "digest",
+          "observed_at",
+          "coverage",
+          "family",
+          "document"
+        ],
+        "title": "SviObservationOut",
         "type": "object"
       },
       "SviOut": {
@@ -9386,6 +11384,16 @@
             "title": "Interfaces",
             "type": "array"
           },
+          "observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SviObservationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "read_state": {
             "$ref": "#/components/schemas/FamilyReadState"
           }
@@ -9393,7 +11401,8 @@
         "required": [
           "device_id",
           "read_state",
-          "interfaces"
+          "interfaces",
+          "observation"
         ],
         "title": "SviOut",
         "type": "object"
@@ -9487,6 +11496,101 @@
         "title": "SwitchportApplyRequest",
         "type": "object"
       },
+      "SwitchportDocument": {
+        "properties": {
+          "interfaces": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/SwitchportEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interfaces"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "unprojectable": {
+            "items": {
+              "$ref": "#/components/schemas/UnprojectableEntry"
+            },
+            "title": "Unprojectable",
+            "type": "array"
+          }
+        },
+        "required": [
+          "present",
+          "interfaces",
+          "unprojectable"
+        ],
+        "title": "SwitchportDocument",
+        "type": "object"
+      },
+      "SwitchportEntry": {
+        "properties": {
+          "interface_name": {
+            "title": "Interface Name",
+            "type": "string"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "tagged_vlans": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tagged Vlans"
+          },
+          "untagged_vlan": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Untagged Vlan"
+          }
+        },
+        "required": [
+          "interface_name"
+        ],
+        "title": "SwitchportEntry",
+        "type": "object"
+      },
       "SwitchportIfaceOut": {
         "properties": {
           "interface_name": {
@@ -9530,6 +11634,50 @@
         "title": "SwitchportIfaceOut",
         "type": "object"
       },
+      "SwitchportObservationOut": {
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/ObservationCoverage"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/SwitchportDocument"
+          },
+          "family": {
+            "const": "switchport",
+            "title": "Family",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "source_epoch",
+          "digest",
+          "observed_at",
+          "coverage",
+          "family",
+          "document"
+        ],
+        "title": "SwitchportObservationOut",
+        "type": "object"
+      },
       "SwitchportOut": {
         "properties": {
           "device_id": {
@@ -9543,6 +11691,16 @@
             "title": "Interfaces",
             "type": "array"
           },
+          "observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SwitchportObservationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "read_state": {
             "$ref": "#/components/schemas/FamilyReadState"
           }
@@ -9550,7 +11708,8 @@
         "required": [
           "device_id",
           "read_state",
-          "interfaces"
+          "interfaces",
+          "observation"
         ],
         "title": "SwitchportOut",
         "type": "object"
@@ -9619,6 +11778,16 @@
             "title": "Device Id",
             "type": "integer"
           },
+          "observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/VlanObservationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "read_state": {
             "$ref": "#/components/schemas/FamilyReadState"
           },
@@ -9633,12 +11802,52 @@
         "required": [
           "device_id",
           "read_state",
-          "vlans"
+          "vlans",
+          "observation"
         ],
         "title": "VlanDatabaseOut",
         "type": "object"
       },
-      "VlanEntry": {
+      "VlanDocument": {
+        "properties": {
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "unprojectable": {
+            "items": {
+              "$ref": "#/components/schemas/UnprojectableEntry"
+            },
+            "title": "Unprojectable",
+            "type": "array"
+          },
+          "vlans": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/VlanEntry-Output"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vlans"
+          }
+        },
+        "required": [
+          "present",
+          "vlans",
+          "unprojectable"
+        ],
+        "title": "VlanDocument",
+        "type": "object"
+      },
+      "VlanEntry-Input": {
         "properties": {
           "accepted_at": {
             "anyOf": [
@@ -9670,11 +11879,42 @@
         "title": "VlanEntry",
         "type": "object"
       },
+      "VlanEntry-Output": {
+        "properties": {
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "vlan_id": {
+            "title": "Vlan Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "vlan_id"
+        ],
+        "title": "VlanEntry",
+        "type": "object"
+      },
       "VlanIntentUpdate": {
         "properties": {
           "vlans": {
             "items": {
-              "$ref": "#/components/schemas/VlanEntry"
+              "$ref": "#/components/schemas/VlanEntry-Input"
             },
             "title": "Vlans",
             "type": "array"
@@ -9684,6 +11924,50 @@
           "vlans"
         ],
         "title": "VlanIntentUpdate",
+        "type": "object"
+      },
+      "VlanObservationOut": {
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/ObservationCoverage"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/VlanDocument"
+          },
+          "family": {
+            "const": "vlan",
+            "title": "Family",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "source_epoch",
+          "digest",
+          "observed_at",
+          "coverage",
+          "family",
+          "document"
+        ],
+        "title": "VlanObservationOut",
         "type": "object"
       },
       "VlanOut": {

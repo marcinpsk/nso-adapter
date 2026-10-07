@@ -17,8 +17,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.domain.read_projection import project_vlans
+from nso_adapter.domain.switching_observation import parse_vlan_string, project_switchports
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.shape import VLAN_ID_MAX, VLAN_ID_MIN, as_list, require_vlan_id, wire_int
+from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import (
     Device,
     DeviceSwitchport,
@@ -28,48 +30,15 @@ from nso_adapter.store.models import (
 
 logger = structlog.get_logger(__name__)
 
-_INVALID_TAGGED_VLAN_RANGE = "tagged-vlans contains an invalid VLAN range"
-
 
 def _now():
     return datetime.now(UTC)
 
 
-def parse_vlan_string(raw: str | None) -> list[int]:
-    """Expand the NSO ``tagged-vlans`` range string into a sorted VLAN ID list."""
-    if raw is None or raw == "":
-        return []
-    if not isinstance(raw, str):
-        raise ValueError(f"tagged-vlans must be a string (type {type(raw).__name__})")
-    vlans: set[int] = set()
-    for chunk in raw.split(","):
-        chunk = chunk.strip()
-        if not chunk:
-            # Empty chunks, including trailing commas, are malformed provider data.
-            raise ValueError(_INVALID_TAGGED_VLAN_RANGE)
-        unusable = None
-        try:
-            if "-" in chunk:
-                start, end = (wire_int(x) for x in chunk.split("-", 1))
-            else:
-                start = end = wire_int(chunk)
-        except ValueError:
-            unusable = ValueError(_INVALID_TAGGED_VLAN_RANGE)
-        # Raise after the handler so the provider value is not retained as exception context.
-        if unusable is not None:
-            raise unusable
-        # Bound to the legal 802.1Q range so a malformed upstream string
-        # (e.g. "1-999999999") can't blow up memory via range expansion.
-        if not (VLAN_ID_MIN <= start <= end <= VLAN_ID_MAX):
-            raise ValueError(_INVALID_TAGGED_VLAN_RANGE)
-        vlans.update(range(start, end + 1))
-    return sorted(vlans)
-
-
 async def _upsert_vlans(
     db: AsyncSession,
     device: Device,
-    vlans: list[dict],
+    data: dict,
     refresh_source: str,
 ) -> None:
     """Diff-by-key materializer: upsert each read VLAN by vlan-id, prune the unseen.
@@ -84,25 +53,22 @@ async def _upsert_vlans(
     }
     seen: set[int] = set()
     now = _now()
-    for item in vlans:
-        raw_vlan_id = item.get("vlan-id", item.get("vlan_id"))
-        unusable = None
-        try:
-            vid = wire_int(raw_vlan_id)
-        except (TypeError, ValueError):
-            # A skipped item would vanish from `seen` and the prune below would delete its
-            # existing row — reject the whole refresh instead (the engine's savepoint keeps
-            # the last-known rows and records the failure).
-            unusable = ValueError(
-                f"a vlan-database item for device {device.id} carries a vlan-id of type "
-                f"{type(raw_vlan_id).__name__}, not an integer"
-            )
-        if unusable is not None:
-            raise unusable
-        vid = require_vlan_id(vid, "vlan-database", str(device.id), "vlan-id")
+    projection = project_vlans(data)
+    if projection.unprojectable:
+        if "conflicting collection aliases" in projection.unprojectable[0].reason:
+            raise ValueError("vlan-database has conflicting collection aliases")
+        vlans = as_list(data["vlan"] if "vlan" in data else data.get("vlans"))
+        raw = vlans[projection.unprojectable[0].index]
+        raw_vlan_id = raw.get("vlan-id", raw.get("vlan_id")) if isinstance(raw, dict) else None
+        raise ValueError(
+            f"a vlan-database item for device {device.id} carries a vlan-id of type "
+            f"{type(raw_vlan_id).__name__}, not a valid VLAN id"
+        )
+    for entry in projection.vlans or []:
+        vid = entry.vlan_id
         seen.add(vid)
         row = existing.get(vid) or DeviceVlan(device_id=device.id, vlan_id=vid)
-        row.name = item.get("name") or ""
+        row.name = entry.name or ""
         row.last_refreshed_at = now
         row.refresh_source = refresh_source
         db.add(row)
@@ -113,8 +79,7 @@ async def _upsert_vlans(
 
 VLAN_DATABASE_SPEC = FamilySpec(
     name="vlan",
-    # as_list guards the singleton-rendered-as-bare-dict case; extract({}) → [] → prune all (clear).
-    extract=lambda data: as_list(data.get("vlan") or data.get("vlans")),
+    extract=lambda data: data,
     materialize=_upsert_vlans,
     wire_name="vlan-database",  # READSEM S3: fetch from the device-state envelope
 )
@@ -138,7 +103,7 @@ async def refresh_vlan_database_for_device(
 async def _upsert_switchports(
     db: AsyncSession,
     device: Device,
-    interfaces: list[dict],
+    data: dict,
     refresh_source: str,
 ) -> None:
     """Diff-by-key materializer: upsert each switchport by interface-name, prune the unseen.
@@ -166,39 +131,35 @@ async def _upsert_switchports(
     }
     seen: set[str] = set()
     now = _now()
-    for item in interfaces:
-        name = item.get("interface-name") or item.get("interface_name")
-        if not name:
-            continue
+    projection = project_switchports(data)
+    if projection.unprojectable:
+        if "conflicting collection aliases" in projection.unprojectable[0].reason:
+            raise ValueError("switchport has conflicting collection aliases")
+        interfaces = as_list(data["interface"] if "interface" in data else data.get("interfaces"))
+        raw = interfaces[projection.unprojectable[0].index]
+        if isinstance(raw, dict):
+            tagged = raw["tagged-vlans"] if "tagged-vlans" in raw else raw.get("tagged_vlans")
+            parse_vlan_string(tagged)
+            untagged = raw.get("untagged-vlan", raw.get("untagged_vlan"))
+            if untagged is not None:
+                raise ValueError(
+                    f"a switchport item for device {device.id} carries an invalid untagged-vlan "
+                    f"(type {type(untagged).__name__})"
+                )
+        raise ValueError("switchport item has an invalid interface-name, mode, or duplicate identity")
+    for item in projection.interfaces or []:
+        name = item.interface_name
         seen.add(name)
         row = existing.get(name) or DeviceSwitchport(device_id=device.id, interface_name=name)
-        row.mode = item.get("mode") or ""
-        untagged = item.get("untagged-vlan", item.get("untagged_vlan"))
-        uv = None
-        if untagged is not None:
-            unusable = None
-            try:
-                untagged_vid = wire_int(untagged)
-            except (TypeError, ValueError):
-                # The value is the device's own; name the field and what arrived, not the leaf.
-                unusable = ValueError(
-                    f"a switchport item for device {device.id} carries an untagged-vlan that is "
-                    f"not a vlan id (type {type(untagged).__name__})"
-                )
-            # Raised outside the handler: the caught error repeats the value verbatim.
-            if unusable is not None:
-                raise unusable
-            untagged_vid = require_vlan_id(untagged_vid, "switchport", name, "untagged-vlan")
-            uv = vlan_by_vid.get(untagged_vid)
+        row.mode = item.mode or ""
+        uv = vlan_by_vid.get(item.untagged_vlan) if item.untagged_vlan is not None else None
         row.untagged_vlan_id = uv.id if uv is not None else None
         row.last_refreshed_at = now
         row.refresh_source = refresh_source
         db.add(row)
         await db.flush()
-        # rebuild tagged-vlan join rows
         await db.execute(delete(DeviceSwitchportTaggedVlan).where(DeviceSwitchportTaggedVlan.switchport_id == row.id))
-        raw_tagged = item["tagged-vlans"] if "tagged-vlans" in item else item.get("tagged_vlans")
-        for tv in parse_vlan_string(raw_tagged):
+        for tv in item.tagged_vlans or []:
             vlan = vlan_by_vid.get(tv)
             if vlan is not None:
                 db.add(DeviceSwitchportTaggedVlan(switchport_id=row.id, vlan_id=vlan.id))
@@ -209,8 +170,7 @@ async def _upsert_switchports(
 
 SWITCHPORT_SPEC = FamilySpec(
     name="switchport",
-    # as_list guards the singleton-rendered-as-bare-dict case; extract({}) → [] → prune all (clear).
-    extract=lambda data: as_list(data.get("interface") or data.get("interfaces")),
+    extract=lambda data: data,
     materialize=_upsert_switchports,
     wire_name="switchport",  # READSEM S3: fetch from the device-state envelope
 )

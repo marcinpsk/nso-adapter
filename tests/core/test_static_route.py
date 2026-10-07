@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from unittest.mock import AsyncMock
 
 import pytest
@@ -16,6 +17,7 @@ from nso_adapter.core.static_route import (
 )
 from nso_adapter.store.models import Device, DeviceStaticRoute
 from tests.conftest import seed_device, session
+from tests.fixtures.family_read_payloads import STATIC_ROUTES_READ_PAYLOAD
 
 
 @asynccontextmanager
@@ -36,10 +38,7 @@ async def test_refresh_inserts_routes(adapter_client):
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "name": "sr-insert-sw01",
-            "route": [
-                {"vrf": "", "prefix": "10.0.0.0/8", "next-hop": "192.168.1.1"},
-                {"vrf": "MGMT", "prefix": "0.0.0.0/0", "next-hop": "10.10.10.1", "metric": 1},
-            ],
+            **deepcopy(STATIC_ROUTES_READ_PAYLOAD),
         }
 
         await refresh_static_routes_for_device(db, device, nso_client, refresh_source="poll")

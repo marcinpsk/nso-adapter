@@ -22,6 +22,7 @@ from nso_adapter.api.errors import (
     api_error,
 )
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
+from nso_adapter.api.observation import BfdObservationOut
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.core.removal import is_cleared
@@ -54,6 +55,7 @@ class BfdConfigOut(BaseModel):
     refresh_source: str  # legacy freshness (S5 retires it); read_state is the S4 truth
     read_state: FamilyReadState
     interfaces: list[BfdInterfaceOut]
+    observation: BfdObservationOut | None
 
 
 @router.get(
@@ -70,9 +72,10 @@ async def get_bfd(device_id: int, db: AsyncSession = Depends(get_read_db)):
         raise api_error(404, "not_found", "Device not found")
 
     # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
-    read_state = read_state_payload(
-        await outcome_store.get_current_outcome(db, device_id, "bfd"), source_epoch=device.source_epoch
+    outcome, observation = await outcome_store.get_current_publication(
+        db, device_id, "bfd", source_epoch=device.source_epoch
     )
+    read_state = read_state_payload(outcome, source_epoch=device.source_epoch)
 
     rows = (
         (
@@ -109,6 +112,7 @@ async def get_bfd(device_id: int, db: AsyncSession = Depends(get_read_db)):
         "last_refreshed_at": iso_z(latest),
         "refresh_source": rows[0].refresh_source if rows else "never",
         "read_state": read_state,
+        "observation": observation,
         "interfaces": interfaces,
     }
 

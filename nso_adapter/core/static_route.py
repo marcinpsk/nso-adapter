@@ -15,6 +15,7 @@ from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.domain.service_observation import project_static_routes
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.models import Device, DeviceStaticRoute
 
@@ -31,23 +32,20 @@ async def _upsert_static_routes(
     await db.execute(delete(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id))
 
     now = datetime.now(UTC)
-    for route in routes_data:
-        prefix = route.get("prefix", "")
-        next_hop = route.get("next-hop", "")
-        if not prefix:
-            continue
+    document = project_static_routes({"route": routes_data})
+    for route in document.routes or []:
         db.add(
             DeviceStaticRoute(
                 device_id=device.id,
-                vrf=route.get("vrf", ""),
-                prefix=prefix,
-                next_hop=next_hop,
-                interface_next_hop=route.get("interface-next-hop"),
-                next_hop_vrf=route.get("next-hop-vrf"),
-                metric=route.get("metric"),
-                permanent=route.get("permanent"),
-                tag=route.get("tag"),
-                name=route.get("name"),
+                vrf=route.vrf or "",
+                prefix=route.prefix,
+                next_hop=route.next_hop or "",
+                interface_next_hop=route.interface_next_hop,
+                next_hop_vrf=route.next_hop_vrf,
+                metric=route.metric,
+                permanent=route.permanent,
+                tag=route.tag,
+                name=route.name,
                 last_refreshed_at=now,
                 refresh_source=refresh_source,
             )

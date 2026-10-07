@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from unittest.mock import AsyncMock
 
 import pytest
@@ -18,6 +19,7 @@ from nso_adapter.core.vlan import (
 from nso_adapter.nso.client import NsoExportUnavailableError
 from nso_adapter.store.models import Device, DeviceSwitchport, DeviceSwitchportTaggedVlan, DeviceVlan
 from tests.conftest import seed_device, session
+from tests.fixtures.switching_read_payloads import SWITCHING_READ_PAYLOADS
 
 
 @asynccontextmanager
@@ -74,10 +76,7 @@ async def test_refresh_vlan_database_upserts_and_prunes(adapter_client):
     async with _device_session(device_id) as (db, device):
         nso = AsyncMock()
         sections = _serve_sections(nso)
-        sections["vlan-database"] = {
-            "status": "ok",
-            "vlan": [{"vlan-id": 10, "name": "MGMT"}, {"vlan-id": 20, "name": "DATA"}],
-        }
+        sections["vlan-database"] = {"status": "ok", **deepcopy(SWITCHING_READ_PAYLOADS["vlan"])}
         await refresh_vlan_database_for_device(db, device, nso)
         rows = (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device.id))).scalars().all()
         assert {(r.vlan_id, r.name) for r in rows} == {(10, "MGMT"), (20, "DATA")}
@@ -233,17 +232,7 @@ async def test_refresh_switchport_links_vlans(adapter_client):
             "vlan": [{"vlan-id": 10, "name": "A"}, {"vlan-id": 20, "name": "B"}, {"vlan-id": 99, "name": "N"}],
         }
         await refresh_vlan_database_for_device(db, device, nso)
-        sections["switchport"] = {
-            "status": "ok",
-            "interface": [
-                {
-                    "interface-name": "Gi0/1",
-                    "mode": "trunk",
-                    "untagged-vlan": 99,
-                    "tagged-vlans": "10,10,20",
-                }
-            ],
-        }
+        sections["switchport"] = {"status": "ok", **deepcopy(SWITCHING_READ_PAYLOADS["switchport"])}
         assert await refresh_switchport_for_device(db, device, nso) is True
 
         sp = (await db.execute(select(DeviceSwitchport).where(DeviceSwitchport.device_id == device.id))).scalars().one()

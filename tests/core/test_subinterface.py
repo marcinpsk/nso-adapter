@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from unittest.mock import AsyncMock
 
 import pytest
@@ -13,6 +14,7 @@ from sqlalchemy import select
 from nso_adapter.core.subinterface import refresh_subinterface_for_device
 from nso_adapter.store.models import Device, DeviceSubinterface
 from tests.conftest import seed_device, session
+from tests.fixtures.switching_read_payloads import SWITCHING_READ_PAYLOADS
 
 
 @asynccontextmanager
@@ -47,21 +49,7 @@ async def test_refresh_inserts_subinterfaces(adapter_client):
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "device-name": "subif-rtr01",
-            "interface": [
-                {
-                    "interface-name": "GigabitEthernet0/1.100",
-                    "parent-interface": "GigabitEthernet0/1",
-                    "dot1q-vlan": 100,
-                    "type": "subinterface",
-                    "vrf": "TENANT_A",
-                },
-                {
-                    "interface-name": "ge-0/0/0.200",
-                    "parent-interface": "ge-0/0/0",
-                    "dot1q-vlan": 200,
-                    "type": "subinterface",
-                },
-            ],
+            **deepcopy(SWITCHING_READ_PAYLOADS["subinterface"]),
         }
         await refresh_subinterface_for_device(db, device, nso_client, refresh_source="test")
         rows = await _rows(db, device_id)

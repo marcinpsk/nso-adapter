@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from unittest.mock import AsyncMock
 
 import pytest
@@ -13,6 +14,7 @@ from sqlalchemy import select
 from nso_adapter.core.interface_mtu import refresh_interface_mtu_for_device
 from nso_adapter.store.models import Device, DeviceInterfaceMtu
 from tests.conftest import seed_device, session
+from tests.fixtures.switching_read_payloads import SWITCHING_READ_PAYLOADS
 
 
 @asynccontextmanager
@@ -39,11 +41,7 @@ async def test_refresh_inserts_mtu(adapter_client):
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "device-name": "mtu-rtr01",
-            "interface": [
-                {"interface-name": "Port-channel1", "mtu": 9216},
-                {"interface-name": "Port-channel1.100", "ip-mtu": 9000},
-                {"interface-name": "LAG99:99", "ip-mtu": 9170, "bound-port": "lag-99"},
-            ],
+            **deepcopy(SWITCHING_READ_PAYLOADS["interface_mtu"]),
         }
         await refresh_interface_mtu_for_device(db, device, nso_client, refresh_source="test")
         rows = await _rows(db, device_id)

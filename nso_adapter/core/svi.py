@@ -16,8 +16,9 @@ from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.domain.switching_observation import project_svis
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.shape import as_list, require_vlan_id, wire_int
+from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceSvi
 
 logger = structlog.get_logger(__name__)
@@ -27,22 +28,17 @@ async def _upsert_svi(db: AsyncSession, device: Device, interfaces: list[dict], 
     """Full-replace the device's SVI/IRB rows (the materializer)."""
     now = datetime.now(UTC)
     await db.execute(delete(DeviceSvi).where(DeviceSvi.device_id == device.id))
-    for item in interfaces:
-        name = item.get("interface-name")
-        if not name:
-            continue
-        vlan_id = item.get("vlan-id")
-        if vlan_id is None:
-            raise ValueError(f"svi {name} has no vlan-id")
-        vlan_id = wire_int(vlan_id)
-        vlan_id = require_vlan_id(vlan_id, "svi", name, "vlan-id")
+    projection = project_svis({"interface": interfaces})
+    if projection.unprojectable:
+        raise ValueError("svi item has invalid vlan-id or interface-name")
+    for item in projection.interfaces or []:
         db.add(
             DeviceSvi(
                 device_id=device.id,
-                interface_name=name,
-                vlan_id=vlan_id,
-                svi_type=item.get("type") or "svi",
-                vrf=item.get("vrf") or None,
+                interface_name=item.interface_name,
+                vlan_id=item.vlan_id,
+                svi_type=item.type or "svi",
+                vrf=item.vrf or None,
                 last_refreshed_at=now,
                 refresh_source=refresh_source,
             )

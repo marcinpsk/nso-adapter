@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from unittest.mock import AsyncMock
 
 import pytest
@@ -13,6 +14,7 @@ from sqlalchemy import select
 from nso_adapter.core.svi import refresh_svi_for_device
 from nso_adapter.store.models import Device, DeviceSvi
 from tests.conftest import seed_device, session
+from tests.fixtures.switching_read_payloads import SWITCHING_READ_PAYLOADS
 
 
 @asynccontextmanager
@@ -37,10 +39,7 @@ async def test_refresh_inserts_svis(adapter_client):
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "device-name": "svi-sw01",
-            "interface": [
-                {"interface-name": "Vlan100", "vlan-id": 100, "type": "svi", "vrf": "MGMT"},
-                {"interface-name": "Vlan200", "vlan-id": 200, "type": "svi"},
-            ],
+            **deepcopy(SWITCHING_READ_PAYLOADS["svi"]),
         }
         await refresh_svi_for_device(db, device, nso_client, refresh_source="test")
         svis = await _svis(db, device_id)

@@ -11,6 +11,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.domain.switching_observation import project_lag_config
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, LagBundleConfig, LagMemberConfig
@@ -32,47 +33,30 @@ async def _upsert_lag_configs(
     await db.execute(delete(LagBundleConfig).where(LagBundleConfig.device_id == device.id))
 
     now = datetime.now(UTC)
-    for bundle in bundles_data:
-        # name + lag-id are the NOT-NULL identity; a bundle missing either (or a non-numeric
-        # lag-id) is malformed — skip it rather than KeyError/ValueError-abort the upsert
-        # (which runs outside the fetch try/except) and freeze the whole LAG mirror.
-        name = bundle.get("name")
-        lag_id_raw = bundle.get("lag-id")
-        if not name or lag_id_raw is None:
-            continue
-        try:
-            lag_id = int(lag_id_raw)
-        except (TypeError, ValueError):
-            continue
+    projection = project_lag_config({"lag": bundles_data})
+    for bundle in projection.bundles or []:
         b = LagBundleConfig(
             device_id=device.id,
-            name=name,
-            lag_id=lag_id,
-            min_links=bundle.get("min-links"),
-            system_priority=bundle.get("system-priority"),
-            system_id=bundle.get("system-id"),
-            timer=bundle.get("timer"),
-            admin_key=bundle.get("admin-key"),
-            # NX-P2: the reader emits `vpc-sensitive` only for a vPC-protected bundle (absent =
-            # ordinary). Carry it so the plugin can gate/badge it — a vPC bundle is refused
-            # zero-write by the lag-reconciler, so it must never be offered for accept.
-            vpc_sensitive=bool(bundle.get("vpc-sensitive")),
+            name=bundle.name,
+            lag_id=bundle.lag_id,
+            min_links=bundle.min_links,
+            system_priority=bundle.system_priority,
+            system_id=bundle.system_id,
+            timer=bundle.timer,
+            admin_key=bundle.admin_key,
+            vpc_sensitive=bool(bundle.vpc_sensitive),
             last_refreshed_at=now,
             refresh_source=refresh_source,
         )
         db.add(b)
         await db.flush()
-        # as_list guards the singleton-rendered-as-bare-dict case for the nested member list.
-        for member in as_list(bundle.get("member")):
-            member_name = member.get("interface-name")
-            if not member_name:
-                continue  # NOT-NULL member key missing → skip this member
+        for member in bundle.member or []:
             db.add(
                 LagMemberConfig(
                     lag_bundle_id=b.id,
-                    interface_name=member_name,
-                    mode=member.get("mode"),
-                    port_priority=member.get("port-priority"),
+                    interface_name=member.interface_name,
+                    mode=member.mode,
+                    port_priority=member.port_priority,
                 )
             )
 
