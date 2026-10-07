@@ -22,7 +22,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.core.bgp import validate_bgp_as_numbers
 from nso_adapter.core.cancelsafe import await_uncancellable
 from nso_adapter.core.refresh_engine import classify_envelope_family_read
-from nso_adapter.domain.asn import checked_device_source_ref, validate_asn_rows, validate_source_as_numbers
+from nso_adapter.domain.asn import validate_asn_rows, validate_source_as_numbers
+from nso_adapter.domain.observation import observe_redistribution
+from nso_adapter.domain.redistribution_observation import (
+    project_redistribution,
+    project_redistribution_sources,
+)
 from nso_adapter.nso.client import NsoClient, failure_detail
 from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
@@ -39,25 +44,6 @@ from nso_adapter.store.models import Device, DeviceRedistribution
 logger = structlog.get_logger(__name__)
 
 
-def _ospf_dest_ref(instance: dict) -> str:
-    """Stable dest_ref for OSPF: '<process_id>'."""
-    return str(instance.get("process-id", ""))
-
-
-def _isis_dest_ref(process: dict) -> str:
-    """Stable dest_ref for ISIS: area-tag (empty string for untagged process)."""
-    return str(process.get("process-tag", ""))
-
-
-def _bgp_dest_ref(asn: str, scope: dict) -> str:
-    """Stable dest_ref for BGP AF: '<asn>/<vrf>/<afi>'.
-
-    One redistribute list lives per (asn, vrf, afi) address-family block.
-    """
-    vrf = scope.get("vrf", "") or ""
-    return f"{asn}/{vrf}"
-
-
 def _build_rows(
     device_id: int,
     dest_protocol: str,
@@ -68,89 +54,64 @@ def _build_rows(
     location: str,
 ) -> list[DeviceRedistribution]:
     validate_source_as_numbers(as_list(redist_list), "device_read.redistribution", location)
-    rows = []
-    for entry in as_list(redist_list):
-        src_proto = str(entry.get("source-protocol", "")).strip()
-        if src_proto == "bgp":
-            checked_device_source_ref(entry.get("source-ref", ""), "device_read.redistribution", location, "source-ref")
-        src_ref = str(entry.get("source-ref", ""))
-        if src_proto != "bgp":
-            src_ref = src_ref.strip()
-        if not src_proto:
-            continue
-        rows.append(
-            DeviceRedistribution(
-                device_id=device_id,
-                dest_protocol=dest_protocol,
-                dest_ref=dest_ref,
-                source_protocol=src_proto,
-                source_ref=src_ref,
-                route_map=entry.get("route-map") or None,
-                metric=entry.get("metric"),
-                metric_type=entry.get("metric-type") or None,
-                last_refreshed_at=now,
-                refresh_source=refresh_source,
-            )
+    entries, _invalid = project_redistribution_sources(redist_list, location)
+    return [
+        DeviceRedistribution(
+            device_id=device_id,
+            dest_protocol=dest_protocol,
+            dest_ref=dest_ref,
+            source_protocol=entry.source_protocol,
+            source_ref=entry.source_ref,
+            route_map=entry.route_map,
+            metric=entry.metric,
+            metric_type=entry.metric_type,
+            last_refreshed_at=now,
+            refresh_source=refresh_source,
         )
-    return rows
+        for entry in entries
+    ]
+
+
+def _component_rows(
+    device_id: int, protocol: str, data: dict, now: datetime, refresh_source: str
+) -> list[DeviceRedistribution]:
+    if protocol == "bgp":
+        validate_bgp_as_numbers(as_list(data.get("router")))
+    else:
+        key = "instance" if protocol == "ospf" else "process"
+        for index, destination in enumerate(as_list(data.get(key))):
+            if isinstance(destination, dict):
+                validate_source_as_numbers(
+                    as_list(destination.get("redistribute")), "device_read.redistribution", f"{key}[{index}]"
+                )
+    document, _coverage = project_redistribution({protocol: data})
+    return [
+        DeviceRedistribution(
+            device_id=device_id,
+            dest_protocol=entry.dest_protocol,
+            dest_ref=entry.dest_ref,
+            source_protocol=entry.source_protocol,
+            source_ref=entry.source_ref,
+            route_map=entry.route_map,
+            metric=entry.metric,
+            metric_type=entry.metric_type,
+            last_refreshed_at=now,
+            refresh_source=refresh_source,
+        )
+        for entry in document.entries
+    ]
 
 
 def _ospf_redistribution_rows(device_id: int, entry: dict, now: datetime, refresh_source: str) -> list:
-    rows: list[DeviceRedistribution] = []
-    for index, inst in enumerate(as_list(entry.get("instance"))):
-        rows.extend(
-            _build_rows(
-                device_id,
-                "ospf",
-                _ospf_dest_ref(inst),
-                inst.get("redistribute"),
-                now,
-                refresh_source,
-                f"instance[{index}]",
-            )
-        )
-    return rows
+    return _component_rows(device_id, "ospf", entry, now, refresh_source)
 
 
 def _isis_redistribution_rows(device_id: int, entry: dict, now: datetime, refresh_source: str) -> list:
-    rows: list[DeviceRedistribution] = []
-    for index, proc in enumerate(as_list(entry.get("process"))):
-        rows.extend(
-            _build_rows(
-                device_id,
-                "isis",
-                _isis_dest_ref(proc),
-                proc.get("redistribute"),
-                now,
-                refresh_source,
-                f"process[{index}]",
-            )
-        )
-    return rows
+    return _component_rows(device_id, "isis", entry, now, refresh_source)
 
 
 def _bgp_redistribution_rows(device_id: int, entry: dict, now: datetime, refresh_source: str) -> list:
-    rows: list[DeviceRedistribution] = []
-    validate_bgp_as_numbers(as_list(entry.get("router")))
-    for router_index, router in enumerate(as_list(entry.get("router"))):
-        asn = str(router.get("asn", ""))
-        for scope_index, scope in enumerate(as_list(router.get("scope"))):
-            scope_dest_ref = _bgp_dest_ref(asn, scope)
-            for af_index, af in enumerate(as_list(scope.get("address-family"))):
-                afi = str(af.get("afi", ""))
-                dest_ref = f"{scope_dest_ref}/{afi}" if afi else scope_dest_ref
-                rows.extend(
-                    _build_rows(
-                        device_id,
-                        "bgp",
-                        dest_ref,
-                        af.get("redistribute"),
-                        now,
-                        refresh_source,
-                        f"router[{router_index}].scope[{scope_index}].address-family[{af_index}]",
-                    )
-                )
-    return rows
+    return _component_rows(device_id, "bgp", entry, now, refresh_source)
 
 
 # Each source protocol: its envelope section (READSEM S3 B5) + the row builder that
@@ -429,6 +390,15 @@ async def _commit_partitions(
                 succeeded=terminal_succeeded,
                 row_count=len(rebuilt),
                 publish_payload=terminal_result == "replaced",
+                observation=observe_redistribution(
+                    {
+                        protocol: outcome.data if isinstance(outcome, Present) else {}
+                        for protocol, outcome in outcomes.items()
+                        if isinstance(outcome, (Present, AbsentAuthoritative))
+                    }
+                )
+                if terminal_result == "replaced"
+                else None,
             )
             if not selected:
                 await savepoint.rollback()

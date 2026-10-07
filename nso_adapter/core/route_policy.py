@@ -16,9 +16,10 @@ import structlog
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.community_dialect import community_dialect_for
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.domain.diagnostics import device_fields
+from nso_adapter.domain.read_projection import entry_payload
+from nso_adapter.domain.routing_observation import project_route_policy
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import (
@@ -41,44 +42,8 @@ def _content_hash(obj: object) -> str:
     return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
-def _required(entry: dict, *keys: str) -> bool:
-    """Report whether every required (NOT-NULL) leaf is present and non-null.
-
-    A malformed entry missing one of these would otherwise KeyError (direct subscript) or
-    land None in a NOT-NULL column — either way aborting and wiping the 4-family full-replace.
-    """
-    return all(entry.get(k) is not None for k in keys)
-
-
-def _dedup_by_name(items: list, family: str, device_id: int) -> list:
-    """Drop objects repeating a name within one refresh (keep the first, log the rest).
-
-    The store keys route-policy objects by ``(device_id, name)``; a reader that reports the
-    same name twice — e.g. SR OS lets an ``as-path`` and an ``as-path-group`` (or two
-    prefix-list reads) share a name — would otherwise abort the WHOLE full-replace refresh on
-    a unique-constraint violation, FREEZING the device's read-mirror. This makes the refresh
-    resilient to any such duplicate regardless of which reader produced it.
-    """
-    seen: set = set()
-    out: list = []
-    for item in items:
-        name = item.get("name")
-        if name in seen:
-            logger.warning(
-                "route_policy.refresh.duplicate_name_skipped",
-                **device_fields(device_id=device_id),
-                family=family,
-            )
-            continue
-        seen.add(name)
-        out.append(item)
-    return out
-
-
 async def _upsert_prefix_lists(db, device, items, now, refresh_source) -> None:
-    for pl_data in _dedup_by_name(items, "prefix-list", device.id):
-        if not pl_data.get("name"):
-            continue  # list without a name → nothing to key on
+    for pl_data in items:
         pl = DeviceRoutePolicyPrefixList(
             device_id=device.id,
             name=pl_data["name"],
@@ -90,8 +55,6 @@ async def _upsert_prefix_lists(db, device, items, now, refresh_source) -> None:
         db.add(pl)
         await db.flush()
         for e in as_list(pl_data.get("entry")):
-            if not _required(e, "sequence", "action", "prefix"):
-                continue
             db.add(
                 DeviceRoutePolicyPrefixListEntry(
                     prefix_list_id=pl.id,
@@ -104,10 +67,8 @@ async def _upsert_prefix_lists(db, device, items, now, refresh_source) -> None:
             )
 
 
-async def _upsert_community_lists(db, device, items, now, refresh_source, dialect) -> None:
-    for cl_data in _dedup_by_name(items, "community-list", device.id):
-        if not cl_data.get("name"):
-            continue
+async def _upsert_community_lists(db, device, items, now, refresh_source) -> None:
+    for cl_data in items:
         cl = DeviceRoutePolicyCommunityList(
             device_id=device.id,
             name=cl_data["name"],
@@ -119,23 +80,18 @@ async def _upsert_community_lists(db, device, items, now, refresh_source, dialec
         db.add(cl)
         await db.flush()
         for e in as_list(cl_data.get("entry")):
-            # null/absent community would also crash dialect.to_canonical (None.strip()).
-            if not _required(e, "sequence", "action", "community"):
-                continue
             db.add(
                 DeviceRoutePolicyCommunityListEntry(
                     community_list_id=cl.id,
                     sequence=e["sequence"],
                     action=e["action"],
-                    community=dialect.to_canonical(e["community"]),
+                    community=e["community"],
                 )
             )
 
 
 async def _upsert_as_paths(db, device, items, now, refresh_source) -> None:
-    for ap_data in _dedup_by_name(items, "as-path", device.id):
-        if not ap_data.get("name"):
-            continue
+    for ap_data in items:
         ap = DeviceRoutePolicyASPath(
             device_id=device.id,
             name=ap_data["name"],
@@ -146,8 +102,6 @@ async def _upsert_as_paths(db, device, items, now, refresh_source) -> None:
         db.add(ap)
         await db.flush()
         for e in as_list(ap_data.get("entry")):
-            if not _required(e, "sequence", "action", "pattern"):
-                continue
             db.add(
                 DeviceRoutePolicyASPathEntry(
                     as_path_id=ap.id,
@@ -159,9 +113,7 @@ async def _upsert_as_paths(db, device, items, now, refresh_source) -> None:
 
 
 async def _upsert_route_maps(db, device, items, now, refresh_source) -> None:
-    for rm_data in _dedup_by_name(items, "route-map", device.id):
-        if not rm_data.get("name"):
-            continue
+    for rm_data in items:
         rm = DeviceRoutePolicyRouteMap(
             device_id=device.id,
             name=rm_data["name"],
@@ -172,8 +124,6 @@ async def _upsert_route_maps(db, device, items, now, refresh_source) -> None:
         db.add(rm)
         await db.flush()
         for e in as_list(rm_data.get("entry")):
-            if not _required(e, "sequence", "action"):
-                continue
             db.add(
                 DeviceRoutePolicyRouteMapEntry(
                     route_map_id=rm.id,
@@ -197,7 +147,22 @@ async def _upsert_route_policy_data(
     """Full-replace: delete existing route-policy rows for *device*, then insert."""
     # Per-NED community members are normalised to the canonical (Cisco/Junos) form
     # on the way in, so the plugin and drift-detection compare like-for-like.
-    dialect = community_dialect_for(device.ned_id)
+    projection = project_route_policy(data, ned_id=device.ned_id)
+    data = {
+        "prefix-list": [entry_payload(entry) for entry in projection.prefix_lists or []],
+        "community-list": [entry_payload(entry) for entry in projection.community_lists or []],
+        "as-path": [entry_payload(entry) for entry in projection.as_paths or []],
+        "route-map": [entry_payload(entry) for entry in projection.route_maps or []],
+    }
+    for invalid in projection.unprojectable:
+        if "duplicate identity" in invalid.reason:
+            for collection in ("prefix-list", "community-list", "as-path", "route-map"):
+                if invalid.reason.startswith(f"{collection}["):
+                    logger.warning(
+                        "route_policy.refresh.duplicate_name_skipped",
+                        **device_fields(device_id=device.id),
+                        family=collection,
+                    )
     await db.execute(delete(DeviceRoutePolicyPrefixList).where(DeviceRoutePolicyPrefixList.device_id == device.id))
     await db.execute(
         delete(DeviceRoutePolicyCommunityList).where(DeviceRoutePolicyCommunityList.device_id == device.id)
@@ -210,7 +175,7 @@ async def _upsert_route_policy_data(
     # as_list guards the RESTCONF singleton-rendered-as-bare-dict case for each top-level list;
     # an empty ``data`` dict (the AbsentAuthoritative clear) yields four empty lists → clear.
     await _upsert_prefix_lists(db, device, as_list(data.get("prefix-list")), now, refresh_source)
-    await _upsert_community_lists(db, device, as_list(data.get("community-list")), now, refresh_source, dialect)
+    await _upsert_community_lists(db, device, as_list(data.get("community-list")), now, refresh_source)
     await _upsert_as_paths(db, device, as_list(data.get("as-path")), now, refresh_source)
     await _upsert_route_maps(db, device, as_list(data.get("route-map")), now, refresh_source)
 

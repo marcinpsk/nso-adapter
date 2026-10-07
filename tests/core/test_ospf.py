@@ -9,10 +9,13 @@ directly with oper-data dicts).
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 from sqlalchemy import select
 
 from nso_adapter.store.models import Device, DeviceOspfInstance, DeviceOspfInterface
 from tests.conftest import session
+from tests.fixtures.routing_read_payloads import OSPF_INSTANCES_READ, OSPF_INTERFACES_READ
 
 
 async def _seed_device(nso_device_name: str = "rtr", netbox_device_id: int = 500) -> int:
@@ -30,11 +33,8 @@ async def test_ospf_interface_in_two_processes_does_not_abort_refresh(adapter_cl
     from nso_adapter.core.ospf import _upsert_ospf_data
 
     device_id = await _seed_device(nso_device_name="ospf-2proc")
-    instances = [{"process-id": "1"}, {"process-id": "2"}]
-    interfaces = [
-        {"interface-name": "GigabitEthernet0/0", "process-id": "1", "area-id": "0"},
-        {"interface-name": "GigabitEthernet0/0", "process-id": "2", "area-id": "0"},
-    ]
+    instances = deepcopy(OSPF_INSTANCES_READ)
+    interfaces = deepcopy(OSPF_INTERFACES_READ)
     async with session() as db:
         device = await db.get(Device, device_id)
         await _upsert_ospf_data(db, device, instances, interfaces, "test")

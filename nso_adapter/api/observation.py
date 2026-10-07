@@ -8,6 +8,8 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from nso_adapter.domain.observation import InterfaceAttributesDocument, InterfaceIpDocument, ObservationCoverage
 from nso_adapter.domain.read_projection import VlanDocument
+from nso_adapter.domain.redistribution_observation import RedistributionCoverage, RedistributionDocument
+from nso_adapter.domain.routing_observation import BgpDocument, IsisDocument, OspfDocument, RoutePolicyDocument
 from nso_adapter.domain.service_observation import (
     BfdDocument,
     L2ServiceDocument,
@@ -100,6 +102,32 @@ class StaticRouteObservationOut(ReadObservationOut):
     document: StaticRouteDocument
 
 
+class BgpObservationOut(ReadObservationOut):
+    family: Literal["bgp"]
+    document: BgpDocument
+
+
+class IsisObservationOut(ReadObservationOut):
+    family: Literal["isis"]
+    document: IsisDocument
+
+
+class OspfObservationOut(ReadObservationOut):
+    family: Literal["ospf"]
+    document: OspfDocument
+
+
+class RoutePolicyObservationOut(ReadObservationOut):
+    family: Literal["route_policy"]
+    document: RoutePolicyDocument
+
+
 class VlanObservationOut(ReadObservationOut):
     family: Literal["vlan"]
     document: VlanDocument
+
+
+class RedistributionObservationOut(ReadObservationOut):
+    family: Literal["redistribution"]
+    document: RedistributionDocument
+    coverage: RedistributionCoverage

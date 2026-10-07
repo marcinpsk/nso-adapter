@@ -7,6 +7,8 @@ from copy import deepcopy
 import pytest
 
 from nso_adapter.core import importer
+from nso_adapter.core.bgp import BGP_SPEC
+from nso_adapter.core.redistribution import refresh_redistribution_from_outcomes
 from nso_adapter.core.refresh_engine import run_family_refresh_from_outcome
 from nso_adapter.core.vlan import VLAN_DATABASE_SPEC
 from nso_adapter.nso.read_outcome import Freshness, Present, Unavailable, UnavailableReason
@@ -14,7 +16,11 @@ from nso_adapter.store.models import Device
 from tests.conftest import AUTH, push_seq, seed_device, session
 from tests.core.test_read_observation import DeviceReadNso, assert_publication
 
+BGP_PAYLOAD = {
+    "router": [{"asn": "64512", "scope": [{"vrf": "", "peer": [{"peer-address": "198.18.0.2", "enabled": False}]}]}]
+}
 VLAN_PAYLOAD = {"vlan": [{"vlan-id": 10, "name": "device"}]}
+OSPF_PAYLOAD = {"instance": [{"process-id": "1", "redistribute": [{"source-protocol": "connected", "metric": 0}]}]}
 
 
 def _family_payload(family: str) -> dict:
@@ -33,10 +39,12 @@ class FamilyReadNso(DeviceReadNso):
         super().__init__([])
         self.sections = {
             "interface-attributes": self.section,
+            "bgp-config": {"status": "ok", **BGP_PAYLOAD},
+            "ospf-config": {"status": "ok", **OSPF_PAYLOAD},
             "isis-interface": {"status": "unsupported"},
             **{
                 _family_spec(family).wire_name: {"status": "ok", **_family_payload(family)}
-                for family, _path in FAMILY_ENDPOINTS
+                for family, _path in SEAM_ENDPOINTS
             },
         }
 
@@ -62,17 +70,39 @@ async def test_new_family_observations_are_stored_and_served(adapter_client, mon
     if seam == "refresh":
         async with session() as db:
             device = await db.get(Device, device_id)
-            for family, _path in FAMILY_ENDPOINTS:
+            for family, _path in SEAM_ENDPOINTS:
                 await run_family_refresh_from_outcome(
                     db, device, _family_spec(family), Present(_family_payload(family), Freshness.fresh)
                 )
+            await run_family_refresh_from_outcome(db, device, BGP_SPEC, Present(BGP_PAYLOAD, Freshness.fresh))
+            await refresh_redistribution_from_outcomes(
+                db,
+                device,
+                {
+                    "ospf": Present(OSPF_PAYLOAD, Freshness.fresh),
+                    "bgp": Present(BGP_PAYLOAD, Freshness.fresh),
+                    "isis": Unavailable(UnavailableReason.unsupported),
+                },
+            )
     else:
         async with session() as db:
             await importer.sync_device(device_id, db, comprehensive=True)
-    for family, path in FAMILY_ENDPOINTS:
+    for family, path in SEAM_ENDPOINTS:
         response = await adapter_client.get(f"/api/v1/devices/{device_id}/{path}", headers=AUTH)
         assert response.status_code == 200, (family, response.text)
         assert_publication(response.json(), family)
+    for family, path in [("bgp", "bgp-config"), ("redistribution", "redistribution")]:
+        response = await adapter_client.get(f"/api/v1/devices/{device_id}/{path}", headers=AUTH)
+        assert response.status_code == 200, response.text
+        observation = assert_publication(response.json(), family)
+        assert observation["document"]["unprojectable"] == []
+        if family == "redistribution":
+            components = observation["coverage"]["components"]
+            assert {component["protocol"] for component in components} == {"bgp", "ospf"}
+            ospf = next(component for component in components if component["protocol"] == "ospf")
+            assert ospf["destinations"] == ["1"]
+            assert ospf["sources"] == [{"protocol": "connected", "reference": ""}]
+            assert observation["document"]["entries"][0]["metric"] == 0
 
 
 async def test_vlan_intent_cannot_change_the_device_observation(adapter_client):
@@ -104,7 +134,14 @@ FAMILY_ENDPOINTS = [
     ("logging", "logging-config"),
     ("snmp", "snmp-config"),
     ("static_route", "static-routes"),
+    ("bgp", "bgp-config"),
+    ("isis", "isis-interfaces"),
+    ("ospf", "ospf"),
+    ("route_policy", "route-policy"),
 ]
+
+# Routing families have explicit payloads in the seam test; the rest use the shared read fixtures.
+SEAM_ENDPOINTS = [(f, p) for f, p in FAMILY_ENDPOINTS if f not in {"bgp", "isis", "ospf", "route_policy"}]
 
 
 @pytest.mark.parametrize("family,path", FAMILY_ENDPOINTS)
@@ -133,13 +170,82 @@ async def test_family_api_distinguishes_no_read_empty_and_failed_read(adapter_cl
     assert failed.json()["read_state"]["payload_revision"] == old["revision"]
 
 
-@pytest.mark.parametrize("family,path", FAMILY_ENDPOINTS)
+async def test_partial_redistribution_never_claims_retained_component_as_observed(adapter_client):
+    device_id = await seed_device(nso_device_name="observation-device")
+    initial = {
+        "ospf": Present(OSPF_PAYLOAD, Freshness.fresh),
+        "isis": Present({}, Freshness.fresh),
+        "bgp": Present({}, Freshness.fresh),
+    }
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        await refresh_redistribution_from_outcomes(db, device, initial)
+    endpoint = f"/api/v1/devices/{device_id}/redistribution"
+    old = (await adapter_client.get(endpoint, headers=AUTH)).json()["observation"]
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        await refresh_redistribution_from_outcomes(
+            db,
+            device,
+            {
+                "ospf": Unavailable(UnavailableReason.read_error),
+                "isis": Present({}, Freshness.fresh),
+                "bgp": Present({}, Freshness.fresh),
+            },
+        )
+    response = await adapter_client.get(endpoint, headers=AUTH)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    observation = assert_publication(body, "redistribution")
+    assert len(body["entries"]) == 1
+    assert observation["document"]["entries"] == []
+    assert {component["protocol"] for component in observation["coverage"]["components"]} == {"bgp", "isis"}
+    assert observation["revision"] > old["revision"]
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        await refresh_redistribution_from_outcomes(
+            db, device, {protocol: Unavailable(UnavailableReason.read_error) for protocol in ["bgp", "isis", "ospf"]}
+        )
+    assert (await adapter_client.get(endpoint, headers=AUTH)).json()["observation"] == observation
+
+
+@pytest.mark.parametrize(
+    "protocol,key,identity,value", [("ospf", "instance", "process-id", "1"), ("isis", "process", "process-tag", "CORE")]
+)
+async def test_redistribution_rejects_malformed_asn_on_duplicate_destination(
+    adapter_client, protocol, key, identity, value
+):
+    from nso_adapter.domain.asn import AsnRuleViolation
+
+    device_id = await seed_device(nso_device_name="observation-device")
+    destination = {identity: value, "redistribute": [{"source-protocol": "connected"}]}
+    initial = {name: Present({}, Freshness.fresh) for name in ["ospf", "isis", "bgp"]}
+    initial[protocol] = Present({key: [destination]}, Freshness.fresh)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        await refresh_redistribution_from_outcomes(db, device, initial)
+    endpoint = f"/api/v1/devices/{device_id}/redistribution"
+    old = (await adapter_client.get(endpoint, headers=AUTH)).json()["observation"]
+    invalid = {identity: value, "redistribute": [{"source-protocol": "bgp", "source-ref": "064512"}]}
+    initial[protocol] = Present({key: [destination, invalid]}, Freshness.fresh)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        with pytest.raises(AsnRuleViolation):
+            await refresh_redistribution_from_outcomes(db, device, initial)
+    body = (await adapter_client.get(endpoint, headers=AUTH)).json()
+    assert body["observation"] == old
+    assert body["read_state"]["payload_revision"] == old["revision"]
+    assert body["read_state"]["attempt_id"] > old["revision"]
+    assert body["entries"][0]["source_protocol"] == "connected"
+
+
+@pytest.mark.parametrize("family,path", FAMILY_ENDPOINTS + [("redistribution", "redistribution")])
 async def test_observation_json_never_contains_credentials(adapter_client, family, path):
     import json
     from copy import deepcopy
 
     from nso_adapter.secrets.refs import secret_fingerprint
-    from tests._secret_discipline import assert_text_free_of
+    from tests._secret_discipline import assert_text_contains, assert_text_free_of
     from tests.core.test_read_observation import stored_observations
     from tests.core.test_service_observers import READ_PAYLOADS
     from tests.fixtures.switching_read_payloads import SWITCHING_READ_PAYLOADS
@@ -147,7 +253,54 @@ async def test_observation_json_never_contains_credentials(adapter_client, famil
     placeholder = "placeholder-observation-secret"
     payload = deepcopy({**READ_PAYLOADS, **SWITCHING_READ_PAYLOADS}.get(family, {}))
     payload["unsupported-credential"] = placeholder
-    if family == "snmp":
+    if family == "bgp":
+        payload = {
+            "router": [
+                {
+                    "asn": "64512",
+                    "scope": [{"vrf": "", "peer": [{"peer-address": "198.18.0.2", "password": placeholder}]}],
+                }
+            ]
+        }
+    elif family == "isis":
+        payload = {
+            "process": [
+                {
+                    "process-tag": "CORE",
+                    "area-auth-key": placeholder,
+                    "domain-auth-key": placeholder,
+                    "area-auth-present": True,
+                }
+            ]
+        }
+    elif family in ("ospf", "route_policy"):
+        from tests.fixtures.routing_read_payloads import OSPF_INSTANCES_READ, ROUTE_POLICY_COMMUNITIES_READ
+
+        payload = deepcopy({"instance": OSPF_INSTANCES_READ} if family == "ospf" else ROUTE_POLICY_COMMUNITIES_READ)
+        next(iter(payload.values()))[0]["credential"] = placeholder
+    elif family == "redistribution":
+        payload = {
+            "bgp": {
+                "router": [
+                    {
+                        "asn": "64512",
+                        "scope": [
+                            {
+                                "vrf": "",
+                                "peer": [
+                                    {"peer-address": "198.18.0.2", "password": placeholder},
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            },
+            "isis": {
+                "process": [{"process-tag": "CORE", "area-auth-key": placeholder, "domain-auth-key": placeholder}]
+            },
+            "ospf": OSPF_PAYLOAD,
+        }
+    elif family == "snmp":
         payload = {
             "community": [{"name": secret_fingerprint(placeholder), "has-secret": True}],
             "v3-user": [{"username": "monitor", "has-auth-secret": True, "auth-key": placeholder}],
@@ -155,16 +308,63 @@ async def test_observation_json_never_contains_credentials(adapter_client, famil
     device_id = await seed_device(nso_device_name="observation-device")
     async with session() as db:
         device = await db.get(Device, device_id)
-        spec = importer.projectable_spec("lag_topology" if family == "lag" else family)
-        await run_family_refresh_from_outcome(db, device, spec, Present(payload, Freshness.fresh))
+        if family == "redistribution":
+            await refresh_redistribution_from_outcomes(
+                db, device, {protocol: Present(component, Freshness.fresh) for protocol, component in payload.items()}
+            )
+        else:
+            spec = importer.projectable_spec("lag_topology" if family == "lag" else family)
+            await run_family_refresh_from_outcome(db, device, spec, Present(payload, Freshness.fresh))
     response = await adapter_client.get(f"/api/v1/devices/{device_id}/{path}", headers=AUTH)
     assert_text_free_of(json.dumps(response.json()["observation"]), [placeholder])
     assert response.status_code == 200
-    assert_publication(response.json(), family)
+    observation = assert_publication(response.json(), family)
     rows = await stored_observations(device_id)
     for row in rows:
         assert_text_free_of(json.dumps(row.document), [placeholder])
     assert rows
+    if family == "bgp":
+        peer = observation["document"]["routers"][0]["scope"][0]["peer"][0]
+        assert peer["password_present"] is True
+        assert peer["password_fingerprint"] == secret_fingerprint(placeholder)
+        assert_text_contains(response.json()["routers"][0]["scopes"][0]["peers"][0]["password"], [placeholder])
+    elif family == "isis":
+        process = observation["document"]["processes"][0]
+        assert process["area_auth_key_present"] is True
+        assert process["area_auth_key_fingerprint"] == secret_fingerprint(placeholder)
+        assert process["domain_auth_key_fingerprint"] == secret_fingerprint(placeholder)
+
+
+async def test_ospf_redistribution_keeps_same_process_in_two_vrfs(adapter_client):
+    payload = {
+        "instance": [
+            {"process-id": "1", "vrf": "BLUE", "redistribute": [{"source-protocol": "connected"}]},
+            {"process-id": "1", "vrf": "RED", "redistribute": [{"source-protocol": "static"}]},
+        ]
+    }
+    device_id = await seed_device(nso_device_name="observation-device")
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        await refresh_redistribution_from_outcomes(
+            db,
+            device,
+            {
+                "ospf": Present(payload, Freshness.fresh),
+                "bgp": Present({}, Freshness.fresh),
+                "isis": Present({}, Freshness.fresh),
+            },
+        )
+    response = await adapter_client.get(f"/api/v1/devices/{device_id}/redistribution", headers=AUTH)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert sorted((entry["dest_ref"], entry["source_protocol"]) for entry in body["entries"]) == [
+        ("1", "connected"),
+        ("1", "static"),
+    ]
+    observation = assert_publication(body, "redistribution")
+    component = next(item for item in observation["document"]["components"] if item["protocol"] == "ospf")
+    assert [(entry["process_id"], entry["vrf"]) for entry in component["inventory"]] == [("1", "BLUE"), ("1", "RED")]
+    assert observation["document"]["unprojectable"] == []
 
 
 DROPPED_ENTRY_COLLECTIONS = {

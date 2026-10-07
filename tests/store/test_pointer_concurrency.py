@@ -129,14 +129,16 @@ async def test_lost_update_window_cannot_regress_pointer(pointer_engine, lock_pr
 
     async with factory() as db:
         a_base = await outcome_store.record_read_outcome(
-            db, device_id, "bgp", Present({"routers": []}, Freshness.fresh), refresh_source="poll"
+            db, device_id, "bgp", Present({"router": []}, Freshness.fresh), refresh_source="poll"
         )
-        await outcome_store.record_result(db, a_base, result="replaced", succeeded=True)
+        await outcome_store.record_result(
+            db, a_base, result="replaced", succeeded=True, observation=observe_family("bgp", {"router": []})
+        )
         a_victim = await outcome_store.record_read_outcome(
-            db, device_id, "bgp", Present({"routers": []}, Freshness.fresh), refresh_source="poll"
+            db, device_id, "bgp", Present({"router": []}, Freshness.fresh), refresh_source="poll"
         )
         a_holder = await outcome_store.record_read_outcome(
-            db, device_id, "bgp", Present({"routers": []}, Freshness.fresh), refresh_source="poll"
+            db, device_id, "bgp", Present({"router": []}, Freshness.fresh), refresh_source="poll"
         )
         await db.commit()
 

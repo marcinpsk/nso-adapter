@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409, RESP_422_VALIDATION, api_error
+from nso_adapter.api.observation import RedistributionObservationOut
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import iso_z, latest_refreshed
 from nso_adapter.domain.asn import redistribution_source_identity, validate_asn_rows
@@ -61,6 +62,7 @@ class RedistributionConfigOut(BaseModel):
     refresh_source: str  # legacy freshness (S5 retires it); read_state is the S4 truth
     read_state: FamilyReadState
     entries: list[RedistributionOut]
+    observation: RedistributionObservationOut | None
 
 
 @router.get(
@@ -82,9 +84,10 @@ async def get_redistribution(device_id: int, db: AsyncSession = Depends(get_read
         raise api_error(404, "not_found", "Device not found")
 
     # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
-    read_state = read_state_payload(
-        await outcome_store.get_current_outcome(db, device_id, "redistribution"), source_epoch=device.source_epoch
+    outcome, observation = await outcome_store.get_current_publication(
+        db, device_id, "redistribution", source_epoch=device.source_epoch
     )
+    read_state = read_state_payload(outcome, source_epoch=device.source_epoch)
 
     result = await db.execute(
         select(DeviceRedistribution)
@@ -107,6 +110,7 @@ async def get_redistribution(device_id: int, db: AsyncSession = Depends(get_read
             "last_refreshed_at": None,
             "refresh_source": "never",
             "read_state": read_state,
+            "observation": observation,
             "entries": [],
         }
 
@@ -133,5 +137,6 @@ async def get_redistribution(device_id: int, db: AsyncSession = Depends(get_read
         "last_refreshed_at": iso_z(latest.last_refreshed_at),
         "refresh_source": latest.refresh_source,
         "read_state": read_state,
+        "observation": observation,
         "entries": entries,
     }

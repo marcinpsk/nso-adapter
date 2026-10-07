@@ -32,6 +32,11 @@ def redistribution_source_identity(protocol: str, reference: str) -> str:
     return str(parse_asn(reference)) if protocol == "bgp" and reference != "" else reference
 
 
+def redistribution_source_protocol(value: object) -> object:
+    """Remove the whitespace accepted by the device redistribution reader."""
+    return value.strip() if isinstance(value, str) else value
+
+
 def checked_device_source_ref(value: object, table: str, row_id: object, field: str) -> str:
     """Return a device-read BGP source as asplain; Junos and TiMOS report a source without an AS as ""."""
     return "" if value == "" else str(checked_asn(value, table, row_id, field))
@@ -143,7 +148,7 @@ def validate_source_as_numbers(entries: list[dict], table: str, row_id: object) 
     seen: dict[int, object] = {}
     for entry in entries:
         value = entry.get("source-ref", "")
-        if entry.get("source-protocol") != "bgp" or value == "":
+        if redistribution_source_protocol(entry.get("source-protocol")) != "bgp" or value == "":
             continue
         identity = checked_asn(value, table, row_id, "source-ref")
         if identity in seen and seen[identity] != value:

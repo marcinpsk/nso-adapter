@@ -16,6 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.domain.asn import AsnRuleViolation, checked_asn, validate_source_as_numbers
+from nso_adapter.domain.read_projection import entry_payload
+from nso_adapter.domain.routing_observation import project_bgp
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import (
@@ -61,8 +63,8 @@ def _paf_policy(paf_data: dict) -> dict:
     """
     return {
         "enabled": bool(paf_data.get("enabled", True)),
-        "routemap_in": paf_data.get("routemap-in") or paf_data.get("policy-in") or None,
-        "routemap_out": paf_data.get("routemap-out") or paf_data.get("policy-out") or None,
+        "routemap_in": paf_data.get("routemap-in") or None,
+        "routemap_out": paf_data.get("routemap-out") or None,
         "prefixlist_in": paf_data.get("prefixlist-in") or None,
         "prefixlist_out": paf_data.get("prefixlist-out") or None,
     }
@@ -178,8 +180,8 @@ def _add_peer_group_address_families(db: AsyncSession, pg: DeviceBgpPeerGroup, p
             DeviceBgpPeerGroupAddressFamily(
                 peer_group_id=pg.id,
                 af=pgaf_name,
-                routemap_in=pgaf_data.get("routemap-in") or pgaf_data.get("policy-in") or None,
-                routemap_out=pgaf_data.get("routemap-out") or pgaf_data.get("policy-out") or None,
+                routemap_in=pgaf_data.get("routemap-in") or None,
+                routemap_out=pgaf_data.get("routemap-out") or None,
                 prefixlist_in=pgaf_data.get("prefixlist-in") or None,
                 prefixlist_out=pgaf_data.get("prefixlist-out") or None,
             )
@@ -232,6 +234,8 @@ async def _upsert_bgp_data(
 ) -> None:
     """Full-replace: delete existing BGP rows for *device*, then insert fresh ones."""
     validate_bgp_as_numbers(routers)
+    projection = project_bgp({"router": routers})
+    routers = [entry_payload(entry) for entry in projection.routers or []]
     await db.execute(delete(DeviceBgpRouter).where(DeviceBgpRouter.device_id == device.id))
 
     now = datetime.now(UTC)

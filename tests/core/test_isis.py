@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from unittest.mock import AsyncMock
 
 import pytest
@@ -13,6 +14,7 @@ from sqlalchemy import select
 from nso_adapter.core.isis import refresh_isis_interfaces_for_device
 from nso_adapter.store.models import Device, DeviceIsisInterface, DeviceIsisProcess
 from tests.conftest import seed_device, session
+from tests.fixtures.routing_read_payloads import ISIS_LEVEL_READ
 
 
 @asynccontextmanager
@@ -31,11 +33,7 @@ async def test_refresh_normalizes_level_2_alias(adapter_client):
     device_id = await seed_device(nso_device_name="isis-lvl2", netbox_device_id=968)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_device_state_section.return_value = {
-            "status": "ok",
-            "process": [{"process-tag": "0", "is-type": "level-2"}],
-            "interface": [{"interface-name": "Gi0/1", "af": "ipv4", "circuit-type": "level-2"}],
-        }
+        nso_client.get_device_state_section.return_value = deepcopy(ISIS_LEVEL_READ)
 
         await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
 

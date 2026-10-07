@@ -2863,7 +2863,7 @@ Applied via the `logging-reconciler` NSO service.
 
 ### Immutable device observations
 
-The family GETs listed below include `observation`. It is `null` until a successful
+Every family GET includes `observation`. It is `null` until a successful
 read publishes that family. An authoritative empty read publishes an empty
 document. Failed and superseded reads keep the previous observation.
 
@@ -2898,21 +2898,59 @@ publishing a partial replacement.
 | `interface_mtu` | `interface-mtu` | `interfaces` |
 | `svi` | `svi` | `interfaces` |
 | `subinterface` | `subinterface` | `interfaces` |
+| `bgp` | `bgp-config` | `routers`, nested `scope`, peers and address families |
 | `static_route` | `static-routes` | `routes` |
+| `isis` | `isis-interfaces` | `processes`, `interfaces`, nested `flex_algo` |
+| `ospf` | `ospf` | `instances`, `interfaces` |
+| `redistribution` | `redistribution` | `entries`, typed protocol `components` |
 | `bfd` | `bfd` | `interfaces` |
 | `l2_service` | `l2-services` | `services`, nested `saps` |
 | `logging` | `logging-config` | `hosts`, `local_levels` |
 | `snmp` | `snmp-config` | `communities`, `users`, `hosts`, `system` |
+| `route_policy` | `route-policy` | `prefix_lists`, `community_lists`, `as_paths`, `route_maps` |
 
-LACP uses `lag_config` for configuration and `lag` for topology.
-MTU, SVI, and subinterfaces have their own
+LACP uses `lag_config` for configuration and `lag` for topology. ISIS flex
+algorithms use the `isis` document. MTU, SVI, and subinterfaces have their own
 read families. L2 SAPs use `l2_service`. Each family uses the same projection
-for its read mirror and observation.
+for its read mirror and observation. Route-policy community normalization uses
+the device's learned NED dialect in both paths.
 
+Redistribution coverage also contains `components`. Each covered protocol
+names the destination references and source identities read in that component.
+A component with empty lists was authoritatively read. An omitted component
+was not covered by this publication. Its retained mirror rows are not device
+values in the new observation. An unprojectable destination or source stays
+visible in the document diagnostics.
 
-There are no observation size limits. Static routes, interface IPs, and L2
-service inventories can be large.
+Redistribution document components retain the destination inventory and its
+nested source lists. Their `present` fields preserve missing, null, and empty
+inventories and source lists. The flat `entries` collection uses these same
+projected values.
+
+Redistribution keeps the reader's equivalence rules: trim protocol names and
+non-BGP source references, and normalize BGP source references to asplain.
+A BGP destination without an AFI uses its AS and VRF reference. Presence still
+distinguishes a missing AFI from an explicit empty AFI.
+
+There are no observation size limits. BGP, route policy, static routes, ISIS,
+redistribution, interface IPs, and L2 service inventories can be large.
+
+Observations never store BGP passwords or IS-IS authentication keys. They store
+nullable presence flags and fingerprints derived from comparable exported key
+material. The `present` list distinguishes missing keys from explicit null keys.
+An empty key has false presence and the fingerprint of the empty string.
+Raw credential fields remain available only to the existing read mirror.
 
 Coverage can include `not_comparable`. These attributes cannot establish key
-equality. SNMP v3 authentication and privacy exports contain presence flags
-only. Unsupported nested keys produce indexed diagnostics without their values.
+equality. Encrypted keys omitted by the exporter and presence-only authentication
+exports cannot establish plaintext equality. Supplied observation metadata is
+not trusted as device key material.
+
+Unsupported nested keys produce indexed `unprojectable` diagnostics before
+projection filters them. Diagnostics name the fields and omit their values.
+The shared projection declares fields owned by another family in one exclusion
+registry.
+
+OSPF redistribution inventories use process ID and VRF as their identity. Flat
+observation entries also carry `dest_vrf`. Mirror destination references keep
+the process ID format.
