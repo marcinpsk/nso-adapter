@@ -158,6 +158,15 @@ def _attr_str(attr: str, value: object) -> str | None:
     return str(value) if value is not None else None
 
 
+def _attribute_sync_state(attr: str, nso_value, netbox_value, intent_by_attr: dict[str, object]) -> SyncState:
+    """Compare owned descriptions by value without losing empty intent ownership."""
+    if attr == "description" and attr in intent_by_attr:
+        if _attr_str(attr, nso_value) == _attr_str(attr, intent_by_attr[attr]):
+            return SyncState.in_sync
+        return SyncState.drifted
+    return compute_sync_state(nso_value, netbox_value, intent_by_attr.get(attr))
+
+
 def register_nso_client(instance_name: str, client: NsoClient) -> None:
     _nso_clients[instance_name] = client
 
@@ -806,9 +815,8 @@ def _reconcile_attr(db, db_iface, attr, iface, intent_by_attr, existing_attrs, c
         attr_state = InterfaceAttrState(interface_id=db_iface.id, attribute=attr)
         db.add(attr_state)
 
-    intent_val = intent_by_attr.get(attr)
     prev_netbox_val = attr_state.netbox_value
-    status = compute_sync_state(nso_str, prev_netbox_val, intent_val)
+    status = _attribute_sync_state(attr, nso_str, prev_netbox_val, intent_by_attr)
     changed = status == SyncState.changed
 
     # Queue a NetBox write only when the value differs from what we last successfully
@@ -831,7 +839,7 @@ def _reconcile_attr(db, db_iface, attr, iface, intent_by_attr, existing_attrs, c
                 ctx.pending_by_id.setdefault(nb_id, []).append((attr_state, nso_str))
 
     attr_state.nso_value = nso_str
-    if intent_val is not None:
+    if status in (SyncState.in_sync, SyncState.drifted):
         # Phase 2: intent deployed — use in_sync/drifted; never downgrade to "imported".
         attr_state.sync_state = status
     else:
@@ -1424,7 +1432,7 @@ async def _detect_drift_attributes(
             else:
                 netbox_str = attr_state.netbox_value
 
-            status = compute_sync_state(nso_str, netbox_str, intent_by_attr.get(attr))
+            status = _attribute_sync_state(attr, nso_str, netbox_str, intent_by_attr)
             if status in (SyncState.changed, SyncState.drifted):
                 changes_detected += 1
             attr_state.nso_value = nso_str
