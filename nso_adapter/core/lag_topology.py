@@ -63,12 +63,9 @@ async def _upsert_lags(
     now = datetime.now(UTC)
     projection = project_lag_topology({"lag": lags_data})
     for invalid in projection.unprojectable:
-        raw = lags_data[invalid.index] if ".member[" not in invalid.reason else None
-        logger.warning(
-            "lag_topology.entry_skipped",
-            **device_fields(device_id=device.id),
-            reason="no lag-id" if isinstance(raw, dict) and "lag-id" not in raw else "invalid lag-id",
-        )
+        if not invalid.blocks_materialization:
+            continue
+        logger.warning("lag_topology.entry_skipped", **device_fields(device_id=device.id), reason=invalid.reason)
     for lag in projection.bundles or []:
         li = LagInterface(
             device_id=device.id,
