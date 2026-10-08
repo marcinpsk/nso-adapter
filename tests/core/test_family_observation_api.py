@@ -168,6 +168,7 @@ async def test_observation_json_never_contains_credentials(adapter_client, famil
 
 
 DROPPED_ENTRY_COLLECTIONS = {
+    "lag": "lag",
     "bfd": "interface",
     "l2_service": "service",
     "logging": "host",
@@ -178,19 +179,40 @@ DROPPED_ENTRY_COLLECTIONS = {
 }
 
 
+def _mirror_rows(body: object) -> object:
+    if isinstance(body, dict):
+        return {
+            key: _mirror_rows(value)
+            for key, value in body.items()
+            if key not in {"read_state", "observation", "id"} and not key.endswith("_at")
+        }
+    if isinstance(body, list):
+        return [_mirror_rows(item) for item in body]
+    return body
+
+
 @pytest.mark.parametrize(("family", "collection"), DROPPED_ENTRY_COLLECTIONS.items())
 async def test_refresh_logs_each_entry_the_projection_drops(adapter_client, family, collection):
     from structlog.testing import capture_logs
 
     device_id = await seed_device(nso_device_name="observation-device")
-    payload = _family_payload(family)
-    payload[collection] = [*payload[collection], "not-an-object"]
+    path = dict(FAMILY_ENDPOINTS)[family]
     spec = _family_spec(family)
+    payload = _family_payload(family)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        await run_family_refresh_from_outcome(db, device, spec, Present(deepcopy(payload), Freshness.fresh))
+    clean = await adapter_client.get(f"/api/v1/devices/{device_id}/{path}", headers=AUTH)
+    payload[collection] = [*payload[collection], "not-an-object"]
     async with session() as db:
         device = await db.get(Device, device_id)
         with capture_logs() as logs:
             await run_family_refresh_from_outcome(db, device, spec, Present(payload, Freshness.fresh))
-    skipped = [record for record in logs if record["event"] == f"{spec.name}.entry_skipped"]
+    dirty = await adapter_client.get(f"/api/v1/devices/{device_id}/{path}", headers=AUTH)
+    event = "lag_topology.entry_skipped" if family == "lag" else f"{spec.name}.entry_skipped"
+    skipped = [record for record in logs if record["event"] == event]
     assert [(record["device_id"], record["reason"].endswith("expected object")) for record in skipped] == [
         (device_id, True)
     ], logs
+    assert (clean.status_code, dirty.status_code) == (200, 200)
+    assert _mirror_rows(dirty.json()) == _mirror_rows(clean.json())
