@@ -69,6 +69,13 @@ repos:
         entry: uv run --locked --system-certs -- reuse lint
         language: system
         pass_filenames: false
+      # Every third-party module the code imports is a declared dependency (not only a transitive one).
+      - id: deptry
+        name: deptry (direct imports are declared dependencies)
+        entry: uv run --locked --system-certs -- deptry .
+        language: system
+        pass_filenames: false
+        files: ^(nso_adapter/.*\.py|scripts/.*|pyproject\.toml|uv\.lock)$
       - id: review-patterns
         name: custom review patterns (OpenGrep)
         entry: scripts/check-review-patterns scan
