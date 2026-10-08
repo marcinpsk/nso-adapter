@@ -549,3 +549,31 @@ async def test_a_BOOLEAN_untagged_vlan_is_refused_and_never_bound_to_vlan_1(adap
     assert rows == [], "the refused switchport must leave no row behind"
     if not [record for record in logs if record["event"] == "sync.surface_refresh_failed"]:
         raise AssertionError("the failed surface was not reported at all")
+
+
+@pytest.mark.anyio
+async def test_a_duplicate_vlan_id_is_reported_as_a_duplicate(adapter_client):
+    device_id = await seed_device(nso_device_name="vsw-duplicate-vlan", netbox_device_id=1321)
+    async with _device_session(device_id) as (db, device):
+        nso = AsyncMock()
+        sections = _serve_sections(nso)
+        sections["vlan-database"] = {
+            "status": "ok",
+            "vlan": [{"vlan-id": 10, "name": "A"}, {"vlan-id": 10, "name": "B"}],
+        }
+        with pytest.raises(ValueError, match="^a vlan-database item has a duplicate vlan-id$"):
+            await refresh_vlan_database_for_device(db, device, nso)
+
+
+@pytest.mark.anyio
+async def test_a_duplicate_switchport_identity_is_reported_as_a_duplicate(adapter_client):
+    device_id = await seed_device(nso_device_name="vsw-duplicate-switchport", netbox_device_id=1322)
+    interface = {"interface-name": "Gi0/1", "mode": "access", "untagged-vlan": 10}
+    async with _device_session(device_id) as (db, device):
+        nso = AsyncMock()
+        sections = _serve_sections(nso)
+        sections["vlan-database"] = {"status": "ok", "vlan": [{"vlan-id": 10, "name": "MGMT"}]}
+        await refresh_vlan_database_for_device(db, device, nso)
+        sections["switchport"] = {"status": "ok", "interface": [interface, dict(interface)]}
+        with pytest.raises(ValueError, match="^switchport item has a duplicate interface-name$"):
+            await refresh_switchport_for_device(db, device, nso)

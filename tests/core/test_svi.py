@@ -115,3 +115,14 @@ async def test_refresh_authoritative_empty_clears(adapter_client):
         nso_client.get_device_state_section.return_value = {"status": "ok"}
         await refresh_svi_for_device(db, device, nso_client, refresh_source="test")
         assert await _svis(db, device_id) == {}
+
+
+@pytest.mark.anyio
+async def test_a_duplicate_svi_is_reported_as_a_duplicate(adapter_client):
+    device_id = await seed_device(nso_device_name="svi-duplicate", netbox_device_id=989)
+    row = {"interface-name": "Vlan10", "vlan-id": 10, "type": "svi"}
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_device_state_section.return_value = {"status": "ok", "interface": [row, dict(row)]}
+        with pytest.raises(ValueError, match="^svi item has a duplicate interface-name$"):
+            await refresh_svi_for_device(db, device, nso_client, refresh_source="test")

@@ -31,6 +31,8 @@ async def _upsert_svi(db: AsyncSession, device: Device, interfaces: list[dict], 
     projection = project_svis({"interface": interfaces})
     invalid = [item for item in projection.unprojectable if item.blocks_materialization]
     if invalid:
+        if invalid[0].reason.endswith("duplicate identity"):
+            raise ValueError("svi item has a duplicate interface-name")
         raise ValueError("svi item has invalid vlan-id or interface-name")
     for item in projection.interfaces or []:
         db.add(

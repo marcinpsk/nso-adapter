@@ -58,6 +58,8 @@ async def _upsert_vlans(
     if invalid:
         if "conflicting collection aliases" in invalid[0].reason:
             raise ValueError("vlan-database has conflicting collection aliases")
+        if invalid[0].reason.endswith("duplicate identity"):
+            raise ValueError("a vlan-database item has a duplicate vlan-id")
         vlans = as_list(data["vlan"] if "vlan" in data else data.get("vlans"))
         raw = vlans[invalid[0].index]
         raw_vlan_id = raw.get("vlan-id", raw.get("vlan_id")) if isinstance(raw, dict) else None
@@ -137,6 +139,8 @@ async def _upsert_switchports(
     if invalid:
         if "conflicting collection aliases" in invalid[0].reason:
             raise ValueError("switchport has conflicting collection aliases")
+        if invalid[0].reason.endswith("duplicate identity"):
+            raise ValueError("switchport item has a duplicate interface-name")
         interfaces = as_list(data["interface"] if "interface" in data else data.get("interfaces"))
         raw = interfaces[invalid[0].index]
         if isinstance(raw, dict):
@@ -148,7 +152,7 @@ async def _upsert_switchports(
                     f"a switchport item for device {device.id} carries an invalid untagged-vlan "
                     f"(type {type(untagged).__name__})"
                 )
-        raise ValueError("switchport item has an invalid interface-name, mode, or duplicate identity")
+        raise ValueError("switchport item has an invalid interface-name or mode")
     for item in projection.interfaces or []:
         name = item.interface_name
         seen.add(name)

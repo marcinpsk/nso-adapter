@@ -31,6 +31,8 @@ async def _upsert_subinterface(db: AsyncSession, device: Device, interfaces: lis
     projection = project_subinterfaces({"interface": interfaces})
     invalid = [item for item in projection.unprojectable if item.blocks_materialization]
     if invalid:
+        if invalid[0].reason.endswith("duplicate identity"):
+            raise ValueError("subinterface item has a duplicate interface-name")
         raw = interfaces[invalid[0].index]
         if isinstance(raw, dict) and isinstance(raw.get("dot1q-vlan"), bool):
             raise TypeError("subinterface item has a boolean dot1q-vlan")

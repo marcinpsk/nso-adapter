@@ -159,3 +159,14 @@ async def test_a_BOOLEAN_dot1q_vlan_is_refused(adapter_client):
         }
         with pytest.raises(TypeError):
             await refresh_subinterface_for_device(db, device, nso_client, refresh_source="test")
+
+
+@pytest.mark.anyio
+async def test_a_duplicate_subinterface_is_reported_as_a_duplicate(adapter_client):
+    device_id = await seed_device(nso_device_name="subif-duplicate", netbox_device_id=979)
+    row = {"interface-name": "xe-0/0/1.200", "dot1q-vlan": 200}
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_device_state_section.return_value = {"status": "ok", "interface": [row, dict(row)]}
+        with pytest.raises(ValueError, match="^subinterface item has a duplicate interface-name$"):
+            await refresh_subinterface_for_device(db, device, nso_client, refresh_source="test")
