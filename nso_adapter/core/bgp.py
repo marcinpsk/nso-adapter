@@ -14,7 +14,7 @@ import structlog
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.core.refresh_engine import FamilySpec, log_skipped_entries, run_family_refresh
 from nso_adapter.domain.asn import AsnRuleViolation, checked_asn, validate_source_as_numbers
 from nso_adapter.domain.read_projection import entry_payload
 from nso_adapter.domain.routing_observation import project_bgp
@@ -235,6 +235,7 @@ async def _upsert_bgp_data(
     """Full-replace: delete existing BGP rows for *device*, then insert fresh ones."""
     validate_bgp_as_numbers(routers)
     projection = project_bgp({"router": routers})
+    log_skipped_entries("bgp", device.id, projection.unprojectable)
     routers = [entry_payload(entry) for entry in projection.routers or []]
     await db.execute(delete(DeviceBgpRouter).where(DeviceBgpRouter.device_id == device.id))
 

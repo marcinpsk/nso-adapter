@@ -14,7 +14,7 @@ import structlog
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.core.refresh_engine import FamilySpec, log_skipped_entries, run_family_refresh
 from nso_adapter.domain.asn import validate_source_as_numbers
 from nso_adapter.domain.read_projection import entry_payload
 from nso_adapter.domain.routing_observation import project_isis
@@ -86,6 +86,7 @@ async def _upsert_isis_data(
         validate_source_as_numbers(as_list(entry.get("redistribute")), "device_read.isis", f"process[{index}]")
 
     projection = project_isis({"process": processes, "interface": interfaces})
+    log_skipped_entries("isis", device.id, projection.unprojectable)
     processes = [entry_payload(entry) for entry in projection.processes or []]
     interfaces = [entry_payload(entry) for entry in projection.interfaces or []]
 

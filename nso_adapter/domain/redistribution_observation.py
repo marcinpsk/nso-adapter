@@ -208,12 +208,6 @@ def _projected_destinations(
     return destinations
 
 
-def project_redistribution_sources(
-    raw: object, path: str
-) -> tuple[list[RedistributionSourceEntry], list[UnprojectableEntry]]:
-    return project_entries(raw, RedistributionSourceEntry, path)
-
-
 def project_redistribution(data: dict | None) -> tuple[RedistributionDocument, RedistributionCoverage]:
     data = data or {}
     entries: list[RedistributionEntry] = []

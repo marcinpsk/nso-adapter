@@ -345,8 +345,8 @@ async def test_observation_json_never_contains_credentials(adapter_client, famil
             spec = importer.projectable_spec("lag_topology" if family == "lag" else family)
             await run_family_refresh_from_outcome(db, device, spec, Present(payload, Freshness.fresh))
     response = await adapter_client.get(f"/api/v1/devices/{device_id}/{path}", headers=AUTH)
+    assert response.status_code == 200, response.text
     assert_text_free_of(json.dumps(response.json()["observation"]), [placeholder])
-    assert response.status_code == 200
     observation = assert_publication(response.json(), family)
     rows = await stored_observations(device_id)
     for row in rows:
@@ -487,3 +487,50 @@ async def test_refresh_logs_each_entry_the_projection_drops(adapter_client, fami
     ], logs
     assert (clean.status_code, dirty.status_code) == (200, 200)
     assert _mirror_rows(dirty.json()) == _mirror_rows(clean.json())
+
+
+ROUTING_DROPPED_ENTRY_PAYLOADS = {
+    "bgp": {"router": [{"asn": "64512"}, {"asn": "64513", "router-id": 7}]},
+    "isis": {"process": [{"process-tag": "CORE"}, {"process-tag": 7}]},
+    "ospf": {"instance": [{"process-id": "1"}, {"process-id": 7}]},
+    "route_policy": {"prefix-list": [{"name": 7}]},
+}
+
+
+@pytest.mark.parametrize("family", ROUTING_DROPPED_ENTRY_PAYLOADS)
+async def test_routing_refresh_logs_each_entry_the_projection_drops(adapter_client, family):
+    from structlog.testing import capture_logs
+
+    device_id = await seed_device(nso_device_name="observation-device")
+    spec = _family_spec(family)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        with capture_logs() as logs:
+            await run_family_refresh_from_outcome(
+                db, device, spec, Present(deepcopy(ROUTING_DROPPED_ENTRY_PAYLOADS[family]), Freshness.fresh)
+            )
+    skipped = [record for record in logs if record["event"] == f"{family}.entry_skipped"]
+    assert [(record["device_id"], bool(record["reason"])) for record in skipped] == [(device_id, True)], logs
+
+
+async def test_redistribution_refresh_logs_each_source_the_projection_drops(adapter_client):
+    from structlog.testing import capture_logs
+
+    device_id = await seed_device(nso_device_name="observation-device")
+    payload = {
+        "instance": [{"process-id": "1", "redistribute": [{"source-protocol": "static"}, {"source-protocol": 7}]}]
+    }
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        with capture_logs() as logs:
+            await refresh_redistribution_from_outcomes(
+                db,
+                device,
+                {
+                    "ospf": Present(payload, Freshness.fresh),
+                    "bgp": Present({}, Freshness.fresh),
+                    "isis": Present({}, Freshness.fresh),
+                },
+            )
+    skipped = [record for record in logs if record["event"] == "redistribution.entry_skipped"]
+    assert [(record["device_id"], bool(record["reason"])) for record in skipped] == [(device_id, True)], logs

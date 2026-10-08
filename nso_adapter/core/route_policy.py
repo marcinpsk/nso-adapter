@@ -16,7 +16,7 @@ import structlog
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.core.refresh_engine import FamilySpec, log_skipped_entries, run_family_refresh
 from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.domain.read_projection import entry_payload
 from nso_adapter.domain.routing_observation import project_route_policy
@@ -163,6 +163,11 @@ async def _upsert_route_policy_data(
                         **device_fields(device_id=device.id),
                         family=collection,
                     )
+    log_skipped_entries(
+        "route_policy",
+        device.id,
+        [invalid for invalid in projection.unprojectable if "duplicate identity" not in invalid.reason],
+    )
     await db.execute(delete(DeviceRoutePolicyPrefixList).where(DeviceRoutePolicyPrefixList.device_id == device.id))
     await db.execute(
         delete(DeviceRoutePolicyCommunityList).where(DeviceRoutePolicyCommunityList.device_id == device.id)

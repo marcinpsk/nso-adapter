@@ -21,12 +21,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.bgp import validate_bgp_as_numbers
 from nso_adapter.core.cancelsafe import await_uncancellable
-from nso_adapter.core.refresh_engine import classify_envelope_family_read
+from nso_adapter.core.refresh_engine import classify_envelope_family_read, log_skipped_entries
 from nso_adapter.domain.asn import validate_asn_rows, validate_source_as_numbers
 from nso_adapter.domain.observation import observe_redistribution
 from nso_adapter.domain.redistribution_observation import (
     project_redistribution,
-    project_redistribution_sources,
 )
 from nso_adapter.nso.client import NsoClient, failure_detail
 from nso_adapter.nso.read_outcome import (
@@ -44,34 +43,6 @@ from nso_adapter.store.models import Device, DeviceRedistribution
 logger = structlog.get_logger(__name__)
 
 
-def _build_rows(
-    device_id: int,
-    dest_protocol: str,
-    dest_ref: str,
-    redist_list: list[dict],
-    now: datetime,
-    refresh_source: str,
-    location: str,
-) -> list[DeviceRedistribution]:
-    validate_source_as_numbers(as_list(redist_list), "device_read.redistribution", location)
-    entries, _invalid = project_redistribution_sources(redist_list, location)
-    return [
-        DeviceRedistribution(
-            device_id=device_id,
-            dest_protocol=dest_protocol,
-            dest_ref=dest_ref,
-            source_protocol=entry.source_protocol,
-            source_ref=entry.source_ref,
-            route_map=entry.route_map,
-            metric=entry.metric,
-            metric_type=entry.metric_type,
-            last_refreshed_at=now,
-            refresh_source=refresh_source,
-        )
-        for entry in entries
-    ]
-
-
 def _component_rows(
     device_id: int, protocol: str, data: dict, now: datetime, refresh_source: str
 ) -> list[DeviceRedistribution]:
@@ -85,6 +56,7 @@ def _component_rows(
                     as_list(destination.get("redistribute")), "device_read.redistribution", f"{key}[{index}]"
                 )
     document, _coverage = project_redistribution({protocol: data})
+    log_skipped_entries("redistribution", device_id, document.unprojectable)
     return [
         DeviceRedistribution(
             device_id=device_id,
