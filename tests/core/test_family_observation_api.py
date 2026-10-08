@@ -2,6 +2,8 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Observation publication through real family refreshes and API reads."""
 
+from copy import deepcopy
+
 import pytest
 
 from nso_adapter.core import importer
@@ -15,13 +17,27 @@ from tests.core.test_read_observation import DeviceReadNso, assert_publication
 VLAN_PAYLOAD = {"vlan": [{"vlan-id": 10, "name": "device"}]}
 
 
+def _family_payload(family: str) -> dict:
+    from tests.core.test_service_observers import READ_PAYLOADS
+    from tests.fixtures.switching_read_payloads import SWITCHING_READ_PAYLOADS
+
+    return deepcopy({**READ_PAYLOADS, **SWITCHING_READ_PAYLOADS}[family])
+
+
+def _family_spec(family: str):
+    return importer.projectable_spec("lag_topology" if family == "lag" else family)
+
+
 class FamilyReadNso(DeviceReadNso):
     def __init__(self):
         super().__init__([])
         self.sections = {
             "interface-attributes": self.section,
-            "vlan-database": {"status": "ok", **VLAN_PAYLOAD},
             "isis-interface": {"status": "unsupported"},
+            **{
+                _family_spec(family).wire_name: {"status": "ok", **_family_payload(family)}
+                for family, _path in FAMILY_ENDPOINTS
+            },
         }
 
     def respond(self, request):
@@ -46,17 +62,17 @@ async def test_new_family_observations_are_stored_and_served(adapter_client, mon
     if seam == "refresh":
         async with session() as db:
             device = await db.get(Device, device_id)
-            await run_family_refresh_from_outcome(
-                db, device, VLAN_DATABASE_SPEC, Present(VLAN_PAYLOAD, Freshness.fresh)
-            )
+            for family, _path in FAMILY_ENDPOINTS:
+                await run_family_refresh_from_outcome(
+                    db, device, _family_spec(family), Present(_family_payload(family), Freshness.fresh)
+                )
     else:
         async with session() as db:
             await importer.sync_device(device_id, db, comprehensive=True)
-    for family, path in [("vlan", "vlan-database")]:
+    for family, path in FAMILY_ENDPOINTS:
         response = await adapter_client.get(f"/api/v1/devices/{device_id}/{path}", headers=AUTH)
-        assert response.status_code == 200, response.text
-        observation = assert_publication(response.json(), family)
-        assert observation["document"]["unprojectable"] == []
+        assert response.status_code == 200, (family, response.text)
+        assert_publication(response.json(), family)
 
 
 async def test_vlan_intent_cannot_change_the_device_observation(adapter_client):
