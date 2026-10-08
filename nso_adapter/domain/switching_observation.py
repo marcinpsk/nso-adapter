@@ -230,9 +230,9 @@ def project_interface_mtu(data: dict | None) -> InterfaceMtuDocument:
                 row[field] = wire_int(row[field])
             except (TypeError, ValueError):
                 row[field] = None
-                invalid_fields.append(
-                    UnprojectableEntry(index=index, reason=f"interface[{index}].{field}: invalid integer")
-                )
+                diagnostic = UnprojectableEntry(index=index, reason=f"interface[{index}].{field}: invalid integer")
+                diagnostic._coverage_gap = True  # the row stays in the mirror; only this leaf is dropped
+                invalid_fields.append(diagnostic)
         rows.append(row)
     entries, invalid = project_entries(rows, InterfaceMtuEntry, "interface")
     invalid.extend(invalid_fields)

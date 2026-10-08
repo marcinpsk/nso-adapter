@@ -102,3 +102,25 @@ async def test_a_BOOLEAN_mtu_is_dropped_and_never_stored_as_1(adapter_client):
         rows = await _rows(db, device_id)
         assert rows["Gi0/1"].mtu is None
         assert rows["Gi0/1"].ip_mtu == 9000
+
+
+@pytest.mark.anyio
+async def test_an_invalid_mtu_leaf_is_materialized_without_a_skip_warning(adapter_client):
+    """The row is stored with the leaf absent, so it was not kept out of the mirror."""
+    from structlog.testing import capture_logs
+
+    device_id = await seed_device(nso_device_name="mtu-invalid-leaf", netbox_device_id=985)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "device-name": "mtu-invalid-leaf",
+            "interface": [{"interface-name": "Gi0/1", "mtu": True, "ip-mtu": 9000}, {"mtu": 1500}],
+        }
+        with capture_logs() as logs:
+            await refresh_interface_mtu_for_device(db, device, nso_client, refresh_source="test")
+        rows = await _rows(db, device_id)
+        assert list(rows) == ["Gi0/1"]
+        assert rows["Gi0/1"].mtu is None
+        skipped = [record for record in logs if record["event"] == "interface_mtu.entry_skipped"]
+        assert [record["reason"] for record in skipped] == ["interface[1]: invalid interface_name"]
