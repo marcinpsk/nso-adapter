@@ -15,7 +15,7 @@ import structlog
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.core.refresh_engine import FamilySpec, log_skipped_entries, run_family_refresh
 from nso_adapter.domain.switching_observation import project_interface_mtu
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
@@ -29,6 +29,7 @@ async def _upsert_interface_mtu(db: AsyncSession, device: Device, interfaces: li
     now = datetime.now(UTC)
     await db.execute(delete(DeviceInterfaceMtu).where(DeviceInterfaceMtu.device_id == device.id))
     projection = project_interface_mtu({"interface": interfaces})
+    log_skipped_entries("interface_mtu", device.id, projection.unprojectable)
     for item in projection.interfaces or []:
         db.add(
             DeviceInterfaceMtu(

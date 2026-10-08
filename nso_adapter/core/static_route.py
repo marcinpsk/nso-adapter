@@ -14,7 +14,7 @@ import structlog
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.core.refresh_engine import FamilySpec, log_skipped_entries, run_family_refresh
 from nso_adapter.domain.service_observation import project_static_routes
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.models import Device, DeviceStaticRoute
@@ -33,6 +33,7 @@ async def _upsert_static_routes(
 
     now = datetime.now(UTC)
     document = project_static_routes({"route": routes_data})
+    log_skipped_entries("static_route", device.id, document.unprojectable)
     for route in document.routes or []:
         db.add(
             DeviceStaticRoute(

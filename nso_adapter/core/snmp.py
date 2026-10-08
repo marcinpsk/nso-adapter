@@ -15,7 +15,7 @@ import structlog
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.core.refresh_engine import FamilySpec, log_skipped_entries, run_family_refresh
 from nso_adapter.domain.service_observation import project_snmp
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
@@ -47,6 +47,7 @@ async def _upsert_snmp_config(
     for comm in as_list(entry.get("community")):
         require_secret_fingerprint(comm.get("name") if isinstance(comm, dict) else None)
     document = project_snmp(entry)
+    log_skipped_entries("snmp", device.id, document.unprojectable)
 
     await _delete_snmp_rows(db, device)
 

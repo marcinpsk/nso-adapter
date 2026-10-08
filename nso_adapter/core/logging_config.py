@@ -10,7 +10,7 @@ import structlog
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.core.refresh_engine import FamilySpec, log_skipped_entries, run_family_refresh
 from nso_adapter.domain.service_observation import project_logging
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.models import Device, DeviceLoggingHost, DeviceLoggingLevels
@@ -25,6 +25,7 @@ async def _upsert_logging_config(db: AsyncSession, device: Device, entry: dict, 
     authoritative clear runs the same path: no hosts, no local-levels → both wiped.
     """
     document = project_logging(entry)
+    log_skipped_entries("logging", device.id, document.unprojectable)
     await db.execute(delete(DeviceLoggingHost).where(DeviceLoggingHost.device_id == device.id))
     now = datetime.now(UTC)
     for h in document.hosts or []:

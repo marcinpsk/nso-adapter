@@ -17,7 +17,7 @@ import structlog
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.core.refresh_engine import FamilySpec, log_skipped_entries, run_family_refresh
 from nso_adapter.domain.service_observation import project_l2_services
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
@@ -37,6 +37,7 @@ async def _upsert_l2_saps(
 
     now = datetime.now(UTC)
     document = project_l2_services({"service": services_data})
+    log_skipped_entries("l2_service", device.id, document.unprojectable)
     for service in document.services or []:
         for sap in service.saps or []:
             db.add(

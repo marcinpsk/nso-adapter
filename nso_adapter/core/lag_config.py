@@ -10,7 +10,7 @@ import structlog
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.core.refresh_engine import FamilySpec, log_skipped_entries, run_family_refresh
 from nso_adapter.domain.switching_observation import project_lag_config
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
@@ -34,6 +34,7 @@ async def _upsert_lag_configs(
 
     now = datetime.now(UTC)
     projection = project_lag_config({"lag": bundles_data})
+    log_skipped_entries("lag_config", device.id, projection.unprojectable)
     for bundle in projection.bundles or []:
         b = LagBundleConfig(
             device_id=device.id,

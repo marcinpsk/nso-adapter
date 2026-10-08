@@ -10,7 +10,7 @@ import structlog
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.core.refresh_engine import FamilySpec, log_skipped_entries, run_family_refresh
 from nso_adapter.domain.service_observation import project_bfd
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
@@ -29,6 +29,7 @@ async def _upsert_bfd_data(
     await db.execute(delete(DeviceBfdInterface).where(DeviceBfdInterface.device_id == device.id))
     now = datetime.now(UTC)
     document = project_bfd({"interface": interfaces})
+    log_skipped_entries("bfd", device.id, document.unprojectable)
     for iface in document.interfaces or []:
         db.add(
             DeviceBfdInterface(

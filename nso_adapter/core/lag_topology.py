@@ -13,18 +13,14 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 
-import structlog
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
-from nso_adapter.domain.diagnostics import device_fields
+from nso_adapter.core.refresh_engine import FamilySpec, log_skipped_entries, run_family_refresh
 from nso_adapter.domain.switching_observation import project_lag_topology
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, LagInterface, LagMember
-
-logger = structlog.get_logger(__name__)
 
 _DEVICE_RE = re.compile(r"devices/device\[name='([^']+)'\]")
 
@@ -62,10 +58,7 @@ async def _upsert_lags(
 
     now = datetime.now(UTC)
     projection = project_lag_topology({"lag": lags_data})
-    for invalid in projection.unprojectable:
-        if not invalid.blocks_materialization:
-            continue
-        logger.warning("lag_topology.entry_skipped", **device_fields(device_id=device.id), reason=invalid.reason)
+    log_skipped_entries("lag_topology", device.id, projection.unprojectable)
     for lag in projection.bundles or []:
         li = LagInterface(
             device_id=device.id,

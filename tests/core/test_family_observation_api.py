@@ -165,3 +165,32 @@ async def test_observation_json_never_contains_credentials(adapter_client, famil
     for row in rows:
         assert_text_free_of(json.dumps(row.document), [placeholder])
     assert rows
+
+
+DROPPED_ENTRY_COLLECTIONS = {
+    "bfd": "interface",
+    "l2_service": "service",
+    "logging": "host",
+    "snmp": "host",
+    "static_route": "route",
+    "interface_mtu": "interface",
+    "lag_config": "lag",
+}
+
+
+@pytest.mark.parametrize(("family", "collection"), DROPPED_ENTRY_COLLECTIONS.items())
+async def test_refresh_logs_each_entry_the_projection_drops(adapter_client, family, collection):
+    from structlog.testing import capture_logs
+
+    device_id = await seed_device(nso_device_name="observation-device")
+    payload = _family_payload(family)
+    payload[collection] = [*payload[collection], "not-an-object"]
+    spec = _family_spec(family)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        with capture_logs() as logs:
+            await run_family_refresh_from_outcome(db, device, spec, Present(payload, Freshness.fresh))
+    skipped = [record for record in logs if record["event"] == f"{spec.name}.entry_skipped"]
+    assert [(record["device_id"], record["reason"].endswith("expected object")) for record in skipped] == [
+        (device_id, True)
+    ], logs
