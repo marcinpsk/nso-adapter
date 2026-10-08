@@ -345,7 +345,7 @@ async def test_observation_json_never_contains_credentials(adapter_client, famil
             spec = importer.projectable_spec("lag_topology" if family == "lag" else family)
             await run_family_refresh_from_outcome(db, device, spec, Present(payload, Freshness.fresh))
     response = await adapter_client.get(f"/api/v1/devices/{device_id}/{path}", headers=AUTH)
-    assert response.status_code == 200, response.text
+    assert response.status_code == 200
     assert_text_free_of(json.dumps(response.json()["observation"]), [placeholder])
     observation = assert_publication(response.json(), family)
     rows = await stored_observations(device_id)
