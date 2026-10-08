@@ -2935,10 +2935,9 @@ distinguishes a missing AFI from an explicit empty AFI.
 There are no observation size limits. BGP, route policy, static routes, ISIS,
 redistribution, interface IPs, and L2 service inventories can be large.
 
-Observations never store BGP passwords or IS-IS authentication keys. They store
-nullable presence flags and fingerprints derived from comparable exported key
-material. The `present` list distinguishes missing keys from explicit null keys.
-An empty key has false presence and the fingerprint of the empty string.
+Observations never store BGP passwords or IS-IS or OSPF authentication keys.
+They store only nullable `*_present` flags. The `present` list distinguishes
+missing keys from explicit null keys. An empty key has false presence.
 Raw credential fields remain available only to the existing read mirror.
 
 Coverage can include `not_comparable`. These attributes cannot establish key
