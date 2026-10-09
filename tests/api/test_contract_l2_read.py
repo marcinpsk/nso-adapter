@@ -21,13 +21,13 @@ from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-VLAN_TOP_KEYS = {"device_id", "read_state", "vlans"}
+VLAN_TOP_KEYS = {"observation", "device_id", "read_state", "vlans"}
 VLAN_KEYS = {"vlan_id", "name", "source"}
-SWITCHPORT_TOP_KEYS = {"device_id", "read_state", "interfaces"}
+SWITCHPORT_TOP_KEYS = {"observation", "device_id", "read_state", "interfaces"}
 SWITCHPORT_IFACE_KEYS = {"interface_name", "mode", "untagged_vlan", "tagged_vlans", "source"}
-SVI_TOP_KEYS = {"device_id", "read_state", "interfaces"}
+SVI_TOP_KEYS = {"observation", "device_id", "read_state", "interfaces"}
 SVI_IFACE_KEYS = {"interface_name", "vlan_id", "type", "vrf", "source"}
-SUBIF_TOP_KEYS = {"device_id", "read_state", "interfaces"}
+SUBIF_TOP_KEYS = {"observation", "device_id", "read_state", "interfaces"}
 SUBIF_IFACE_KEYS = {"interface_name", "parent_interface", "dot1q_vlan", "type", "vrf", "source"}
 
 
@@ -42,6 +42,7 @@ async def test_vlan_database_contract(adapter_client):
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/vlan-database", headers=AUTH)).json()
     assert set(body.keys()) == VLAN_TOP_KEYS
+    assert body["observation"] is None
     assert set(body["vlans"][0].keys()) == VLAN_KEYS
     assert body["vlans"][0]["source"] == "vlan-database"
 
@@ -57,6 +58,7 @@ async def test_switchport_contract(adapter_client):
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/switchport", headers=AUTH)).json()
     assert set(body.keys()) == SWITCHPORT_TOP_KEYS
+    assert body["observation"] is None
     iface = body["interfaces"][0]
     assert set(iface.keys()) == SWITCHPORT_IFACE_KEYS
     assert iface["untagged_vlan"] is None and iface["tagged_vlans"] == []  # always present even when empty
@@ -82,6 +84,7 @@ async def test_svi_contract(adapter_client):
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/svi", headers=AUTH)).json()
     assert set(body.keys()) == SVI_TOP_KEYS
+    assert body["observation"] is None
     iface = body["interfaces"][0]
     assert set(iface.keys()) == SVI_IFACE_KEYS
     assert iface["type"] == "svi" and iface["source"] == "svi"
@@ -108,6 +111,7 @@ async def test_subinterface_contract(adapter_client):
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/subinterface", headers=AUTH)).json()
     assert set(body.keys()) == SUBIF_TOP_KEYS
+    assert body["observation"] is None
     iface = body["interfaces"][0]
     assert set(iface.keys()) == SUBIF_IFACE_KEYS
     assert iface["source"] == "subinterface"

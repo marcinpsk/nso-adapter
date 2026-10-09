@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from unittest.mock import AsyncMock
 
 import pytest
@@ -13,6 +14,7 @@ from sqlalchemy import select
 from nso_adapter.core.subinterface import refresh_subinterface_for_device
 from nso_adapter.store.models import Device, DeviceSubinterface
 from tests.conftest import seed_device, session
+from tests.fixtures.switching_read_payloads import SWITCHING_READ_PAYLOADS
 
 
 @asynccontextmanager
@@ -47,21 +49,7 @@ async def test_refresh_inserts_subinterfaces(adapter_client):
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "device-name": "subif-rtr01",
-            "interface": [
-                {
-                    "interface-name": "GigabitEthernet0/1.100",
-                    "parent-interface": "GigabitEthernet0/1",
-                    "dot1q-vlan": 100,
-                    "type": "subinterface",
-                    "vrf": "TENANT_A",
-                },
-                {
-                    "interface-name": "ge-0/0/0.200",
-                    "parent-interface": "ge-0/0/0",
-                    "dot1q-vlan": 200,
-                    "type": "subinterface",
-                },
-            ],
+            **deepcopy(SWITCHING_READ_PAYLOADS["subinterface"]),
         }
         await refresh_subinterface_for_device(db, device, nso_client, refresh_source="test")
         rows = await _rows(db, device_id)
@@ -170,4 +158,15 @@ async def test_a_BOOLEAN_dot1q_vlan_is_refused(adapter_client):
             "interface": [{"interface-name": "Gi0/1.100", "dot1q-vlan": True}],
         }
         with pytest.raises(TypeError):
+            await refresh_subinterface_for_device(db, device, nso_client, refresh_source="test")
+
+
+@pytest.mark.anyio
+async def test_a_duplicate_subinterface_is_reported_as_a_duplicate(adapter_client):
+    device_id = await seed_device(nso_device_name="subif-duplicate", netbox_device_id=979)
+    row = {"interface-name": "xe-0/0/1.200", "dot1q-vlan": 200}
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_device_state_section.return_value = {"status": "ok", "interface": [row, dict(row)]}
+        with pytest.raises(ValueError, match="^subinterface item has a duplicate interface-name$"):
             await refresh_subinterface_for_device(db, device, nso_client, refresh_source="test")

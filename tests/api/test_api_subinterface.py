@@ -33,6 +33,7 @@ async def test_subinterface_returns_seeded_rows(adapter_client):
     assert body.pop("read_state")["outcome"] == "unavailable"
     assert body == {
         "device_id": device_id,
+        "observation": None,
         "interfaces": [
             {
                 "interface_name": "GigabitEthernet0/1.100",

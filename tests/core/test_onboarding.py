@@ -15,6 +15,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import select, text
 
+from nso_adapter.domain.observation import observe_family
 from nso_adapter.store.models import DbInterface, Device, InterfaceAttrState, ManagedScope
 from tests._secret_discipline import assert_text_free_of
 from tests.conftest import session
@@ -619,9 +620,17 @@ async def test_rekey_same_source_is_true_noop(adapter_client_with_nso):
 
     device_id = await seed_device(nso_instance="nso-dev", nso_device_name="same-source", netbox_device_id=306)
     async with session() as db:
-        attempt = await outcome_store.record_read_outcome(db, device_id, "bfd", Present([]), refresh_source="poll")
+        attempt = await outcome_store.record_read_outcome(
+            db, device_id, "bfd", Present({"interface": []}), refresh_source="poll"
+        )
         await outcome_store.record_result(
-            db, attempt, result="replaced", succeeded=True, row_count=0, publish_payload=True
+            db,
+            attempt,
+            result="replaced",
+            succeeded=True,
+            row_count=0,
+            publish_payload=True,
+            observation=observe_family("bfd", {"interface": []}),
         )
         db.add(DbInterface(device_id=device_id, name="GE0/0"))
         await db.commit()
@@ -653,11 +662,18 @@ async def test_rekey_invalidates_all_read_publications(adapter_client_with_nso):
                 refresh_source="poll",
             )
         )
+        payload = {"route": [{"vrf": "", "prefix": "198.18.20.0/24", "next-hop": "198.18.0.2"}]}
         attempt = await outcome_store.record_read_outcome(
-            db, device_id, "static_route", Present([]), refresh_source="poll"
+            db, device_id, "static_route", Present(payload), refresh_source="poll"
         )
         await outcome_store.record_result(
-            db, attempt, result="replaced", succeeded=True, row_count=1, publish_payload=True
+            db,
+            attempt,
+            result="replaced",
+            succeeded=True,
+            row_count=1,
+            publish_payload=True,
+            observation=observe_family("static_route", payload),
         )
         device = await db.get(Device, device_id)
         updated = await rekey_device(db, device, nso_device_name="new-source")

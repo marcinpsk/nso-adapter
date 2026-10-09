@@ -12,6 +12,7 @@ from sqlalchemy.orm import selectinload
 
 from nso_adapter.api.deps import get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.observation import LagTopologyObservationOut
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import iso_z, latest_refreshed
 from nso_adapter.store import outcome_store
@@ -41,6 +42,7 @@ class LagTopologyOut(BaseModel):
     refresh_source: str  # legacy freshness (S5 retires it); read_state is the S4 truth
     read_state: FamilyReadState
     lags: list[LagTopologyLagOut]
+    observation: LagTopologyObservationOut | None
 
 
 @router.get(
@@ -55,9 +57,10 @@ async def get_lag_topology(device_id: int, db: AsyncSession = Depends(get_read_d
         raise api_error(404, "not_found", "Device not found")
 
     # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
-    read_state = read_state_payload(
-        await outcome_store.get_current_outcome(db, device_id, "lag"), source_epoch=device.source_epoch
+    outcome, observation = await outcome_store.get_current_publication(
+        db, device_id, "lag", source_epoch=device.source_epoch
     )
+    read_state = read_state_payload(outcome, source_epoch=device.source_epoch)
 
     result = await db.execute(
         select(LagInterface).where(LagInterface.device_id == device_id).options(selectinload(LagInterface.members))
@@ -70,6 +73,7 @@ async def get_lag_topology(device_id: int, db: AsyncSession = Depends(get_read_d
             "last_refreshed_at": None,
             "refresh_source": "never",
             "read_state": read_state,
+            "observation": observation,
             "lags": [],
         }
 
@@ -80,6 +84,7 @@ async def get_lag_topology(device_id: int, db: AsyncSession = Depends(get_read_d
         "last_refreshed_at": iso_z(latest.last_refreshed_at),
         "refresh_source": latest.refresh_source,
         "read_state": read_state,
+        "observation": observation,
         "lags": [
             {
                 "name": lag.name,

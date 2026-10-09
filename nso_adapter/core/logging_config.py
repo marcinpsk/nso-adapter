@@ -10,9 +10,9 @@ import structlog
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.core.refresh_engine import FamilySpec, log_skipped_entries, run_family_refresh
+from nso_adapter.domain.service_observation import project_logging
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceLoggingHost, DeviceLoggingLevels
 
 logger = structlog.get_logger(__name__)
@@ -24,42 +24,37 @@ async def _upsert_logging_config(db: AsyncSession, device: Device, entry: dict, 
     ``entry`` is the whole logging-config payload; ``extract({})`` feeds ``{}`` so the
     authoritative clear runs the same path: no hosts, no local-levels → both wiped.
     """
-    # as_list guards the singleton-rendered-as-bare-dict case (was a raw .get → crash).
-    hosts = as_list(entry.get("host"))
+    document = project_logging(entry)
+    log_skipped_entries("logging", device.id, document.unprojectable)
     await db.execute(delete(DeviceLoggingHost).where(DeviceLoggingHost.device_id == device.id))
     now = datetime.now(UTC)
-    for h in hosts:
-        addr = h.get("address")
-        if not addr:
-            continue
+    for h in document.hosts or []:
         db.add(
             DeviceLoggingHost(
                 device_id=device.id,
-                address=addr,
-                port=h.get("port"),
-                severity=h.get("severity"),
-                facility=h.get("facility"),
-                transport=h.get("transport"),
-                vrf=h.get("vrf"),
-                source=h.get("source"),
+                address=h.address,
+                port=h.port,
+                severity=h.severity,
+                facility=h.facility,
+                transport=h.transport,
+                vrf=h.vrf,
+                source=h.source,
                 last_refreshed_at=now,
                 refresh_source=refresh_source,
             )
         )
 
-    # local-levels (NX-P4a): a pure device mirror — present iff the export reports ≥1
-    # severity (observational presence, not ownership); absent → delete the row.
-    levels = entry.get("local-levels") or {}
+    levels = document.local_levels
     row = (
         await db.execute(select(DeviceLoggingLevels).where(DeviceLoggingLevels.device_id == device.id))
     ).scalar_one_or_none()
-    if levels:
+    if levels is not None and levels.present:
         if row is None:
             row = DeviceLoggingLevels(device_id=device.id)
             db.add(row)
-        row.console_severity = levels.get("console-severity")
-        row.monitor_severity = levels.get("monitor-severity")
-        row.module_severity = levels.get("module-severity")
+        row.console_severity = levels.console_severity
+        row.monitor_severity = levels.monitor_severity
+        row.module_severity = levels.module_severity
         row.last_refreshed_at = now
         row.refresh_source = refresh_source
     elif row is not None:

@@ -13,6 +13,9 @@ license = { text = "Apache-2.0" }
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.141.1",
+    "pydantic>=2.12.4",
+    "starlette>=1.3.1",
+    "anyio>=4.14.2",
     "uvicorn[standard]>=0.52.1",
     "httpx>=0.28",
     "sqlalchemy[asyncio]>=2.0.51",
@@ -29,9 +32,11 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "deptry>=0.25.1",
     "httpx>=0.28.1",
     "mypy>=1.14.0,<2.4.0",
     "mypy-baseline>=0.7.0,<1.0.0",
+    "packaging>=26.2",
     "pre-commit>=4.6.1",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
@@ -84,6 +89,16 @@ allowed_tags = ["feat", "fix", "docs", "style", "refactor", "perf", "test", "bui
 minor_tags = ["feat"]
 patch_tags = ["fix", "perf", "revert"]
 parse_squash_commits = false
+
+[tool.deptry]
+# OpenGrep rule fixtures are sample code, never imported.
+extend_exclude = ["\\.opengrep"]
+
+[tool.deptry.per_rule_ignores]
+# SQLAlchemy loads the drivers by URL scheme; pydantic-settings reads .env through python-dotenv.
+DEP002 = ["asyncpg", "psycopg2-binary", "python-dotenv"]
+# pydantic pins the exact pydantic-core release it was built against.
+DEP003 = ["pydantic_core"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

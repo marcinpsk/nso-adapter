@@ -22,6 +22,7 @@ from nso_adapter.api.errors import (
     api_error,
 )
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
+from nso_adapter.api.observation import L2ServiceObservationOut
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant
 from nso_adapter.store import outcome_store
@@ -55,6 +56,7 @@ class L2ServicesOut(BaseModel):
     device_id: int
     read_state: FamilyReadState  # the S4 truth (this family never had legacy freshness fields)
     services: list[L2ServiceOut]
+    observation: L2ServiceObservationOut | None
 
 
 @router.get(
@@ -68,9 +70,10 @@ async def get_l2_services(device_id: int, db: AsyncSession = Depends(get_read_db
         raise api_error(404, "not_found", "Device not found")
 
     # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
-    read_state = read_state_payload(
-        await outcome_store.get_current_outcome(db, device_id, "l2_service"), source_epoch=device.source_epoch
+    outcome, observation = await outcome_store.get_current_publication(
+        db, device_id, "l2_service", source_epoch=device.source_epoch
     )
+    read_state = read_state_payload(outcome, source_epoch=device.source_epoch)
 
     rows = (
         (
@@ -97,7 +100,12 @@ async def get_l2_services(device_id: int, db: AsyncSession = Depends(get_read_db
         )
         svc["saps"].append({"sap_id": r.sap_id, "port": r.port, "outer_tag": r.outer_tag, "inner_tag": r.inner_tag})
 
-    return {"device_id": device_id, "read_state": read_state, "services": list(services.values())}
+    return {
+        "device_id": device_id,
+        "read_state": read_state,
+        "observation": observation,
+        "services": list(services.values()),
+    }
 
 
 # ---------------------------------------------------------------------------

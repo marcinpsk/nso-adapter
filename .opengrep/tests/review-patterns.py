@@ -691,3 +691,58 @@ def observation_wire_or_default(entry):
     # ok: nso-observation-wire-or-default
     family = "ipv4" if entry.get("family") in (None, "") else entry.get("family")
     return vrf, family
+
+
+def projection_diagnostics(device, data, project_bfd, project_entries, log_skipped_entries, logger):
+    # ruleid: nso-projection-diagnostics-discarded
+    document = project_bfd(data)
+    rows = list(document.interfaces)
+    # ruleid: nso-projection-diagnostics-discarded
+    entries, _invalid = project_entries(data)
+    # ok: nso-projection-diagnostics-discarded
+    logged = project_bfd(data)
+    log_skipped_entries("bfd", device.id, logged.unprojectable)
+    # ok: nso-projection-diagnostics-discarded
+    checked = project_bfd(data)
+    if [item for item in checked.unprojectable if item.blocks_materialization]:
+        raise ValueError("bfd item is invalid")
+    # ok: nso-projection-diagnostics-discarded
+    sources, invalid = project_entries(data)
+    log_skipped_entries("bfd", device.id, invalid)
+    # ruleid: nso-projection-diagnostics-discarded
+    counted = project_bfd(data)
+    skipped = len(counted.unprojectable)
+    # ruleid: nso-projection-diagnostics-discarded
+    measured, dropped = project_entries(data)
+    total = len(dropped)
+    # ruleid: nso-projection-diagnostics-discarded
+    looped = project_bfd(data)
+    for item in looped.unprojectable:
+        total += item.index
+    # ruleid: nso-projection-diagnostics-discarded
+    filtered = project_bfd(data)
+    blocking = [item for item in filtered.unprojectable if item.blocks_materialization]
+    if blocking:
+        total += 1
+    # ok: nso-projection-diagnostics-discarded
+    warned = project_bfd(data)
+    for item in warned.unprojectable:
+        logger.warning("bfd.entry_skipped", index=item.index)
+    # ok: nso-projection-diagnostics-discarded
+    refused = project_bfd(data)
+    failures = [item for item in refused.unprojectable if item.blocks_materialization]
+    if failures:
+        if failures[0].reason.endswith("duplicate identity"):
+            raise ValueError("bfd item has a duplicate identity")
+        raise ValueError("bfd item is invalid")
+    # ok: nso-projection-diagnostics-discarded
+    kept = project_bfd(data)
+    log_skipped_entries("bfd", device.id, [item for item in kept.unprojectable if item.index])
+    # ok: nso-projection-diagnostics-discarded
+    paired, _coverage = project_entries(data)
+    log_skipped_entries("bfd", device.id, paired.unprojectable)
+    # ok: nso-projection-diagnostics-discarded
+    strict, rejected = project_entries(data)
+    if rejected:
+        raise ValueError("bfd item is invalid")
+    return rows, entries, sources, skipped, measured, total, blocking, kept, strict

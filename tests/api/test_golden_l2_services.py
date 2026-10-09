@@ -97,6 +97,7 @@ async def test_l2_services_golden_body(adapter_client):
 
     # Rows ordered by (service_name, sap_id) → services grouped in first-seen order.
     assert body == {
+        "observation": None,
         "device_id": device_id,
         "read_state": _SYNTH_READ_STATE,
         "services": [
@@ -124,4 +125,4 @@ async def test_l2_services_golden_empty(adapter_client):
     device_id = await seed_device(nso_device_name="l2-golden-empty", netbox_device_id=7998)
     await pin_store_incarnation()
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/l2-services", headers=AUTH)).json()
-    assert body == {"device_id": device_id, "read_state": _SYNTH_READ_STATE, "services": []}
+    assert body == {"observation": None, "device_id": device_id, "read_state": _SYNTH_READ_STATE, "services": []}

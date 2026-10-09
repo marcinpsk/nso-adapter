@@ -17,7 +17,8 @@ import structlog
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.core.refresh_engine import FamilySpec, log_skipped_entries, run_family_refresh
+from nso_adapter.domain.service_observation import project_l2_services
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceL2Sap
@@ -35,26 +36,20 @@ async def _upsert_l2_saps(
     await db.execute(delete(DeviceL2Sap).where(DeviceL2Sap.device_id == device.id))
 
     now = datetime.now(UTC)
-    for service in services_data:
-        service_name = service.get("service-name", "")
-        if not service_name:
-            continue
-        service_type = service.get("service-type", "")
-        service_id = service.get("service-id")
-        for sap in as_list(service.get("sap")):
-            sap_id = sap.get("sap-id", "")
-            if not sap_id:
-                continue
+    document = project_l2_services({"service": services_data})
+    log_skipped_entries("l2_service", device.id, document.unprojectable)
+    for service in document.services or []:
+        for sap in service.saps or []:
             db.add(
                 DeviceL2Sap(
                     device_id=device.id,
-                    service_name=service_name,
-                    service_type=service_type,
-                    service_id=service_id,
-                    sap_id=sap_id,
-                    port=sap.get("port", ""),
-                    outer_tag=sap.get("outer-tag"),
-                    inner_tag=sap.get("inner-tag"),
+                    service_name=service.service_name,
+                    service_type=service.service_type or "",
+                    service_id=service.service_id,
+                    sap_id=sap.sap_id,
+                    port=sap.port or "",
+                    outer_tag=sap.outer_tag,
+                    inner_tag=sap.inner_tag,
                     last_refreshed_at=now,
                     refresh_source=refresh_source,
                 )

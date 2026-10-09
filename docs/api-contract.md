@@ -2860,3 +2860,59 @@ Remote syslog hosts. Optional keys (`port`, `severity`, `facility`,
 Keyed `address`. Standard intent-mirror PUT; rows carry `address`, `port`,
 `severity`, `facility`, `transport`, `vrf`, `source`, `accepted_at`.
 Applied via the `logging-reconciler` NSO service.
+
+### Immutable device observations
+
+The family GETs listed below include `observation`. It is `null` until a successful
+read publishes that family. An authoritative empty read publishes an empty
+document. Failed and superseded reads keep the previous observation.
+
+The observation contains `family`, `revision`, `source_epoch`, `digest`,
+`observed_at`, `coverage`, and `document`. Its `revision` equals the inline
+`read_state.payload_revision`. It can differ from `read_state.attempt_id`
+after a failed read. The store publishes the observation and mirror in one
+fenced transaction. Intent writes and apply telemetry cannot change it.
+
+`digest` is SHA-256 over the complete document as compact JSON with sorted
+object keys. Inventory and child lists have a deterministic identity order.
+New projections include `present` lists. These name the fields the device
+supplied. A missing field and an explicit `null` can therefore share a nullable
+value without losing their distinction. Empty strings, empty lists, `false`,
+and zero keep their values. A defaulted identity can still identify the same
+mirror row, such as a missing or empty static-route VRF.
+
+`unprojectable` records every rejected row with its source index and a reason.
+Nested reasons include the parent and child path. Reasons never include the
+rejected value. A consumer must treat these rows as ambiguous. Mirror families
+that require a complete valid inventory can refuse the read instead of
+publishing a partial replacement.
+
+| Family | GET suffix | Document collections |
+| --- | --- | --- |
+| `interface_attributes` | `interfaces-doc` | `interfaces` |
+| `interface_ip` | `interface-ips` | `interfaces`, nested `addresses` |
+| `lag_config` | `lag-config` | `bundles`, nested `member` |
+| `lag` | `lag-topology` | `bundles`, nested `member` |
+| `vlan` | `vlan-database` | `vlans` |
+| `switchport` | `switchport` | `interfaces` |
+| `interface_mtu` | `interface-mtu` | `interfaces` |
+| `svi` | `svi` | `interfaces` |
+| `subinterface` | `subinterface` | `interfaces` |
+| `static_route` | `static-routes` | `routes` |
+| `bfd` | `bfd` | `interfaces` |
+| `l2_service` | `l2-services` | `services`, nested `saps` |
+| `logging` | `logging-config` | `hosts`, `local_levels` |
+| `snmp` | `snmp-config` | `communities`, `users`, `hosts`, `system` |
+
+LACP uses `lag_config` for configuration and `lag` for topology.
+MTU, SVI, and subinterfaces have their own
+read families. L2 SAPs use `l2_service`. Each family uses the same projection
+for its read mirror and observation.
+
+
+There are no observation size limits. Static routes, interface IPs, and L2
+service inventories can be large.
+
+Coverage can include `not_comparable`. These attributes cannot establish key
+equality. SNMP v3 authentication and privacy exports contain presence flags
+only. Unsupported nested keys produce indexed diagnostics without their values.

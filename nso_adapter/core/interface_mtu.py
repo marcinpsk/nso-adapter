@@ -15,39 +15,30 @@ import structlog
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.core.refresh_engine import FamilySpec, log_skipped_entries, run_family_refresh
+from nso_adapter.domain.switching_observation import project_interface_mtu
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.shape import as_list, wire_int
+from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceInterfaceMtu
 
 logger = structlog.get_logger(__name__)
-
-
-def _int_or_none(value) -> int | None:
-    if value is None:
-        return None
-    try:
-        return wire_int(value)
-    except (TypeError, ValueError):
-        return None
 
 
 async def _upsert_interface_mtu(db: AsyncSession, device: Device, interfaces: list[dict], refresh_source: str) -> None:
     """Full-replace the device's interface-MTU rows (the materializer)."""
     now = datetime.now(UTC)
     await db.execute(delete(DeviceInterfaceMtu).where(DeviceInterfaceMtu.device_id == device.id))
-    for item in interfaces:
-        name = item.get("interface-name")
-        if not name:
-            continue
+    projection = project_interface_mtu({"interface": interfaces})
+    log_skipped_entries("interface_mtu", device.id, projection.unprojectable)
+    for item in projection.interfaces or []:
         db.add(
             DeviceInterfaceMtu(
                 device_id=device.id,
-                interface_name=name,
-                mtu=_int_or_none(item.get("mtu")),
-                ip_mtu=_int_or_none(item.get("ip-mtu")),
-                mpls_mtu=_int_or_none(item.get("mpls-mtu")),
-                bound_port=item.get("bound-port") or None,
+                interface_name=item.interface_name,
+                mtu=item.mtu,
+                ip_mtu=item.ip_mtu,
+                mpls_mtu=item.mpls_mtu,
+                bound_port=item.bound_port or None,
                 last_refreshed_at=now,
                 refresh_source=refresh_source,
             )

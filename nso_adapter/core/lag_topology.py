@@ -13,17 +13,14 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 
-import structlog
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
-from nso_adapter.domain.diagnostics import device_fields
+from nso_adapter.core.refresh_engine import FamilySpec, log_skipped_entries, run_family_refresh
+from nso_adapter.domain.switching_observation import project_lag_topology
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.shape import as_list, wire_int
+from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, LagInterface, LagMember
-
-logger = structlog.get_logger(__name__)
 
 _DEVICE_RE = re.compile(r"devices/device\[name='([^']+)'\]")
 
@@ -60,41 +57,24 @@ async def _upsert_lags(
     await db.execute(delete(LagInterface).where(LagInterface.device_id == device.id))
 
     now = datetime.now(UTC)
-    for lag in lags_data:
-        if "lag-id" not in lag:
-            # Live ra1: a Nokia lag named without digits ("lag-aa") serves no lag-id, and
-            # the column is NOT NULL — skip the entry (bgp's asn-less-router convention)
-            # instead of KeyError'ing the whole refresh and losing every lag.
-            logger.warning(
-                "lag_topology.entry_skipped",
-                **device_fields(device_id=device.id),
-                reason="no lag-id",
-            )
-            continue
-        try:
-            lag_id = wire_int(lag["lag-id"])
-        except (TypeError, ValueError):
-            logger.warning(
-                "lag_topology.entry_skipped",
-                **device_fields(device_id=device.id),
-                reason="invalid lag-id",
-            )
-            continue
+    projection = project_lag_topology({"lag": lags_data})
+    log_skipped_entries("lag_topology", device.id, projection.unprojectable)
+    for lag in projection.bundles or []:
         li = LagInterface(
             device_id=device.id,
-            name=lag["name"],
-            lag_id=lag_id,
+            name=lag.name,
+            lag_id=lag.lag_id,
             last_refreshed_at=now,
             refresh_source=refresh_source,
         )
         db.add(li)
         await db.flush()
-        for member in as_list(lag.get("member")):
+        for member in lag.member or []:
             db.add(
                 LagMember(
                     lag_interface_id=li.id,
-                    interface_name=member["interface-name"],
-                    mode=member.get("mode", "unknown"),
+                    interface_name=member.interface_name,
+                    mode=member.mode if member.mode is not None else "unknown",
                 )
             )
 

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from unittest.mock import AsyncMock
 
 import pytest
@@ -13,6 +14,7 @@ from sqlalchemy import select
 from nso_adapter.core.logging_config import refresh_logging_config_for_device
 from nso_adapter.store.models import Device, DeviceLoggingHost, DeviceLoggingLevels
 from tests.conftest import seed_device, session
+from tests.fixtures.family_read_payloads import LOGGING_LEVELS_READ_PAYLOAD
 
 
 @asynccontextmanager
@@ -91,12 +93,7 @@ async def test_refresh_inserts_local_levels(adapter_client):
         nso_client = AsyncMock()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
-            "host": [{"address": "10.0.0.1"}],
-            "local-levels": {
-                "console-severity": "CRITICAL",
-                "monitor-severity": "NOTICE",
-                "module-severity": "NOTICE",
-            },
+            **deepcopy(LOGGING_LEVELS_READ_PAYLOAD),
         }
         await refresh_logging_config_for_device(db, device, nso_client, refresh_source="test")
         row = await _levels(db, device_id)

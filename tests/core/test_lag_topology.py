@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
@@ -16,6 +17,7 @@ from nso_adapter.core.lag_topology import (
 )
 from nso_adapter.store.models import Device, LagInterface, LagMember
 from tests.conftest import seed_device, session
+from tests.fixtures.switching_read_payloads import SWITCHING_READ_PAYLOADS
 
 
 @asynccontextmanager
@@ -69,14 +71,7 @@ async def test_refresh_lag_topology_happy(adapter_client):
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "device-name": "sw03",
-            "lag": [
-                {
-                    "name": "Port-channel1",
-                    "lag-id": 1,
-                    "member": [{"interface-name": "GigabitEthernet0/1", "mode": "active"}],
-                },
-                {"name": "Port-channel2", "lag-id": 2, "member": []},
-            ],
+            **deepcopy(SWITCHING_READ_PAYLOADS["lag"]),
         }
 
         await refresh_lag_topology_for_device(db, device, nso_client, refresh_source="poll")
@@ -157,7 +152,7 @@ async def test_lag_without_lag_id_is_skipped_not_fatal(adapter_client):
         assert [(r.name, r.lag_id) for r in rows] == [("lag-1", 1)]
         record = next(record for record in logs if record["event"] == "lag_topology.entry_skipped")
         assert record["device_id"] == device_id
-        assert record["reason"] == "no lag-id"
+        assert record["reason"] == "lag[1]: invalid lag_id"
         assert_keys_absent(record, ["lag_name"])
         assert_records_free_of([record], ["lag-aa"])
 
@@ -187,6 +182,29 @@ async def test_lag_with_malformed_id_does_not_block_valid_topology(adapter_clien
         assert len(skipped) == 1
         assert_keys_absent(skipped[0], ["lag_name"])
         assert_records_free_of(skipped, ["lag-invalid"])
+
+
+@pytest.mark.anyio
+async def test_lag_coverage_gap_is_materialized_without_a_skip_warning(adapter_client):
+    from structlog.testing import capture_logs
+
+    device_id = await seed_device(nso_device_name="sw-lag-coverage-gap", netbox_device_id=9822)
+    async with _device_session(device_id) as (db, device):
+        client = AsyncMock()
+        client.get_device_state_section.return_value = {
+            "status": "ok",
+            "lag": [
+                {"name": "lag-3", "lag-id": 3, "vendor-ext": 1, "member": []},
+                {"name": "lag-invalid", "lag-id": "invalid", "member": []},
+            ],
+        }
+
+        with capture_logs() as logs:
+            assert await refresh_lag_topology_for_device(db, device, client) is True
+        rows = (await db.execute(select(LagInterface).where(LagInterface.device_id == device.id))).scalars().all()
+        assert [(row.name, row.lag_id) for row in rows] == [("lag-3", 3)]
+        skipped = [record for record in logs if record["event"] == "lag_topology.entry_skipped"]
+        assert [record["reason"] for record in skipped] == ["lag[1]: invalid integer or VLAN id"]
 
 
 @pytest.mark.anyio

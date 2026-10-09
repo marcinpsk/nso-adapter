@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from nso_adapter.domain.observation import digest_document, observe_family
 from tests.conftest import (
     GOLDEN_BORN_ISO,
     GOLDEN_INCARNATION,
@@ -31,9 +32,25 @@ from tests.conftest import (
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 TS = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
+_ROUTE_PAYLOAD = {
+    "route": [
+        {
+            "vrf": "BLUE",
+            "prefix": "198.18.0.0/24",
+            "next-hop": "198.18.1.1",
+            "interface-next-hop": "GE0/0",
+            "next-hop-vrf": "RED",
+            "metric": 10,
+            "permanent": True,
+            "tag": 99,
+            "name": "RT-1",
+        },
+        {"vrf": "", "prefix": "198.19.0.0/24", "next-hop": "198.18.1.254"},
+    ]
+}
 
 
-async def _seed_pinned_outcome(device_id: int) -> int:
+async def _seed_pinned_outcome(device_id: int) -> tuple[int, dict]:
     """Terminalize one static_route attempt and pin its timestamps to TS — the golden
     body byte-pins the full REAL read_state block (attempt_id 1 in a fresh test DB)."""
     from sqlalchemy import update
@@ -42,50 +59,45 @@ async def _seed_pinned_outcome(device_id: int) -> int:
     from nso_adapter.store import outcome_store
     from nso_adapter.store.models import RefreshOutcome
 
+    observation = observe_family("static_route", _ROUTE_PAYLOAD)
+    assert observation is not None
     async with session() as db:
         attempt_id = await outcome_store.record_read_outcome(
-            db, device_id, "static_route", Present({"r": []}, Freshness.fresh), refresh_source="poll"
+            db, device_id, "static_route", Present(_ROUTE_PAYLOAD, Freshness.fresh), refresh_source="poll"
         )
-        await outcome_store.record_result(db, attempt_id, result="replaced", succeeded=True, row_count=2)
+        await db.execute(update(RefreshOutcome).where(RefreshOutcome.id == attempt_id).values(started_at=TS))
+        await outcome_store.record_result(
+            db, attempt_id, result="replaced", succeeded=True, row_count=2, observation=observation
+        )
         await db.execute(
             update(RefreshOutcome).where(RefreshOutcome.id == attempt_id).values(started_at=TS, completed_at=TS)
         )
         await db.commit()
-        return attempt_id
+        document = observation.document.model_dump(mode="json")
+        return attempt_id, {
+            "family": "static_route",
+            "revision": attempt_id,
+            "source_epoch": 1,
+            "digest": digest_document(document),
+            "observed_at": "2026-06-01T10:00:00Z",
+            "coverage": observation.coverage.model_dump(mode="json"),
+            "document": document,
+        }
 
 
 async def _seed_static_routes(device_id: int) -> None:
     from nso_adapter.store.models import DeviceStaticRoute
 
     async with session() as db:
-        # MAXIMAL route — every optional key set, incl. next_hop_vrf.
-        db.add(
-            DeviceStaticRoute(
-                device_id=device_id,
-                vrf="BLUE",
-                prefix="10.0.0.0/8",
-                next_hop="192.0.2.1",
-                interface_next_hop="GE0/0",
-                next_hop_vrf="RED",
-                metric=10,
-                permanent=True,
-                tag=99,
-                name="RT-1",
-                last_refreshed_at=TS,
-                refresh_source="poll",
+        for route in _ROUTE_PAYLOAD["route"]:
+            db.add(
+                DeviceStaticRoute(
+                    **{name.replace("-", "_"): value for name, value in route.items()},
+                    device_id=device_id,
+                    last_refreshed_at=TS,
+                    refresh_source="poll",
+                )
             )
-        )
-        # MINIMAL route — only the required identity keys.
-        db.add(
-            DeviceStaticRoute(
-                device_id=device_id,
-                vrf="",
-                prefix="0.0.0.0/0",
-                next_hop="192.0.2.254",
-                last_refreshed_at=TS,
-                refresh_source="poll",
-            )
-        )
         await db.commit()
 
 
@@ -93,13 +105,14 @@ async def _seed_static_routes(device_id: int) -> None:
 async def test_static_routes_golden_body(adapter_client):
     device_id = await seed_device(nso_device_name="sr-golden", netbox_device_id=7975)
     await pin_store_incarnation()
-    attempt_id = await _seed_pinned_outcome(device_id)
+    attempt_id, observation = await _seed_pinned_outcome(device_id)
     await _seed_static_routes(device_id)
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/static-routes", headers=AUTH)).json()
 
     # Routes ordered by (vrf, prefix, next_hop): "" < "BLUE".
     assert body == {
+        "observation": observation,
         "device_id": device_id,
         "last_refreshed_at": "2026-06-01T10:00:00Z",
         "refresh_source": "poll",
@@ -117,11 +130,11 @@ async def test_static_routes_golden_body(adapter_client):
             "incarnation_born": GOLDEN_BORN_ISO,
         },
         "routes": [
-            {"vrf": "", "prefix": "0.0.0.0/0", "next_hop": "192.0.2.254"},
+            {"vrf": "", "prefix": "198.19.0.0/24", "next_hop": "198.18.1.254"},
             {
                 "vrf": "BLUE",
-                "prefix": "10.0.0.0/8",
-                "next_hop": "192.0.2.1",
+                "prefix": "198.18.0.0/24",
+                "next_hop": "198.18.1.1",
                 "interface_next_hop": "GE0/0",
                 "next_hop_vrf": "RED",
                 "metric": 10,
@@ -139,6 +152,7 @@ async def test_static_routes_golden_empty(adapter_client):
     await pin_store_incarnation()
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/static-routes", headers=AUTH)).json()
     assert body == {
+        "observation": None,
         "device_id": device_id,
         "last_refreshed_at": None,
         "refresh_source": "never",
