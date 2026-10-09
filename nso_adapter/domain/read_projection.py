@@ -20,8 +20,52 @@ EXCLUDED_WIRE_FIELDS: dict[str, tuple[str, ...]] = {
     "SviEntry": ("source",),
     "SubinterfaceEntry": ("source",),
     "LagTopologyEntry": ("vpc-sensitive",),
-    "IsisProcessEntry": ISIS_PROCESS_EXCLUDED_FIELDS,
-    "IsisDestination": ISIS_PROCESS_EXCLUDED_FIELDS,
+    "BgpRouterEntry": ("redistribute",),
+    "BgpAddressFamilyEntry": ("redistribute",),
+    "BgpPolicyEntry": ("redistribute",),
+    "IsisProcessEntry": ("redistribute", *ISIS_PROCESS_EXCLUDED_FIELDS),
+    "OspfInstanceEntry": ("redistribute",),
+    "OspfDestination": ("router-id", "enabled", "area"),
+    "IsisDestination": (
+        "net",
+        "is-type",
+        "metric-style",
+        "overload-bit",
+        "area-auth-type",
+        "area-auth-present",
+        "area-auth-key",
+        "domain-auth-type",
+        "domain-auth-present",
+        "domain-auth-key",
+        "spf-initial-wait",
+        "spf-max-wait",
+        "lsp-initial-wait",
+        "lsp-max-wait",
+        "lsp-lifetime",
+        "lsp-refresh-interval",
+        "lsp-mtu",
+        "overload-on-startup",
+        "overload-timeout",
+        "te-enabled",
+        "suppress-attached-bit",
+        "ignore-attached-bit",
+        "fast-reroute",
+        "microloop-avoidance",
+        "distance",
+        "maximum-paths",
+        "reference-bandwidth",
+        "segment-routing-reported",
+        "segment-routing-configured",
+        "setting",
+        "level",
+        "segment-routing",
+        "flex-algo",
+        "srv6-locator",
+        *ISIS_PROCESS_EXCLUDED_FIELDS,
+    ),
+    "BgpDestination": ("router-id",),
+    "BgpScopeDestination": ("peer", "peer-group"),
+    "BgpAfDestination": (),
 }
 
 
@@ -94,9 +138,7 @@ def entry_payload(entry: DeviceEntry) -> dict:
         for name in type(entry).model_fields
         if name != "present"
         and name in entry.model_fields_set
-        and not any(
-            name == f"{secret}_{suffix}" for secret in entry.credentials for suffix in ("present", "fingerprint")
-        )
+        and not any(name == f"{secret}_present" for secret in entry.credentials)
     }
 
 
@@ -123,9 +165,7 @@ def _input_values(item: dict, model: type[DeviceEntry]) -> tuple[dict, list[str]
     conflicts = []
     supported = set(EXCLUDED_WIRE_FIELDS.get(model.__name__, ()))
     for name, field in model.model_fields.items():
-        if name == "present" or any(
-            name == f"{secret}_{suffix}" for secret in model.credentials for suffix in ("present", "fingerprint")
-        ):
+        if name == "present" or any(name == f"{secret}_present" for secret in model.credentials):
             continue
         wire = str(field.validation_alias or name)
         candidates = model.wire_aliases.get(name, (wire,))

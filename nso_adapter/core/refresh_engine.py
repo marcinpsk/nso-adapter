@@ -453,7 +453,9 @@ async def _materialize_guarded(
             succeeded=True,
             row_count=row_count,
             publish_payload=True,
-            observation=observe_family(spec.name, outcome.data if isinstance(outcome, Present) else {}),
+            observation=observe_family(
+                spec.name, outcome.data if isinstance(outcome, Present) else {}, ned_id=device.ned_id
+            ),
         )
         if not selected:
             await savepoint.rollback()

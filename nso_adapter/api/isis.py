@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
+from nso_adapter.api.observation import IsisObservationOut
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.redistribution import RedistributionSourceModel, validate_unique_redistribution_sources
 from nso_adapter.api.timestamps import UtcInstant, iso_z, latest_refreshed
@@ -208,6 +209,7 @@ class IsisInterfacesOut(BaseModel):
     read_state: FamilyReadState
     processes: list[IsisProcessOut]
     interfaces: list[IsisInterfaceOut]
+    observation: IsisObservationOut | None
 
 
 @router.get(
@@ -223,9 +225,10 @@ async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_rea
         raise api_error(404, "not_found", "Device not found")
 
     # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
-    read_state = read_state_payload(
-        await outcome_store.get_current_outcome(db, device_id, "isis"), source_epoch=device.source_epoch
+    outcome, observation = await outcome_store.get_current_publication(
+        db, device_id, "isis", source_epoch=device.source_epoch
     )
+    read_state = read_state_payload(outcome, source_epoch=device.source_epoch)
 
     proc_rows = (
         (
@@ -257,6 +260,7 @@ async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_rea
             "last_refreshed_at": None,
             "refresh_source": "never",
             "read_state": read_state,
+            "observation": observation,
             "processes": [],
             "interfaces": [],
         }
@@ -268,6 +272,7 @@ async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_rea
         "last_refreshed_at": iso_z(last_ts),
         "refresh_source": latest.refresh_source,
         "read_state": read_state,
+        "observation": observation,
         "processes": [_serialize_isis_process(r) for r in proc_rows],
         "interfaces": [_serialize_isis_interface(r) for r in iface_rows],
     }

@@ -129,7 +129,9 @@ async def test_record_result_terminalizes_and_creates_pointer(adapter_client):
         attempt_id = await outcome_store.record_read_outcome(
             db, device_id, "isis", AbsentAuthoritative(), refresh_source="poll"
         )
-        await outcome_store.record_result(db, attempt_id, result="cleared", succeeded=True, row_count=0)
+        await outcome_store.record_result(
+            db, attempt_id, result="cleared", succeeded=True, row_count=0, observation=observe_family("isis", {})
+        )
     async with session() as db:
         row = await db.get(RefreshOutcome, attempt_id)
     assert row.read_outcome == "absent_authoritative"
@@ -152,12 +154,15 @@ async def test_pointer_does_not_regress_when_older_attempt_finishes_late(adapter
         a = await outcome_store.record_read_outcome(
             db, device_id, "ospf", Unavailable(UnavailableReason.read_error), refresh_source="poll"
         )
+        payload = {"instance": [{"process-id": "1"}, {"process-id": "2"}]}
         b = await outcome_store.record_read_outcome(
-            db, device_id, "ospf", Present({}, Freshness.fresh), refresh_source="sse"
+            db, device_id, "ospf", Present(payload, Freshness.fresh), refresh_source="sse"
         )
         assert b > a  # start order = insertion order = attempt id
         # B (newer) terminalizes first, then A (older) terminalizes late.
-        await outcome_store.record_result(db, b, result="replaced", succeeded=True, row_count=2)
+        await outcome_store.record_result(
+            db, b, result="replaced", succeeded=True, row_count=2, observation=observe_family("ospf", payload)
+        )
         await outcome_store.record_result(db, a, result="kept", succeeded=False, row_count=None)
 
     ptr = await _pointer(device_id, "ospf")

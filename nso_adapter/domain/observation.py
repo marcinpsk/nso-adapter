@@ -18,6 +18,46 @@ from nso_adapter.domain.read_projection import (
     observation_payload,
     project_vlans,
 )
+from nso_adapter.domain.redistribution_observation import (
+    RedistributionCoverage,
+    RedistributionDocument,
+    project_redistribution,
+)
+from nso_adapter.domain.routing_observation import (
+    BgpAddressFamilyEntry,
+    BgpDocument,
+    BgpPeerEntry,
+    BgpPeerGroupEntry,
+    BgpPolicyEntry,
+    BgpRouterEntry,
+    BgpScopeEntry,
+    IsisDocument,
+    IsisFlexAlgoEntry,
+    IsisInterfaceEntry,
+    IsisLevelEntry,
+    IsisLocatorEntry,
+    IsisPrefixSidEntry,
+    IsisProcessEntry,
+    IsisSegmentRoutingEntry,
+    IsisSettingEntry,
+    OspfAreaEntry,
+    OspfDocument,
+    OspfInstanceEntry,
+    OspfInterfaceEntry,
+    PolicyAsPath,
+    PolicyAsPathEntry,
+    PolicyCommunityEntry,
+    PolicyCommunityList,
+    PolicyPrefixEntry,
+    PolicyPrefixList,
+    PolicyRouteMap,
+    PolicyRouteMapEntry,
+    RoutePolicyDocument,
+    project_bgp,
+    project_isis,
+    project_ospf,
+    project_route_policy,
+)
 from nso_adapter.domain.service_observation import (
     BfdDocument,
     L2ServiceDocument,
@@ -92,6 +132,7 @@ ObservationPayload = (
     InterfaceAttributesDocument
     | InterfaceIpDocument
     | VlanDocument
+    | RedistributionDocument
     | LagConfigDocument
     | LagTopologyDocument
     | SwitchportDocument
@@ -103,6 +144,10 @@ ObservationPayload = (
     | LoggingDocument
     | SnmpDocument
     | StaticRouteDocument
+    | BgpDocument
+    | IsisDocument
+    | OspfDocument
+    | RoutePolicyDocument
 )
 
 
@@ -110,7 +155,7 @@ ObservationPayload = (
 class ObservationDocument:
     family: str
     document: ObservationPayload
-    coverage: ObservationCoverage
+    coverage: ObservationCoverage | RedistributionCoverage
 
 
 def digest_document(document: object) -> str:
@@ -230,8 +275,30 @@ def observe_interface_ips(data: dict | None) -> ObservationDocument:
     )
 
 
-def _not_comparable(family: str, document: ObservationPayload) -> list[str]:
-    return ["auth_secret", "priv_secret"] if family == "snmp" else []
+def _coverage(*models: type[BaseModel]) -> list[str]:
+    return sorted(
+        {
+            name
+            for model in models
+            for name in model.model_fields
+            if name != "present" and not model.model_fields[name].exclude
+        }
+    )
+
+
+def _not_comparable(family: str) -> list[str]:
+    gaps: set[str] = set()
+    if family == "bgp":
+        gaps.update(BgpPeerEntry.credentials)
+    if family == "isis":
+        gaps.update(IsisProcessEntry.credentials)
+        gaps.update(IsisInterfaceEntry.credentials)
+        gaps.update(f"level.{name}" for name in IsisLevelEntry.credentials)
+    if family == "ospf":
+        gaps.update(OspfInterfaceEntry.credentials)
+    if family == "snmp":
+        gaps.update(("auth_secret", "priv_secret"))
+    return sorted(gaps)
 
 
 def _observer(
@@ -243,18 +310,42 @@ def _observer(
         return ObservationDocument(
             family=family,
             document=document,
-            coverage=ObservationCoverage(
-                attributes=sorted(attributes), not_comparable=_not_comparable(family, document)
-            ),
+            coverage=ObservationCoverage(attributes=sorted(attributes), not_comparable=_not_comparable(family)),
         )
 
     return observe
+
+
+def observe_redistribution(data: dict | None) -> ObservationDocument:
+    document, coverage = project_redistribution(data)
+    return ObservationDocument(family="redistribution", document=document, coverage=coverage)
+
+
+def observe_route_policy(data: dict | None, *, ned_id: str | None = None) -> ObservationDocument:
+    return ObservationDocument(
+        family="route_policy",
+        document=project_route_policy(data, ned_id=ned_id),
+        coverage=ObservationCoverage(
+            attributes=_coverage(
+                PolicyPrefixList,
+                PolicyPrefixEntry,
+                PolicyCommunityList,
+                PolicyCommunityEntry,
+                PolicyAsPath,
+                PolicyAsPathEntry,
+                PolicyRouteMap,
+                PolicyRouteMapEntry,
+            )
+        ),
+    )
 
 
 OBSERVERS: dict[str, Callable[[dict | None], ObservationDocument]] = {
     "interface_attributes": observe_interface_attributes,
     "interface_ip": observe_interface_ips,
     "vlan": _observer("vlan", project_vlans, ["name", "vlan_id"]),
+    "redistribution": observe_redistribution,
+    "route_policy": observe_route_policy,
     "lag_config": _observer(
         "lag_config",
         project_lag_config,
@@ -333,9 +424,33 @@ OBSERVERS: dict[str, Callable[[dict | None], ObservationDocument]] = {
         project_static_routes,
         ["vrf", "prefix", "next_hop", "interface_next_hop", "next_hop_vrf", "metric", "permanent", "tag", "name"],
     ),
+    "bgp": _observer(
+        "bgp",
+        project_bgp,
+        _coverage(
+            BgpRouterEntry, BgpScopeEntry, BgpPeerEntry, BgpPeerGroupEntry, BgpAddressFamilyEntry, BgpPolicyEntry
+        ),
+    ),
+    "isis": _observer(
+        "isis",
+        project_isis,
+        _coverage(
+            IsisProcessEntry,
+            IsisInterfaceEntry,
+            IsisFlexAlgoEntry,
+            IsisLevelEntry,
+            IsisPrefixSidEntry,
+            IsisLocatorEntry,
+            IsisSegmentRoutingEntry,
+            IsisSettingEntry,
+        ),
+    ),
+    "ospf": _observer("ospf", project_ospf, _coverage(OspfInstanceEntry, OspfInterfaceEntry, OspfAreaEntry)),
 }
 
 
 def observe_family(family: str, data: dict | None, *, ned_id: str | None = None) -> ObservationDocument | None:
+    if family == "route_policy":
+        return observe_route_policy(data, ned_id=ned_id)
     observer = OBSERVERS.get(family)
     return observer(data) if observer is not None else None

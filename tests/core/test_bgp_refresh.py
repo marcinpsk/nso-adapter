@@ -4,11 +4,14 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import pytest
 from sqlalchemy import select
 
 from nso_adapter.domain.asn import AsnRuleViolation
 from tests.conftest import seed_device, session
+from tests.fixtures.routing_read_payloads import BGP_ROUTERS_READ
 
 
 async def _scope_with_peers(*peer_addrs: str) -> list[dict]:
@@ -176,29 +179,7 @@ async def test_peer_af_policy_in_maps_to_routemap(adapter_client):
     from nso_adapter.store.models import Device, DeviceBgpPeerAddressFamily
 
     device_id = await seed_device(nso_device_name="bgp-pol", netbox_device_id=882)
-    routers = [
-        {
-            "asn": "65100",
-            "scope": [
-                {
-                    "vrf": "",
-                    "address-family": [{"afi": "ipv4-unicast"}],
-                    "peer": [
-                        {
-                            "peer-address": "10.0.0.1",
-                            "peer-address-family": [{"afi": "ipv4-unicast", "policy-in": "PIN", "policy-out": "POUT"}],
-                        },
-                        {
-                            "peer-address": "10.0.0.2",
-                            "peer-address-family": [
-                                {"afi": "ipv4-unicast", "routemap-in": "RIN", "prefixlist-out": "PLO"}
-                            ],
-                        },
-                    ],
-                }
-            ],
-        }
-    ]
+    routers = deepcopy(BGP_ROUTERS_READ)
     async with session() as db:
         device = await db.get(Device, device_id)
         await _upsert_bgp_data(db, device, routers, "test")

@@ -107,6 +107,7 @@ async def test_route_policy_golden_body(adapter_client):
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/route-policy", headers=AUTH)).json()
 
     assert body == {
+        "observation": None,
         "device_id": device_id,
         "last_refreshed_at": "2026-06-01T10:00:00Z",
         "read_state": _SYNTH_READ_STATE,
@@ -153,6 +154,7 @@ async def test_route_policy_golden_empty(adapter_client):
     await pin_store_incarnation()
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/route-policy", headers=AUTH)).json()
     assert body == {
+        "observation": None,
         "device_id": device_id,
         "last_refreshed_at": None,
         "read_state": _SYNTH_READ_STATE,

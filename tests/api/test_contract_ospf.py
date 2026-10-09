@@ -20,7 +20,15 @@ from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-REQUIRED_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "read_state", "instances", "interfaces"}
+REQUIRED_TOP_KEYS = {
+    "observation",
+    "device_id",
+    "last_refreshed_at",
+    "refresh_source",
+    "read_state",
+    "instances",
+    "interfaces",
+}
 REQUIRED_INSTANCE_KEYS = {"process_id", "vrf", "areas"}
 OPTIONAL_INSTANCE_KEYS = {"router_id"}
 REQUIRED_IFACE_KEYS = {"interface_name", "passive", "auth_present"}
@@ -90,6 +98,7 @@ async def test_ospf_payload_matches_contract_exactly(adapter_client):
     body = resp.json()
 
     assert set(body.keys()) == REQUIRED_TOP_KEYS
+    assert body["observation"] is None
 
     insts = {i["process_id"]: i for i in body["instances"]}
     assert set(insts["1"].keys()) == REQUIRED_INSTANCE_KEYS | OPTIONAL_INSTANCE_KEYS
@@ -110,6 +119,7 @@ async def test_ospf_no_data_shape(adapter_client):
     assert resp.status_code == 200
     body = resp.json()
     assert set(body.keys()) == REQUIRED_TOP_KEYS
+    assert body["observation"] is None
     assert body["instances"] == [] and body["interfaces"] == []
     assert body["refresh_source"] == "never"
 

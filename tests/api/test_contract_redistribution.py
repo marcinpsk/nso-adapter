@@ -21,7 +21,7 @@ from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-REQUIRED_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "read_state", "entries"}
+REQUIRED_TOP_KEYS = {"observation", "device_id", "last_refreshed_at", "refresh_source", "read_state", "entries"}
 REQUIRED_ENTRY_KEYS = {"dest_protocol", "dest_ref", "source_protocol", "source_ref"}
 OPTIONAL_ENTRY_KEYS = {"route_map", "metric", "metric_type"}
 
@@ -76,6 +76,7 @@ async def test_redistribution_payload_matches_contract_exactly(adapter_client):
     body = resp.json()
 
     assert set(body.keys()) == REQUIRED_TOP_KEYS
+    assert body["observation"] is None
     entries = {(e["dest_protocol"], e["source_protocol"]): e for e in body["entries"]}
     maximal = entries[("ospf", "bgp")]
     minimal = entries[("isis", "connected")]
@@ -93,5 +94,6 @@ async def test_redistribution_no_data_shape(adapter_client):
     assert resp.status_code == 200
     body = resp.json()
     assert set(body.keys()) == REQUIRED_TOP_KEYS
+    assert body["observation"] is None
     assert body["entries"] == []
     assert body["refresh_source"] == "never"
