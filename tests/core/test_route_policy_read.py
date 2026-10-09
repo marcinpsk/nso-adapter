@@ -4,11 +4,14 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import pytest
 from sqlalchemy import select
 
 # adapter_client inits the DB (runs app lifespan -> init_db -> create_all).
 from tests.conftest import session
+from tests.fixtures.routing_read_payloads import ROUTE_POLICY_COMMUNITIES_READ
 
 
 @pytest.mark.asyncio
@@ -20,22 +23,7 @@ async def test_read_carries_invert_match_and_canonicalizes_amp_large(adapter_cli
         DeviceRoutePolicyCommunityListEntry,
     )
 
-    nso_data = {
-        "community-list": [
-            {
-                "name": "SCRUBBER",
-                "invert-match": True,
-                "entry": [
-                    {"sequence": 10, "action": "permit", "community": "no-export"},
-                    {"sequence": 20, "action": "permit", "community": "64500&.*&[0-4]"},
-                ],
-            },
-            {
-                "name": "PLAIN",
-                "entry": [{"sequence": 10, "action": "permit", "community": "64500:100"}],
-            },
-        ]
-    }
+    nso_data = deepcopy(ROUTE_POLICY_COMMUNITIES_READ)
 
     async with session() as db:
         device = Device(
@@ -126,6 +114,7 @@ async def test_duplicate_object_names_are_deduped_not_crashing(adapter_client): 
         assert [a.name for a in aps] == ["AP"]
         duplicates = [record for record in logs if record["event"] == "route_policy.refresh.duplicate_name_skipped"]
         assert [record["device_id"] for record in duplicates] == [device.id, device.id]
+        assert [record["family"] for record in duplicates] == ["prefix-list", "as-path"]
         for record in duplicates:
             assert_keys_absent(record, ["name"])
         assert_records_free_of(duplicates, [device.nso_device_name, "DUP", "AP"])

@@ -314,40 +314,34 @@ def test_shared_asn_parser_accepts_rfc_boundaries(spelling, number):
     assert parse_asn(spelling) == number
 
 
+def _redistribution_component(protocol: str, source: dict) -> dict:
+    if protocol == "bgp":
+        family = {"afi": "ipv4", "redistribute": [source]}
+        return {"router": [{"asn": "64512", "scope": [{"vrf": "default", "address-family": [family]}]}]}
+    key, identity = ("instance", "process-id") if protocol == "ospf" else ("process", "process-tag")
+    return {key: [{identity: "placeholder-process", "redistribute": [source]}]}
+
+
 @pytest.mark.parametrize("protocol", ["ospf", "isis", "bgp"])
 def test_redistribution_read_refuses_malformed_bgp_source_as(protocol):
     from datetime import UTC, datetime
 
-    from nso_adapter.core.redistribution import _build_rows
+    from nso_adapter.core.redistribution import _component_rows
 
+    data = _redistribution_component(protocol, {"source-protocol": "bgp", "source-ref": " 64512"})
     with pytest.raises(AsnRuleViolation, match="violates RFC 5396"):
-        _build_rows(
-            1,
-            protocol,
-            "placeholder-process",
-            [{"source-protocol": "bgp", "source-ref": " 64512"}],
-            datetime.now(UTC),
-            "test",
-            location="instance[0]",
-        )
+        _component_rows(1, protocol, data, datetime.now(UTC), "test")
 
 
 @pytest.mark.parametrize("invalid", [1.0, True])
 def test_redistribution_read_refuses_noninteger_source_scalars(invalid):
     from datetime import UTC, datetime
 
-    from nso_adapter.core.redistribution import _build_rows
+    from nso_adapter.core.redistribution import _component_rows
 
+    data = _redistribution_component("ospf", {"source-protocol": "bgp", "source-ref": invalid})
     with pytest.raises(AsnRuleViolation, match="violates RFC 5396"):
-        _build_rows(
-            1,
-            "ospf",
-            "placeholder-process",
-            [{"source-protocol": "bgp", "source-ref": invalid}],
-            datetime.now(UTC),
-            "test",
-            location="instance[0]",
-        )
+        _component_rows(1, "ospf", data, datetime.now(UTC), "test")
 
 
 async def test_bgp_refresh_records_error_and_retains_valid_mirror(adapter_client):

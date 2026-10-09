@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
+from nso_adapter.api.observation import RoutePolicyObservationOut
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import iso_z
 from nso_adapter.core.removal import lost_content
@@ -172,6 +173,7 @@ class RoutePolicyConfigOut(BaseModel):
     community_lists: list[RoutePolicyCommunityListOut]
     as_paths: list[RoutePolicyASPathOut]
     route_maps: list[RoutePolicyRouteMapOut]
+    observation: RoutePolicyObservationOut | None
 
 
 @router.get(
@@ -191,9 +193,10 @@ async def get_route_policy(device_id: int, db: AsyncSession = Depends(get_read_d
         raise api_error(404, "not_found", "Device not found")
 
     # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
-    read_state = read_state_payload(
-        await outcome_store.get_current_outcome(db, device_id, "route_policy"), source_epoch=device.source_epoch
+    outcome, observation = await outcome_store.get_current_publication(
+        db, device_id, "route_policy", source_epoch=device.source_epoch
     )
+    read_state = read_state_payload(outcome, source_epoch=device.source_epoch)
 
     prefix_lists = await _load_named(db, DeviceRoutePolicyPrefixList, device_id)
     community_lists = await _load_named(db, DeviceRoutePolicyCommunityList, device_id)
@@ -244,6 +247,7 @@ async def get_route_policy(device_id: int, db: AsyncSession = Depends(get_read_d
         "device_id": device_id,
         "last_refreshed_at": iso_z(last_refreshed_at),
         "read_state": read_state,
+        "observation": observation,
         "prefix_lists": [_serialize_prefix_list(pl, pl_entries.get(pl.id, [])) for pl in prefix_lists],
         "community_lists": [_serialize_community_list(cl, cl_entries.get(cl.id, [])) for cl in community_lists],
         "as_paths": [_serialize_as_path(ap, ap_entries.get(ap.id, [])) for ap in as_paths],

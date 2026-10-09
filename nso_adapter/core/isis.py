@@ -14,9 +14,10 @@ import structlog
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.isis_canon import isis_level
-from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
+from nso_adapter.core.refresh_engine import FamilySpec, log_skipped_entries, run_family_refresh
 from nso_adapter.domain.asn import validate_source_as_numbers
+from nso_adapter.domain.read_projection import entry_payload
+from nso_adapter.domain.routing_observation import project_isis
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceIsisInterface, DeviceIsisProcess
@@ -84,6 +85,11 @@ async def _upsert_isis_data(
     for index, entry in enumerate(processes):
         validate_source_as_numbers(as_list(entry.get("redistribute")), "device_read.isis", f"process[{index}]")
 
+    projection = project_isis({"process": processes, "interface": interfaces})
+    log_skipped_entries("isis", device.id, projection.unprojectable)
+    processes = [entry_payload(entry) for entry in projection.processes or []]
+    interfaces = [entry_payload(entry) for entry in projection.interfaces or []]
+
     await db.execute(delete(DeviceIsisProcess).where(DeviceIsisProcess.device_id == device.id))
     await db.execute(delete(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id))
 
@@ -105,7 +111,7 @@ async def _upsert_isis_data(
                 device_id=device.id,
                 process_tag=proc_tag,
                 net=proc.get("net"),
-                is_type=isis_level(proc.get("is-type")),
+                is_type=proc.get("is-type"),
                 metric_style=proc.get("metric-style"),
                 overload_bit=proc.get("overload-bit"),
                 area_auth_type=proc.get("area-auth-type"),
@@ -141,7 +147,7 @@ async def _upsert_isis_data(
                 interface_name=iface_name,
                 af=af,
                 process_tag=iface.get("process-tag", ""),
-                circuit_type=isis_level(iface.get("circuit-type")),
+                circuit_type=iface.get("circuit-type"),
                 network_type=iface.get("network-type"),
                 metric=iface.get("metric"),
                 passive=bool(iface.get("passive", False)),

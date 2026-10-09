@@ -27,7 +27,7 @@ from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "read_state", "processes", "interfaces"}
+TOP_KEYS = {"observation", "device_id", "last_refreshed_at", "refresh_source", "read_state", "processes", "interfaces"}
 
 PROC_REQUIRED_KEYS = {"process_tag"}
 PROC_OPTIONAL_SCALARS = {
@@ -300,6 +300,7 @@ async def test_isis_payload_matches_contract_exactly(adapter_client):
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/isis-interfaces", headers=AUTH)).json()
     assert set(body.keys()) == TOP_KEYS
+    assert body["observation"] is None
 
     procs = {p["process_tag"]: p for p in body["processes"]}
     maximal, minimal, empty_sr = procs["1"], procs["2"], procs["3"]
@@ -333,5 +334,6 @@ async def test_isis_no_data_shape(adapter_client):
     device_id = await seed_device(nso_device_name="isis-ct-empty", netbox_device_id=7901)
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/isis-interfaces", headers=AUTH)).json()
     assert set(body.keys()) == TOP_KEYS
+    assert body["observation"] is None
     assert body["processes"] == [] and body["interfaces"] == []
     assert body["refresh_source"] == "never"

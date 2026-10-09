@@ -26,6 +26,7 @@ from tests.conftest import VALID_TOKEN, seed_device, session
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 REQUIRED_TOP_KEYS = {
+    "observation",
     "device_id",
     "last_refreshed_at",
     "read_state",
@@ -121,6 +122,7 @@ async def test_route_policy_payload_matches_contract_exactly(adapter_client):
     body = resp.json()
 
     assert set(body.keys()) == REQUIRED_TOP_KEYS  # NB: no refresh_source
+    assert body["observation"] is None
 
     pl = body["prefix_lists"][0]
     assert set(pl.keys()) == REQUIRED_PL_KEYS
@@ -154,6 +156,7 @@ async def test_route_policy_no_data_shape(adapter_client):
     assert resp.status_code == 200
     body = resp.json()
     assert set(body.keys()) == REQUIRED_TOP_KEYS
+    assert body["observation"] is None
     assert body["prefix_lists"] == [] and body["route_maps"] == []
     assert body["last_refreshed_at"] is None
 

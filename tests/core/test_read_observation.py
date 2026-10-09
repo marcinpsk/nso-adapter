@@ -511,7 +511,7 @@ async def test_materialization_error_preserves_observation(adapter_client, monke
     assert len(await stored_observations(device_id)) == 1
 
 
-@pytest.mark.parametrize("family", ["static_route"])
+@pytest.mark.parametrize("family", ["static_route", "bgp"])
 async def test_new_family_refuses_another_familys_observation(adapter_client, family):
     from nso_adapter.domain.observation import observe_family
 
@@ -741,20 +741,3 @@ async def test_authority_reset_preserves_read_observations(adapter_client, monke
         await db.commit()
     for seam in ["sync", "ip"]:
         assert (await read_family(adapter_client, device_id, seam))["observation"] == old[seam]
-
-
-@pytest.mark.parametrize("family", ["bgp"])
-async def test_family_without_observer_refuses_observation(adapter_client, family):
-    from nso_adapter.domain.observation import observe_family
-
-    device_id = await seed_device(nso_device_name="observation-device")
-    async with session() as db:
-        attempt = await outcome_store.record_read_outcome(
-            db, device_id, family, Present({}, Freshness.fresh), refresh_source="poll"
-        )
-        row = await db.get(RefreshOutcome, attempt)
-        await outcome_store.acquire_family_fence(db, device_id, family)
-        with pytest.raises(ValueError, match="no observation observer"):
-            await outcome_store.stage_result(
-                db, row, result="replaced", succeeded=True, row_count=0, observation=observe_family("interface_ip", {})
-            )

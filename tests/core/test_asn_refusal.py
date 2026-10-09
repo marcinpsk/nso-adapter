@@ -649,6 +649,4 @@ def test_redistribution_source_refusal_uses_structural_location(protocol, source
     assert_text_free_of(caught.value.error, [rejected])
     assert caught.value.error["detail"]["field"] == "source-ref"
     location = {"isis": "process[0]", "ospf": "instance[0]", "bgp": "router[0].scope[0]"}[protocol]
-    if protocol == "bgp" and source_protocol != "bgp":
-        location += ".address-family[0]"
     assert caught.value.error["detail"]["row_id"] == location

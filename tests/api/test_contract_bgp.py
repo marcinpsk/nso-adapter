@@ -24,7 +24,7 @@ from tests.conftest import VALID_TOKEN, seed_bgp_config, seed_device
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 # ── The contract. Keep in lockstep with the plugin mirror + docs/api-contract.md. ──
-REQUIRED_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "read_state", "routers"}
+REQUIRED_TOP_KEYS = {"observation", "device_id", "last_refreshed_at", "refresh_source", "read_state", "routers"}
 # router_id is always present (null when unset), like the top-level last_refreshed_at.
 REQUIRED_ROUTER_KEYS = {"asn", "router_id", "scopes"}
 REQUIRED_SCOPE_KEYS = {"vrf", "address_families", "peers", "peer_groups"}
@@ -101,6 +101,7 @@ async def test_bgp_config_payload_matches_contract_exactly(adapter_client):
     body = resp.json()
 
     assert set(body.keys()) == REQUIRED_TOP_KEYS
+    assert body["observation"] is None
     assert isinstance(body["routers"], list) and len(body["routers"]) == 1
     bgp_router = body["routers"][0]
     assert set(bgp_router.keys()) == REQUIRED_ROUTER_KEYS
@@ -140,5 +141,6 @@ async def test_bgp_config_no_data_shape(adapter_client):
     assert resp.status_code == 200
     body = resp.json()
     assert set(body.keys()) == REQUIRED_TOP_KEYS
+    assert body["observation"] is None
     assert body["routers"] == []
     assert body["refresh_source"] == "never"

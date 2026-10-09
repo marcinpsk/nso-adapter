@@ -83,6 +83,7 @@ async def test_redistribution_golden_body(adapter_client):
 
     # Ordered by (dest_protocol, dest_ref, source_protocol): "isis" < "ospf".
     assert body == {
+        "observation": None,
         "device_id": device_id,
         "last_refreshed_at": "2026-06-01T10:00:00Z",
         "refresh_source": "poll",
@@ -108,6 +109,7 @@ async def test_redistribution_golden_empty(adapter_client):
     await pin_store_incarnation()
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/redistribution", headers=AUTH)).json()
     assert body == {
+        "observation": None,
         "device_id": device_id,
         "last_refreshed_at": None,
         "refresh_source": "never",
