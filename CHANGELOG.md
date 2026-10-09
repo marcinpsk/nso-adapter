@@ -2,6 +2,38 @@
 
 <!-- version list -->
 
+## v1.12.0 (2026-10-09)
+
+### Bug Fixes
+
+- **observation**: Decode IS-IS wire bandwidth integers
+  ([`8359315`](https://github.com/marcinpsk/nso-adapter/commit/8359315c7f57c7e64e8f83996b142d0f0ed87db3))
+
+- **observation**: Keep routing credentials presence only
+  ([`ca31bf9`](https://github.com/marcinpsk/nso-adapter/commit/ca31bf9e470ea1fb6d08cd967ee9272c58ac3600))
+
+- **observation**: Log each routing entry a projection keeps out of the mirror
+  ([`e47fa73`](https://github.com/marcinpsk/nso-adapter/commit/e47fa73d2e23f6d732bb7b93049cd3bca811b958))
+
+### Documentation
+
+- **api**: Observations keep only credential presence flags
+  ([`22e9008`](https://github.com/marcinpsk/nso-adapter/commit/22e900880ef0ad34d39c1cb1d6b446fac39a26d5))
+
+### Features
+
+- Add routing and redistribution observations
+  ([`8baa2fb`](https://github.com/marcinpsk/nso-adapter/commit/8baa2fb4ca1c5ee39649883dfa7172fd3c5edf5a))
+
+### Testing
+
+- **observation**: Keep the credential status check free of the response body
+  ([`3c3478f`](https://github.com/marcinpsk/nso-adapter/commit/3c3478f8c8a5a35a1be46085a58409210c0dc9fd))
+
+- **observation**: Keep the IS-IS mirror when the export has unknown fields
+  ([`81bcab2`](https://github.com/marcinpsk/nso-adapter/commit/81bcab2f76e6c55ad41afa37b67076d0a23243fc))
+
+
 ## v1.11.0 (2026-10-09)
 
 ### Bug Fixes
