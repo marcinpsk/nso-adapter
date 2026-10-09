@@ -691,3 +691,22 @@ def observation_wire_or_default(entry):
     # ok: nso-observation-wire-or-default
     family = "ipv4" if entry.get("family") in (None, "") else entry.get("family")
     return vrf, family
+
+
+def projection_diagnostics(device, data, project_bfd, project_entries, log_skipped_entries):
+    # ruleid: nso-projection-diagnostics-discarded
+    document = project_bfd(data)
+    rows = list(document.interfaces)
+    # ruleid: nso-projection-diagnostics-discarded
+    entries, _invalid = project_entries(data)
+    # ok: nso-projection-diagnostics-discarded
+    logged = project_bfd(data)
+    log_skipped_entries("bfd", device.id, logged.unprojectable)
+    # ok: nso-projection-diagnostics-discarded
+    checked = project_bfd(data)
+    if [item for item in checked.unprojectable if item.blocks_materialization]:
+        raise ValueError("bfd item is invalid")
+    # ok: nso-projection-diagnostics-discarded
+    sources, invalid = project_entries(data)
+    log_skipped_entries("bfd", device.id, invalid)
+    return rows, entries, sources

@@ -1,12 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
-"""Typed observation responses for the two published device projections."""
+"""Typed observation responses for all published device projections."""
 
 from typing import Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from nso_adapter.domain.observation import InterfaceAttributesDocument, InterfaceIpDocument, ObservationCoverage
+from nso_adapter.domain.read_projection import VlanDocument
+from nso_adapter.domain.service_observation import (
+    BfdDocument,
+    L2ServiceDocument,
+    LoggingDocument,
+    SnmpDocument,
+    StaticRouteDocument,
+)
+from nso_adapter.domain.switching_observation import (
+    InterfaceMtuDocument,
+    LagConfigDocument,
+    LagTopologyDocument,
+    SubinterfaceDocument,
+    SviDocument,
+    SwitchportDocument,
+)
 
 
 class ReadObservationOut(BaseModel):
@@ -27,3 +43,63 @@ class InterfaceAttributesObservationOut(ReadObservationOut):
 class InterfaceIpObservationOut(ReadObservationOut):
     family: Literal["interface_ip"]
     document: InterfaceIpDocument
+
+
+class LagConfigObservationOut(ReadObservationOut):
+    family: Literal["lag_config"]
+    document: LagConfigDocument
+
+
+class LagTopologyObservationOut(ReadObservationOut):
+    family: Literal["lag"]
+    document: LagTopologyDocument
+
+
+class SwitchportObservationOut(ReadObservationOut):
+    family: Literal["switchport"]
+    document: SwitchportDocument
+
+
+class InterfaceMtuObservationOut(ReadObservationOut):
+    family: Literal["interface_mtu"]
+    document: InterfaceMtuDocument
+
+
+class SviObservationOut(ReadObservationOut):
+    family: Literal["svi"]
+    document: SviDocument
+
+
+class SubinterfaceObservationOut(ReadObservationOut):
+    family: Literal["subinterface"]
+    document: SubinterfaceDocument
+
+
+class BfdObservationOut(ReadObservationOut):
+    family: Literal["bfd"]
+    document: BfdDocument
+
+
+class L2ServiceObservationOut(ReadObservationOut):
+    family: Literal["l2_service"]
+    document: L2ServiceDocument
+
+
+class LoggingObservationOut(ReadObservationOut):
+    family: Literal["logging"]
+    document: LoggingDocument
+
+
+class SnmpObservationOut(ReadObservationOut):
+    family: Literal["snmp"]
+    document: SnmpDocument
+
+
+class StaticRouteObservationOut(ReadObservationOut):
+    family: Literal["static_route"]
+    document: StaticRouteDocument
+
+
+class VlanObservationOut(ReadObservationOut):
+    family: Literal["vlan"]
+    document: VlanDocument

@@ -23,7 +23,7 @@ keep working unchanged.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
 
 import structlog
@@ -31,7 +31,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.cancelsafe import await_uncancellable
 from nso_adapter.core.claim import ClaimLostError
+from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.domain.observation import observe_family
+from nso_adapter.domain.read_projection import UnprojectableEntry
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError, failure_detail
 from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
@@ -50,6 +52,14 @@ from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device
 
 logger = structlog.get_logger(__name__)
+
+
+def log_skipped_entries(family: str, device_id: int, unprojectable: Iterable[UnprojectableEntry]) -> None:
+    """Log each projection diagnostic that keeps an entry out of the mirror."""
+    for invalid in unprojectable:
+        if invalid.blocks_materialization:
+            logger.warning(f"{family}.entry_skipped", **device_fields(device_id=device_id), reason=invalid.reason)
+
 
 # ── in-process refresh coordination (codex S3-R1 F2) ─────────────────────────────────
 # The adapter is a SINGLE process; these primitives serialize same-(device, family)

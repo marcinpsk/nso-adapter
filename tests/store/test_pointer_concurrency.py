@@ -31,6 +31,7 @@ import pytest
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from nso_adapter.domain.observation import observe_family
 from nso_adapter.nso.read_outcome import Freshness, Present
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device, DeviceStaticRoute, RefreshOutcome, RefreshOutcomePointer
@@ -85,14 +86,16 @@ async def test_late_older_terminalization_is_a_noop(pointer_engine):
     device_id = await _seed_device(factory, "ptr-seq1", 8821)
     async with factory() as db:
         a_old = await outcome_store.record_read_outcome(
-            db, device_id, "static_route", Present({"r": []}, Freshness.fresh), refresh_source="poll"
+            db, device_id, "static_route", Present({"route": []}, Freshness.fresh), refresh_source="poll"
         )
         a_new = await outcome_store.record_read_outcome(
-            db, device_id, "static_route", Present({"r": []}, Freshness.fresh), refresh_source="poll"
+            db, device_id, "static_route", Present({"route": []}, Freshness.fresh), refresh_source="poll"
         )
         await db.commit()
     async with factory() as db:
-        await outcome_store.record_result(db, a_new, result="replaced", succeeded=True)
+        await outcome_store.record_result(
+            db, a_new, result="replaced", succeeded=True, observation=observe_family("static_route", {"route": []})
+        )
     async with factory() as db:
         await outcome_store.record_result(db, a_old, result="kept", succeeded=False)
     async with factory() as db:
@@ -212,14 +215,22 @@ async def test_payload_and_revision_publish_or_rollback_together(pointer_engine)
                 refresh_source="poll",
             )
         )
+        base_payload = {"route": [{"vrf": "", "prefix": "198.18.10.0/24", "next-hop": "198.18.0.1"}]}
+        next_payload = {"route": [{"vrf": "", "prefix": "198.18.20.0/24", "next-hop": "198.18.0.2"}]}
         base = await outcome_store.record_read_outcome(
-            db, device_id, "static_route", Present({"route": []}), refresh_source="poll"
+            db, device_id, "static_route", Present(base_payload), refresh_source="poll"
         )
         await outcome_store.record_result(
-            db, base, result="replaced", succeeded=True, row_count=1, publish_payload=True
+            db,
+            base,
+            result="replaced",
+            succeeded=True,
+            row_count=1,
+            publish_payload=True,
+            observation=observe_family("static_route", base_payload),
         )
         attempt = await outcome_store.record_read_outcome(
-            db, device_id, "static_route", Present({"route": []}), refresh_source="poll"
+            db, device_id, "static_route", Present(next_payload), refresh_source="poll"
         )
         await db.commit()
 
@@ -237,7 +248,13 @@ async def test_payload_and_revision_publish_or_rollback_together(pointer_engine)
             )
         )
         assert await outcome_store.stage_result(
-            publisher, row, result="replaced", succeeded=True, row_count=1, publish_payload=True
+            publisher,
+            row,
+            result="replaced",
+            succeeded=True,
+            row_count=1,
+            publish_payload=True,
+            observation=observe_family("static_route", next_payload),
         )
 
         async with factory() as observer:
@@ -266,7 +283,13 @@ async def test_payload_and_revision_publish_or_rollback_together(pointer_engine)
             )
         )
         assert await outcome_store.stage_result(
-            publisher, row, result="replaced", succeeded=True, row_count=1, publish_payload=True
+            publisher,
+            row,
+            result="replaced",
+            succeeded=True,
+            row_count=1,
+            publish_payload=True,
+            observation=observe_family("static_route", next_payload),
         )
         await publisher.commit()
 

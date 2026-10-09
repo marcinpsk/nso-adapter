@@ -26,6 +26,7 @@ async def test_vlan_database_returns_seeded_rows(adapter_client):
     assert body.pop("read_state")["outcome"] == "unavailable"
     assert body == {
         "device_id": device_id,
+        "observation": None,
         "vlans": [{"vlan_id": 10, "name": "MGMT", "source": "vlan-database"}],
     }
 

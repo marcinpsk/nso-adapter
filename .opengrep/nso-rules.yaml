@@ -830,3 +830,33 @@ rules:
         - review-patterns.py
     patterns:
       - pattern: $ENTRY.get(...) or $DEFAULT
+  - id: nso-projection-diagnostics-discarded
+    languages: [python]
+    severity: ERROR
+    message: Pass the projection's unprojectable entries to log_skipped_entries (or raise on them); a materializer that ignores them drops rows from the mirror without a log line.
+    paths:
+      include:
+        - nso_adapter/core/*.py
+        - review-patterns.py
+    patterns:
+      - metavariable-regex:
+          metavariable: $PROJECT
+          regex: ^project_
+      - pattern-either:
+          - patterns:
+              - pattern: $P = $PROJECT(...)
+              - pattern-not: $A, $B = $PROJECT(...)
+              - pattern-not-inside: |
+                  $P = $PROJECT(...)
+                  ...
+                  <... $P.unprojectable ...>
+          - patterns:
+              - pattern: $P, $SECOND = $PROJECT(...)
+              - pattern-not-inside: |
+                  $P, $SECOND = $PROJECT(...)
+                  ...
+                  <... $P.unprojectable ...>
+              - pattern-not-inside: |
+                  $P, $SECOND = $PROJECT(...)
+                  ...
+                  <... $SECOND ...>

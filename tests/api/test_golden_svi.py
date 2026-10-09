@@ -51,6 +51,7 @@ async def test_svi_golden_body(adapter_client):
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/svi", headers=AUTH)).json()
     # Ordered by vlan_id.
     assert body == {
+        "observation": None,
         "device_id": device_id,
         "read_state": _SYNTH_READ_STATE,
         "interfaces": [
@@ -65,4 +66,4 @@ async def test_svi_golden_empty(adapter_client):
     device_id = await seed_device(nso_device_name="svi-golden-empty", netbox_device_id=7985)
     await pin_store_incarnation()
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/svi", headers=AUTH)).json()
-    assert body == {"device_id": device_id, "read_state": _SYNTH_READ_STATE, "interfaces": []}
+    assert body == {"observation": None, "device_id": device_id, "read_state": _SYNTH_READ_STATE, "interfaces": []}

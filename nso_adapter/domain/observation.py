@@ -8,20 +8,43 @@ import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from nso_adapter.domain.read_projection import (
+    ObservationCoverage,
+    UnprojectableEntry,
+    VlanDocument,
+    observation_payload,
+    project_vlans,
+)
+from nso_adapter.domain.service_observation import (
+    BfdDocument,
+    L2ServiceDocument,
+    LoggingDocument,
+    SnmpDocument,
+    StaticRouteDocument,
+    project_bfd,
+    project_l2_services,
+    project_logging,
+    project_snmp,
+    project_static_routes,
+)
+from nso_adapter.domain.switching_observation import (
+    InterfaceMtuDocument,
+    LagConfigDocument,
+    LagTopologyDocument,
+    SubinterfaceDocument,
+    SviDocument,
+    SwitchportDocument,
+    project_interface_mtu,
+    project_lag_config,
+    project_lag_topology,
+    project_subinterfaces,
+    project_svis,
+    project_switchports,
+)
 from nso_adapter.nso.shape import as_list
-
-
-class UnprojectableEntry(BaseModel):
-    index: int
-    reason: str
-
-
-class ObservationCoverage(BaseModel):
-    attributes: list[str]
 
 
 class InterfaceAttributesEntry(BaseModel):
@@ -65,10 +88,28 @@ class InterfaceIpDocument(BaseModel):
     unprojectable: list[UnprojectableEntry]
 
 
+ObservationPayload = (
+    InterfaceAttributesDocument
+    | InterfaceIpDocument
+    | VlanDocument
+    | LagConfigDocument
+    | LagTopologyDocument
+    | SwitchportDocument
+    | InterfaceMtuDocument
+    | SviDocument
+    | SubinterfaceDocument
+    | BfdDocument
+    | L2ServiceDocument
+    | LoggingDocument
+    | SnmpDocument
+    | StaticRouteDocument
+)
+
+
 @dataclass(frozen=True)
 class ObservationDocument:
-    family: Literal["interface_attributes", "interface_ip"]
-    document: InterfaceAttributesDocument | InterfaceIpDocument
+    family: str
+    document: ObservationPayload
     coverage: ObservationCoverage
 
 
@@ -189,12 +230,112 @@ def observe_interface_ips(data: dict | None) -> ObservationDocument:
     )
 
 
+def _not_comparable(family: str, document: ObservationPayload) -> list[str]:
+    return ["auth_secret", "priv_secret"] if family == "snmp" else []
+
+
+def _observer(
+    family: str, project: Callable[[dict | None], ObservationPayload], attributes: list[str]
+) -> Callable[[dict | None], ObservationDocument]:
+    def observe(data: dict | None) -> ObservationDocument:
+        projected = project(data)
+        document = observation_payload(projected)
+        return ObservationDocument(
+            family=family,
+            document=document,
+            coverage=ObservationCoverage(
+                attributes=sorted(attributes), not_comparable=_not_comparable(family, document)
+            ),
+        )
+
+    return observe
+
+
 OBSERVERS: dict[str, Callable[[dict | None], ObservationDocument]] = {
     "interface_attributes": observe_interface_attributes,
     "interface_ip": observe_interface_ips,
+    "vlan": _observer("vlan", project_vlans, ["name", "vlan_id"]),
+    "lag_config": _observer(
+        "lag_config",
+        project_lag_config,
+        [
+            "name",
+            "lag_id",
+            "min_links",
+            "system_priority",
+            "system_id",
+            "timer",
+            "admin_key",
+            "vpc_sensitive",
+            "member",
+            "member.interface_name",
+            "member.mode",
+            "member.port_priority",
+        ],
+    ),
+    "lag": _observer("lag", project_lag_topology, ["name", "lag_id", "member", "member.interface_name", "member.mode"]),
+    "switchport": _observer(
+        "switchport", project_switchports, ["interface_name", "mode", "untagged_vlan", "tagged_vlans"]
+    ),
+    "interface_mtu": _observer(
+        "interface_mtu", project_interface_mtu, ["interface_name", "mtu", "ip_mtu", "mpls_mtu", "bound_port"]
+    ),
+    "svi": _observer("svi", project_svis, ["interface_name", "vlan_id", "type", "vrf"]),
+    "subinterface": _observer(
+        "subinterface", project_subinterfaces, ["interface_name", "parent_interface", "dot1q_vlan", "type", "vrf"]
+    ),
+    "bfd": _observer(
+        "bfd", project_bfd, ["bound_port", "enabled", "interface_name", "micro_bfd", "min_rx", "min_tx", "multiplier"]
+    ),
+    "l2_service": _observer(
+        "l2_service",
+        project_l2_services,
+        ["service_name", "service_type", "service_id", "sap_id", "port", "outer_tag", "inner_tag"],
+    ),
+    "logging": _observer(
+        "logging",
+        project_logging,
+        [
+            "address",
+            "port",
+            "severity",
+            "facility",
+            "transport",
+            "vrf",
+            "source",
+            "console_severity",
+            "monitor_severity",
+            "module_severity",
+        ],
+    ),
+    "snmp": _observer(
+        "snmp",
+        project_snmp,
+        [
+            "name",
+            "access",
+            "acl",
+            "has_secret",
+            "username",
+            "has_auth_secret",
+            "has_priv_secret",
+            "address",
+            "version",
+            "notify_type",
+            "port",
+            "user",
+            "location",
+            "contact",
+        ],
+    ),
+    "static_route": _observer(
+        "static_route",
+        project_static_routes,
+        ["vrf", "prefix", "next_hop", "interface_next_hop", "next_hop_vrf", "metric", "permanent", "tag", "name"],
+    ),
 }
 
 
-def observe_family(family: str, data: dict | None) -> ObservationDocument | None:
+def observe_family(family: str, data: dict | None, *, ned_id: str | None = None) -> ObservationDocument | None:
     observer = OBSERVERS.get(family)
     return observer(data) if observer is not None else None

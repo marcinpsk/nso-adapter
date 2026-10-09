@@ -24,6 +24,7 @@ from nso_adapter.api.errors import (
     api_error,
 )
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
+from nso_adapter.api.observation import StaticRouteObservationOut
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant, iso_z, latest_refreshed
 from nso_adapter.config import get_config
@@ -81,6 +82,7 @@ class StaticRoutesOut(BaseModel):
     refresh_source: str  # legacy freshness (S5 retires it); read_state is the S4 truth
     read_state: FamilyReadState
     routes: list[StaticRouteOut]
+    observation: StaticRouteObservationOut | None
 
 
 @router.get(
@@ -97,9 +99,10 @@ async def get_static_routes(device_id: int, db: AsyncSession = Depends(get_read_
 
     # Pointer FIRST, rows second, one snapshot (D2): rows can only be same-or-newer than
     # the outcome they're paired with — the benign direction for the plugin gate.
-    read_state = read_state_payload(
-        await outcome_store.get_current_outcome(db, device_id, "static_route"), source_epoch=device.source_epoch
+    outcome, observation = await outcome_store.get_current_publication(
+        db, device_id, "static_route", source_epoch=device.source_epoch
     )
+    read_state = read_state_payload(outcome, source_epoch=device.source_epoch)
 
     result = await db.execute(
         select(DeviceStaticRoute)
@@ -114,6 +117,7 @@ async def get_static_routes(device_id: int, db: AsyncSession = Depends(get_read_
             "last_refreshed_at": None,
             "refresh_source": "never",
             "read_state": read_state,
+            "observation": observation,
             "routes": [],
         }
 
@@ -146,6 +150,7 @@ async def get_static_routes(device_id: int, db: AsyncSession = Depends(get_read_
         "last_refreshed_at": iso_z(last_ts),
         "refresh_source": latest.refresh_source,
         "read_state": read_state,
+        "observation": observation,
         "routes": routes,
     }
 

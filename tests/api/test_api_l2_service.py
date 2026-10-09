@@ -16,7 +16,7 @@ async def test_l2_services_no_data_returns_empty(adapter_client):
     body = resp.json()
     # read_state rides every family GET (S4); byte-level pins live in the golden test.
     assert body.pop("read_state")["outcome"] == "unavailable"
-    assert body == {"device_id": device_id, "services": []}
+    assert body == {"observation": None, "device_id": device_id, "services": []}
 
 
 async def test_l2_services_grouped_by_service(adapter_client):

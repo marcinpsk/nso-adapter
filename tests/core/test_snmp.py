@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from unittest.mock import AsyncMock
 
 import pytest
@@ -14,6 +15,13 @@ from nso_adapter.core.refresh_engine import run_family_refresh_from_section
 from nso_adapter.core.snmp import SNMP_SPEC, refresh_snmp_config_for_device
 from nso_adapter.store.models import Device, SnmpCommunity, SnmpHost, SnmpSystemInfo, SnmpV3User
 from tests.conftest import seed_device, session
+from tests.fixtures.family_read_payloads import (
+    SNMP_COMMUNITIES_READ_PAYLOAD,
+    SNMP_RECEIVERS_READ_PAYLOAD,
+    SNMP_SYSTEM_READ_PAYLOAD,
+    SNMP_USERS_READ_PAYLOAD,
+    SNMP_V3_RECEIVERS_READ_PAYLOAD,
+)
 
 
 @asynccontextmanager
@@ -34,10 +42,7 @@ async def test_refresh_inserts_communities(adapter_client):
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "name": "snmp-insert-sw01",
-            "community": [
-                {"name": "abc123def456abcd", "access": "RO", "acl": "20", "has-secret": True},
-                {"name": "def456abc123def4", "access": "RW", "has-secret": True},
-            ],
+            **deepcopy(SNMP_COMMUNITIES_READ_PAYLOAD),
         }
 
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
@@ -85,10 +90,7 @@ async def test_refresh_inserts_v3_users(adapter_client):
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "name": "snmp-v3-sw01",
-            "v3-user": [
-                {"username": "monitor", "has-auth-secret": True, "has-priv-secret": False},
-                {"username": "placeholder-user", "has-auth-secret": True, "has-priv-secret": True},
-            ],
+            **deepcopy(SNMP_USERS_READ_PAYLOAD),
         }
 
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
@@ -111,9 +113,7 @@ async def test_refresh_inserts_hosts(adapter_client):
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "name": "snmp-hosts-sw01",
-            "host": [
-                {"address": "10.0.1.100", "version": "2c", "notify-type": "trap", "port": 162},
-            ],
+            **deepcopy(SNMP_RECEIVERS_READ_PAYLOAD),
         }
 
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
@@ -146,9 +146,7 @@ async def test_refresh_stores_a_v3_hosts_SECURITY_USER_NAME(adapter_client):
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "name": "snmp-v3host-sw01",
-            "host": [
-                {"address": "10.0.1.101", "version": "3", "notify-type": "inform", "user": "netmon-v3"},
-            ],
+            **deepcopy(SNMP_V3_RECEIVERS_READ_PAYLOAD),
         }
 
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
@@ -168,8 +166,7 @@ async def test_refresh_inserts_system_info(adapter_client):
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "name": "snmp-sysinfo-sw01",
-            "location": "ITC-Lab",
-            "contact": "noc@example.com",
+            **deepcopy(SNMP_SYSTEM_READ_PAYLOAD),
         }
 
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")

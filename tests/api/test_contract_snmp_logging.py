@@ -21,6 +21,7 @@ from tests.conftest import VALID_TOKEN, seed_device, session
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 SNMP_TOP_KEYS = {
+    "observation",
     "device_id",
     "last_refreshed_at",
     "refresh_source",
@@ -36,7 +37,7 @@ SNMP_V3USER_KEYS = {"username", "has_auth_secret", "has_priv_secret"}
 # NSO host writers KEY the receiver on — without it a v3 trap host cannot be pushed (CR-P16).
 SNMP_HOST_KEYS = {"address", "version", "notify_type", "port", "username"}
 SNMP_SYSINFO_KEYS = {"location", "contact"}
-LOGGING_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "read_state", "hosts"}
+LOGGING_TOP_KEYS = {"observation", "device_id", "last_refreshed_at", "refresh_source", "read_state", "hosts"}
 LOGGING_HOST_REQUIRED_KEYS = {"address"}
 LOGGING_HOST_OPTIONAL_KEYS = {"port", "severity", "facility", "transport", "vrf", "source"}
 
@@ -90,6 +91,7 @@ async def test_snmp_config_contract(adapter_client):
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/snmp-config", headers=AUTH)).json()
     assert set(body.keys()) == SNMP_TOP_KEYS
+    assert body["observation"] is None
     assert set(body["communities"][0].keys()) == SNMP_COMMUNITY_KEYS
     assert set(body["v3_users"][0].keys()) == SNMP_V3USER_KEYS
     assert set(body["hosts"][0].keys()) == SNMP_HOST_KEYS
@@ -125,6 +127,7 @@ async def test_logging_config_contract(adapter_client):
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/logging-config", headers=AUTH)).json()
     assert set(body.keys()) == LOGGING_TOP_KEYS
+    assert body["observation"] is None
     hosts = {h["address"]: h for h in body["hosts"]}
     assert set(hosts["10.0.0.5"].keys()) == LOGGING_HOST_REQUIRED_KEYS | LOGGING_HOST_OPTIONAL_KEYS
     assert set(hosts["10.0.0.6"].keys()) == LOGGING_HOST_REQUIRED_KEYS  # optionals omitted

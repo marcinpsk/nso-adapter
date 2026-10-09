@@ -46,6 +46,7 @@ async def test_vlan_database_golden_body(adapter_client):
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/vlan-database", headers=AUTH)).json()
     assert body == {
+        "observation": None,
         "device_id": device_id,
         "read_state": _SYNTH_READ_STATE,
         "vlans": [
@@ -60,7 +61,7 @@ async def test_vlan_database_golden_empty(adapter_client):
     device_id = await seed_device(nso_device_name="vlan-golden-empty", netbox_device_id=7981)
     await pin_store_incarnation()
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/vlan-database", headers=AUTH)).json()
-    assert body == {"device_id": device_id, "read_state": _SYNTH_READ_STATE, "vlans": []}
+    assert body == {"observation": None, "device_id": device_id, "read_state": _SYNTH_READ_STATE, "vlans": []}
 
 
 @pytest.mark.anyio
@@ -78,6 +79,7 @@ async def test_switchport_golden_body(adapter_client):
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/switchport", headers=AUTH)).json()
     assert body == {
+        "observation": None,
         "device_id": device_id,
         "read_state": _SYNTH_READ_STATE,
         "interfaces": [
@@ -105,4 +107,4 @@ async def test_switchport_golden_empty(adapter_client):
     device_id = await seed_device(nso_device_name="sw-golden-empty", netbox_device_id=7983)
     await pin_store_incarnation()
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/switchport", headers=AUTH)).json()
-    assert body == {"device_id": device_id, "read_state": _SYNTH_READ_STATE, "interfaces": []}
+    assert body == {"observation": None, "device_id": device_id, "read_state": _SYNTH_READ_STATE, "interfaces": []}

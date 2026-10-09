@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import select
 
+from nso_adapter.domain.observation import observe_family
 from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
     Freshness,
@@ -169,10 +170,13 @@ async def test_pointer_shows_newest_failure(adapter_client):
     behind an older success."""
     device_id = await seed_device(nso_device_name="oc-fail", netbox_device_id=8805)
     async with session() as db:
+        payload = {"host": [{"address": "198.18.0.10", "version": "2c", "notify-type": "trap"}]}
         a = await outcome_store.record_read_outcome(
-            db, device_id, "snmp", Present({}, Freshness.fresh), refresh_source="poll"
+            db, device_id, "snmp", Present(payload, Freshness.fresh), refresh_source="poll"
         )
-        await outcome_store.record_result(db, a, result="replaced", succeeded=True, row_count=1)
+        await outcome_store.record_result(
+            db, a, result="replaced", succeeded=True, row_count=1, observation=observe_family("snmp", payload)
+        )
         b = await outcome_store.record_read_outcome(
             db, device_id, "snmp", Unavailable(UnavailableReason.export_down), refresh_source="poll"
         )
@@ -190,11 +194,18 @@ async def test_kept_outcome_advances_attempt_but_preserves_payload_revision(adap
     """#1332: a failed/unavailable read changes declared truth but not the mirror body."""
     device_id = await seed_device(nso_device_name="oc-revision-keep", netbox_device_id=8891)
     async with session() as db:
+        payload = {"route": [{"prefix": "198.18.0.0/24", "next-hop": "198.18.1.1"}]}
         published = await outcome_store.record_read_outcome(
-            db, device_id, "static_route", Present({}, Freshness.fresh), refresh_source="poll"
+            db, device_id, "static_route", Present(payload, Freshness.fresh), refresh_source="poll"
         )
         await outcome_store.record_result(
-            db, published, result="replaced", succeeded=True, row_count=1, publish_payload=True
+            db,
+            published,
+            result="replaced",
+            succeeded=True,
+            row_count=1,
+            publish_payload=True,
+            observation=observe_family("static_route", payload),
         )
         kept = await outcome_store.record_read_outcome(
             db,
@@ -359,10 +370,13 @@ async def test_get_current_outcome_returns_newest_terminal(adapter_client):
     """The accessor resolves the pointer to the newest TERMINAL attempt's full row."""
     device_id = await seed_device(nso_device_name="oc-acc1", netbox_device_id=8811)
     async with session() as db:
+        payload = {"route": [{"prefix": f"198.18.{index}.0/24", "next-hop": "198.18.10.1"} for index in range(3)]}
         a1 = await outcome_store.record_read_outcome(
-            db, device_id, "static_route", Present({"r": []}, Freshness.fresh), refresh_source="poll"
+            db, device_id, "static_route", Present(payload, Freshness.fresh), refresh_source="poll"
         )
-        await outcome_store.record_result(db, a1, result="replaced", succeeded=True, row_count=3)
+        await outcome_store.record_result(
+            db, a1, result="replaced", succeeded=True, row_count=3, observation=observe_family("static_route", payload)
+        )
         a2 = await outcome_store.record_read_outcome(
             db,
             device_id,
@@ -400,12 +414,17 @@ async def test_get_current_outcomes_maps_families_in_one_query(adapter_client):
     """The bulk accessor returns {family: newest-terminal-row} for every pointed family."""
     device_id = await seed_device(nso_device_name="oc-acc3", netbox_device_id=8813)
     async with session() as db:
+        payload = {"interface": [{"interface-name": "Vlan10", "vlan-id": 10}]}
         a1 = await outcome_store.record_read_outcome(
-            db, device_id, "svi", Present({"svis": []}, Freshness.fresh), refresh_source="poll"
+            db, device_id, "svi", Present(payload, Freshness.fresh), refresh_source="poll"
         )
-        await outcome_store.record_result(db, a1, result="replaced", succeeded=True, row_count=1)
+        await outcome_store.record_result(
+            db, a1, result="replaced", succeeded=True, row_count=1, observation=observe_family("svi", payload)
+        )
         a2 = await outcome_store.record_read_outcome(db, device_id, "bfd", AbsentAuthoritative(), refresh_source="poll")
-        await outcome_store.record_result(db, a2, result="cleared", succeeded=True, row_count=0)
+        await outcome_store.record_result(
+            db, a2, result="cleared", succeeded=True, row_count=0, observation=observe_family("bfd", {})
+        )
     async with session() as db:
         by_family = await outcome_store.get_current_outcomes(db, device_id)
         assert set(by_family) == {"svi", "bfd"}

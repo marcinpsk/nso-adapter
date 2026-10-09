@@ -19,7 +19,7 @@ from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "read_state", "bundles"}
+TOP_KEYS = {"observation", "device_id", "last_refreshed_at", "refresh_source", "read_state", "bundles"}
 BUNDLE_REQUIRED_KEYS = {"name", "lag_id", "members"}
 BUNDLE_OPTIONAL_KEYS = {"min_links", "system_priority", "system_id", "timer", "admin_key"}
 MEMBER_REQUIRED_KEYS = {"interface_name"}
@@ -58,6 +58,7 @@ async def test_lag_config_contract(adapter_client):
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/lag-config", headers=AUTH)).json()
     assert set(body.keys()) == TOP_KEYS
+    assert body["observation"] is None
     bundles = {b["lag_id"]: b for b in body["bundles"]}
     assert set(bundles[1].keys()) == BUNDLE_REQUIRED_KEYS | BUNDLE_OPTIONAL_KEYS
     assert set(bundles[2].keys()) == BUNDLE_REQUIRED_KEYS  # optionals omitted
@@ -71,4 +72,5 @@ async def test_lag_config_no_data_shape(adapter_client):
     device_id = await seed_device(nso_device_name="lag-ct-empty", netbox_device_id=7991)
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/lag-config", headers=AUTH)).json()
     assert set(body.keys()) == TOP_KEYS
+    assert body["observation"] is None
     assert body["bundles"] == [] and body["refresh_source"] == "never"

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
@@ -15,6 +16,7 @@ from sqlalchemy import select
 from nso_adapter.core.lag_config import refresh_lag_config_for_device
 from nso_adapter.store.models import Device, LagBundleConfig, LagMemberConfig
 from tests.conftest import seed_device, session
+from tests.fixtures.switching_read_payloads import SWITCHING_READ_PAYLOADS
 
 
 @asynccontextmanager
@@ -34,20 +36,7 @@ async def test_refresh_lag_config_happy(adapter_client):
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "device-name": "sw03",
-            "lag": [
-                {
-                    "name": "Port-channel1",
-                    "lag-id": 1,
-                    "min-links": 2,
-                    "system-priority": 100,
-                    "timer": "fast",
-                    "member": [
-                        {"interface-name": "GigabitEthernet0/1", "mode": "active", "port-priority": 200},
-                        {"interface-name": "GigabitEthernet0/2", "mode": "active"},
-                    ],
-                },
-                {"name": "Port-channel2", "lag-id": 2, "member": []},
-            ],
+            **deepcopy(SWITCHING_READ_PAYLOADS["lag_config"]),
         }
 
         await refresh_lag_config_for_device(db, device, nso_client, refresh_source="poll")
