@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v1.11.0 (2026-10-09)
+
+### Bug Fixes
+
+- **opengrep**: Require diagnostic handling, not a later reference
+  ([`a359515`](https://github.com/marcinpsk/nso-adapter/commit/a35951519ce6957544fd21b173825c762b420ad7))
+
+### Chores
+
+- **deps**: Bump mako from 1.3.12 to 1.4.2
+  ([`3b2795a`](https://github.com/marcinpsk/nso-adapter/commit/3b2795ada35e5ebc2676ca8802b4c16b904f16fc))
+
+
 ## v1.10.0 (2026-10-07)
 
 
