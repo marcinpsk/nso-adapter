@@ -76,6 +76,13 @@ repos:
         language: system
         pass_filenames: false
         files: ^(nso_adapter/.*\.py|scripts/.*|pyproject\.toml|uv\.lock)$
+      # deptry excludes tests by default and reads every test import of pytest as DEP004.
+      - id: deptry-tests
+        name: deptry (test imports are declared dependencies)
+        entry: uv run --locked --system-certs -- deptry . --exclude 'venv|\.venv|\.direnv|\.git|setup\.py' --ignore DEP002,DEP004
+        language: system
+        pass_filenames: false
+        files: ^(tests/.*\.py|pyproject\.toml|uv\.lock)$
       - id: review-patterns
         name: custom review patterns (OpenGrep)
         entry: scripts/check-review-patterns scan
