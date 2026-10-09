@@ -833,7 +833,7 @@ rules:
   - id: nso-projection-diagnostics-discarded
     languages: [python]
     severity: ERROR
-    message: Pass the projection's unprojectable entries to log_skipped_entries (or raise on them); a materializer that ignores them drops rows from the mirror without a log line.
+    message: Pass the projection's unprojectable entries to log_skipped_entries, log each one, or raise on them; a materializer that only reads them drops rows from the mirror without a log line.
     paths:
       include:
         - nso_adapter/core/*.py
@@ -849,14 +849,39 @@ rules:
               - pattern-not-inside: |
                   $P = $PROJECT(...)
                   ...
-                  <... $P.unprojectable ...>
+                  log_skipped_entries(..., <... $P.unprojectable ...>, ...)
+              - pattern-not-inside: |
+                  $P = $PROJECT(...)
+                  ...
+                  for $ITEM in $P.unprojectable:
+                      ...
+                      logger.$LEVEL(...)
+              - pattern-not-inside: |
+                  $P = $PROJECT(...)
+                  ...
+                  $INVALID = [$ITEM for $ITEM in $P.unprojectable if $COND]
+                  if $INVALID:
+                      ...
+                      raise $ERROR
+              - pattern-not-inside: |
+                  $P = $PROJECT(...)
+                  ...
+                  if [$ITEM for $ITEM in $P.unprojectable if $COND]:
+                      ...
+                      raise $ERROR
           - patterns:
               - pattern: $P, $SECOND = $PROJECT(...)
               - pattern-not-inside: |
                   $P, $SECOND = $PROJECT(...)
                   ...
-                  <... $P.unprojectable ...>
+                  log_skipped_entries(..., <... $P.unprojectable ...>, ...)
               - pattern-not-inside: |
                   $P, $SECOND = $PROJECT(...)
                   ...
-                  <... $SECOND ...>
+                  log_skipped_entries(..., $SECOND, ...)
+              - pattern-not-inside: |
+                  $P, $SECOND = $PROJECT(...)
+                  ...
+                  if $SECOND:
+                      ...
+                      raise $ERROR
