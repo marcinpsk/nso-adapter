@@ -24,24 +24,24 @@ def _envelope(message, root="ietf-restconf:errors", tags=_REFUSAL_TAGS):
 
 
 @pytest.mark.parametrize(
-    ("status", "body", "transport_failure", "expected"),
+    ("status", "body", "expected"),
     [
-        (500, _envelope(_message()), None, "DefiniteRefusal"),
-        (500, _envelope(_message(), "errors"), None, "DefiniteRefusal"),
-        (500, json.dumps({"error": [{**_REFUSAL_TAGS, "error-message": _message()}]}), None, "DefiniteRefusal"),
-        (400, _envelope(_message()), None, "ProtocolFault"),
-        (503, _envelope(_message()), None, "ProtocolFault"),
-        (200, _envelope(_message()), None, "ProtocolFault"),
-        (500, _envelope("ordinary rejection"), None, "Unavailable"),
-        (502, _envelope("ordinary rejection"), None, "Unavailable"),
-        (503, "opaque response", None, "Unavailable"),
-        (400, _envelope("ordinary rejection"), None, "OrdinaryRejection"),
-        (404, "opaque response", None, "OrdinaryRejection"),
-        (None, None, OSError("placeholder transport failure"), "Unavailable"),
+        (500, _envelope(_message()), "DefiniteRefusal"),
+        (500, _envelope(_message(), "errors"), "DefiniteRefusal"),
+        (500, json.dumps({"error": [{**_REFUSAL_TAGS, "error-message": _message()}]}), "DefiniteRefusal"),
+        (400, _envelope(_message()), "ProtocolFault"),
+        (503, _envelope(_message()), "ProtocolFault"),
+        (200, _envelope(_message()), "ProtocolFault"),
+        (500, _envelope("ordinary rejection"), "Unavailable"),
+        (502, _envelope("ordinary rejection"), "Unavailable"),
+        (503, "opaque response", "Unavailable"),
+        (400, _envelope("ordinary rejection"), "OrdinaryRejection"),
+        (404, "opaque response", "OrdinaryRejection"),
+        (None, None, "Unavailable"),
     ],
 )
-def test_classify_error_table(status, body, transport_failure, expected):
-    result = classify_error(status, body, transport_failure=transport_failure)
+def test_classify_error_table(status, body, expected):
+    result = classify_error(status, body)
     assert type(result).__name__ == expected
     if expected == "DefiniteRefusal":
         assert result.records == protocol.parse_refusals(_message())
@@ -202,12 +202,10 @@ def test_malformed_claim_secret_never_reaches_result_or_exception_chain(status, 
     assert exception_chain(captured) == [captured]
 
 
-def test_transport_failure_does_not_retain_exception():
-    secret = "placeholder-transport-secret-canary"
-    failure = OSError(secret)
-    result = classify_error(None, None, transport_failure=failure)
-    assert isinstance(result, Unavailable)
-    assert_text_free_of((result, repr(result)), [secret])
+def test_a_transport_failure_cannot_carry_an_http_status():
+    # An unread 4xx body cannot exclude a refusal claim, so a status never pairs with a transport failure.
+    with pytest.raises(TypeError):
+        classify_error(404, None, transport_failure=OSError("placeholder transport failure"))
 
 
 def test_ordinary_rejection_has_no_server_text():

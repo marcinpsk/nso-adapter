@@ -126,15 +126,13 @@ def _claimed_records(decoded: object) -> tuple[Refusal, ...] | None:
     return records
 
 
-def classify_error(
-    status: int | None, body: bytes | str | None, *, transport_failure: BaseException | None = None
-) -> ErrorClassification:
+def classify_error(status: int | None, body: bytes | str | None) -> ErrorClassification:
     """Classify claims before HTTP errors, without retaining external text.
 
     Successful responses stay with the native and CLI decoders. Transport failures
     have no HTTP status. Construct faults after parsing handlers have finished.
     """
-    if status is None or transport_failure is not None:
+    if status is None:
         return Unavailable()
     raw_text = body.decode("utf-8", errors="surrogateescape") if isinstance(body, bytes) else body
     claimed = claims_refusal(raw_text)
