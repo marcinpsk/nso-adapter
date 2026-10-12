@@ -39,10 +39,12 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from nso_adapter.core.request_flags import PENDING_CLEAR_PROVENANCES, REMOVAL_MARKINGS
 from nso_adapter.store.ddl import (
+    execution_evidence_immutability_ddl,
     generation_immutability_ddl,
     job_coalescible_immutability_ddl,
     observation_immutability_ddl,
 )
+from nso_adapter.store.execution_evidence import validate_catalog_payload
 
 
 class Base(DeclarativeBase):
@@ -803,6 +805,99 @@ for _statement in job_coalescible_immutability_ddl():
     event.listen(Job.__table__, "after_create", DDL(_statement))
 for _statement in generation_immutability_ddl():
     event.listen(DeploymentGeneration.__table__, "after_create", DDL(_statement))
+
+
+class ApplyExecutionAttempt(Base):
+    """Frozen send membership and private restoration evidence for one worker run."""
+
+    __tablename__ = "apply_execution_attempt"
+    __table_args__ = (
+        UniqueConstraint("job_id", "run_attempt", name="uq_execution_attempt_job_run"),
+        UniqueConstraint("job_correlation_id", "run_attempt", name="uq_execution_attempt_correlation_run"),
+        CheckConstraint("run_attempt > 0", name="ck_execution_attempt_run"),
+        CheckConstraint("operation_kind IN ('apply', 'removal')", name="ck_execution_attempt_operation"),
+        CheckConstraint("phase IN ('prepared', 'response_recorded', 'terminal')", name="ck_execution_attempt_phase"),
+        CheckConstraint(
+            "response_phase IS NULL OR response_phase IN ('pre_commit_dry_run', 'commit', 'post_commit_verification')",
+            name="ck_execution_attempt_response_phase",
+        ),
+        Index("ix_execution_attempt_device_generation", "device_id", "generation_id"),
+        Index("ix_execution_attempt_removal_authority", "removal_tombstone_ids", postgresql_using="gin"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(Integer, ForeignKey("devices.id", ondelete="CASCADE"))
+    generation_id: Mapped[int] = mapped_column(Integer, ForeignKey("deployment_generation.id", ondelete="CASCADE"))
+    job_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
+    job_correlation_id: Mapped[int] = mapped_column(Integer)
+    run_attempt: Mapped[int] = mapped_column(Integer)
+    operation_kind: Mapped[str] = mapped_column(String(16))
+    document_digest: Mapped[str] = mapped_column(String(64))
+    claim_token: Mapped[str] = mapped_column(String(64))
+    stream_revisions: Mapped[dict] = mapped_column(JSONB)
+    generation_authorities: Mapped[list] = mapped_column(JSONB)
+    manual_attempt_id: Mapped[uuid.UUID | None] = mapped_column(PGUUID(as_uuid=True), nullable=True)
+    removal_tombstone_ids: Mapped[list] = mapped_column(JSONB)
+    logical_membership: Mapped[list] = mapped_column(JSONB)
+    attempted_carriers: Mapped[list] = mapped_column(JSONB)
+    safe_origins: Mapped[list] = mapped_column(JSONB)
+    prior_bookkeeping: Mapped[list] = mapped_column(JSONB)
+    phase: Mapped[str] = mapped_column(String(32), default="prepared", server_default=text("'prepared'"))
+    response_phase: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    response_classification: Mapped[dict] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
+    commit_acknowledged: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now())
+
+
+class RowOutcome(Base):
+    """One logical disposition, with a separate frozen count and stamp carrier."""
+
+    __tablename__ = "row_outcome"
+    __table_args__ = (
+        UniqueConstraint(
+            "execution_attempt_id",
+            "stream",
+            "row_subject",
+            "row_key",
+            "settlement_cohort",
+            name="uq_row_outcome_logical_identity",
+            postgresql_nulls_not_distinct=True,
+        ),
+        CheckConstraint(
+            "disposition IN ('in_sync', 'refused', 'not_applied', 'unavailable')",
+            name="ck_row_outcome_disposition",
+        ),
+        CheckConstraint(
+            "(disposition = 'refused' AND jsonb_array_length(refusals) > 0) OR "
+            "(disposition <> 'refused' AND refusals = '[]'::jsonb)",
+            name="ck_row_outcome_refusals",
+        ),
+        Index("ix_row_outcome_attempt", "execution_attempt_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    execution_attempt_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("apply_execution_attempt.id", ondelete="CASCADE"),
+    )
+    stream: Mapped[str] = mapped_column(String(64))
+    row_subject: Mapped[str] = mapped_column(String(128))
+    row_key: Mapped[str] = mapped_column(String(64))
+    settlement_cohort: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    source_identity: Mapped[list] = mapped_column(JSONB)
+    logical_identity: Mapped[dict] = mapped_column(JSONB)
+    carrier_identity: Mapped[dict] = mapped_column(JSONB)
+    disposition: Mapped[str] = mapped_column(String(16))
+    refusals: Mapped[list] = mapped_column(JSONB)
+
+
+for _statement in execution_evidence_immutability_ddl():
+    event.listen(RowOutcome.__table__, "after_create", DDL(_statement))
+
+
+@event.listens_for(RowOutcome, "before_insert")
+def _validate_outcome_catalog(_mapper, _connection, outcome: RowOutcome) -> None:
+    validate_catalog_payload(outcome.refusals)
 
 
 class DeviceSettings(Base):
