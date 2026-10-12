@@ -50,7 +50,14 @@ from nso_adapter.domain.asn import AsnRuleViolation, validate_asn_rows
 from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.apply import NsoApplyError
 from nso_adapter.nso.client import failure_detail
-from nso_adapter.nso.origins import EncodedSection, OriginContext, OriginIndex, PriorContribution, RemovalAuthority
+from nso_adapter.nso.origins import (
+    EncodedSection,
+    OriginConstructionError,
+    OriginContext,
+    OriginIndex,
+    PriorContribution,
+    RemovalAuthority,
+)
 from nso_adapter.nso.refusal_protocol import row_ref
 from nso_adapter.store.models import (
     DbInterface,
@@ -598,7 +605,12 @@ def encode_section(
         refuse_gated_local_levels(table_rows)
     if proof is None:
         proof = _hydrated_proof(document, section)
-    return entry.encode(table_rows, section_execution(document, section, proof, origin_context))
+    try:
+        return entry.encode(table_rows, section_execution(document, section, proof, origin_context))
+    except OriginConstructionError as exc:
+        # The message is fixed text; raised outside the handler so no context rides along.
+        failure = NsoApplyError("origin_construction", str(exc))
+    raise failure
 
 
 def overlay_retained_routes(encoded: EncodedSection, retained: list[dict]) -> set:
