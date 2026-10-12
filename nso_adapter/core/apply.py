@@ -600,16 +600,10 @@ def encode_section(
     reads a live intent row or the device row.
     """
     from nso_adapter.core.projection import section_rows_by_table
-    from nso_adapter.nso.apply import refuse_gated_local_levels
 
     entry = section_registry()[section]
     source = rows if rows is not None else section_rows_by_table(document, section)
     table_rows = {table: _carried(table_rows) for table, table_rows in source.items()}
-    if section == "logging":
-        # A send-boundary refusal, never the encoder's: one document must encode the same
-        # bytes in every process, and a weaker host-only body would stamp the levels row
-        # in_sync with no severity landing.
-        refuse_gated_local_levels(table_rows)
     if proof is None:
         proof = _hydrated_proof(document, section)
     try:
@@ -758,6 +752,9 @@ async def build_device_containers(
     decides. It is never silently omitted: under a full-document PUT an omitted family is a
     RETRACTED family, so a body with a build error is not sendable at all.
     """
+    from nso_adapter.core.projection import section_rows_by_table
+    from nso_adapter.nso.apply import refuse_gated_local_levels
+
     registry = section_registry()
     containers: dict[str, dict] = {}
     origins = OriginIndex()
@@ -767,6 +764,7 @@ async def build_device_containers(
     for section, entry in registry.items():
         if section not in document:
             continue
+        encoded = None
         try:
             encoded = encode_section(
                 document,
@@ -775,6 +773,10 @@ async def build_device_containers(
                 proof=(proof_by_section or {}).get(section),
                 origin_context=origin_context,
             )
+            if section == "logging":
+                rows = (rows_by_section or {}).get(section)
+                source = rows if rows is not None else section_rows_by_table(document, section)
+                refuse_gated_local_levels({table: _carried(table_rows) for table, table_rows in source.items()})
             if section == "static_route":
                 retained: list[dict] = []
                 if retain_static_routes:
@@ -783,6 +785,9 @@ async def build_device_containers(
                 sent_route_keys = overlay_retained_routes(encoded, retained)
                 _record_route_omissions(encoded.origins, document, sent_route_keys, origin_context)
         except NsoApplyError as exc:
+            # An unsent section keeps the logical rows its encoder identified.
+            if encoded is not None:
+                origins.merge(encoded.origins)
             logger.error(
                 "apply.section_build_failed",
                 **device_fields(device_id=device.id),

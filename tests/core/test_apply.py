@@ -1330,7 +1330,7 @@ async def test_gated_local_levels_refuse_the_whole_send(adapter_client):
         assert job.result["logging_count_by_outcome"] == {
             "in_sync": 0,
             "apply_failed": 0,
-            "not_applied": 0,
+            "not_applied": 1,
             "unavailable": 0,
         }
         # the unrelated family never reached the device either, so it stays pending

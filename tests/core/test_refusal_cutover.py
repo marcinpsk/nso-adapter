@@ -18,7 +18,7 @@ from nso_adapter.core import worker
 from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, revoke_stale_claims
 from nso_adapter.core.jobs import _JOB_RUNNERS
 from nso_adapter.nso.client import DEVICE_INTENT_ROOT
-from nso_adapter.nso.refusal_protocol import refusal, row_ref
+from nso_adapter.nso.refusal_protocol import RowRef, refusal, row_ref
 from nso_adapter.store.models import (
     ApplyExecutionAttempt,
     BgpRouterIntent,
@@ -242,7 +242,7 @@ async def terminal(api, device_id, *, refused=True):
 class CommitGate:
     """Pause around a real checkpoint commit without replacing settlement behavior."""
 
-    def __init__(self, monkeypatch, phase, *, before=False, failure=None):
+    def __init__(self, monkeypatch, phase, *, before=False, failure=None, sender_phase=None):
         self.reached = asyncio.Event()
         self.release = asyncio.Event()
         self.phase = phase
@@ -253,6 +253,7 @@ class CommitGate:
             for row in (*db.new, *db.dirty):
                 if isinstance(row, ApplyExecutionAttempt):
                     db.info["observed_attempt_phase"] = row.phase
+                    db.info["observed_response_phase"] = row.response_phase
 
         self.observe = observe
         event.listen(Session, "before_flush", observe)
@@ -260,6 +261,8 @@ class CommitGate:
 
         async def commit(db):
             matches = db.info.get("observed_attempt_phase") == phase
+            if sender_phase is not None:
+                matches = matches and db.info.get("observed_response_phase") == sender_phase
             if matches and not self.hit and before:
                 self.hit = True
                 self.reached.set()
@@ -1323,3 +1326,218 @@ async def test_removal_unsent_failure_retains_attempt_evidence(adapter_client, m
     async with session() as db:
         row = await db.scalar(select(VlanIntent).where(VlanIntent.device_id == device_id))
         assert row.last_apply_at is not None and row.last_apply_error is None
+
+
+@pytest.mark.parametrize("failure", ["logging_gate", "retention_read"])
+async def test_apply_build_failure_preserves_selected_unsent_rows(adapter_client, monkeypatch, failure):
+    device_id, transport = await setup(adapter_client, monkeypatch, admit=False)
+    selected = {"vlan": 41, "interface_config": 41}
+    if failure == "logging_gate":
+        monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "1")
+        response = await adapter_client.put(
+            f"/api/v1/devices/{device_id}/logging-intent",
+            json={"hosts": [{"address": "192.0.2.99"}], "local_levels": {"console_severity": "CRITICAL"}},
+            headers=AUTH | push_seq(41),
+        )
+        stream, error_code = "logging", "local_levels_gated"
+        expected_rows = {
+            row_ref("logging", "logging.host", (("host", ("192.0.2.99",)),)),
+            row_ref("logging", "logging.local-levels", ()),
+        }
+    else:
+        routes = [
+            {"route_id": index, "vrf": "", "prefix": f"198.18.{index}.0/24", "next_hop": "192.0.2.1"}
+            for index in (1, 2)
+        ]
+        response = await _put_routes(adapter_client, device_id, routes, seq=41)
+        stream, error_code = "static_route", "static_route_snapshot_inconclusive"
+        expected_rows = {
+            row_ref("static-route", "static-route.route", (("route", ("", route["prefix"], route["next_hop"])),))
+            for route in routes
+        }
+    assert response.status_code == 200
+    selected[stream] = 41
+    response = await _apply(adapter_client, device_id, selected)
+    assert response.status_code == 202
+    if failure == "logging_gate":
+        monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "0")
+    else:
+        transport.fake.service_status = "inconclusive"
+    job_id = await run_next(device_id)
+    job = await job_row(job_id)
+    assert job.status == JobStatus.failed
+    assert job.error["code"] == error_code
+    assert transport.documents == []
+    attempts, outcomes = await evidence(device_id)
+    attempt = attempts[-1]
+    assert attempt.phase == "terminal" and not attempt.commit_acknowledged
+    own = [row for row in outcomes if row.execution_attempt_id == attempt.id]
+    assert expected_rows == {
+        RowRef(outcome.row_subject, outcome.row_key) for outcome in own if outcome.stream == stream
+    }, "every selected row in the failed section must retain terminal evidence"
+    assert len(own) == len(attempt.logical_membership) == 6
+    assert all(outcome.disposition == "not_applied" and not outcome.refusals for outcome in own)
+    assert job.result["refusals"] == []
+    assert not job.result["commit_acknowledged"]
+    for key in (stream, "vlan", "attribute"):
+        assert job.result[f"{key}_count_by_outcome"] == {
+            "in_sync": 0,
+            "apply_failed": 0,
+            "not_applied": 2,
+            "unavailable": 0,
+        }
+    assert len(job.result["settlement_owners"]) == 6
+    response = await adapter_client.get(f"/api/v1/jobs/{job_id}", headers=AUTH)
+    assert response.status_code == 200
+    assert response.json()["error"] == job.error
+    assert response.json()["row_outcomes"] == job.result["row_outcomes"]
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/deployment-evidence", json={"apply_attempt_ids": []}, headers=AUTH
+    )
+    assert response.status_code == 200
+    assert response.json()["head"]["row_outcomes"] == job.result["row_outcomes"]
+    async with session() as db:
+        for row in await db.scalars(select(VlanIntent).where(VlanIntent.device_id == device_id)):
+            assert row.last_apply_at == PRIOR_AT and row.last_apply_error == PRIOR_ERROR
+
+
+async def missing_retained_route_history(api, monkeypatch):
+    from tests.api.test_static_route_deleted_routes import deleted
+
+    device_id, transport = await setup(api, monkeypatch)
+    transport.refuse = False
+    await run_next(device_id)
+    route = {"route_id": 1, "vrf": "", "prefix": "198.18.0.0/24", "next_hop": "192.0.2.1"}
+    response = await _put_routes(api, device_id, [route], seq=41)
+    assert response.status_code == 200
+    response = await _apply(api, device_id, {"static_route": 41})
+    assert response.status_code == 202
+    transport.raw = b"{}"
+    transport.refuse = True
+    await run_next(device_id)
+    transport.raw = None
+    transport.fake.service = [{"vrf": "", "prefix": route["prefix"], "next-hop": route["next_hop"]}]
+    response = await api.post(
+        f"/api/v1/devices/{device_id}/actions/abandon-generation",
+        json={"generation_id": (await generations(device_id))[-1].id},
+        headers=AUTH,
+    )
+    assert response.status_code == 202
+    response = await _put_routes(
+        api, device_id, [], seq=42, deleted=[deleted(1, [("", route["prefix"], route["next_hop"])])]
+    )
+    assert response.status_code == 200
+    transport.records = (
+        refusal(
+            "static-route",
+            row_ref("static-route", "static-route.route", (("route", ("", route["prefix"], route["next_hop"])),)),
+            "write-blocked",
+        ),
+    )
+    await run_next(device_id)
+    response = await api.post(
+        f"/api/v1/devices/{device_id}/actions/abandon-generation",
+        json={"generation_id": (await generations(device_id))[-1].id},
+        headers=AUTH,
+    )
+    assert response.status_code == 202
+    response = await put_vlans(api, device_id, [101, 102], seq=42)
+    assert response.status_code == 200
+    response = await _apply(api, device_id, {"vlan": 42})
+    assert response.status_code == 202
+    return device_id, transport
+
+
+@pytest.mark.parametrize("cause", ["unknown_digest", "missing_history"])
+@pytest.mark.parametrize("lane", ["normal", "claimless", "expired"])
+async def test_post_commit_attribution_failure_remains_public(adapter_client, monkeypatch, cause, lane):
+    from nso_adapter.nso.origins import AttributionFailure, resolve_refusals
+    from nso_adapter.store.execution_evidence import origins_from_records
+    from nso_adapter.store.models import DeploymentGeneration, GenerationStatus
+
+    if cause == "missing_history":
+        device_id, transport = await missing_retained_route_history(adapter_client, monkeypatch)
+        expected_reason = "missing_baseline_provenance"
+    else:
+        device_id, transport = await setup(adapter_client, monkeypatch)
+        transport.records = (refusal("vlan", row_ref("vlan", "vlan.vlan", (("vlan", (999,)),)), "write-blocked"),)
+        expected_reason = "missing_binding"
+    transport.refuse = False
+    transport.documents.clear()
+    transport.verification_error = (500, envelope(transport.records))
+    gate = None
+    task = None
+    try:
+        if lane == "normal":
+            await run_next(device_id)
+        else:
+            gate = CommitGate(
+                monkeypatch,
+                "response_recorded",
+                failure=ClaimLostError("placeholder lost holder"),
+                sender_phase="post_commit_verification",
+            )
+            task = asyncio.create_task(run_next(device_id))
+            await asyncio.wait_for(gate.reached.wait(), 5)
+            attempts, _ = await evidence(device_id)
+            assert attempts[-1].commit_acknowledged
+            assert attempts[-1].response_classification["post_commit_verification"]["kind"] == "refused"
+            gate.release.set()
+            with pytest.raises(ClaimLostError):
+                await task
+            async with session() as db:
+                if lane == "claimless":
+                    await db.execute(delete(DeviceClaim).where(DeviceClaim.device_id == device_id))
+                    await db.execute(
+                        update(Job)
+                        .where(Job.device_id == device_id, Job.status == JobStatus.running)
+                        .values(heartbeat_at=None)
+                    )
+                else:
+                    await db.execute(
+                        update(DeviceClaim).where(DeviceClaim.device_id == device_id).values(heartbeat_at=PRIOR_AT)
+                    )
+                await db.commit()
+            if lane == "claimless":
+                await worker.requeue_orphaned_jobs()
+            else:
+                await revoke_stale_claims(cutoff_seconds=0)
+        attempts, outcomes = await evidence(device_id)
+        attempt = attempts[-1]
+        assert attempt.phase == "terminal" and attempt.commit_acknowledged
+        assert attempt.response_classification["commit"]["kind"] == "acknowledged"
+        assert attempt.response_classification["post_commit_verification"]["kind"] == "refused"
+        resolved = resolve_refusals(transport.records, origins_from_records(attempt.safe_origins))
+        assert isinstance(resolved, AttributionFailure) and resolved.reason == expected_reason
+        own = [outcome for outcome in outcomes if outcome.execution_attempt_id == attempt.id]
+        assert len(own) == len(attempt.logical_membership) > 0
+        assert all(outcome.disposition == "unavailable" and not outcome.refusals for outcome in own)
+        job = await terminal(adapter_client, device_id, refused=False)
+        assert job.error["code"] == "attribution_failed"
+        assert job.result["commit_acknowledged"]
+        assert job.result["refusals"] == []
+        assert job.result["vlan_count_by_outcome"] == {
+            "in_sync": 0,
+            "apply_failed": 0,
+            "not_applied": 0,
+            "unavailable": 2,
+        }
+        assert all(owner["disposition"] == "unavailable" for owner in job.result["settlement_owners"])
+        response = await adapter_client.get(f"/api/v1/jobs/{job.id}", headers=AUTH)
+        assert response.status_code == 200
+        assert response.json()["error"]["code"] == "attribution_failed"
+        async with session() as db:
+            generation = await db.get(DeploymentGeneration, attempt.generation_id)
+            assert generation.status == GenerationStatus.outcome_unknown
+            assert generation.carrier_job_error["code"] == "attribution_failed"
+            assert generation.carrier_job_result == job.result
+        assert len(transport.documents) == 1
+        assert await run_next(device_id) is None
+    finally:
+        if gate is not None:
+            gate.release.set()
+            gate.close()
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)

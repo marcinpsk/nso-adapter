@@ -393,8 +393,9 @@ def _disposition_evidence(attempt: ApplyExecutionAttempt) -> tuple[str, dict, li
         if verification.get("kind") == "refused":
             origins = origins_from_records(attempt.safe_origins)
             attributed = resolve_refusals(refusals_from_payload(verification["refusals"]), origins)
-            if not isinstance(attributed, AttributionFailure):
-                verification_records = attributed_catalog_records(attributed, origins, "post_commit_verification")
+            if isinstance(attributed, AttributionFailure):
+                return "attribution_failed", {}, []
+            verification_records = attributed_catalog_records(attributed, origins, "post_commit_verification")
         return "post_commit_unavailable", {}, verification_records
     if checkpoint.get("kind") == "rejected":
         return "rejected", {}, []
