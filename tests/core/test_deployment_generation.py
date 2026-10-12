@@ -1949,9 +1949,9 @@ async def _stored_job(job_id: int) -> dict:
 
 
 def _normalize_stored_value(value, *, key: str | None = None):
-    if key in {"id", "device_id"}:
+    if key in {"id", "device_id", "generation_id", "source_push_seq"}:
         return "identity" if value is not None else None
-    if key and key.endswith("_at"):
+    if key and (key.endswith("_at") or key == "acceptance_identity"):
         return "set" if value is not None else None
     if isinstance(value, dict):
         return {name: _normalize_stored_value(item, key=name) for name, item in sorted(value.items())}

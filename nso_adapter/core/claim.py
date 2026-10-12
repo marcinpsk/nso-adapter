@@ -260,7 +260,7 @@ async def _commit_outcome(db: AsyncSession) -> ClaimOutcome:
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001 - classification IS the handling here
-        logger.error("claim.commit_outcome_unknown", error=repr(exc))
+        logger.error("claim.commit_outcome_unknown", exception_type=type(exc).__name__)
         return ClaimOutcome.OUTCOME_UNKNOWN
     return ClaimOutcome.COMMIT_ACKNOWLEDGED
 
@@ -930,13 +930,16 @@ async def mark_failed_and_release(
         try:
             await _set_lock_timeout(conn, lock_timeout_ms)
             await lock_claim(conn, reg)  # claim -> jobs, per §3.9
-            await terminalize_running(
-                conn,
-                job_id,
-                status=JobStatus.failed,
-                error={"code": code, "message": message, "detail": {}},
-                expected_attempt=reg.run_attempt,
-            )
+            from nso_adapter.core.execution import dispose_run
+
+            if not await dispose_run(conn, job_id, reg, "runner_failed"):
+                await terminalize_running(
+                    conn,
+                    job_id,
+                    status=JobStatus.failed,
+                    error={"code": code, "message": message, "detail": {}},
+                    expected_attempt=reg.run_attempt,
+                )
             await _delete_own_claim(conn, reg)
         except ClaimLostError:
             # Recovery already re-dispositioned this job; writing now would clobber it.
@@ -957,6 +960,7 @@ async def dispose_cancelled(
     *,
     db: AsyncSession | None = None,
     lock_timeout_ms: int | None = None,
+    exit_reason="cancelled",
 ) -> ClaimOutcome:
     """Disposition a cancelled run AND delete the claim in ONE transaction.
 
@@ -967,13 +971,17 @@ async def dispose_cancelled(
         try:
             await _set_lock_timeout(conn, lock_timeout_ms)
             await lock_claim(conn, reg)
-            status = disposition_for(job_type)
+            from nso_adapter.core.execution import dispose_run
+
+            handled = await dispose_run(conn, job_id, reg, exit_reason)
+            status = disposition_for(job_type) if not handled else JobStatus.failed
             error = (
                 {"code": "cancelled", "message": "Worker cancelled the run", "detail": {}}
                 if status == JobStatus.failed
                 else None
             )
-            await terminalize_running(conn, job_id, status=status, error=error, expected_attempt=reg.run_attempt)
+            if not handled:
+                await terminalize_running(conn, job_id, status=status, error=error, expected_attempt=reg.run_attempt)
             await _delete_own_claim(conn, reg)
         except ClaimLostError:
             logger.warning("claim.dispose_claim_lost", job_id=job_id, device_id=reg.device_id)
@@ -1026,39 +1034,36 @@ async def revoke_stale_claims(
     revoked: list[RevokedClaim] = []
     async with claim_session(db) as conn:
         await _set_lock_timeout(conn, lock_timeout_ms)
+        from nso_adapter.store.execution_attempt_store import dispose_execution_attempt
+
         rows = (
             await conn.execute(
-                delete(DeviceClaim)
+                select(DeviceClaim.device_id, DeviceClaim.claim_token, DeviceClaim.job_id, DeviceClaim.purpose)
                 .where(DeviceClaim.heartbeat_at < cutoff_at)
-                .returning(
-                    DeviceClaim.device_id,
-                    DeviceClaim.claim_token,
-                    DeviceClaim.job_id,
-                    DeviceClaim.purpose,
-                )
+                .with_for_update()
             )
         ).all()
         for device_id, token, job_id, purpose in rows:
             revoked.append(RevokedClaim(device_id, token, job_id, purpose))
-            if job_id is None:
-                continue
-            observed = (await conn.execute(select(Job.job_type, Job.run_attempt).where(Job.id == job_id))).one_or_none()
-            if observed is None:
-                continue
-            job_type, run_attempt = observed
-            await terminalize_running(
-                conn,
-                job_id,
-                status=disposition_for(job_type),
-                error=(
-                    {"code": "orphaned", "message": "Claim revoked after heartbeat loss", "detail": {}}
-                    if disposition_for(job_type) == JobStatus.failed
-                    else None
-                ),
-                # Carried for uniformity, not for safety: this path's own DELETE holds the
-                # device_claim primary-key row lock to COMMIT, and re-acquisition inserts
-                # that same key, so no successor can re-enter `running` before it lands.
-                expected_attempt=run_attempt,
+            if job_id is not None:
+                observed = (
+                    await conn.execute(select(Job.job_type, Job.run_attempt).where(Job.id == job_id))
+                ).one_or_none()
+                if observed is not None:
+                    job_type, run_attempt = observed
+                    disposition = await dispose_execution_attempt(conn, job_id, run_attempt, token, "claim_expired")
+                    if disposition == "no_attempt":
+                        await terminalize_running(
+                            conn,
+                            job_id,
+                            status=disposition_for(job_type),
+                            error={"code": "orphaned", "message": "Claim revoked after heartbeat loss", "detail": {}}
+                            if disposition_for(job_type) == JobStatus.failed
+                            else None,
+                            expected_attempt=run_attempt,
+                        )
+            await conn.execute(
+                delete(DeviceClaim).where(DeviceClaim.device_id == device_id, DeviceClaim.claim_token == token)
             )
         await conn.commit()
     for entry in revoked:

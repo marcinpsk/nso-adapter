@@ -321,9 +321,9 @@ async def test_a_failed_allocation_never_takes_a_second_terminal_write(adapter_c
     from unittest.mock import AsyncMock, patch
 
     from nso_adapter.core import claim as claim_mod
-    from nso_adapter.core.apply import run_apply
     from nso_adapter.core.claim import BookkeepingOutcomeUnknown, acquire_claim, release_claim
     from nso_adapter.store.models import StaticRouteIntent
+    from tests.core.execution_helpers import run_apply
     from tests.core.test_static_route_removal import SrFake, sr_client
 
     device_id = await seed_device(nso_device_name=f"lc-alloc-{failure}", netbox_device_id=8631)
@@ -388,7 +388,7 @@ async def test_a_failed_allocation_leaves_a_removals_carrier_alone(adapter_clien
     or, worse, one that did. Recovery re-runs the removal; the carrier must still be there.
     """
     from nso_adapter.core.claim import BookkeepingOutcomeUnknown, acquire_claim, release_claim
-    from nso_adapter.core.removal import run_removal
+    from tests.core.execution_helpers import run_removal
     from tests.core.test_static_route_put import A, wire
     from tests.core.test_static_route_removal import SrFake, seed_removal_job, seed_tomb, sr_client, tombstone_ids
 

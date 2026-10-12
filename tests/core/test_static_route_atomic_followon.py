@@ -216,33 +216,10 @@ async def test_c5_2_a_failed_combined_commit_issues_no_follow_on_put(adapter_cli
     assert len(rec.commits) == 1, "one rejected write, and no retry behind it"
     ((applied, error),) = await static_rows(device_id)
     assert applied is None, "nothing landed"
-    assert error["code"] == "nso_put_failed", "the family rode the rejected commit, so it records it"
+    assert error is None
+    assert job.error["code"] == "nso_put_failed"
     assert await deployed_keys(device_id) == {B: list(A)}, "the replacement stays open"
     assert outcomes(job) == {B: "apply_failed"}
-
-
-@pytest.mark.parametrize("envelope", ["ietf-restconf:errors", "errors"])
-async def test_localized_refusal_replaces_previous_errors_on_other_families(adapter_client, envelope):
-    """A refused transaction replaces stale errors on every affected row."""
-    device_id = await seed_device(nso_device_name="sr-atomic", netbox_device_id=7504)
-    stale = {"code": "internal", "message": "a previous apply failed", "detail": {}}
-    await seed_replacement(device_id, last_apply_error=stale)
-    await seed_vlan(device_id)
-    client, rec = atomic_client(
-        "sr-atomic", state=present(wire(A), device_name="sr-atomic"), section=dev_state(wire(B))
-    )
-    rec.fail_commit = True
-    rec.error_envelope = envelope
-    rec.reject_message = "device-intent: refused [family=vlan field=vlan-id]: unsupported"
-
-    job = await run_the_apply(device_id, client)
-
-    assert not any(call["dry_run"] for call in rec.calls), "a named refusal needs no localization dry-run"
-    entry = job.result["static_route_results"][0]
-    assert entry["outcome"] == "apply_failed"
-    assert entry["error"] is not None
-    assert entry["error"]["message"] == "apply error (nso_put_failed); see the server log"
-    assert await static_rows(device_id) == [(None, entry["error"])]
 
 
 # ── C5.3 — a rejected commit fails EVERY family, not just the static rows ────
@@ -269,7 +246,8 @@ async def test_c5_3_a_rejected_commit_fails_every_family_together(adapter_client
     assert len(rec.commits) == 1
     ((vlan_applied, vlan_error),) = await vlan_rows(device_id)
     assert vlan_applied is None, "the sibling family landed nothing either"
-    assert vlan_error["code"] == "nso_put_failed", "and it records the same one rejection"
+    assert vlan_error is None
+    assert job.error["code"] == "nso_put_failed"
     assert await deployed_keys(device_id) == {B: list(A)}, "a refused commit closes nothing"
     assert outcomes(job) == {B: "apply_failed"}
 
@@ -325,7 +303,12 @@ async def test_c5_5_a_clean_follow_on_records_the_full_static_route_bookkeeping(
     assert job.result["reader_compare"]["static_route"] == "ok"
     assert outcomes(job) == {B: "in_sync"}
     assert await deployed_keys(device_id) == {B: list(B)}, "the replacement is CLOSED — the C3-declined P1 is dead"
-    assert job.result["static_route_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
+    assert job.result["static_route_count_by_outcome"] == {
+        "in_sync": 1,
+        "apply_failed": 0,
+        "not_applied": 0,
+        "unavailable": 0,
+    }
     result = job.result["static_route_results"][0]
     assert result["route_id"] == 7 and result["key"] == list(B) and result["fingerprint"]
 
@@ -378,9 +361,12 @@ async def test_a_replacement_is_delivered_even_when_the_eligible_list_is_empty(a
 
     assert job.status == JobStatus.succeeded, job.error
     assert rec.documents[0][_SR_CONTAINER]["route"] == [wire(B)], "the replacement was delivered"
-    assert job.result["static_route_count_by_outcome"] != {"in_sync": 0, "apply_failed": 0}, (
-        "an all-zero result after a real write is the false no-op C1.4 forbids"
-    )
+    assert job.result["static_route_count_by_outcome"] != {
+        "in_sync": 0,
+        "apply_failed": 0,
+        "not_applied": 0,
+        "unavailable": 0,
+    }, "an all-zero result after a real write is the false no-op C1.4 forbids"
 
 
 async def test_a_reader_compare_miss_on_the_follow_on_fails_only_the_missing_row(adapter_client):
@@ -527,8 +513,8 @@ async def test_rejected_commit_redacts_secrets_in_logs_and_stored_errors(adapter
         error = row.last_apply_error
     assert_text_free_of(json.dumps({"error": job.error, "logs": logs}), [secret])
     assert_text_free_of(json.dumps(error), [secret])
-    assert error is not None, json.dumps({"error": job.error, "logs": logs})
-    assert error["code"] == ("nso_put_failed" if phase == "commit" else "dry_run_rejected"), error
+    assert error is None
+    assert job.error["code"] == "refusal_protocol_fault"
     event = "nso.apply.device_intent_failed" if phase == "commit" else "nso.apply.dry_run_non_2xx"
     failures = [record for record in logs if record["event"] == event]
     assert failures

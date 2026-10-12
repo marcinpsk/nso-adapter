@@ -1,0 +1,123 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
+"""Runtime transactions over the shared execution-attempt store."""
+
+from collections.abc import Iterable
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from nso_adapter.core.claim import ClaimLostError, JobError, lock_claim
+from nso_adapter.nso.apply import ResponseCheckpoint
+from nso_adapter.nso.origins import LogicalRow
+from nso_adapter.store.execution_attempt_store import (
+    AttemptOwnershipLost,
+    bind_historical_origins,
+    dispose_execution_attempt,
+    prepare_execution_attempt,
+    record_classified_response,
+)
+from nso_adapter.store.models import ApplyExecutionAttempt, DeploymentGeneration, Job
+
+
+async def prepare_send(
+    db: AsyncSession, generation: DeploymentGeneration, origins, logicals: Iterable[LogicalRow], reg
+) -> ResponseCheckpoint:
+    """Commit preparation before delivery and commit each sender checkpoint separately."""
+    if reg is None or not reg.registered:
+        raise JobError("execution_claim_required", "Execution requires a REGISTERED claim")
+    if generation.job_id is None:
+        raise ValueError("Execution requires its job correlation")
+    await lock_claim(db, reg)
+    await bind_historical_origins(db, generation.device_id, origins, generation)
+    attempt = None
+    try:
+        attempt = await prepare_execution_attempt(
+            db, generation.job_id, reg.run_attempt, reg.token, generation.id, origins=origins, logical_rows=logicals
+        )
+    except AttemptOwnershipLost:
+        await db.rollback()
+    if attempt is None:
+        raise ClaimLostError("Execution preparation ownership was lost")
+    await db.commit()
+    identity = attempt.id, generation.job_id, reg.run_attempt, reg.token
+
+    async def checkpoint(phase, classification, acknowledged):
+        try:
+            await record_classified_response(
+                db, attempt.id, *identity[1:], classification, sender_phase=phase, commit_acknowledged=acknowledged
+            )
+            await db.commit()
+        except AttemptOwnershipLost:
+            await db.rollback()
+            lost = True
+        else:
+            lost = False
+        if lost:
+            raise ClaimLostError("Execution checkpoint ownership was lost")
+
+    return checkpoint
+
+
+async def dispose_run(
+    db: AsyncSession, job_id: int, reg, reason="runner_failed", *, terminal_error: dict | None = None
+) -> bool:
+    """Stage attempt settlement before a generic terminal write; caller commits once."""
+    if reg is not None and reg.registered:
+        await lock_claim(db, reg)
+    attempt = await db.scalar(select(Job.run_attempt).where(Job.id == job_id)) if reg is None else reg.run_attempt
+    token = reg.token if reg is not None and reg.registered else None
+    result = None
+    try:
+        result = await dispose_execution_attempt(db, job_id, attempt, token, reason, terminal_error=terminal_error)
+    except AttemptOwnershipLost:
+        await db.rollback()
+    if result is None:
+        raise ClaimLostError("Execution settlement ownership was lost")
+    return result != "no_attempt"
+
+
+async def active_attempt(db: AsyncSession, job_id: int) -> ApplyExecutionAttempt | None:
+    return await db.scalar(
+        select(ApplyExecutionAttempt)
+        .where(ApplyExecutionAttempt.job_id == job_id)
+        .order_by(ApplyExecutionAttempt.id.desc())
+        .limit(1)
+    )
+
+
+async def settle_unsent(db: AsyncSession, generation, origins, logicals, reg, error: dict) -> None:
+    """Settle known unsent membership with the existing attempt and disposition helpers."""
+    from nso_adapter.nso.refusals import OrdinaryRejection
+
+    await lock_claim(db, reg)
+    attempt = await prepare_execution_attempt(
+        db, generation.job_id, reg.run_attempt, reg.token, generation.id, origins=origins, logical_rows=logicals
+    )
+    await record_classified_response(
+        db,
+        attempt.id,
+        generation.job_id,
+        reg.run_attempt,
+        reg.token,
+        OrdinaryRejection(),
+        sender_phase="pre_commit_dry_run",
+    )
+    await dispose_execution_attempt(db, generation.job_id, reg.run_attempt, reg.token, "disposed", terminal_error=error)
+
+
+async def record_send_history(db: AsyncSession, job_id: int, reg, client, device) -> None:
+    """Record acknowledged origin history in the same terminal transaction."""
+    from nso_adapter.core.static_route_reader import certified_static_route_section
+    from nso_adapter.store.execution_attempt_store import record_acknowledged_origins
+
+    attempt = await active_attempt(db, job_id)
+    if attempt is None or not attempt.commit_acknowledged:
+        return
+    generation = await db.get(DeploymentGeneration, attempt.generation_id)
+    certified = (
+        await certified_static_route_section(client, device)
+        if generation is not None and "static_route" in generation.document
+        else None
+    )
+    await record_acknowledged_origins(db, attempt.id, job_id, reg.run_attempt, reg.token, certified)

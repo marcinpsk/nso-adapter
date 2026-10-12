@@ -40,7 +40,7 @@ def test_reader_compare_bgp_as_number_identity(intent_asn, view_asn, verdict):
         device_id=1,
     )
     assert status == verdict
-    assert evidence == {1: "present" if verdict == "ok" else "missing"}
+    assert evidence == {("bgp_router_intent", 1): "present" if verdict == "ok" else "missing"}
     assert (ok, failed) == ((1, 0) if verdict == "ok" else (0, 1))
     if verdict == "missing":
         assert row.last_apply_error["code"] == "reader_compare_missing"
@@ -205,7 +205,7 @@ async def test_bgp_mirror_refresh_preserves_redistribution_key_and_compares_aspl
         job_id=1,
         device_id=device_id,
     )
-    assert (ok, failed, errors, status, evidence) == (1, 0, [], "ok", {1: "present"})
+    assert (ok, failed, errors, status, evidence) == (1, 0, [], "ok", {("bgp_router_intent", 1): "present"})
 
 
 @pytest.mark.parametrize("invalid", ["064520", " 64512", "64512 ", "01.2", "1.02"])

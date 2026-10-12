@@ -29,6 +29,7 @@ from nso_adapter.api.errors import (
     RESP_500_INTERNAL,
     api_error,
 )
+from nso_adapter.api.execution import AttributedRefusalOut
 from nso_adapter.core.jobs import enqueue_job
 from nso_adapter.core.request_flags import MAX_PUSH_SEQ, MIN_PUSH_SEQ
 from nso_adapter.store.models import DeploymentGeneration, Device, JobType
@@ -59,6 +60,8 @@ class ApplyDiffOut(BaseModel):
     diffs: dict[str, str]
     generation_id: int | None
     document_digest: str | None
+    status: Literal["ready", "refused", "unavailable", "error"]
+    refusals: list[AttributedRefusalOut]
 
 
 class ActionApplyIn(BaseModel):
@@ -648,6 +651,8 @@ async def action_apply_diff(
             diffs={PREVIEW_KEY: "!! preview unavailable: executable generation changed during preview"},
             generation_id=None,
             document_digest=None,
+            status="unavailable",
+            refusals=(),
         )
     return {
         "device_id": device_id,
@@ -655,4 +660,6 @@ async def action_apply_diff(
         "diffs": preview.diffs,
         "generation_id": preview.generation_id,
         "document_digest": preview.document_digest,
+        "status": preview.status,
+        "refusals": list(preview.refusals),
     }

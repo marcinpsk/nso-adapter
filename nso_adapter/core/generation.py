@@ -1561,6 +1561,28 @@ async def generation_execution_sections(db: AsyncSession, job_id: int) -> frozen
     return frozenset(stream_section(stream) for stream in streams)
 
 
+async def generation_execution_context(db: AsyncSession, job_id: int):
+    """Keep each carried stream's authority while encoding the highest document."""
+    from nso_adapter.nso.origins import OriginContext
+
+    generations = await _job_generations(db, job_id)
+    if not generations:
+        raise ValueError("Execution requires a carried generation")
+    contexts = {
+        stream: OriginContext.from_generation(generation)
+        for generation in generations
+        for stream in generation.stream_revisions
+    }
+    highest = generations[-1]
+    return OriginContext(
+        highest.id,
+        {stream: context.source_push_seq.get(stream) for stream, context in contexts.items()},
+        {stream: context.stream_revisions[stream] for stream, context in contexts.items()},
+        highest.settlement_cohort,
+        contexts,
+    )
+
+
 class GenerationTampered(RuntimeError):
     """A stored generation's digest no longer matches its document. It is not executed."""
 
@@ -2048,7 +2070,28 @@ async def retry_generation(db: AsyncSession, generation_id: int) -> Job | None:
     await _claim_blocked_head(db, generation_id, GenerationStatus.pending)
     generation.status = GenerationStatus.pending
     generation.updated_at = _now()
+    from nso_adapter.core.projection import section_operation, section_registry
+    from nso_adapter.store.models import StaticRouteTombstone
+
+    previous_carrier = generation.job_id
     job = await _create_dedicated_carrier(db, generation)
+    if generation.removal_context:
+        ids = [
+            identity
+            for section in generation.document
+            if section in section_registry()
+            for identity in section_operation(generation.document, section).get("tombstone_ids", [])
+        ]
+        if ids:
+            await db.execute(
+                sa_update(StaticRouteTombstone)
+                .where(
+                    StaticRouteTombstone.id.in_(ids),
+                    StaticRouteTombstone.device_id == generation.device_id,
+                    (StaticRouteTombstone.job_id == previous_carrier) | StaticRouteTombstone.job_id.is_(None),
+                )
+                .values(job_id=job.id)
+            )
     logger.warning(
         "generation.retry_admitted",
         generation_id=generation_id,

@@ -29,6 +29,11 @@ class OriginContext:
     stream_revisions: Mapping[str, int] = field(default_factory=dict)
     settlement_cohort: int | None = None
 
+    stream_contexts: Mapping[str, OriginContext] = field(default_factory=dict)
+
+    def for_stream(self, stream: str) -> OriginContext:
+        return self.stream_contexts.get(stream, self)
+
     @classmethod
     def from_generation(cls, generation: Any) -> OriginContext:
         return cls(
@@ -337,16 +342,17 @@ class OriginRecorder:
         children: tuple[SourceRef, ...] = (),
     ) -> LogicalRow:
         row = row_ref(self.family, subject, path)
+        context = self.context.for_stream(stream)
         if carrier is None:
             carrier = SettlementOwner(
                 stream,
                 source.source_table,
                 row,
-                self.context.source_push_seq.get(stream),
+                context.source_push_seq.get(stream),
                 source.frozen_revision,
                 source.accepted_at,
-                self.context.generation_id,
-                self.context.settlement_cohort,
+                context.generation_id,
+                context.settlement_cohort,
                 source.content_identity,
             )
         acceptance = source.accepted_at if source.accepted_at is not None else carrier.accepted_at
@@ -354,11 +360,11 @@ class OriginRecorder:
             stream,
             row,
             (source, *children),
-            self.context.source_push_seq.get(stream),
+            context.source_push_seq.get(stream),
             source.frozen_revision,
             acceptance.isoformat() if acceptance is not None else None,
-            self.context.generation_id,
-            self.context.settlement_cohort,
+            context.generation_id,
+            context.settlement_cohort,
             carrier,
         )
         if (stream, row) in self._contributor_keys:

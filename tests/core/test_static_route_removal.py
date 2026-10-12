@@ -202,7 +202,7 @@ def sr_client(fake: SrFake):
 
 
 async def run_removal_job(device_id: int, job_id: int, client, *, reg=None, sync_from=None) -> Job:
-    from nso_adapter.core.removal import run_removal
+    from tests.core.execution_helpers import run_removal
 
     attempt = await start_job(job_id)  # the head transition a directly-invoked runner does not do
     own_claim = reg is None
@@ -227,7 +227,7 @@ async def run_removal_job(device_id: int, job_id: int, client, *, reg=None, sync
 
 
 async def run_apply_job(device_id: int, client, *, reg=None) -> Job:
-    from nso_adapter.core.apply import run_apply
+    from tests.core.execution_helpers import run_apply
 
     job_id = await seed_apply_job(device_id)
     own_claim = reg is None
@@ -568,7 +568,7 @@ async def test_c4_9_residue_found_fails_the_job_and_the_next_sweep_reissues(adap
     assert job.status == JobStatus.failed
     assert job.error["code"] == "static_route_removal_residue_found"
     assert await tombstone_ids(device_id) == [tomb]
-    assert await sweep_tombstones() == 1, "a failed owner makes the tombstone eligible again"
+    assert await sweep_tombstones() == 0, "unresolved delivery requires an explicit retry"
     record = next(record for record in logs if record["event"] == "removal.residue_found")
     assert record["device_id"] == device_id
     assert record["scope"] == "static_route"
@@ -1277,7 +1277,12 @@ async def test_a_superseded_run_attempt_refuses_the_removal_terminal_write(adapt
     client = sr_client(fake)
     client.run_device_state_read = AsyncMock(side_effect=_supersede)
 
-    job = await run_removal_job(device_id, job_id, client)
+    from nso_adapter.core.claim import ClaimLostError
+
+    with pytest.raises(ClaimLostError):
+        await run_removal_job(device_id, job_id, client)
+    async with session() as db:
+        job = await db.get(Job, job_id)
 
     client.run_device_state_read.assert_awaited_once()
     assert job.status == JobStatus.running, "a superseded execution must not write a terminal status"

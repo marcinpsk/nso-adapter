@@ -70,6 +70,8 @@ async def test_get_job_maximal_golden(adapter_client):
         "started_at": TS_Z,
         "heartbeat_at": TS_Z,
         "settle_seq": 7,
+        "row_outcomes": None,
+        "refusals": None,
     }
 
 
@@ -106,6 +108,8 @@ async def test_list_jobs_nullable_golden(adapter_client):
             "started_at": None,
             "heartbeat_at": None,
             "settle_seq": None,
+            "row_outcomes": None,
+            "refusals": None,
         }
     ]
 

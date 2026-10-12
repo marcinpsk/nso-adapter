@@ -35,8 +35,13 @@ async def _blocked_orphans(device_id: int) -> dict:
 
     async with session() as db:
         row = (await db.execute(sa.select(VlanIntent).where(VlanIntent.device_id == device_id))).scalar_one()
-    assert row.last_apply_error["code"] == "removal_blocked_collateral"
-    return row.last_apply_error["detail"]["orphans"]
+    assert row.last_apply_error is None
+    from nso_adapter.store.models import Job
+
+    async with session() as db:
+        job = await db.scalar(sa.select(Job).where(Job.device_id == device_id).order_by(Job.id.desc()))
+    assert job.error["code"] == "removal_blocked_collateral"
+    return job.error["detail"]["orphans"]
 
 
 def _live(*, description: str | None = None, addresses: list[dict] | None = None) -> dict:
@@ -147,8 +152,8 @@ async def test_unasserted_interface_attribute_blocks_an_ip_only_put(adapter_clie
     assert job.status.value == "failed", job.result
     async with session() as db:
         row = (await db.execute(select(InterfaceIpIntent))).scalar_one()
-        assert row.last_apply_error["code"] == "removal_blocked_collateral"
-        assert row.last_apply_error["detail"]["orphans"] == {f"interface_config/{attribute}": [[_IFACE]]}
+        assert row.last_apply_error is None
+        assert job.error["detail"]["orphans"] == {f"interface_config/{attribute}": [[_IFACE]]}
     assert not rec.documents
 
 
@@ -285,7 +290,7 @@ async def test_automatic_attribute_edit_with_detach(adapter_client, reject, queu
 
     if reject:
         assert job.status.value == "failed", (job.error, job.result)
-        assert job.error["code"] == "nso_commit_failed"
+        assert job.error["code"] == "nso_put_failed"
         assert await run_head(device_id, client) is None
         assert len(rec.documents) == offset + 1
         await check_unsettled()

@@ -276,7 +276,7 @@ def inconclusive():
 
 
 async def run_the_apply(device_id: int, client, *, force: bool = True) -> Job:
-    from nso_adapter.core.apply import run_apply
+    from tests.core.execution_helpers import run_apply
 
     job_id = await seed_apply_job(device_id)
     with (
@@ -328,15 +328,14 @@ async def test_c2_2_a_service_owned_sibling_blocks_the_replace(adapter_client):
 
     assert job.status == JobStatus.failed
     assert rec.sr_commits() == [], "nothing may be committed once the guard refuses"
-    item = next(i for i in job.error["detail"]["items"] if i["type"] == "static_route")
-    assert item["error"] == "apply error (removal_blocked_collateral); see the server log"
+    assert job.error["code"] == "removal_blocked_collateral"
 
     async with session() as db:
         from nso_adapter.store.models import StaticRouteIntent
 
         row = (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id))).scalar_one()
-        assert row.last_apply_error["code"] == "removal_blocked_collateral"
-        assert row.last_apply_error["detail"]["orphans"] == {"static_route/route": [["", C[1], C[2]]]}
+        assert row.last_apply_error is None
+        assert job.error["detail"]["orphans"] == {"static_route/route": [["", C[1], C[2]]]}
 
 
 # ── C2.3 / C2.4 — unconsumed tombstone entries survive VERBATIM ──────────────
@@ -468,7 +467,7 @@ async def test_c2_6_the_preview_payload_is_byte_identical_to_the_applied_one(ada
         patch("nso_adapter.core.importer.get_nso_client", return_value=apply_client),
         patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=AsyncMock()),
     ):
-        from nso_adapter.core.apply import run_apply
+        from tests.core.execution_helpers import run_apply
 
         await run_apply(job_id=job_id, device_id=device_id, force=True)
     job = await read_job(job_id)
@@ -535,7 +534,12 @@ async def test_c2_8_a_force_false_apply_still_carries_every_accepted_route(adapt
     assert rec.routes(rec.sr_commits("put")[0]) == [wire(B), wire(C)]
     # NOT _finalize_job's all-zero early success, which would report a clean no-op for a
     # device this apply had just PUT-replaced.
-    assert job.result["static_route_count_by_outcome"] == {"in_sync": 2, "apply_failed": 0}
+    assert job.result["static_route_count_by_outcome"] == {
+        "in_sync": 0,
+        "apply_failed": 0,
+        "not_applied": 0,
+        "unavailable": 2,
+    }
 
 
 # ── C2.9 — an uncertified read is never a licence to replace ─────────────────
@@ -557,13 +561,12 @@ async def test_c2_9_an_inconclusive_snapshot_refuses_the_put(adapter_client):
 
     assert job.status == JobStatus.failed
     assert rec.calls == [], "not even a dry-run may be built from an uncertified read"
-    item = next(i for i in job.error["detail"]["items"] if i["type"] == "static_route")
-    assert "static_route_snapshot_inconclusive" in item["error"] or "certify" in item["error"]
+    assert job.error["code"] == "static_route_snapshot_inconclusive"
     async with session() as db:
         from nso_adapter.store.models import StaticRouteIntent
 
         row = (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id))).scalar_one()
-        assert row.last_apply_error["code"] == "static_route_snapshot_inconclusive"
+        assert row.last_apply_error is None
     assert await tombstone_ids(device_id), "nothing is consumed on an uncertified read"
 
 
@@ -708,9 +711,8 @@ async def test_a_blocked_replace_reports_the_orphan_it_refused_over(adapter_clie
     job = await run_the_apply(device_id, client)
 
     assert job.status == JobStatus.failed
-    item = next(i for i in job.error["detail"]["items"] if i["type"] == "static_route")
-    assert item["error"] == "apply error (removal_blocked_collateral); see the server log"
+    assert job.error["code"] == "removal_blocked_collateral"
     row_error = await _first_row_error(device_id)
-    assert row_error["code"] == "removal_blocked_collateral"
-    assert row_error["detail"]["orphans"] == {"static_route/route": [list(C)]}
-    assert_text_free_of(json.dumps(row_error), [delta])
+    assert row_error is None
+    assert job.error["detail"]["orphans"] == {"static_route/route": [list(C)]}
+    assert_text_free_of(json.dumps(job.error), [delta])

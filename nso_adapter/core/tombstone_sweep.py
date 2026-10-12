@@ -73,7 +73,7 @@ def _removal_context(row: StaticRouteTombstone) -> dict:
     }
 
 
-async def reissue_removal_job(conn: AsyncSession, device_id: int, row: StaticRouteTombstone) -> Job:
+async def reissue_removal_job(conn: AsyncSession, device_id: int, row: StaticRouteTombstone) -> Job | None:
     """Re-issue *row*'s removal as a generation and the job that carries it. Caller commits.
 
     Shared by the sweeper and the reclaimer, which are the same operation reached from two
@@ -83,8 +83,11 @@ async def reissue_removal_job(conn: AsyncSession, device_id: int, row: StaticRou
     it (#1522 §H2).
     """
     from nso_adapter.core.generation import GenerationCarrierCorruption, attach_to_job, create_reissue_generation
+    from nso_adapter.store.execution_attempt_store import automatic_removal_reissue_blocked
     from nso_adapter.store.models import GenerationMode
 
+    if await automatic_removal_reissue_blocked(conn, device_id, row.id):
+        return None
     context = _removal_context(row)
     generation = await create_reissue_generation(
         conn,
@@ -165,8 +168,8 @@ async def sweep_one_device(device_id: int, *, db: AsyncSession | None = None) ->
                 .all()
             )
             for row in rows:
-                await reissue_removal_job(conn, device_id, row)
-                created += 1
+                if await reissue_removal_job(conn, device_id, row) is not None:
+                    created += 1
             await conn.commit()
     except BaseException:
         if db is not None:

@@ -447,7 +447,9 @@ async def test_disposition_keeps_post_commit_evidence(db_session, verification):
     outcomes = list(await db_session.scalars(sa.select(RowOutcome)))
     assert [outcome.disposition for outcome in outcomes] == ["unavailable"]
     assert attempt.commit_acknowledged and job.result["commit_acknowledged"]
-    assert job.result["refusals"] == [] and job.error["code"] == "post_commit_unavailable"
+    assert bool(job.result["refusals"]) == bool(verification)
+    assert job.error["code"] == "post_commit_unavailable"
+    assert all(record["sender_phase"] == "post_commit_verification" for record in job.result["refusals"])
     assert generation.status == GenerationStatus.outcome_unknown
 
 
@@ -838,7 +840,10 @@ async def test_disposition_requires_complete_attribution(db_session, attribution
         ["unavailable", "unavailable"] if attribution_fault else ["refused", "not_applied"]
     )
     assert rows[1].last_apply_error == {"code": "prior BGP"} and rows[1].last_apply_at == APPLIED
-    assert job.result["refusals"] == ([] if attribution_fault else outcomes[0].refusals)
+    assert [
+        {key: value for key, value in record.items() if key not in {"logical_rows", "provenance", "sender_phase"}}
+        for record in job.result["refusals"]
+    ] == ([] if attribution_fault else outcomes[0].refusals)
     assert rows[0].last_apply_error["code"] == ("prior" if attribution_fault else "refused")
     assert all(generation.carrier_job_result == job.result for generation in generations)
 

@@ -150,6 +150,8 @@ async def test_evidence_serves_terminal_attempt_after_carrier_deletion(adapter_c
             "carrier_job_error": error,
             "created_at": created_at,
             "updated_at": updated_at,
+            "row_outcomes": None,
+            "refusals": None,
         },
         "blocked": True,
         "write_work_pending": False,
@@ -174,6 +176,8 @@ async def test_evidence_serves_terminal_attempt_after_carrier_deletion(adapter_c
                         "carrier_job_result": result,
                         "carrier_job_error": error,
                         "updated_at": updated_at,
+                        "row_outcomes": None,
+                        "refusals": None,
                     }
                 ],
             }
@@ -357,6 +361,8 @@ async def test_terminal_snapshots_survive_carrier_deletion_in_evidence(
             "carrier_job_result": result,
             "carrier_job_error": error,
             "updated_at": body["attempts"][0]["generations"][0]["updated_at"],
+            "row_outcomes": None,
+            "refusals": None,
         }
     ]
 
