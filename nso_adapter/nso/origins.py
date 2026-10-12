@@ -324,6 +324,7 @@ class OriginRecorder:
         self.context = context or OriginContext()
         self.index = OriginIndex()
         self.contributors: list[LogicalRow] = []
+        self._contributor_keys: set[tuple[str, RowRef]] = set()
 
     def logical(
         self,
@@ -360,8 +361,9 @@ class OriginRecorder:
             self.context.settlement_cohort,
             carrier,
         )
-        if any(previous.stream == stream and previous.row == row for previous in self.contributors):
+        if (stream, row) in self._contributor_keys:
             raise OriginConstructionError("duplicate origin")
+        self._contributor_keys.add((stream, row))
         self.contributors.append(logical)
         return logical
 

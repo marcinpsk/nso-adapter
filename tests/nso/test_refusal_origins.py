@@ -589,3 +589,26 @@ def test_duplicate_tagged_membership_fails_before_send(stored_sections):
     row.tagged_vlans.append(row.tagged_vlans[0])
     with pytest.raises(ValueError, match="duplicate origin"):
         _encode(stored_sections, "switchport")
+
+
+def test_duplicate_origin_check_stays_linear_in_the_section_rows():
+    from nso_adapter.nso.origins import OriginConstructionError, OriginContext, OriginRecorder, SourceRef
+
+    class CountingStream(str):
+        comparisons = 0
+
+        def __eq__(self, other):
+            type(self).comparisons += 1
+            return str.__eq__(self, other)
+
+        __hash__ = str.__hash__
+
+    stream = CountingStream("static_route")
+    recorder = OriginRecorder("static-route", OriginContext())
+    for index in range(300):
+        path = (("route", ("", f"198.18.{index // 250}.{index % 250}/32", "198.18.255.1")),)
+        source = SourceRef("static_route_intent", (index,), "digest", None, None, None)
+        recorder.logical("static-route.route", path, source, stream)
+    assert CountingStream.comparisons < 300
+    with pytest.raises(OriginConstructionError, match="duplicate origin"):
+        recorder.logical("static-route.route", path, source, stream)
