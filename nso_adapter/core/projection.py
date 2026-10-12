@@ -65,6 +65,7 @@ from nso_adapter.nso.apply import (
     encode_switchport,
     encode_vlan,
 )
+from nso_adapter.nso.origins import EncodedSection
 from nso_adapter.store.models import (
     BfdIntent,
     BgpAfIntent,
@@ -181,7 +182,7 @@ class _Section(NamedTuple):
 
     tables: tuple[_Spec, ...]
     container: str
-    encode: Callable[[Mapping[str, list[Any]], Any], dict]
+    encode: Callable[[Mapping[str, list[Any]], Any], EncodedSection]
     read_family: str
     verify: Verification
     guard_lists: tuple[GuardList, ...] = ()

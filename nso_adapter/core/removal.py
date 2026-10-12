@@ -43,6 +43,7 @@ from nso_adapter.core.request_flags import (
 from nso_adapter.domain.asn import AsnRuleViolation, checked_asn, validate_asn_rows, validate_source_as_numbers
 from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.client import failure_detail
+from nso_adapter.nso.origins import OriginContext
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device
 
@@ -825,7 +826,11 @@ async def _put_removal_document(db: AsyncSession, device, client, scope: str, co
     if not policy.no_networking:
         _refuse_unverifiable_recorded_put(generation)
     body = await build_device_containers(
-        client, device, generation.document, retain_static_routes=policy.retain_static_routes
+        client,
+        device,
+        generation.document,
+        retain_static_routes=policy.retain_static_routes,
+        origin_context=OriginContext.from_generation(generation),
     )
     if body.errors:
         raise next(iter(body.errors.values()))

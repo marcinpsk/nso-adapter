@@ -334,9 +334,8 @@ async def test_apply_lag_config_treats_empty_timer_and_system_id_as_unset(adapte
     from sqlalchemy import update
 
     from nso_adapter.core.projection import hydrate_section
-    from nso_adapter.core.switching_intent import encode_lag_section
     from nso_adapter.store.models import LagBundleIntent
-    from tests.core.projection_helpers import freeze_snapshot
+    from tests.core.projection_helpers import encode_hydrated_section, freeze_snapshot
 
     device_id = await seed_device(nso_device_name="lag-empty-strings", netbox_device_id=1215)
     body = {"bundles": [{"name": "Port-channel1", "lag_id": 1}], "source_revision": 1, "deleted_roots": []}
@@ -375,7 +374,7 @@ async def test_apply_lag_config_treats_empty_timer_and_system_id_as_unset(adapte
         document = {"lag": await freeze_snapshot(db, device_id, "lag")}
         await db.rollback()
     context = {"ned_id": "cisco-ios-cli-6.95", "dialect": "identity"}
-    assert encode_lag_section(hydrate_section(document, "lag"), context) == {
+    assert encode_hydrated_section("lag", hydrate_section(document, "lag"), context).body == {
         "bundle": [{"name": "Port-channel1", "lag-id": 1}]
     }, "the unset leaves are omitted"
 
@@ -816,8 +815,7 @@ async def test_apply_lag_config_requires_an_explicit_deletion_authority(adapter_
 async def test_apply_lag_accepts_the_lacp_vocabulary_the_export_emits(adapter_client):
     """A GET body must replay into apply: the export serves the raw NED string, not a fixed set."""
     from nso_adapter.core.projection import hydrate_section
-    from nso_adapter.core.switching_intent import encode_lag_section
-    from tests.core.projection_helpers import freeze_tables
+    from tests.core.projection_helpers import encode_hydrated_section, freeze_tables
 
     device_id = await seed_device(nso_device_name="lag-export-vocabulary", netbox_device_id=None)
     body = {
@@ -868,7 +866,7 @@ async def test_apply_lag_accepts_the_lacp_vocabulary_the_export_emits(adapter_cl
     async with session() as db:
         document = {"lag": await freeze_tables(db, device_id, "lag", (await _stream_row(device_id)).prepared_tables)}
         await db.rollback()
-    assert encode_lag_section(hydrate_section(document, "lag"), context) == {
+    assert encode_hydrated_section("lag", hydrate_section(document, "lag"), context).body == {
         "bundle": [
             {
                 "name": "Bundle-Ether2",
@@ -894,8 +892,7 @@ async def test_apply_lag_accepts_the_lacp_vocabulary_the_export_emits(adapter_cl
 async def test_apply_lag_accepts_an_lacp_leaf_at_the_column_width(adapter_client):
     """The request bound equals the store column width, so the longest accepted value fits."""
     from nso_adapter.core.projection import hydrate_section
-    from nso_adapter.core.switching_intent import encode_lag_section
-    from tests.core.projection_helpers import freeze_tables
+    from tests.core.projection_helpers import encode_hydrated_section, freeze_tables
 
     device_id = await seed_device(nso_device_name="lag-leaf-width", netbox_device_id=None)
     mode, timer = "m" * 16, "t" * 8
@@ -934,7 +931,7 @@ async def test_apply_lag_accepts_an_lacp_leaf_at_the_column_width(adapter_client
     async with session() as db:
         document = {"lag": await freeze_tables(db, device_id, "lag", (await _stream_row(device_id)).prepared_tables)}
         await db.rollback()
-    assert encode_lag_section(hydrate_section(document, "lag"), context) == {
+    assert encode_hydrated_section("lag", hydrate_section(document, "lag"), context).body == {
         "bundle": [
             {
                 "name": "Port-channel1",
@@ -969,8 +966,7 @@ async def test_apply_lag_rejects_an_lacp_leaf_past_the_column_width(adapter_clie
 @pytest.mark.parametrize("mode", ["", None])
 async def test_apply_lag_treats_an_empty_member_mode_as_unset(adapter_client, mode):
     from nso_adapter.core.projection import hydrate_section
-    from nso_adapter.core.switching_intent import encode_lag_section
-    from tests.core.projection_helpers import freeze_tables
+    from tests.core.projection_helpers import encode_hydrated_section, freeze_tables
 
     device_id = await seed_device(nso_device_name="lag-unset-mode", netbox_device_id=None)
     response = await _post_lag(
@@ -1004,7 +1000,7 @@ async def test_apply_lag_treats_an_empty_member_mode_as_unset(adapter_client, mo
     async with session() as db:
         document = {"lag": await freeze_tables(db, device_id, "lag", (await _stream_row(device_id)).prepared_tables)}
         await db.rollback()
-    assert encode_lag_section(hydrate_section(document, "lag"), context) == {
+    assert encode_hydrated_section("lag", hydrate_section(document, "lag"), context).body == {
         "bundle": [{"name": "Port-channel1", "lag-id": 1, "member": [{"interface-name": "Gi0/1"}]}]
     }
 

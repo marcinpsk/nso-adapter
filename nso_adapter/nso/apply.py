@@ -29,6 +29,15 @@ from nso_adapter.domain.asn import asn_row_identity, checked_asn, checked_intent
 from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.client import DEVICE_INTENT_PATH, DEVICE_INTENT_ROOT, NsoClient, _url_key
 from nso_adapter.nso.nso_json import boundary_safe_dumps
+from nso_adapter.nso.origins import (
+    EncodedSection,
+    LogicalRow,
+    OriginConstructionError,
+    OriginContext,
+    OriginRecorder,
+    UnsupportedOrigin,
+)
+from nso_adapter.nso.refusal_protocol import SUBJECTS, row_ref
 from nso_adapter.nso.shape import require_vlan_id
 from nso_adapter.secrets.refs import VaultRefError, parse_vault_ref
 
@@ -519,6 +528,7 @@ def build_interface_ip_body(
     service: str | None = None,
     parent_binding: str | None = None,
     encap_tag: str | None = None,
+    origins: OriginRecorder | None = None,
 ) -> dict:
     """Shape one interface's IP body — the same leaves, without the service instance key.
 
@@ -527,8 +537,10 @@ def build_interface_ip_body(
     """
     entry: dict = {"interface-name": interface_name}
 
-    # VRF is an interface-level concept; take the first non-empty VRF value.
-    vrf = next((r.vrf for r in ip_intent_rows if r.vrf), None)
+    vrfs = {row.vrf for row in ip_intent_rows}
+    if len(vrfs) > 1:
+        raise OriginConstructionError("competing field producers")
+    vrf = next(iter(vrfs), None)
     if vrf:
         entry["vrf"] = vrf
 
@@ -538,6 +550,8 @@ def build_interface_ip_body(
 
     ipv4_entries = []
     ipv6_entries = []
+    logicals = []
+    vrf_logicals = []
     for row in ip_intent_rows:
         # Validate ip/prefix before the atomic path can fail with an opaque ValueError.
         if "/" not in (row.address or ""):
@@ -555,6 +569,20 @@ def build_interface_ip_body(
                 "invalid_ip_address",
                 "IP intent address has a non-numeric prefix length",
             )
+        if origins is not None and row.family in {"ipv4", "ipv6"}:
+            subject = "interface." + row.family + "-address"
+            path = (("interface", (interface_name,)), (row.family + "-address", (addr,)))
+            source = origins.source(
+                row,
+                "interface_ip_intent",
+                "ip",
+                writer_context=(interface_name, kind, service, parent_binding, encap_tag),
+            )
+            logical = origins.logical(subject, path, source, "ip")
+            origins.emit(subject, path, (logical,))
+            logicals.append(logical)
+            if row.vrf:
+                vrf_logicals.append(logical)
         if row.family == "ipv4":
             # A None `secondary` must serialize as JSON false, never null (a boolean YANG
             # leaf rejects null and would 400 the whole interface's IP apply).
@@ -569,6 +597,8 @@ def build_interface_ip_body(
                 "IP intent address has an unsupported family",
             )
 
+    if origins is not None and logicals:
+        origins.emit("interface.vrf", (("interface", (interface_name,)),), vrf_logicals or logicals)
     if ipv4_entries:
         entry["ipv4-address"] = ipv4_entries
     if ipv6_entries:
@@ -900,8 +930,34 @@ def _bgp_redistribute_entry(row, ned_id: str | None) -> dict:
     return entry
 
 
-def _bgp_peer_entry(peer) -> dict:
-    """One BGP ``peer`` entry incl. its peer-address-family list; optionals when set."""
+class _BgpConstruct(NamedTuple):
+    subject: str
+    path: tuple
+    contributors: list[LogicalRow]
+    sources: list
+    field_rows: dict | None = None
+    field_sources: dict | None = None
+
+
+def _bgp_nested_sources(origins: OriginRecorder, router) -> tuple:
+    scopes = []
+    for scope in router.scopes:
+        children = [origins.source(af, "bgp_af_intent", "bgp", stampable=False) for af in scope.address_families]
+        for peer in scope.peers:
+            afs = tuple(
+                origins.source(af, "bgp_peer_af_intent", "bgp", stampable=False) for af in peer.peer_address_families
+            )
+            children.append(origins.source(peer, "bgp_peer_intent", "bgp", stampable=False, children=afs))
+        scopes.append(origins.source(scope, "bgp_scope_intent", "bgp", stampable=False, children=children))
+    return tuple(scopes)
+
+
+def _bgp_peer_entry(peer, origins: OriginRecorder, path: tuple, carrier) -> tuple[dict, LogicalRow]:
+    af_sources = tuple(
+        origins.source(af, "bgp_peer_af_intent", "bgp", stampable=False) for af in peer.peer_address_families
+    )
+    source = origins.source(peer, "bgp_peer_intent", "bgp", stampable=False, children=af_sources)
+    logical = origins.logical("bgp.router.scope.peer", path, source, "bgp", carrier=carrier, children=af_sources)
     entry: dict = {"peer-address": peer.peer_address, "enabled": peer.enabled}
     for attr, key in (
         ("peer_group", "peer-group"),
@@ -918,43 +974,115 @@ def _bgp_peer_entry(peer) -> dict:
                 if attr in {"remote_as", "local_as"}
                 else val
             )
-    entry["peer-address-family"] = [
-        {
-            "afi": paf.af,
-            "enabled": paf.enabled,
-            **({"routemap-in": paf.routemap_in} if paf.routemap_in else {}),
-            **({"routemap-out": paf.routemap_out} if paf.routemap_out else {}),
-            **({"prefixlist-in": paf.prefixlist_in} if paf.prefixlist_in else {}),
-            **({"prefixlist-out": paf.prefixlist_out} if paf.prefixlist_out else {}),
+    afs = []
+    for af, af_source in zip(peer.peer_address_families, af_sources, strict=True):
+        af_entry = {
+            "afi": af.af,
+            "enabled": af.enabled,
+            **({"routemap-in": af.routemap_in} if af.routemap_in else {}),
+            **({"routemap-out": af.routemap_out} if af.routemap_out else {}),
+            **({"prefixlist-in": af.prefixlist_in} if af.prefixlist_in else {}),
+            **({"prefixlist-out": af.prefixlist_out} if af.prefixlist_out else {}),
         }
-        for paf in peer.peer_address_families
-    ]
-    return entry
+        origins.emit(
+            "bgp.router.scope.peer.peer-address-family",
+            (*path, ("peer-address-family", (af.af,))),
+            (logical,),
+            sources=(af_source,),
+        )
+        afs.append(af_entry)
+    entry["peer-address-family"] = afs
+    fields = {
+        field: (af_sources if field == "bgp.paf.enabled" and af_sources else (source,))
+        for field in SUBJECTS["bgp.router.scope.peer"].fields
+    }
+    origins.emit("bgp.router.scope.peer", path, (logical,), field_sources=fields)
+    return entry, logical
 
 
-def _attach_orphan_bgp_redistribute(routers, redist_by_af, router_by_asn, scope_by_key, af_seen) -> None:
-    """Synthesize router→scope→AF skeletons for orphan redistribute rows.
+def _bgp_scope_entry(
+    scope, asn: int, origins: OriginRecorder, router: LogicalRow, constructs: dict, af_by_key: dict
+) -> dict:
+    path = (("router", (str(asn),)), ("scope", (scope.vrf,)))
+    scope_source = origins.source(scope, "bgp_scope_intent", "bgp", stampable=False)
+    scope_key = (asn, scope.vrf)
+    if scope_key in constructs:
+        raise OriginConstructionError("duplicate origin")
+    construct = _BgpConstruct(
+        "bgp.router.scope",
+        path,
+        [router],
+        [scope_source],
+        {"bgp.scope.vrf": (router,)},
+        {"bgp.scope.vrf": (scope_source,)},
+    )
+    constructs[scope_key] = construct
+    afs = []
+    for af in scope.address_families:
+        af_path = (*path, ("address-family", (af.af,)))
+        af_source = origins.source(af, "bgp_af_intent", "bgp", stampable=False)
+        af_key = (asn, scope.vrf, af.af)
+        if af_key in constructs:
+            raise OriginConstructionError("duplicate origin")
+        constructs[af_key] = _BgpConstruct("bgp.router.scope.address-family", af_path, [router], [af_source])
+        af_entry = {"afi": af.af}
+        af_by_key[af_key] = af_entry
+        afs.append(af_entry)
+    peers = []
+    for peer in scope.peers:
+        entry, logical = _bgp_peer_entry(peer, origins, (*path, ("peer", (peer.peer_address,))), router.carrier)
+        construct.contributors.append(logical)
+        construct.sources.extend(logical.source_refs)
+        constructs[(asn,)].contributors.append(logical)
+        constructs[(asn,)].sources.extend(logical.source_refs)
+        peers.append(entry)
+    return {"vrf": scope.vrf, "address-family": afs, "peer": peers}
 
-    A redistribute row whose parent router/scope/AF is absent from this apply (parent
-    applied cleanly → filtered out by force=False eligibility) must still land, so build
-    the minimal skeleton carrying just the redistribute rather than dropping it silently.
-    Mutates *routers* and the index dicts in place.
-    """
-    for (asn, vrf, af), redist_list in redist_by_af.items():
-        if (asn, vrf, af) in af_seen:
-            continue
-        router_dict = router_by_asn.get(asn)
-        if router_dict is None:
-            router_dict = {"asn": asn, "scope": []}
-            routers.append(router_dict)
-            router_by_asn[asn] = router_dict
-        scope_dict = scope_by_key.get((asn, vrf))
-        if scope_dict is None:
-            scope_dict = {"vrf": vrf, "address-family": [], "peer": []}
-            router_dict["scope"].append(scope_dict)
-            scope_by_key[(asn, vrf)] = scope_dict
-        scope_dict["address-family"].append({"afi": af, "redistribute": redist_list})
-        af_seen.add((asn, vrf, af))
+
+def _bgp_attach_redistribution(
+    row,
+    identity: tuple,
+    origins: OriginRecorder,
+    routers: list,
+    router_by_asn: dict,
+    scope_by_key: dict,
+    af_by_key: dict,
+    constructs: dict,
+    ned_id: str | None,
+) -> None:
+    asn, vrf, af = identity
+    path = (("router", (str(asn),)), ("scope", (vrf,)), ("address-family", (af,)))
+    entry = _bgp_redistribute_entry(row, ned_id)
+    logical = _origin_row(
+        origins,
+        "bgp.router.scope.address-family.redistribute",
+        (*path, ("redistribute", (entry["source-protocol"], entry["source-ref"]))),
+        row,
+        "redistribution_intent",
+        "bgp",
+    )
+    router = router_by_asn.get(asn)
+    if router is None:
+        router = {"asn": asn, "scope": []}
+        router_by_asn[asn] = router
+        routers.append(router)
+        constructs[(asn,)] = _BgpConstruct("bgp.router", path[:1], [], [])
+    scope = scope_by_key.get((asn, vrf))
+    if scope is None:
+        scope = {"vrf": vrf, "address-family": [], "peer": []}
+        scope_by_key[(asn, vrf)] = scope
+        router["scope"].append(scope)
+        constructs[(asn, vrf)] = _BgpConstruct("bgp.router.scope", path[:2], [], [])
+    af_entry = af_by_key.get((asn, vrf, af))
+    if af_entry is None:
+        af_entry = {"afi": af}
+        af_by_key[(asn, vrf, af)] = af_entry
+        scope["address-family"].append(af_entry)
+        constructs[(asn, vrf, af)] = _BgpConstruct("bgp.router.scope.address-family", path, [], [])
+    af_entry.setdefault("redistribute", []).append(entry)
+    for key in ((asn,), (asn, vrf), (asn, vrf, af)):
+        constructs[key].contributors.append(logical)
+        constructs[key].sources.extend(logical.source_refs)
 
 
 # Route-map intent entry keys → route-policy-reconciler YANG leaf names. The plugin
@@ -1081,6 +1209,7 @@ class SectionExecution(NamedTuple):
     ned_id: str | None
     dialect: CommunityDialect
     proof: Any = None
+    origin_context: OriginContext | None = None
 
 
 #: One section's rows as an encoder reads them: table name -> the document's rows.
@@ -1090,71 +1219,72 @@ SectionRows = Mapping[str, list[Any]]
 _CONTEXT_FREE_EXECUTION = SectionExecution(None, community_dialect_for(None))
 
 
-def encode_snmp(rows: SectionRows, execution: SectionExecution) -> dict:
-    """Encode the ``snmp`` container: communities, v3 users, trap hosts, location, contact.
-
-    Secret material never reaches the body: each Vault reference is split into the
-    mount/path/key triple the service resolves at commit time.
-    """
-    entry: dict = {}
-    community_intents = rows["snmp_community_intent"]
-    v3_user_intents = rows["snmp_v3_user_intent"]
-    host_intents = rows["snmp_host_intent"]
-    system_info = rows["snmp_system_info_intent"]
-
-    if community_intents:
-        entry["community"] = [
-            {
-                "name": c.label,
-                "access": _snmp_enum(c.access, _SNMP_ACCESS, "access"),
-                **({"acl": c.acl} if c.acl else {}),
-                **_snmp_vault_triple(c.vault_ref, ""),
-            }
-            for c in community_intents
-        ]
-
-    if v3_user_intents:
-        entry["v3-user"] = [
-            {
-                "username": u.username,
-                **({"group": u.group_name} if u.group_name else {}),
-                **({"auth-protocol": u.auth_protocol} if u.auth_protocol else {}),
-                **({"priv-protocol": u.priv_protocol} if u.priv_protocol else {}),
-                **(_snmp_vault_triple(u.auth_vault_ref, "auth-") if u.auth_vault_ref else {}),
-                **(_snmp_vault_triple(u.priv_vault_ref, "priv-") if u.priv_vault_ref else {}),
-            }
-            for u in v3_user_intents
-        ]
-
-    if host_intents:
-        entry["host"] = [
-            {
-                "address": h.address,
-                "version": _snmp_enum(h.version, _SNMP_VERSION, "version"),
-                "notify-type": _snmp_enum(h.notify_type, _SNMP_NOTIFY, "notify_type"),
-                # optional leaf: a binding-less host (ArcOS targets bind via
-                # target-parameters, not the target) must omit it, not send null
-                **({"community-or-user": h.community_or_user} if h.community_or_user else {}),
-                **({"port": h.port} if h.port is not None else {}),
-            }
-            for h in host_intents
-        ]
-
-    for info in system_info:
+def encode_snmp(rows: SectionRows, execution: SectionExecution) -> EncodedSection:
+    """Encode SNMP references and keep credential natural keys transient."""
+    origins = OriginRecorder("snmp", execution.origin_context)
+    body: dict = {}
+    for table, subject, list_name, key_name in (
+        ("snmp_community_intent", "snmp.community", "community", "label"),
+        ("snmp_v3_user_intent", "snmp.v3-user", "v3-user", "username"),
+        ("snmp_host_intent", "snmp.host", "host", "address"),
+    ):
+        entries = []
+        for row in rows[table]:
+            if subject == "snmp.community":
+                entry = {
+                    "name": row.label,
+                    "access": _snmp_enum(row.access, _SNMP_ACCESS, "access"),
+                    **({"acl": row.acl} if row.acl else {}),
+                    **_snmp_vault_triple(row.vault_ref, ""),
+                }
+            elif subject == "snmp.v3-user":
+                entry = {
+                    "username": row.username,
+                    **({"group": row.group_name} if row.group_name else {}),
+                    **({"auth-protocol": row.auth_protocol} if row.auth_protocol else {}),
+                    **({"priv-protocol": row.priv_protocol} if row.priv_protocol else {}),
+                    **(_snmp_vault_triple(row.auth_vault_ref, "auth-") if row.auth_vault_ref else {}),
+                    **(_snmp_vault_triple(row.priv_vault_ref, "priv-") if row.priv_vault_ref else {}),
+                }
+            else:
+                entry = {
+                    "address": row.address,
+                    "version": _snmp_enum(row.version, _SNMP_VERSION, "version"),
+                    "notify-type": _snmp_enum(row.notify_type, _SNMP_NOTIFY, "notify_type"),
+                    **({"community-or-user": row.community_or_user} if row.community_or_user else {}),
+                    **({"port": row.port} if row.port is not None else {}),
+                }
+            path = ((list_name, (getattr(row, key_name),)),)
+            source = origins.source(row, table, "snmp")
+            logical = origins.logical(subject, path, source, "snmp")
+            origins.emit(subject, path, (logical,))
+            entries.append(entry)
+        if entries:
+            body[list_name] = entries
+    for info in rows["snmp_system_info_intent"]:
+        if info.location is not None or info.contact is not None:
+            source = origins.source(info, "snmp_system_info_intent", "snmp")
+            logical = origins.logical("snmp.system-info", (), source, "snmp")
+            origins.emit("snmp.system-info", (), (logical,))
         if info.location is not None:
-            entry["location"] = info.location
+            body["location"] = info.location
         if info.contact is not None:
-            entry["contact"] = info.contact
-    return entry
+            body["contact"] = info.contact
+    return origins.finish(body)
 
 
-def encode_static_route(rows: SectionRows, execution: SectionExecution) -> dict:
-    """Encode the ``static-route`` container from the document's own routes.
-
-    Retention is NOT here: the ratified sender exception overlays the live certified
-    service entries of the frozen retained key set onto this body, after encoding.
-    """
-    return {"route": [static_route_entry(row) for row in rows["static_route_intent"]]}
+def encode_static_route(rows: SectionRows, execution: SectionExecution) -> EncodedSection:
+    """Encode current routes. The caller records certified retained contributions."""
+    origins = OriginRecorder("static-route", execution.origin_context)
+    routes = []
+    for row in rows["static_route_intent"]:
+        entry = static_route_entry(row)
+        path = (("route", (entry["vrf"], entry["prefix"], entry["next-hop"])),)
+        source = origins.source(row, "static_route_intent", "static_route")
+        logical = origins.logical("static-route.route", path, source, "static_route")
+        origins.emit("static-route.route", path, (logical,))
+        routes.append(entry)
+    return origins.finish({"route": routes})
 
 
 def refuse_gated_local_levels(rows: SectionRows) -> None:
@@ -1173,12 +1303,13 @@ def refuse_gated_local_levels(rows: SectionRows) -> None:
             raise NsoApplyError("local_levels_gated", _LOCAL_LEVELS_GATED, {"levels": levels})
 
 
-def encode_logging(rows: SectionRows, execution: SectionExecution) -> dict:
+def encode_logging(rows: SectionRows, execution: SectionExecution) -> EncodedSection:
     """Encode the ``logging`` container: remote syslog hosts plus the local-levels singleton.
 
     The severities are emitted whenever the row sets them; whether they may be SENT is
     :func:`refuse_gated_local_levels`'s question, at the send boundary.
     """
+    origins = OriginRecorder("logging", execution.origin_context)
     hosts = []
     for row in rows["logging_host_intent"]:
         entry: dict = {"address": row.address}
@@ -1194,46 +1325,70 @@ def encode_logging(rows: SectionRows, execution: SectionExecution) -> dict:
             entry["vrf"] = row.vrf
         if row.source:
             entry["source"] = row.source
+        source = origins.source(row, "logging_host_intent", "logging")
+        logical = origins.logical("logging.host", (("host", (row.address,)),), source, "logging")
+        origins.emit("logging.host", (("host", (row.address,)),), (logical,))
         hosts.append(entry)
 
     body: dict = {"host": hosts}
     for levels_row in rows["logging_levels_intent"]:
         if levels := _local_levels(levels_row):
+            source = origins.source(levels_row, "logging_levels_intent", "logging")
+            logical = origins.logical("logging.local-levels", (), source, "logging")
+            origins.emit("logging.local-levels", (), (logical,))
             body["local-levels"] = levels
-    return body
+    return origins.finish(body)
 
 
-def encode_svi(rows: SectionRows, execution: SectionExecution) -> dict:
+def encode_svi(rows: SectionRows, execution: SectionExecution) -> EncodedSection:
     """Encode the ``svi`` container: L3 VLAN interfaces (SVIs / IRBs)."""
+    origins = OriginRecorder("svi", execution.origin_context)
     interfaces = []
     for row in rows["svi_intent"]:
         require_vlan_id(row.vlan_id, "svi", row.interface_name, "vlan_id")
         entry: dict = {"interface-name": row.interface_name, "vlan-id": row.vlan_id, "type": row.svi_type}
         if row.vrf:
             entry["vrf"] = row.vrf
+        source = origins.source(row, "svi_intent", "svi")
+        logical = origins.logical("svi.interface", (("interface", (row.interface_name,)),), source, "svi")
+        origins.emit("svi.interface", (("interface", (row.interface_name,)),), (logical,))
         interfaces.append(entry)
-    return {"interface": interfaces}
+    return origins.finish({"interface": interfaces})
 
 
-def encode_subinterface(rows: SectionRows, execution: SectionExecution) -> dict:
+def encode_subinterface(rows: SectionRows, execution: SectionExecution) -> EncodedSection:
     """Encode the ``subinterface`` container: dot1q L3 subinterfaces."""
-    return {"interface": build_subif_interfaces(rows["subinterface_intent"])}
+    origins = OriginRecorder("subinterface", execution.origin_context)
+    interfaces = []
+    for row in rows["subinterface_intent"]:
+        entry = build_subif_interfaces([row])[0]
+        path = (("interface", (row.interface_name,)),)
+        source = origins.source(row, "subinterface_intent", "subinterface")
+        logical = origins.logical("subinterface.interface", path, source, "subinterface")
+        origins.emit("subinterface.interface", path, (logical,))
+        interfaces.append(entry)
+    return origins.finish({"interface": interfaces})
 
 
-def encode_vlan(rows: SectionRows, execution: SectionExecution) -> dict:
+def encode_vlan(rows: SectionRows, execution: SectionExecution) -> EncodedSection:
     """Encode the ``vlan`` container: the device's L2 VLAN database."""
+    origins = OriginRecorder("vlan", execution.origin_context)
     vlans = []
     for row in rows["vlan_intent"]:
         require_vlan_id(row.vlan_id, "vlan", str(row.vlan_id), "vlan_id")
         entry: dict = {"vlan-id": row.vlan_id}
         if row.name:
             entry["name"] = row.name
+        source = origins.source(row, "vlan_intent", "vlan")
+        logical = origins.logical("vlan.vlan", (("vlan", (row.vlan_id,)),), source, "vlan")
+        origins.emit("vlan.vlan", (("vlan", (row.vlan_id,)),), (logical,))
         vlans.append(entry)
-    return {"vlan": vlans}
+    return origins.finish({"vlan": vlans})
 
 
-def encode_bfd(rows: SectionRows, execution: SectionExecution) -> dict:
+def encode_bfd(rows: SectionRows, execution: SectionExecution) -> EncodedSection:
     """Encode the ``bfd`` container: per-interface BFD timers."""
+    origins = OriginRecorder("bfd", execution.origin_context)
     interfaces = []
     for row in rows["bfd_intent"]:
         entry: dict = {"interface-name": row.interface_name, "micro-bfd": bool(row.micro_bfd)}
@@ -1243,12 +1398,16 @@ def encode_bfd(rows: SectionRows, execution: SectionExecution) -> dict:
             entry["min-rx"] = row.min_rx
         if row.multiplier is not None:
             entry["multiplier"] = row.multiplier
+        source = origins.source(row, "bfd_intent", "bfd")
+        logical = origins.logical("bfd.interface", (("interface", (row.interface_name,)),), source, "bfd")
+        origins.emit("bfd.interface", (("interface", (row.interface_name,)),), (logical,))
         interfaces.append(entry)
-    return {"interface": interfaces}
+    return origins.finish({"interface": interfaces})
 
 
-def encode_interface_mtu(rows: SectionRows, execution: SectionExecution) -> dict:
+def encode_interface_mtu(rows: SectionRows, execution: SectionExecution) -> EncodedSection:
     """Encode the ``mtu`` container: per-interface L2 / IP / MPLS MTU."""
+    origins = OriginRecorder("mtu", execution.origin_context)
     interfaces = []
     for row in rows["interface_mtu_intent"]:
         entry: dict = {"interface-name": row.interface_name}
@@ -1258,12 +1417,16 @@ def encode_interface_mtu(rows: SectionRows, execution: SectionExecution) -> dict
             entry["ip-mtu"] = row.ip_mtu
         if row.mpls_mtu is not None:
             entry["mpls-mtu"] = row.mpls_mtu
+        source = origins.source(row, "interface_mtu_intent", "interface_mtu")
+        logical = origins.logical("mtu.interface", (("interface", (row.interface_name,)),), source, "interface_mtu")
+        origins.emit("mtu.interface", (("interface", (row.interface_name,)),), (logical,))
         interfaces.append(entry)
-    return {"interface": interfaces}
+    return origins.finish({"interface": interfaces})
 
 
-def encode_l2_sap(rows: SectionRows, execution: SectionExecution) -> dict:
+def encode_l2_sap(rows: SectionRows, execution: SectionExecution) -> EncodedSection:
     """Encode the ``l2-sap`` container: SAPs under existing SR OS epipe/vpls services."""
+    origins = OriginRecorder("l2-sap", execution.origin_context)
     saps = []
     for row in rows["l2_sap_intent"]:
         entry: dict = {
@@ -1277,34 +1440,100 @@ def encode_l2_sap(rows: SectionRows, execution: SectionExecution) -> dict:
             entry["outer-tag"] = row.outer_tag
         if row.inner_tag is not None:
             entry["inner-tag"] = row.inner_tag
+        source = origins.source(row, "l2_sap_intent", "l2_sap")
+        logical = origins.logical("l2-sap.sap", (("sap", (row.service_name, row.sap_id)),), source, "l2_sap")
+        origins.emit("l2-sap.sap", (("sap", (row.service_name, row.sap_id)),), (logical,))
         saps.append(entry)
-    return {"sap": saps}
+    return origins.finish({"sap": saps})
 
 
-def encode_isis(rows: SectionRows, execution: SectionExecution) -> dict:
-    """Encode the ``isis`` container: processes, per-level tuning, flex-algo and interfaces.
+def _origin_row(origins: OriginRecorder, subject: str, path: tuple, row: Any, table: str, stream: str) -> LogicalRow:
+    source = origins.source(row, table, stream)
+    logical = origins.logical(subject, path, source, stream)
+    origins.emit(subject, path, (logical,))
+    return logical
 
-    An empty list is OMITTED, not sent as ``[]``: a keyed-list merge reads an explicit
-    empty list as "replace with empty" and would over-delete the device's IS-IS state.
-    """
-    processes = build_isis_process_payload(
-        rows["isis_process_intent"],
-        rows["redistribution_intent"],
-        rows["isis_flex_algo_intent"],
-        rows["isis_level_intent"],
-        ned_id=execution.ned_id,
-    )
-    interfaces = build_isis_interface_payload(rows["isis_interface_intent"])
+
+def encode_isis(rows: SectionRows, execution: SectionExecution) -> EncodedSection:
+    """Encode IS-IS and preserve each contributor's exact stream."""
+    origins = OriginRecorder("isis", execution.origin_context)
+    children: dict[str, list[LogicalRow]] = {}
+    redist_by_proc: dict[str, list[dict]] = {}
+    for row in rows["redistribution_intent"]:
+        entry = _redistribute_entry(row, execution.ned_id)
+        path: tuple = (
+            ("process-config", (row.dest_ref,)),
+            ("redistribute", (entry["source-protocol"], entry["source-ref"])),
+        )
+        logical = _origin_row(origins, "isis.process-config.redistribute", path, row, "redistribution_intent", "isis")
+        children.setdefault(row.dest_ref, []).append(logical)
+        redist_by_proc.setdefault(row.dest_ref, []).append(entry)
+    flex_by_proc: dict[str, list[dict]] = {}
+    for row in rows["isis_flex_algo_intent"]:
+        tag = row.process_tag or ""
+        entry = _isis_flex_algo_entry(row)
+        path = (("process-config", (tag,)), ("flex-algo", (entry["algo-id"],)))
+        logical = _origin_row(
+            origins, "isis.process-config.flex-algo", path, row, "isis_flex_algo_intent", "isis_flex_algo"
+        )
+        children.setdefault(tag, []).append(logical)
+        flex_by_proc.setdefault(tag, []).append(entry)
+    levels_by_proc: dict[str, list[dict]] = {}
+    for row in rows["isis_level_intent"]:
+        tag = row.process_tag or ""
+        entry = _isis_level_entry(row)
+        path = (("process-config", (tag,)), ("level", (entry["level"],)))
+        logical = _origin_row(origins, "isis.process-config.level", path, row, "isis_level_intent", "isis")
+        children.setdefault(tag, []).append(logical)
+        levels_by_proc.setdefault(tag, []).append(entry)
+    parents: dict[str, dict] = {}
+    own: dict[str, LogicalRow] = {}
+    for row in rows["isis_process_intent"]:
+        tag = row.process_tag or ""
+        source = origins.source(
+            row,
+            "isis_process_intent",
+            "isis",
+            children=tuple(source for logical in children.get(tag, []) for source in logical.source_refs),
+        )
+        own[tag] = origins.logical("isis.process-config", (("process-config", (tag,)),), source, "isis")
+        parents[tag] = _isis_process_entry(row, redist_by_proc.get(tag, []))
+    for tag, entries in redist_by_proc.items():
+        if tag not in parents:
+            parents[tag] = {"process-tag": tag, "redistribute": entries}
+    for tag, entries in flex_by_proc.items():
+        parents.setdefault(tag, {"process-tag": tag})["flex-algo"] = entries
+    for tag, entries in levels_by_proc.items():
+        parents.setdefault(tag, {"process-tag": tag})["level"] = entries
+    processes = []
+    for tag, entry in parents.items():
+        contributors = (*((own[tag],) if tag in own else ()), *children.get(tag, []))
+        fields = {field: (own[tag],) for field in SUBJECTS["isis.process-config"].fields} if tag in own else None
+        origins.emit("isis.process-config", (("process-config", (tag,)),), contributors, field_rows=fields)
+        processes.append(entry)
+    interfaces = []
+    for row in rows["isis_interface_intent"]:
+        entry = build_isis_interface_payload([row])[0]
+        _origin_row(
+            origins,
+            "isis.interface-config",
+            (("interface-config", (row.interface_name, row.af)),),
+            row,
+            "isis_interface_intent",
+            "isis",
+        )
+        interfaces.append(entry)
     body: dict = {}
     if interfaces:
         body["interface-config"] = interfaces
     if processes:
         body["process-config"] = processes
-    return body
+    return origins.finish(body)
 
 
-def encode_bgp(rows: SectionRows, execution: SectionExecution) -> dict:
-    """Encode the ``bgp`` container: the router / scope / address-family / peer tree."""
+def encode_bgp(rows: SectionRows, execution: SectionExecution) -> EncodedSection:
+    """Encode BGP with canonical string ASN identities and separate peer outcomes."""
+    origins = OriginRecorder("bgp", execution.origin_context)
     validate_asn_rows(
         "bgp_router_intent", [{"id": getattr(row, "id", None), "asn": row.asn} for row in rows["bgp_router_intent"]]
     )
@@ -1319,44 +1548,50 @@ def encode_bgp(rows: SectionRows, execution: SectionExecution) -> dict:
         for row in rows["redistribution_intent"]
     ]
     validate_asn_rows("redistribution_intent", redistribution, ned_id=execution.ned_id)
-    redist_by_af: dict[tuple[int, str, str], list[dict]] = {}
-    for row, record in zip(rows["redistribution_intent"], redistribution, strict=True):
-        identity = asn_row_identity("redistribution_intent", record)
-        assert identity is not None
-        asn, vrf, af = identity[1]
-        redist_by_af.setdefault((asn, vrf, af), []).append(_bgp_redistribute_entry(row, execution.ned_id))
-
     routers: list[dict] = []
     router_by_asn: dict[int, dict] = {}
     scope_by_key: dict[tuple[int, str], dict] = {}
-    af_seen: set[tuple[int, str, str]] = set()
-    for r in rows["bgp_router_intent"]:
-        asn = checked_asn(r.asn, "bgp_router_intent", getattr(r, "id", None), "asn")
-        scopes_out = []
-        for scope in r.scopes:
-            afs_out = []
-            for af in scope.address_families:
-                af_entry: dict = {"afi": af.af}
-                af_redist = redist_by_af.get((asn, scope.vrf, af.af), [])
-                if af_redist:
-                    af_entry["redistribute"] = af_redist
-                afs_out.append(af_entry)
-                af_seen.add((asn, scope.vrf, af.af))
-            scope_dict = {
-                "vrf": scope.vrf,
-                "address-family": afs_out,
-                "peer": [_bgp_peer_entry(peer) for peer in scope.peers],
-            }
-            scopes_out.append(scope_dict)
-            scope_by_key[(asn, scope.vrf)] = scope_dict
-        router_dict: dict = {"asn": asn, "scope": scopes_out}
-        if r.router_id:
-            router_dict["router-id"] = r.router_id  # bgp-reconciler leaf, sibling of asn
-        routers.append(router_dict)
-        router_by_asn[asn] = router_dict
-
-    _attach_orphan_bgp_redistribute(routers, redist_by_af, router_by_asn, scope_by_key, af_seen)
-    return {"router": routers}
+    af_by_key: dict[tuple[int, str, str], dict] = {}
+    constructs: dict[tuple, _BgpConstruct] = {}
+    for row in rows["bgp_router_intent"]:
+        asn = checked_asn(row.asn, "bgp_router_intent", getattr(row, "id", None), "asn")
+        path = (("router", (str(asn),)),)
+        source = origins.source(row, "bgp_router_intent", "bgp", children=_bgp_nested_sources(origins, row))
+        logical = origins.logical("bgp.router", path, source, "bgp")
+        constructs[(asn,)] = _BgpConstruct(
+            "bgp.router",
+            path,
+            [logical],
+            [source],
+            {field: (logical,) for field in SUBJECTS["bgp.router"].fields},
+            {field: (source,) for field in SUBJECTS["bgp.router"].fields},
+        )
+        scopes = []
+        for scope in row.scopes:
+            entry = _bgp_scope_entry(scope, asn, origins, logical, constructs, af_by_key)
+            scope_by_key[(asn, scope.vrf)] = entry
+            scopes.append(entry)
+        router: dict = {"asn": asn, "scope": scopes}
+        if row.router_id:
+            router["router-id"] = row.router_id
+        routers.append(router)
+        router_by_asn[asn] = router
+    for row, record in zip(rows["redistribution_intent"], redistribution, strict=True):
+        identity = asn_row_identity("redistribution_intent", record)
+        assert identity is not None
+        _bgp_attach_redistribution(
+            row, identity[1], origins, routers, router_by_asn, scope_by_key, af_by_key, constructs, execution.ned_id
+        )
+    for construct in constructs.values():
+        origins.emit(
+            construct.subject,
+            construct.path,
+            construct.contributors,
+            sources=tuple(dict.fromkeys(construct.sources)),
+            field_rows=construct.field_rows,
+            field_sources=construct.field_sources,
+        )
+    return origins.finish({"router": routers})
 
 
 def _community_member(entry: object) -> str:
@@ -1386,74 +1621,111 @@ def unrenderable_route_policy_members(rows: SectionRows, dialect: CommunityDiale
     return skipped
 
 
-def encode_route_policy(rows: SectionRows, execution: SectionExecution) -> dict:
-    """Encode the ``route-policy`` container: prefix-lists, community-lists, AS-paths, route-maps.
-
-    Community members are stored canonically and spelled per NED; the FROZEN dialect
-    translates them, never the device row, so an unrelated reissue after a NED change
-    sends the members the authorization froze.
-    """
-    by_family: dict[str, list] = {}
+def encode_route_policy(rows: SectionRows, execution: SectionExecution) -> EncodedSection:
+    """Encode policy objects and entry causes at the plugin's object settlement grain."""
+    origins = OriginRecorder("route-policy", execution.origin_context)
+    body: dict = {"prefix-list": [], "community-list": [], "as-path": [], "route-map": []}
     for row in rows["route_policy_object_intent"]:
+        list_name = row.family.replace("_", "-")
+        if list_name not in body:
+            continue
+        subject = "route-policy." + list_name
+        path = ((list_name, (row.name,)),)
+        source = origins.source(row, "route_policy_object_intent", "route_policy")
+        logical = origins.logical(subject, path, source, "route_policy")
         entries = row.entries
         if row.family == "route_map":
-            entries = [_normalize_route_map_entry(e) for e in entries if isinstance(e, dict)]
-        by_family.setdefault(row.family, []).append(
-            {"name": row.name, "entries": entries, "invert_match": getattr(row, "invert_match", False)}
-        )
+            entries = [_normalize_route_map_entry(entry) for entry in entries if isinstance(entry, dict)]
+        kept = []
+        for entry in entries:
+            if row.family == "community_list":
+                member = _community_member(entry)
+                wire = execution.dialect.from_canonical(member)
+                if wire is UNREPRESENTABLE:
+                    continue
+                entry = {**entry, "community": wire} if wire != member else entry
+            entry_subject = subject + ".entry"
+            if "sequence" in entry:
+                origins.emit(entry_subject, (*path, ("entry", (entry["sequence"],))), (logical,))
+            else:
+                origins.index.unsupported_subjects[entry_subject] = UnsupportedOrigin("missing_natural_key")
+            kept.append(entry)
+        emitted: dict = {"name": row.name}
+        if row.family == "community_list":
+            emitted["invert-match"] = bool(getattr(row, "invert_match", False))
+        emitted["entry"] = kept
+        origins.emit(subject, path, (logical,))
+        body[list_name].append(emitted)
+    return origins.finish(body)
 
-    def _community_list_entry(obj: dict) -> dict:
-        kept: list = []
-        for entry in obj["entries"]:
-            member = _community_member(entry)
-            wire = execution.dialect.from_canonical(member)
-            if wire is UNREPRESENTABLE:
-                continue
-            kept.append({**entry, "community": wire} if wire != member else entry)
-        return {"name": obj["name"], "invert-match": bool(obj.get("invert_match", False)), "entry": kept}
 
-    return {
-        "prefix-list": [{"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("prefix_list", [])],
-        "community-list": [_community_list_entry(obj) for obj in by_family.get("community_list", [])],
-        "as-path": [{"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("as_path", [])],
-        "route-map": [{"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("route_map", [])],
-    }
-
-
-def encode_ospf(rows: SectionRows, execution: SectionExecution) -> dict:
-    """Encode the ``ospf`` container: processes and interfaces.
-
-    A redistribute row whose process has no row of its own still lands, through a minimal
-    synthesized process entry — parity with IS-IS and BGP, so nothing is silently dropped.
-    """
+def encode_ospf(rows: SectionRows, execution: SectionExecution) -> EncodedSection:
+    """Encode OSPF with exact same-stream synthetic parent contributors."""
+    origins = OriginRecorder("ospf", execution.origin_context)
     redist_by_proc: dict[str, list[dict]] = {}
+    children: dict[str, list[LogicalRow]] = {}
     for row in rows["redistribution_intent"]:
-        redist_by_proc.setdefault(row.dest_ref, []).append(_redistribute_entry(row, execution.ned_id))
-
-    processes = [
-        _ospf_process_entry(row, redist_by_proc.get(str(row.process_id), [])) for row in rows["ospf_instance_intent"]
-    ]
-    emitted_pids = {p["process-id"] for p in processes}
+        entry = _redistribute_entry(row, execution.ned_id)
+        path: tuple = (
+            ("process-config", (row.dest_ref,)),
+            ("redistribute", (entry["source-protocol"], entry["source-ref"])),
+        )
+        logical = _origin_row(origins, "ospf.process-config.redistribute", path, row, "redistribution_intent", "ospf")
+        children.setdefault(row.dest_ref, []).append(logical)
+        redist_by_proc.setdefault(row.dest_ref, []).append(entry)
+    processes = []
+    emitted_pids = set()
+    for row in rows["ospf_instance_intent"]:
+        pid = str(row.process_id)
+        entry = _ospf_process_entry(row, redist_by_proc.get(pid, []))
+        source = origins.source(
+            row,
+            "ospf_instance_intent",
+            "ospf",
+            children=tuple(source for logical in children.get(pid, []) for source in logical.source_refs),
+        )
+        path = (("process-config", (pid,)),)
+        logical = origins.logical("ospf.process-config", path, source, "ospf")
+        origins.emit(
+            "ospf.process-config",
+            path,
+            (logical, *children.get(pid, [])),
+            field_rows={field: (logical,) for field in SUBJECTS["ospf.process-config"].fields},
+        )
+        processes.append(entry)
+        emitted_pids.add(pid)
     for pid, redist_list in redist_by_proc.items():
         if pid not in emitted_pids:
+            origins.emit("ospf.process-config", (("process-config", (pid,)),), children[pid])
             processes.append({"process-id": pid, "enabled": True, "redistribute": redist_list})
             emitted_pids.add(pid)
-
-    interfaces = [_ospf_interface_entry(row) for row in rows["ospf_interface_intent"]]
+    interfaces = []
+    for row in rows["ospf_interface_intent"]:
+        entry = _ospf_interface_entry(row)
+        _origin_row(
+            origins,
+            "ospf.interface-config",
+            (("interface-config", (row.interface_name,)),),
+            row,
+            "ospf_interface_intent",
+            "ospf",
+        )
+        interfaces.append(entry)
     body: dict = {}
     if interfaces:
         body["interface-config"] = interfaces
     if processes:
         body["process-config"] = processes
-    return body
+    return origins.finish(body)
 
 
-def encode_switchport(rows: SectionRows, execution: SectionExecution) -> dict:
+def encode_switchport(rows: SectionRows, execution: SectionExecution) -> EncodedSection:
     """Encode the ``switchport`` container: per-interface L2 mode and VLAN membership.
 
     ``tagged-vlan`` is sorted so two stores holding the same membership in a different
     insertion order encode the same bytes; a YANG leaf-list is order-insensitive.
     """
+    origins = OriginRecorder("switchport", execution.origin_context)
     interfaces = []
     for row in rows["switchport_intent"]:
         entry: dict = {"interface-name": row.interface_name}
@@ -1463,12 +1735,27 @@ def encode_switchport(rows: SectionRows, execution: SectionExecution) -> dict:
             require_vlan_id(row.untagged_vlan, "switchport", row.interface_name, "untagged_vlan")
             entry["untagged-vlan"] = row.untagged_vlan
         tagged = sorted(tag.vlan_id for tag in row.tagged_vlans)
+        if len(tagged) != len(set(tagged)):
+            raise OriginConstructionError("duplicate origin")
         for vlan_id in tagged:
             require_vlan_id(vlan_id, "switchport", row.interface_name, "tagged_vlans")
         if tagged:
             entry["tagged-vlan"] = tagged
+        child_sources = tuple(
+            origins.source(tag, "switchport_tagged_vlan_intent", "switchport", stampable=False)
+            for tag in row.tagged_vlans
+        )
+        source = origins.source(row, "switchport_intent", "switchport", children=child_sources)
+        logical = origins.logical(
+            "switchport.interface",
+            (("interface", (row.interface_name,)),),
+            source,
+            "switchport",
+            children=child_sources,
+        )
+        origins.emit("switchport.interface", (("interface", (row.interface_name,)),), (logical,))
         interfaces.append(entry)
-    return {"interface": interfaces}
+    return origins.finish({"interface": interfaces})
 
 
 #: LAG bundle scalar -> its YANG leaf. Every one is optional: an unset column is a leaf
@@ -1483,105 +1770,146 @@ _LAG_BUNDLE_LEAVES = (
 )
 
 
-def encode_lag(rows: SectionRows, execution: SectionExecution) -> dict:
-    """Encode the ``lag`` container: LACP bundles and their member interfaces."""
+def encode_lag(rows: SectionRows, execution: SectionExecution) -> EncodedSection:
+    """Encode LACP bundles with separate member outcomes and bundle carriers."""
+    origins = OriginRecorder("lag", execution.origin_context)
     bundles = []
     for row in rows["lag_bundle_intent"]:
+        path = (("bundle", (row.name,)),)
+        member_sources = tuple(
+            origins.source(member, "lag_member_intent", "lag", stampable=False) for member in row.members
+        )
+        source = origins.source(row, "lag_bundle_intent", "lag", children=member_sources)
+        bundle = origins.logical("lag.bundle", path, source, "lag")
         entry: dict = {"name": row.name}
         for attribute, leaf in _LAG_BUNDLE_LEAVES:
             value = getattr(row, attribute)
             if value is not None:
                 entry[leaf] = value
         members = []
-        for member in row.members:
+        member_logicals = []
+        for member, member_source in zip(row.members, member_sources, strict=True):
             member_entry: dict = {"interface-name": member.interface_name}
             if member.mode:
                 member_entry["mode"] = member.mode
             if member.port_priority is not None:
                 member_entry["port-priority"] = member.port_priority
+            member_path = (*path, ("member", (member.interface_name,)))
+            logical = origins.logical("lag.bundle.member", member_path, member_source, "lag", carrier=bundle.carrier)
+            origins.emit("lag.bundle.member", member_path, (logical,))
+            member_logicals.append(logical)
             members.append(member_entry)
         if members:
             entry["member"] = members
+        origins.emit(
+            "lag.bundle",
+            path,
+            (bundle, *member_logicals),
+            field_rows={
+                field: (member_logicals if field == "lag.member_mode" and member_logicals else (bundle,))
+                for field in SUBJECTS["lag.bundle"].fields
+            },
+        )
         bundles.append(entry)
-    return {"bundle": bundles}
+    return origins.finish({"bundle": bundles})
 
 
-#: The interface attributes this writer has a wire leaf for. Anything else is refused rather
-#: than dropped: the managed scope is operator data, not a closed enum.
 INTERFACE_ATTRIBUTE_LEAVES = frozenset({"description", "enabled"})
 
 
-def encode_interface_config(rows: SectionRows, execution: SectionExecution) -> dict:
-    """Encode the ``interface`` container: description, admin state and addresses, merged.
-
-    Attributes and addresses ride ONE keyed interface entry, so an interface named by both
-    halves must appear once. The section's proof supplies the writer context and the
-    per-attribute eligibility decisions; an ineligible attribute never reaches the wire.
-    """
-    interfaces = execution.proof.interfaces
-    eligible = execution.proof.eligible_attributes
-    by_name: dict[str, dict] = {}
-
-    def _entry(name: str) -> dict:
-        return by_name.setdefault(name, {"interface-name": name})
-
-    attributed: set[str] = set()
+def _interface_attribute_rows(
+    rows: SectionRows, execution: SectionExecution, origins: OriginRecorder, by_name: dict
+) -> dict[str, dict[str, LogicalRow]]:
+    attributes: dict[str, dict[str, LogicalRow]] = {}
     for row in rows["interface_intent"]:
-        if (row.interface_id, row.attribute) not in eligible:
+        if (row.interface_id, row.attribute) not in execution.proof.eligible_attributes:
             continue
-        iface = interfaces[row.interface_id]
-        attributed.add(iface.name)
+        iface = execution.proof.interfaces[row.interface_id]
         if row.attribute not in INTERFACE_ATTRIBUTE_LEAVES:
-            # The managed scope is data, so the store CAN hold an attribute this writer has
-            # no leaf for. Refusing is the only honest answer: emitting the entry without it
-            # would stamp the row in_sync for a leaf that never reached the device (#26).
-            # The attribute is caller-controlled (PUT /scope and PUT /intent both store the
-            # submitted name), so it travels in `detail`, never in the message str()/repr() render.
             raise NsoApplyError(
                 "unsupported_attribute",
                 "interface_config: an attribute in the managed scope has no wire leaf",
                 detail={"interface": iface.name, "attribute": row.attribute},
             )
-        entry = _entry(iface.name)
+        entry = by_name.setdefault(iface.name, {"interface-name": iface.name})
         if row.attribute == "description":
             entry["description"] = row.intent_value if row.intent_value is not None else ""
         else:
-            # Strict coercion (raises on garbage), so a corrupt value never silently
-            # shuts an interface down.
             entry["enabled"] = _coerce_enabled_intent(row.intent_value)
+        context = (iface.name, nokia_attr_kind(iface), iface.service, iface.parent_binding, iface.encap_tag)
+        source = origins.source(row, "interface_intent", "interface_config", writer_context=context)
+        logical = origins.logical(
+            "interface." + row.attribute, (("interface", (iface.name,)),), source, "interface_config"
+        )
+        attributes.setdefault(iface.name, {})[row.attribute] = logical
+    return attributes
 
+
+def _interface_parent_origins(
+    origins: OriginRecorder,
+    name: str,
+    attrs: dict[str, LogicalRow],
+    ips: list[LogicalRow],
+    attr_kind: str | None,
+    ip_kind: str | None,
+) -> None:
+    path = (("interface", (name,)),)
+    attr_rows = tuple(attrs.values())
+    for attribute in ("description", "enabled"):
+        subject = "interface." + attribute
+        if attr_rows:
+            origins.emit(subject, path, (attrs[attribute],) if attribute in attrs else attr_rows)
+        else:
+            origins.index.mark_unsupported("interface", row_ref("interface", subject, path), "missing_binding")
+    structural = attr_rows if attr_kind else ips if ip_kind else (*attr_rows, *ips)
+    fields = {field: structural for field in SUBJECTS["interface.interface"].fields}
+    fields["interface.attrs.interface_name"] = attr_rows or tuple(ips)
+    origins.emit("interface.interface", path, (*attr_rows, *ips), field_rows=fields)
+
+
+def encode_interface_config(rows: SectionRows, execution: SectionExecution) -> EncodedSection:
+    """Encode one interface row and preserve attribute and IP stream ownership."""
+    origins = OriginRecorder("interface", execution.origin_context)
+    interfaces = execution.proof.interfaces
+    by_name: dict[str, dict] = {}
+    attributes = _interface_attribute_rows(rows, execution, origins, by_name)
     ip_by_iface: dict[int, list] = {}
     for row in rows["interface_ip_intent"]:
         ip_by_iface.setdefault(row.interface_id, []).append(row)
+    ip_logicals: dict[str, list[LogicalRow]] = {}
+    ip_kinds: dict[str, str | None] = {}
     for interface_id, ip_rows in ip_by_iface.items():
         iface = interfaces[interface_id]
-        routed_kind = nokia_routed_kind(iface)
+        kind = nokia_routed_kind(iface)
+        before = len(origins.contributors)
         ip_entry = build_interface_ip_body(
             iface.name,
             ip_rows,
-            kind=routed_kind,
-            service=iface.service if routed_kind in ("ies", "vprn") else None,
+            kind=kind,
+            service=iface.service if kind in ("ies", "vprn") else None,
             parent_binding=iface.parent_binding,
             encap_tag=iface.encap_tag,
+            origins=origins,
         )
-        entry = _entry(iface.name)
-        for key, value in ip_entry.items():
-            if key != "interface-name":
-                entry[key] = value
-
-    # The attribute half's context, last so a lag keeps the kind only IT can name. The two
-    # halves rode separate service instances before and each stamped its own; one entry
-    # carries one context, and an attribute-only entry with none writes to the wrong node.
-    for interface_id, iface in interfaces.items():
-        if iface.name not in attributed:
+        ip_logicals[iface.name] = origins.contributors[before:]
+        ip_kinds[iface.name] = kind
+        entry = by_name.setdefault(iface.name, {"interface-name": iface.name})
+        entry.update({key: value for key, value in ip_entry.items() if key != "interface-name"})
+    attr_kinds: dict[str, str | None] = {}
+    for iface in interfaces.values():
+        if iface.name not in attributes:
             continue
-        attr_kind = nokia_attr_kind(iface)
+        kind = nokia_attr_kind(iface)
+        attr_kinds[iface.name] = kind
         _add_nokia_routed_context(
             by_name[iface.name],
-            kind=attr_kind,
-            service=iface.service if attr_kind in ("ies", "vprn") else None,
+            kind=kind,
+            service=iface.service if kind in ("ies", "vprn") else None,
             parent_binding=iface.parent_binding,
             encap_tag=iface.encap_tag,
         )
-
-    return {"interface": list(by_name.values())}
+    for name in by_name:
+        _interface_parent_origins(
+            origins, name, attributes.get(name, {}), ip_logicals.get(name, []), attr_kinds.get(name), ip_kinds.get(name)
+        )
+    return origins.finish({"interface": list(by_name.values())})

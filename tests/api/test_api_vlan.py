@@ -342,8 +342,7 @@ async def test_put_vlan_intent_refuses_invalid_id_before_replacement(adapter_cli
 async def test_apply_switchport_accepts_the_trunk_all_mode(adapter_client):
     """`trunk-all` is live: the plugin sends it for NetBox `tagged-all`, and YANG names it."""
     from nso_adapter.core.projection import hydrate_section
-    from nso_adapter.core.switching_intent import encode_switchport_section
-    from tests.core.projection_helpers import freeze_snapshot
+    from tests.core.projection_helpers import encode_hydrated_section, freeze_snapshot
 
     device_id = await seed_device(nso_device_name="switchport-trunk-all", netbox_device_id=1212)
     response = await adapter_client.post(
@@ -368,7 +367,7 @@ async def test_apply_switchport_accepts_the_trunk_all_mode(adapter_client):
         document = {"switchport": await freeze_snapshot(db, device_id, "switchport")}
         await db.rollback()
     context = {"ned_id": "cisco-ios-cli-6.95", "dialect": "identity"}
-    assert encode_switchport_section(hydrate_section(document, "switchport"), context) == {
+    assert encode_hydrated_section("switchport", hydrate_section(document, "switchport"), context).body == {
         "interface": [{"interface-name": "Gi0/1", "mode": "trunk-all"}]
     }
 
