@@ -2,10 +2,8 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Exact encoding origins and atomic refusal attribution, without settlement effects.
 
-C4 must store acknowledged origins and exact entry fingerprints. Certified retained
-entries must join that baseline. Historical omission needs prior origins and immutable
-removal or clear authority. History must retain child fences and survive job pruning.
-Until then, historical contributions fail attribution. C5 activates settlement.
+Certified retained entries join acknowledged baseline fingerprints. Historical omission
+requires prior origins and immutable removal or clear authority. C5 activates settlement.
 """
 
 from __future__ import annotations
@@ -115,6 +113,9 @@ class OriginBinding:
     construct: str
     provenance: Literal["current", "retained", "prior"]
     logical_rows: tuple[LogicalRow, ...]
+    baseline_attempt_id: int | None = None
+    entry_fingerprint: str | None = None
+    authority: RemovalAuthority | None = None
 
 
 FailureReason = Literal[
@@ -134,7 +135,7 @@ class UnsupportedOrigin:
 
 @dataclass(frozen=True)
 class RemovalAuthority:
-    """C4 must join this immutable operation fence to a recorded prior origin."""
+    """An immutable operation fence joined to a recorded prior origin."""
 
     generation_id: int
     stream: str
@@ -178,7 +179,9 @@ class OriginIndex:
     def record_retained(self, entry: dict) -> None:
         """Keep verbatim retention sendable while refusing unproven attribution."""
         row = row_ref(
-            "static-route", "static-route.route", (("route", (entry["vrf"], entry["prefix"], entry["next-hop"])),)
+            "static-route",
+            "static-route.route",
+            (("route", (entry.get("vrf") or "", entry["prefix"], entry.get("next-hop") or "")),),
         )
         self.retained.append(RetainedContribution(row, content_digest(entry)))
         self.mark_unsupported("static-route", row, "missing_baseline_provenance")
@@ -187,11 +190,17 @@ class OriginIndex:
 
     def record_omission(self, contribution: PriorContribution) -> None:
         self.omitted.append(contribution)
-        self.mark_unsupported(contribution.family, contribution.row, "missing_removal_provenance")
+        self.mark_unsupported(
+            contribution.family, contribution.row, "missing_removal_provenance", preserve_current=True
+        )
 
-    def mark_unsupported(self, family: str, row: RowRef, reason: FailureReason) -> None:
+    def mark_unsupported(
+        self, family: str, row: RowRef, reason: FailureReason, *, preserve_current: bool = False
+    ) -> None:
         for declared in (None, *SUBJECTS[row.subject].fields):
             key = OriginKey(family, row, declared)
+            if preserve_current and key in self.bindings and self.bindings[key].provenance == "current":
+                continue
             self.bindings.pop(key, None)
             self.unsupported[key] = UnsupportedOrigin(reason)
 
@@ -245,7 +254,10 @@ def resolve_refusals(
             if key.row.subject in origins.unsupported_subjects:
                 return AttributionFailure(origins.unsupported_subjects[key.row.subject].reason, key)
             return AttributionFailure("missing_binding", key)
-        if binding.provenance != "current":
+        if (
+            binding.provenance == "retained"
+            and (binding.baseline_attempt_id is None or binding.entry_fingerprint is None)
+        ) or (binding.provenance == "prior" and (binding.baseline_attempt_id is None or binding.authority is None)):
             reason: FailureReason = (
                 "missing_baseline_provenance" if binding.provenance == "retained" else "missing_removal_provenance"
             )

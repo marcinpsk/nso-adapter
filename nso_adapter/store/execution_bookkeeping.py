@@ -257,3 +257,40 @@ async def restore_bookkeeping(db: AsyncSession, device_id: int, snapshots: list)
         restored.add((row.__tablename__, row.id))
     await db.flush()
     return restored
+
+
+async def stamp_refused_bookkeeping(db: AsyncSession, device_id: int, snapshots: list, causes: dict) -> None:
+    """Stamp named carriers under the same content, authorization, and observation fences."""
+    for snapshot in snapshots:
+        records = [
+            cause
+            for contributor in snapshot["contributors"]
+            for cause in causes.get(
+                (
+                    contributor["stream"],
+                    contributor["row"]["subject"],
+                    contributor["row"]["key"],
+                    contributor["settlement_cohort"],
+                ),
+                [],
+            )
+        ]
+        if not records or not await _authorized(db, device_id, snapshot["stream"], snapshot["frozen_revision"]):
+            continue
+        row = await _lock_tree(db, snapshot["fence"])
+        if row is None or _bookkeeping(row) != snapshot["expected"]:
+            continue
+        attribute = snapshot["attribute"]
+        state = None
+        if attribute is not None:
+            state = await _lock_attribute(db, row)
+            if state is None or state.id != attribute["id"] or _attribute_observation(state) != attribute["expected"]:
+                continue
+        if hasattr(row, "last_apply_error"):
+            row.last_apply_error = {
+                "code": "refused",
+                "refusals": list({content_digest(cause): cause for cause in records}.values()),
+            }
+        if state is not None:
+            state.sync_state = SyncState.apply_failed
+    await db.flush()

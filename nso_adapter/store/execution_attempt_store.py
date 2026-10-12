@@ -13,15 +13,33 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.projection import section_operation, section_registry
-from nso_adapter.nso.origins import LogicalRow, OriginIndex
+from nso_adapter.nso.origins import AttributionFailure, LogicalRow, OriginIndex, resolve_refusals
 from nso_adapter.nso.refusal_protocol import Refusal
 from nso_adapter.nso.refusals import DefiniteRefusal, ErrorClassification, OrdinaryRejection, ProtocolFault, Unavailable
-from nso_adapter.store.execution_bookkeeping import restore_bookkeeping, snapshot_bookkeeping
-from nso_adapter.store.execution_evidence import catalog_records, source_record
+from nso_adapter.store.execution_bookkeeping import restore_bookkeeping, snapshot_bookkeeping, stamp_refused_bookkeeping
+from nso_adapter.store.execution_evidence import (
+    catalog_records,
+    logical_from_record,
+    logical_record,
+    origin_records,
+    origins_from_records,
+    refusals_from_payload,
+)
+from nso_adapter.store.execution_history import (
+    automatic_removal_reissue_blocked as automatic_removal_reissue_blocked,
+)
+from nso_adapter.store.execution_history import (
+    bind_historical_origins as bind_historical_origins,
+)
+from nso_adapter.store.execution_history import (
+    record_acknowledged_origins as record_acknowledged_origins,
+)
 from nso_adapter.store.models import (
     ApplyExecutionAttempt,
     DeploymentGeneration,
+    Device,
     DeviceClaim,
+    GenerationStatus,
     Job,
     JobStatus,
     JobType,
@@ -35,11 +53,15 @@ class AttemptOwnershipLost(RuntimeError):
 
 
 async def _lock_run(
-    db: AsyncSession, job_id: int, run_attempt: int, token: str, generation_id: int
+    db: AsyncSession, job_id: int, run_attempt: int, token: str | None, generation_id: int
 ) -> tuple[Job, list[DeploymentGeneration]]:
+    if token is None:
+        device_id = await db.scalar(select(Job.device_id).where(Job.id == job_id))
+        # The device lock excludes a new claim insertion through its foreign key.
+        await db.scalar(select(Device.id).where(Device.id == device_id).with_for_update())
     claim = await db.scalar(
         select(DeviceClaim)
-        .where(DeviceClaim.job_id == job_id, DeviceClaim.claim_token == token)
+        .where(DeviceClaim.device_id == select(Job.device_id).where(Job.id == job_id).scalar_subquery())
         .with_for_update()
         .execution_options(populate_existing=True)
     )
@@ -59,11 +81,10 @@ async def _lock_run(
         )
     )
     if (
-        claim is None
+        (claim is not None if token is None else claim is None or claim.claim_token != token or claim.job_id != job_id)
         or job is None
         or not generations
         or generations[-1].id != generation_id
-        or claim.device_id != job.device_id
         or (
             any(generation.device_id != job.device_id for generation in generations)
             or job.job_type not in (JobType.apply, JobType.removal)
@@ -84,45 +105,6 @@ def _generation_authorities(generations: list[DeploymentGeneration]) -> list[dic
         }
         for generation in generations
     ]
-
-
-def _logical_record(logical: LogicalRow) -> dict:
-    return {
-        **logical.public_record(),
-        "sources": [source_record(source) for source in logical.source_refs],
-        "carrier_content_identity": logical.carrier.content_identity,
-    }
-
-
-def _origin_records(origins: OriginIndex) -> list[dict]:
-    records = [
-        {
-            "family": key.family,
-            "row": {"subject": key.row.subject, "key": key.row.key},
-            "field": key.field,
-            "stream": binding.stream,
-            "construct": binding.construct,
-            "provenance": binding.provenance,
-            "sources": [source_record(source) for source in binding.sources],
-            "logical_rows": [_logical_record(logical) for logical in binding.logical_rows],
-        }
-        for key, binding in origins.bindings.items()
-    ]
-    records.extend(
-        {
-            "family": key.family,
-            "row": {"subject": key.row.subject, "key": key.row.key},
-            "field": key.field,
-            "unsupported_reason": unsupported.reason,
-            "logical_rows": [],
-        }
-        for key, unsupported in origins.unsupported.items()
-    )
-    records.extend(
-        {"subject": subject, "unsupported_reason": unsupported.reason, "logical_rows": []}
-        for subject, unsupported in origins.unsupported_subjects.items()
-    )
-    return records
 
 
 async def prepare_execution_attempt(
@@ -201,7 +183,7 @@ async def prepare_execution_attempt(
         generation_authorities=_generation_authorities(generations),
         manual_attempt_id=generation.apply_attempt_id,
         removal_tombstone_ids=tombstone_ids,
-        logical_membership=[_logical_record(logical) for logical in logicals],
+        logical_membership=[logical_record(logical) for logical in logicals],
         attempted_carriers=[
             {
                 **carrier.public_record(),
@@ -210,7 +192,7 @@ async def prepare_execution_attempt(
             }
             for carrier in carriers
         ],
-        safe_origins=_origin_records(origins),
+        safe_origins=origin_records(origins),
         prior_bookkeeping=await snapshot_bookkeeping(db, generation, origins, logicals),
     )
     db.add(attempt)
@@ -297,7 +279,17 @@ async def stage_row_outcome(
 ) -> RowOutcome:
     """Stage one frozen logical outcome without changing its carrier or committing."""
     attempt = await _owned_attempt(db, attempt_id, job_id, run_attempt, claim_token)
-    identity = _logical_record(logical)
+    return await _stage_outcome(db, attempt, logical, disposition, refusals)
+
+
+async def _stage_outcome(
+    db: AsyncSession,
+    attempt: ApplyExecutionAttempt,
+    logical: LogicalRow,
+    disposition: Literal["in_sync", "refused", "not_applied", "unavailable"],
+    refusals: Iterable[Refusal],
+) -> RowOutcome:
+    identity = logical_record(logical)
     if identity not in attempt.logical_membership:
         raise ValueError("Row outcome is outside attempted logical membership")
     causes = catalog_records(refusals)
@@ -332,6 +324,10 @@ async def restore_prior_bookkeeping(
 ) -> set[tuple[str, int]]:
     """Keep frozen outcomes on a row CAS miss; ownership loss requires caller rollback."""
     attempt = await _owned_attempt(db, attempt_id, job_id, run_attempt, claim_token)
+    return await _restore_attempt_bookkeeping(db, attempt)
+
+
+async def _restore_attempt_bookkeeping(db: AsyncSession, attempt: ApplyExecutionAttempt) -> set[tuple[str, int]]:
     outcomes = list(await db.scalars(select(RowOutcome).where(RowOutcome.execution_attempt_id == attempt.id)))
     dispositions = {
         (outcome.stream, outcome.row_subject, outcome.row_key, outcome.settlement_cohort): outcome.disposition
@@ -355,3 +351,152 @@ async def restore_prior_bookkeeping(
         )
     ]
     return await restore_bookkeeping(db, attempt.device_id, unnamed)
+
+
+ExitReason = Literal["cancelled", "timeout", "runner_failed", "removal_failed", "disposed", "orphaned", "claim_expired"]
+_EXIT_MESSAGES = {
+    "cancelled": "Execution cancelled",
+    "timeout": "Execution budget expired",
+    "runner_failed": "Execution runner failed",
+    "removal_failed": "Removal runner failed",
+    "disposed": "Execution ownership disposed",
+    "orphaned": "Execution interrupted by restart",
+    "claim_expired": "Execution claim expired",
+}
+
+
+def _identity(logical: dict) -> tuple:
+    return logical["stream"], logical["row"]["subject"], logical["row"]["key"], logical["settlement_cohort"]
+
+
+def _disposition_evidence(attempt: ApplyExecutionAttempt) -> tuple[str, dict, list]:
+    """Resolve complete durable attribution without reading live intent rows."""
+    phase = "commit" if "commit" in attempt.response_classification else "pre_commit_dry_run"
+    checkpoint = attempt.response_classification.get(phase, {})
+    if not attempt.commit_acknowledged and checkpoint.get("kind") == "refused":
+        records = refusals_from_payload(checkpoint["refusals"])
+        attributed = resolve_refusals(records, origins_from_records(attempt.safe_origins))
+        if isinstance(attributed, AttributionFailure):
+            return "attribution_failed", {}, []
+        causes: dict = {}
+        for site in attributed:
+            for logical in site.logical_rows:
+                causes.setdefault(_identity(logical.public_record()), []).extend(catalog_records((site.refusal,)))
+        return "refused", causes, catalog_records(records)
+    if attempt.commit_acknowledged:
+        return "post_commit_unavailable", {}, []
+    if checkpoint.get("kind") == "rejected":
+        return "rejected", {}, []
+    return "unavailable", {}, []
+
+
+def _carrier_results(attempt: ApplyExecutionAttempt, outcomes: list[RowOutcome]) -> tuple[list, dict]:
+    carriers: list[dict] = []
+    counts: dict[str, dict[str, int]] = {}
+    priority = {"in_sync": 0, "not_applied": 1, "unavailable": 2, "refused": 3}
+    for carrier in attempt.attempted_carriers:
+        public = {key: value for key, value in carrier.items() if key not in {"source_table", "content_identity"}}
+        members = [outcome for outcome in outcomes if outcome.carrier_identity == public]
+        if not members:
+            raise ValueError("An attempted carrier requires logical outcomes")
+        disposition = max((outcome.disposition for outcome in members), key=priority.__getitem__)
+        carriers.append({**public, "disposition": disposition})
+        key = "attribute" if carrier["stream"] == "interface_config" else carrier["stream"]
+        count = counts.setdefault(
+            f"{key}_count_by_outcome", {"in_sync": 0, "apply_failed": 0, "not_applied": 0, "unavailable": 0}
+        )
+        count["apply_failed" if disposition == "refused" else disposition] += 1
+    return carriers, counts
+
+
+async def dispose_execution_attempt(
+    db: AsyncSession,
+    job_id: int,
+    run_attempt: int,
+    claim_token: str | None,
+    exit_reason: ExitReason,
+) -> Literal["no_attempt", "terminal", "settled"]:
+    """Stage one terminal transaction. Caller commits once, then disposes ownership.
+
+    A null token requires an absent device claim and locks out acquisition. Expired-claim
+    recovery calls this while it still holds the claim row, before deleting that row.
+    Unknown commit acknowledgement requires durable recovery, never a second write.
+    """
+    if exit_reason not in _EXIT_MESSAGES:
+        raise ValueError("Execution disposition requires a safe exit reason")
+    attempt = await db.scalar(
+        select(ApplyExecutionAttempt)
+        .where(
+            ApplyExecutionAttempt.job_correlation_id == job_id,
+            ApplyExecutionAttempt.run_attempt == run_attempt,
+        )
+        .execution_options(populate_existing=True)
+    )
+    if attempt is None:
+        return "no_attempt"
+    if attempt.phase == "terminal":
+        return "terminal"
+    job, generations = await _lock_run(db, job_id, run_attempt, claim_token, attempt.generation_id)
+    attempt = await db.scalar(
+        select(ApplyExecutionAttempt)
+        .where(ApplyExecutionAttempt.id == attempt.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if (
+        attempt.job_id != job_id
+        or (claim_token is not None and attempt.claim_token != claim_token)
+        or attempt.document_digest != generations[-1].digest
+        or attempt.generation_authorities != _generation_authorities(generations)
+    ):
+        raise AttemptOwnershipLost("Execution attempt no longer owns this settlement")
+    if attempt.phase == "terminal":
+        return "terminal"
+    kind, causes, records = _disposition_evidence(attempt)
+    if kind in {"unavailable", "attribution_failed"} and "delivery" not in attempt.response_classification:
+        attempt.response_classification = {
+            **attempt.response_classification,
+            "delivery": {"kind": "unavailable", "reason": exit_reason},
+        }
+        attempt.phase = "response_recorded"
+    outcomes = []
+    for frozen in attempt.logical_membership:
+        row_causes = causes.get(_identity(frozen), [])
+        disposition: Literal["in_sync", "refused", "not_applied", "unavailable"] = (
+            "refused" if row_causes else "not_applied" if kind in {"refused", "rejected"} else "unavailable"
+        )
+        logical = logical_from_record(frozen)
+        outcome = await _stage_outcome(db, attempt, logical, disposition, refusals_from_payload(row_causes))
+        outcomes.append(outcome)
+    await _restore_attempt_bookkeeping(db, attempt)
+    await stamp_refused_bookkeeping(db, attempt.device_id, attempt.prior_bookkeeping, causes)
+    carriers, counts = _carrier_results(attempt, outcomes)
+    result = {
+        **counts,
+        "row_outcomes": [
+            {**outcome.logical_identity, "disposition": outcome.disposition, "refusals": outcome.refusals}
+            for outcome in outcomes
+        ],
+        "refusals": records,
+        "settlement_owners": carriers,
+        "commit_acknowledged": attempt.commit_acknowledged,
+    }
+    from nso_adapter.core.claim import terminalize
+
+    write = await terminalize(
+        db,
+        job_id,
+        status=JobStatus.failed,
+        expect=JobStatus.running,
+        run_attempt=run_attempt,
+        result=result,
+        error={"code": kind, "message": _EXIT_MESSAGES[exit_reason], "detail": {}},
+        generation_outcome=GenerationStatus.failed
+        if kind in {"refused", "rejected"}
+        else GenerationStatus.outcome_unknown,
+    )
+    if write is None:
+        raise AttemptOwnershipLost("Execution attempt terminal ownership was lost")
+    attempt.phase = "terminal"
+    await db.flush()
+    return "settled"

@@ -1594,6 +1594,9 @@ async def enqueue_removal(
             discharged_clear_ids=discharged_clear_ids,
             apply_attempt_id=apply_attempt_id,
             frozen_fragments=frozen_fragments,
+            immediate_clear_streams=promotes
+            if retract and not defer_retract and mode == GenerationMode.networked and scope != "static_route"
+            else (),
         )
     job = await create_dedicated_job(db, device_id, JobType.removal, context=context)
     await require_attach_to_job(db, generation, job)

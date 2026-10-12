@@ -1277,6 +1277,7 @@ async def create_generation(
     discharged_clear_ids: tuple[int, ...] = (),
     apply_attempt_id: UUID | None = None,
     frozen_fragments: dict[str, dict] | None = None,
+    immediate_clear_streams: tuple[str, ...] = (),
 ) -> DeploymentGeneration:
     """Promote *streams* and store the immutable generation they authorize. Caller commits.
 
@@ -1287,6 +1288,9 @@ async def create_generation(
     *document* overrides the composition below with a complete document built elsewhere — the
     seam #1522's aggregate device-intent builder plugs into. *removal_context* is the job
     context a removal's generation must keep so a retry can rebuild the job that executes it.
+
+    *immediate_clear_streams* records clear authority from admission when no parked carrier
+    exists. The operation document keeps this authority independently of discharged clear ids.
 
     *frozen_fragments* carries the already-frozen fragment of a stream the caller froze
     itself. Manual Apply freezes every selected stream once and passes them all; a stream
@@ -1386,6 +1390,7 @@ async def create_generation(
         static_route_tombstone_ids=static_route_tombstone_ids,
         discharged_clear_ids=discharged_clear_ids,
         apply_attempt_id=apply_attempt_id,
+        immediate_clear_streams=immediate_clear_streams,
     )
 
 
@@ -1403,6 +1408,7 @@ async def _store_generation(
     static_route_tombstone_ids: tuple[int, ...],
     discharged_clear_ids: tuple[int, ...],
     apply_attempt_id: UUID | None,
+    immediate_clear_streams: tuple[str, ...] = (),
 ) -> DeploymentGeneration:
     """Allocate the sequence and write the immutable row. The projection lock is held.
 
@@ -1427,6 +1433,8 @@ async def _store_generation(
         # One deployment's facts, never a fragment's: which carriers this operation
         # discharges, and — for static-route — how it classified the authority it was given.
         operation: dict = {"pending_clear_ids": sorted(discharged_clear_ids)}
+        if immediate_clear_streams:
+            operation["immediate_clear_streams"] = sorted(immediate_clear_streams)
         if scope == "static_route":
             from nso_adapter.core.static_route_plan import build_static_route_operation
 
