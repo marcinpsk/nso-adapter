@@ -1639,6 +1639,45 @@ async def test_certified_success_preserves_a_new_writer_context(adapter_client, 
         await asyncio.gather(task, return_exceptions=True)
 
 
+async def test_certified_success_stamps_unchanged_child_rows_at_a_new_revision(adapter_client, monkeypatch):
+    from nso_adapter.store.models import BgpScopeIntent, DeviceProjectionStream
+
+    device_id, transport = await setup(adapter_client, monkeypatch, family="bgp")
+    transport.refuse = False
+    gate = CommitGate(monkeypatch, "response_recorded")
+    task = asyncio.create_task(run_next(device_id))
+    try:
+        await asyncio.wait_for(gate.reached.wait(), 5)
+        async with session() as db:
+            router = await db.scalar(select(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id))
+            assert await db.scalar(select(BgpScopeIntent.id).where(BgpScopeIntent.router_id == router.id))
+            stream = await db.scalar(
+                select(DeviceProjectionStream).where(
+                    DeviceProjectionStream.device_id == device_id, DeviceProjectionStream.stream == "bgp"
+                )
+            )
+            stream.desired_revision += 1
+            stream.authorized_revision = stream.desired_revision
+            await db.commit()
+        gate.release.set()
+        await task
+        attempts, outcomes = await evidence(device_id)
+        job = await job_row(attempts[-1].job_correlation_id)
+        assert job.status == JobStatus.succeeded
+        own = [row for row in outcomes if row.execution_attempt_id == attempts[-1].id]
+        assert own and all(row.disposition == "in_sync" for row in own)
+        async with session() as db:
+            router = await db.scalar(select(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id))
+            assert router.last_apply_at > PRIOR_AT
+            assert router.last_apply_error is None
+    finally:
+        gate.release.set()
+        gate.close()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_removal_unsent_failure_retains_attempt_evidence(adapter_client, monkeypatch):
     device_id, transport = await setup(adapter_client, monkeypatch)
     transport.refuse = False

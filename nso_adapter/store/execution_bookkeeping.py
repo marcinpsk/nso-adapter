@@ -145,7 +145,7 @@ async def _authorized(
     frozen = {(row.__tablename__, row.id): row for rows in hydrate_section(document, section).values() for row in rows}
     tree = certified_snapshot["fence"]
     original = frozen.get((tree["table"], tree["id"]))
-    return original is not None and _tree(original, frozen) == {
+    return original is not None and _tree(original, _frozen_children(frozen)) == {
         key: value for key, value in tree.items() if key != "interface_context"
     }
 
