@@ -10,7 +10,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from sqlalchemy import delete, event, select, update
+from sqlalchemy import delete, event, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
@@ -24,6 +24,7 @@ from nso_adapter.store.models import (
     BgpRouterIntent,
     DbInterface,
     DeviceClaim,
+    GenerationStatus,
     InterfaceAttrState,
     InterfaceIntent,
     Job,
@@ -98,6 +99,112 @@ class RuntimeTransport(httpx.AsyncBaseTransport):
                 return httpx.Response(200, json={"network-state-export:output": {"device-state": {}}}, request=request)
             return httpx.Response(200, json={"tailf-ncs:output": {"result": True}}, request=request)
         return await self.fake.handle(request.method.lower(), url, request.content)
+
+
+class HistoryTransport(RuntimeTransport):
+    def __init__(self, name):
+        super().__init__(name)
+        self.refuse = False
+        self.next_history_read_number = 1
+        self.prove_routes = False
+        self.history_read_number = None
+        self.post_commit_reads = 0
+        self.history_error = None
+        self.history_locks = None
+
+    async def handle_async_request(self, request):
+        if request.method == "POST" and "device-state-read" in request.url.path and self.prove_routes:
+            self.device_sections = {"static-route": self.fake.section()}
+        if request.method == "GET" and "device-intent=" in request.url.path and self.history_read_number is not None:
+            self.post_commit_reads += 1
+            if self.post_commit_reads == self.history_read_number:
+                async with session() as db:
+                    await db.execute(text("SELECT pg_stat_clear_snapshot()"))
+                    self.history_locks = list(
+                        await db.execute(
+                            text(
+                                "SELECT c.relname, l.mode FROM pg_locks l JOIN pg_class c ON c.oid = l.relation "
+                                "WHERE l.database = (SELECT oid FROM pg_database WHERE datname = current_database()) "
+                                "AND l.pid != pg_backend_pid() AND l.granted "
+                                "AND l.mode IN ('RowShareLock', 'RowExclusiveLock')"
+                            )
+                        )
+                    )
+                if self.history_error == "transport":
+                    raise httpx.ReadError(CANARY, request=request)
+                if self.history_error == "http":
+                    return httpx.Response(503, content=CANARY.encode(), request=request)
+        response = await super().handle_async_request(request)
+        if request.method == "PUT" and "dry-run=" not in str(request.url) and response.is_success:
+            self.post_commit_reads = 0
+            self.history_read_number = self.next_history_read_number
+        return response
+
+
+@pytest.mark.parametrize("operation", ["apply", "static_route_removal", "vlan_removal"])
+@pytest.mark.parametrize("history_error", ["transport", "http", None])
+async def test_acknowledged_history_read_precedes_settlement(
+    adapter_client, monkeypatch, debug_logs, operation, history_error
+):
+    from tests.api.test_static_route_deleted_routes import deleted
+
+    name = "placeholder-history-device"
+    device_id = await seed_device(nso_device_name=name, netbox_device_id=None)
+    await seed_settings(device_id, auto_apply=False)
+    transport = HistoryTransport(name)
+    client = _client_with(transport)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda _instance: client)
+    routes = [
+        {"route_id": identity, "vrf": "", "prefix": f"198.18.{identity}.0/24", "next_hop": "192.0.2.1"}
+        for identity in (1, 2)
+    ]
+    assert (await _put_routes(adapter_client, device_id, routes, seq=41)).status_code == 200
+    assert (await put_vlans(adapter_client, device_id, [101, 102], seq=41)).status_code == 200
+    assert (await _apply(adapter_client, device_id, {"static_route": 41, "vlan": 41})).status_code == 202
+    if operation != "apply":
+        await run_next(device_id)
+        transport.history_read_number = None
+        if operation == "static_route_removal":
+            transport.prove_routes = True
+            transport.next_history_read_number = 2
+            response = await _put_routes(
+                adapter_client,
+                device_id,
+                routes[1:],
+                seq=42,
+                deleted=[deleted(1, [("", routes[0]["prefix"], routes[0]["next_hop"])])],
+            )
+        else:
+            response = await put_vlans(adapter_client, device_id, [101], seq=42, query="?delete_origin=true")
+        assert response.status_code == 200
+    transport.history_error = history_error
+    transport.history_locks = None
+    job_id = await run_next(device_id)
+    job = await job_row(job_id)
+    head = (await generations(device_id))[-1]
+    attempts, outcomes = await evidence(device_id)
+    attempt = attempts[-1]
+    assert attempt.commit_acknowledged
+    assert job.status == JobStatus.succeeded, (job.error, attempt.response_classification, head.status)
+    assert head.status == GenerationStatus.settled
+    assert attempt.phase == "terminal"
+    assert transport.history_locks == []
+    history = attempt.response_classification["origin_history"]
+    if history_error is not None:
+        assert not any(record["family"] == "static-route" for record in history)
+        warnings = [record for record in debug_logs if record["event"] == "execution.history_read_failed"]
+        assert len(warnings) == 1
+        assert warnings[0]["device_id"] == device_id
+        assert warnings[0]["log_level"] == "warning"
+        assert_records_free_of(debug_logs, [CANARY])
+    else:
+        assert any(record["family"] == "static-route" for record in history)
+    if operation == "apply":
+        assert all(
+            outcome.disposition != "in_sync" or outcome.stream != "static_route"
+            for outcome in outcomes
+            if outcome.execution_attempt_id == attempt.id
+        )
 
 
 async def setup(api, monkeypatch, *, operation="apply", family="vlan", admit=True, prior_state=SyncState.in_sync):
