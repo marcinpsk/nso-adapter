@@ -256,10 +256,15 @@ class CommitGate:
         event.listen(Session, "before_flush", observe)
         event.listen(Session, "after_flush", observe)
 
-        async def commit(db):
+        def observed(db):
             matches = db.info.get("observed_attempt_phase") == phase
             if sender_phase is not None:
                 matches = matches and db.info.get("observed_response_phase") == sender_phase
+            return matches
+
+        async def commit(db):
+            observe(db, None)
+            matches = observed(db)
             if matches and not self.hit and before:
                 self.hit = True
                 self.reached.set()
@@ -267,6 +272,10 @@ class CommitGate:
                 if failure:
                     raise failure
             await original(db)
+            # The commit's own flush can set the phase; clear it so a later commit cannot match stale info.
+            matches = matches or observed(db)
+            db.info.pop("observed_attempt_phase", None)
+            db.info.pop("observed_response_phase", None)
             if matches and not self.hit:
                 self.hit = True
                 self.reached.set()
