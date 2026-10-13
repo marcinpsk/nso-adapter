@@ -904,6 +904,10 @@ async def _release(reg: ClaimRegistration, job_id: int | None = None) -> ClaimOu
         except ClaimLostError:
             await db.rollback()
             return ClaimOutcome.ABORT_KNOWN
+        except Exception as exc:
+            logger.warning("worker.release_aborted", job_id=job_id, exception_type=type(exc).__name__)
+            await db.rollback()
+            return ClaimOutcome.ABORT_KNOWN
         if reg.registered:
             return await release_claim(reg, db=db)
         return await _commit_outcome(db)

@@ -317,12 +317,14 @@ async def _dispatch(device_id: int, scope: str, *, context_extra: dict | None = 
 
     reg = await acquire_claim(device_id, "job", job_id=job_id)
     reg.run_attempt = 1
-    async with session() as db:
-        device = await db.get(Device, device_id)
-        context = {"scope": scope, **(context_extra or {})}
-        with patch("nso_adapter.nso.apply.apply_device_intent", sender):
-            await removal_mod._dispatch_scope(db, device, client, scope, context, job_id=job_id, reg=reg)
-    await release_claim(reg)
+    try:
+        async with session() as db:
+            device = await db.get(Device, device_id)
+            context = {"scope": scope, **(context_extra or {})}
+            with patch("nso_adapter.nso.apply.apply_device_intent", sender):
+                await removal_mod._dispatch_scope(db, device, client, scope, context, job_id=job_id, reg=reg)
+    finally:
+        await release_claim(reg)
     assert len(_commits(sender)) == 1
     return _sent(sender)
 

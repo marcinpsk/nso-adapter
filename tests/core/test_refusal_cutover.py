@@ -15,7 +15,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
 from nso_adapter.core import worker
-from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, revoke_stale_claims
+from nso_adapter.core.claim import (
+    BookkeepingOutcomeUnknown,
+    ClaimLostError,
+    ClaimOutcome,
+    ClaimRegistration,
+    revoke_stale_claims,
+)
 from nso_adapter.core.jobs import _JOB_RUNNERS
 from nso_adapter.nso.client import DEVICE_INTENT_ROOT
 from nso_adapter.nso.refusal_protocol import RowRef, refusal, row_ref
@@ -23,6 +29,8 @@ from nso_adapter.store.models import (
     ApplyExecutionAttempt,
     BgpRouterIntent,
     DbInterface,
+    Device,
+    DeviceCapability,
     DeviceClaim,
     GenerationStatus,
     InterfaceAttrState,
@@ -313,6 +321,158 @@ async def evidence(device_id):
             )
         )
         return attempts, outcomes
+
+
+@pytest.mark.parametrize("residue_found", [True, False])
+async def test_removal_residue_withholds_durable_success(adapter_client, monkeypatch, residue_found):
+    device_id, transport = await setup(adapter_client, monkeypatch, operation="removal")
+    transport.refuse = False
+    transport.device_sections = {
+        "vlan-database": {
+            "status": "ok",
+            "vlan": [{"vlan-id": vlan} for vlan in ([101, 102] if residue_found else [101])],
+        }
+    }
+    async with session() as db:
+        row = await db.scalar(select(VlanIntent).where(VlanIntent.device_id == device_id))
+        row.last_apply_at = PRIOR_AT
+        row.last_apply_error = deepcopy(PRIOR_ERROR)
+        await db.commit()
+
+    job_id = await run_next(device_id)
+    job = await job_row(job_id)
+    attempts, outcomes = await evidence(device_id)
+    attempt = attempts[-1]
+    assert job.status == JobStatus.succeeded
+    assert attempt.commit_acknowledged and attempt.phase == "terminal"
+    assert attempt.response_classification["post_commit_verification"]["kind"] == "verified"
+    assert job.result["residue_check"] == ("found" if residue_found else "clean")
+    if residue_found:
+        assert job.result["residue"] == {"vlan": [["102"]]}
+    settled = [row for row in outcomes if row.execution_attempt_id == attempt.id]
+    assert settled
+    expected = "unavailable" if residue_found else "in_sync"
+    assert {row.disposition for row in settled} == {expected}
+    assert {row["disposition"] for row in job.result["row_outcomes"]} == {expected}
+    assert job.result["vlan_count_by_outcome"] == {
+        "in_sync": 0 if residue_found else 1,
+        "apply_failed": 0,
+        "not_applied": 0,
+        "unavailable": 1 if residue_found else 0,
+    }
+    async with session() as db:
+        row = await db.scalar(select(VlanIntent).where(VlanIntent.device_id == device_id))
+        if residue_found:
+            assert row.last_apply_at == PRIOR_AT and row.last_apply_error == PRIOR_ERROR
+        else:
+            assert row.last_apply_at > PRIOR_AT and row.last_apply_error is None
+
+
+@pytest.mark.parametrize("write_fails", [True, False])
+async def test_capability_write_preserves_apply_error_and_disposal(
+    adapter_client, monkeypatch, debug_logs, write_fails
+):
+    device_id, transport = await setup(adapter_client, monkeypatch)
+    transport.status = 400
+    transport.raw = json.dumps(
+        {"ietf-restconf:errors": {"error": [{"error-message": "command: set extcommunity color"}]}}
+    ).encode()
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        device.ned_id = "cisco-ios-cli-6.114"
+        device.sw_version = "placeholder-version"
+        if write_fails:
+            await db.execute(
+                text("""
+                CREATE FUNCTION refuse_capability_write() RETURNS trigger AS $$
+                BEGIN
+                    RAISE EXCEPTION USING ERRCODE = 'integrity_constraint_violation', MESSAGE = 'capability write refused';
+                END;
+                $$ LANGUAGE plpgsql
+            """)
+            )
+            await db.execute(
+                text("""
+                CREATE TRIGGER refuse_capability_write BEFORE INSERT OR UPDATE ON device_capability
+                FOR EACH ROW EXECUTE FUNCTION refuse_capability_write()
+            """)
+            )
+        await db.commit()
+
+    job_id = await run_next(device_id)
+    job = await job_row(job_id)
+    attempts, outcomes = await evidence(device_id)
+    attempt = attempts[-1]
+    assert job.status == JobStatus.failed
+    assert job.error["code"] == "nso_put_failed"
+    assert (
+        job.error["detail"]["nso_error"]["ietf-restconf:errors"]["error"][0]["error-message"]
+        == "command: set extcommunity color"
+    )
+    assert attempt.phase == "terminal" and not attempt.commit_acknowledged
+    assert attempt.response_classification["commit"]["kind"] == "rejected"
+    assert {row.disposition for row in outcomes if row.execution_attempt_id == attempt.id} == {"not_applied"}
+    assert len([record for record in debug_logs if record["event"] == "apply.capability_record_failed"]) == int(
+        write_fails
+    )
+    async with session() as db:
+        assert await db.get(DeviceClaim, device_id) is None
+        capabilities = list(await db.scalars(select(DeviceCapability)))
+        assert len(capabilities) == int(not write_fails)
+        if capabilities:
+            assert (capabilities[0].scope, capabilities[0].name, capabilities[0].source) == (
+                "rm-set",
+                "set extcommunity color",
+                "apply",
+            )
+
+
+@pytest.mark.parametrize("through_loop", [False, True])
+async def test_claimless_disposal_error_is_known_abort(adapter_client, monkeypatch, debug_logs, through_loop):
+    async with session() as db:
+        jobs = [Job(job_type=JobType.provision, status=JobStatus.queued, coalescible=False) for _ in range(2)]
+        db.add_all(jobs)
+        await db.commit()
+        job_ids = [job.id for job in jobs]
+        await db.execute(text("ALTER TABLE apply_execution_attempt RENAME TO unavailable_execution_attempt"))
+        await db.commit()
+    stop = asyncio.Event()
+    task = None
+    seen = []
+
+    async def runner(job_id, device_id, reg):
+        assert not reg.registered
+        seen.append(job_id)
+        async with session() as db:
+            job = await db.get(Job, job_id)
+            job.status = JobStatus.succeeded
+            await db.commit()
+        if len(seen) == 2:
+            stop.set()
+
+    try:
+        if through_loop:
+            monkeypatch.setitem(_JOB_RUNNERS, JobType.provision, runner)
+            task = asyncio.create_task(worker._worker_loop(1, stop))
+            await asyncio.wait_for(task, 5)
+            assert seen == job_ids
+            for job_id in job_ids:
+                assert (await job_row(job_id)).status == JobStatus.succeeded
+            abandoned = [record for record in debug_logs if record["event"] == "claim.abandoned_to_staleness"]
+            assert len(abandoned) == 2 and all(record["outcome"] == "abort_known" for record in abandoned)
+        else:
+            reg = ClaimRegistration()
+            reg.run_attempt = 1
+            assert await worker._release(reg, job_ids[0]) is ClaimOutcome.ABORT_KNOWN
+    finally:
+        stop.set()
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        async with session() as db:
+            await db.execute(text("ALTER TABLE unavailable_execution_attempt RENAME TO apply_execution_attempt"))
+            await db.commit()
 
 
 async def terminal(api, device_id, *, refused=True):

@@ -1765,7 +1765,7 @@ async def enqueue_static_route_removals(
     return list(jobs.values())
 
 
-async def _completed_removal_result(db: AsyncSession, job_id: int, reg, certified) -> dict:
+async def _completed_removal_result(db: AsyncSession, job_id: int, reg, certified, *, residue_found: bool) -> dict:
     from nso_adapter.core.execution import active_attempt, record_send_history
     from nso_adapter.store.execution_attempt_store import complete_execution_result
 
@@ -1776,7 +1776,7 @@ async def _completed_removal_result(db: AsyncSession, job_id: int, reg, certifie
     verified = execution.response_classification.get("post_commit_verification", {}).get("kind") == "verified"
     dispositions = {
         (row["stream"], row["row"]["subject"], row["row"]["key"], row["settlement_cohort"]): "in_sync"
-        if verified
+        if verified and not residue_found
         else "unavailable"
         for row in execution.logical_membership
     }
@@ -1872,7 +1872,11 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
             from nso_adapter.core.execution import read_send_history
 
             certified = await read_send_history(db, job_id, client, device)
-            result.update(await _completed_removal_result(db, job_id, reg, certified))
+            result.update(
+                await _completed_removal_result(
+                    db, job_id, reg, certified, residue_found=result.get("residue_check") == "found"
+                )
+            )
             if (
                 await terminalize(
                     db,

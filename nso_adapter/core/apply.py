@@ -1184,7 +1184,8 @@ async def _record_ordinary_capability(db, client, device, exc) -> None:
         scope, construct = parse_rejected_iface_construct(message)
     if construct and device.ned_id:
         try:
-            await record_capability_rejection(db, device.ned_id, device.sw_version or "", scope, construct, message)
+            async with db.begin_nested():
+                await record_capability_rejection(db, device.ned_id, device.sw_version or "", scope, construct, message)
         except ClaimLostError:
             raise
         except Exception as error:
