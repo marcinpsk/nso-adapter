@@ -946,15 +946,20 @@ async def test_missing_peer_proof_withholds_carrier_success(adapter_client, monk
     assert job.result["bgp_count_by_outcome"] == {"in_sync": 0, "apply_failed": 0, "not_applied": 0, "unavailable": 1}
 
 
-async def blocked_writer(db, writer_pid):
+async def lock_wait_seen(db, query, pid):
     from sqlalchemy import text
 
+    # PostgreSQL snapshots pg_stat_activity per transaction; a backend that connects later is invisible without a clear.
+    await db.execute(text("SELECT pg_stat_clear_snapshot()"))
+    return await db.scalar(text(query), {"pid": pid})
+
+
+async def blocked_writer(db, writer_pid):
     async with asyncio.timeout(5):
-        while not await db.scalar(
-            text(
-                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = :pid AND cardinality(pg_blocking_pids(pid)) > 0)"
-            ),
-            {"pid": writer_pid},
+        while not await lock_wait_seen(
+            db,
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = :pid AND cardinality(pg_blocking_pids(pid)) > 0)",
+            writer_pid,
         ):
             await asyncio.wait([asyncio.create_task(asyncio.sleep(0.01))])
 
@@ -1010,11 +1015,10 @@ async def test_worker_refusal_preserves_both_successor_schedules(
                 gate.release.set()
                 async with session() as observer:
                     async with asyncio.timeout(5):
-                        while not await observer.scalar(
-                            text(
-                                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE :pid = ANY(pg_blocking_pids(pid)))"
-                            ),
-                            {"pid": pid},
+                        while not await lock_wait_seen(
+                            observer,
+                            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE :pid = ANY(pg_blocking_pids(pid)))",
+                            pid,
                         ):
                             await asyncio.wait([asyncio.create_task(asyncio.sleep(0.01))])
                 await rival.commit()
