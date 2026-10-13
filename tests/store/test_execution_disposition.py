@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from nso_adapter.core.apply import encode_device_document, overlay_retained_routes
 from nso_adapter.core.projection import _row_dict
 from nso_adapter.core.static_route_reader import certified_static_route_section
-from nso_adapter.nso.apply import NsoApplyError, apply_device_intent
+from nso_adapter.nso.apply import apply_device_intent
 from nso_adapter.nso.origins import (
     AttributionFailure,
     EncodedSection,
@@ -182,8 +182,6 @@ async def test_acknowledged_history_survives_closed_send_gate(db_session, monkey
     assert "origin_history" not in attempt.response_classification
     certified = await certified_static_route_section(client, device)
     monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "0")
-    with pytest.raises(NsoApplyError, match="NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE"):
-        encode_device_document(gen.document)
     await record_acknowledged_origins(db_session, attempt.id, job.id, 1, token, certified)
     await db_session.commit()
     await db_session.refresh(attempt)

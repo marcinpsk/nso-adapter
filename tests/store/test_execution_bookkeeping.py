@@ -7,7 +7,7 @@ from cProfile import Profile
 import pytest
 
 from nso_adapter.core.apply import encode_device_document
-from nso_adapter.core.projection import _row_dict, intent_state
+from nso_adapter.core.projection import _row_dict, intent_state, section_context, stream_section
 from nso_adapter.nso.origins import OriginContext, content_digest
 from nso_adapter.nso.refusal_protocol import row_ref
 from nso_adapter.store import execution_bookkeeping
@@ -94,6 +94,9 @@ async def test_snapshot_preserves_route_records(db_session):
             {
                 "stream": "static_route",
                 "frozen_revision": 7,
+                "writer_context_identity": content_digest(
+                    section_context(generation.document, stream_section("static_route"))
+                ),
                 "fence": {
                     "table": "static_route_intent",
                     "id": row.id,
@@ -231,6 +234,7 @@ async def test_snapshot_preserves_nested_carriers_and_contributor_order(db_sessi
             {
                 "stream": "bgp",
                 "frozen_revision": 7,
+                "writer_context_identity": content_digest(section_context(generation.document, stream_section("bgp"))),
                 "fence": fence(router, [{"table": "bgp_scope_intent", "parent_column": "router_id", "rows": nested}]),
                 "prior": prior,
                 "expected": prior,
