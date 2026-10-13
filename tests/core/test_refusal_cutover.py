@@ -28,6 +28,7 @@ from nso_adapter.store.models import (
     InterfaceIntent,
     Job,
     JobStatus,
+    JobType,
     RowOutcome,
     SnmpV3UserIntent,
     StaticRouteTombstone,
@@ -210,8 +211,9 @@ async def terminal(api, device_id, *, refused=True):
     assert attempt.phase == "terminal"
     job = await job_row(attempt.job_correlation_id)
     assert job.status == JobStatus.failed
+    outcomes = [outcome for outcome in outcomes if outcome.execution_attempt_id == attempt.id]
     assert outcomes or not attempt.logical_membership
-    assert all(outcome.disposition != "in_sync" for outcome in outcomes if outcome.execution_attempt_id == attempt.id)
+    assert all(outcome.disposition != "in_sync" for outcome in outcomes)
     response = await api.get(f"/api/v1/jobs/{job.id}", headers=AUTH)
     assert_text_free_of(response.text, [CANARY])
     assert response.status_code == 200
@@ -221,15 +223,10 @@ async def terminal(api, device_id, *, refused=True):
             assert set(counts) == {"in_sync", "apply_failed", "not_applied", "unavailable"}
     if refused:
         assert job.result["refusals"]
-        assert (
-            any(outcome.disposition == "refused" for outcome in outcomes if outcome.execution_attempt_id == attempt.id)
-            or not attempt.logical_membership
-        )
+        assert any(outcome.disposition == "refused" for outcome in outcomes) or not attempt.logical_membership
     else:
         assert not job.result["refusals"]
-        assert all(
-            outcome.disposition == "unavailable" for outcome in outcomes if outcome.execution_attempt_id == attempt.id
-        )
+        assert all(outcome.disposition == "unavailable" for outcome in outcomes)
     response = await api.post(
         f"/api/v1/devices/{device_id}/deployment-evidence", json={"apply_attempt_ids": []}, headers=AUTH
     )
@@ -407,10 +404,6 @@ async def test_runner_failure_uses_attempt_disposition(adapter_client, monkeypat
     await interrupt(adapter_client, monkeypatch, operation, "refusal", failure=RuntimeError(CANARY))
 
 
-async def test_removal_failure_handler_settles_recorded_refusal(adapter_client, monkeypatch):
-    await interrupt(adapter_client, monkeypatch, "removal", "refusal", failure=RuntimeError(CANARY))
-
-
 @pytest.mark.parametrize("operation", ["apply", "removal"])
 @pytest.mark.parametrize("lane", ["claimless", "expired"])
 async def test_recorded_refusal_recovery_lanes_do_not_resend(adapter_client, monkeypatch, operation, lane):
@@ -422,6 +415,62 @@ async def test_recorded_refusal_recovery_lanes_do_not_resend(adapter_client, mon
         failure=ClaimLostError("placeholder claim lost"),
         recovery=lane,
     )
+
+
+@pytest.mark.parametrize("lane", ["claimless", "expired"])
+async def test_recovery_lane_isolates_an_attempt_that_lost_ownership(adapter_client, monkeypatch, lane):
+    device_id, _transport = await setup(adapter_client, monkeypatch)
+    gate = CommitGate(monkeypatch, "response_recorded", failure=ClaimLostError("placeholder lost holder"))
+    task = asyncio.create_task(run_next(device_id))
+    try:
+        await asyncio.wait_for(gate.reached.wait(), 5)
+        gate.release.set()
+        with pytest.raises(ClaimLostError):
+            await task
+    finally:
+        gate.release.set()
+        gate.close()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    healthy = await seed_device(nso_device_name="placeholder-healthy-device", netbox_device_id=None)
+    async with session() as db:
+        # A job that no longer matches its attempt makes disposal raise AttemptOwnershipLost.
+        await db.execute(update(Job).where(Job.device_id == device_id).values(job_type=JobType.sync))
+        if lane == "claimless":
+            await db.execute(delete(DeviceClaim).where(DeviceClaim.device_id == device_id))
+            await db.execute(update(Job).where(Job.device_id == device_id).values(heartbeat_at=None))
+            healthy_job = Job(
+                job_type=JobType.sync, device_id=healthy, status=JobStatus.running, coalescible=True, heartbeat_at=None
+            )
+            db.add(healthy_job)
+            await db.flush()
+            healthy_job_id = healthy_job.id
+        else:
+            await db.execute(
+                update(DeviceClaim).where(DeviceClaim.device_id == device_id).values(heartbeat_at=PRIOR_AT)
+            )
+            db.add(
+                DeviceClaim(
+                    device_id=healthy,
+                    claim_token="placeholder-healthy-token",
+                    purpose="intent_put",
+                    job_id=None,
+                    heartbeat_at=PRIOR_AT,
+                )
+            )
+        await db.commit()
+    if lane == "claimless":
+        await worker.requeue_orphaned_jobs()
+        assert (await job_row(healthy_job_id)).status == JobStatus.queued
+    else:
+        revoked = await revoke_stale_claims(cutoff_seconds=0)
+        assert [entry.device_id for entry in revoked] == [healthy]
+        async with session() as db:
+            assert set(await db.scalars(select(DeviceClaim.device_id))) == {device_id}
+    attempts, outcomes = await evidence(device_id)
+    assert attempts[-1].phase != "terminal" and not outcomes
+    assert (await job_row(attempts[-1].job_correlation_id)).status == JobStatus.running
 
 
 @pytest.mark.parametrize("field", ["auth-credential-ref", "priv-credential-ref"])
@@ -548,10 +597,6 @@ async def test_child_refusal_preserves_successor_peer(adapter_client, monkeypatc
         if not task.done():
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-
-
-async def test_parent_counts_deduplicate_child_outcomes(adapter_client, monkeypatch):
-    await test_child_refusal_restores_unnamed_peer(adapter_client, monkeypatch)
 
 
 @pytest.mark.parametrize("site", ["peer", "peer-af"])
@@ -813,6 +858,7 @@ async def test_preview_exposes_attribution_and_phase(adapter_client, monkeypatch
         assert body["refusals"][0]["logical_rows"][0]["row"]["key"] == SITE.row.key
     else:
         assert body["refusals"] == []
+    assert "!! preview unavailable" in body["diffs"]["device_intent"], "a non-ready preview never reads as no delta"
     if kind == "unknown":
         assert "refusal attribution failed" in body["diffs"]["device_intent"]
     assert not transport.documents

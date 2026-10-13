@@ -1072,8 +1072,8 @@ them again and refuses if the head, digest, or preview changed.
 One document is one transaction, so there is ONE delta: `diffs` carries a single
 `device_intent` entry covering every family the document holds, the two switching sections
 included. An empty `diffs` with `status=ready` means the device already holds the document. Where no preview can
-be rendered (no generation to deploy, an inconclusive dry-run, a body the adapter could not
-build), that one entry carries a `!! preview unavailable: <reason>` line instead of a delta.
+be rendered (no generation to deploy, an inconclusive dry-run, a refused document, a body the
+adapter could not build), that one entry carries a `!! preview unavailable: <reason>` line instead of a delta.
 Malformed AS content in the frozen document returns a 409 `asn_rule_violation`
 `ErrorEnvelope` instead of a preview-unavailable entry.
 `outformat=cli` renders NSO's NED-uniform `+`/`-` tree diff instead of device-native config.

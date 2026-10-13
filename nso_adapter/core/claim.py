@@ -1034,7 +1034,7 @@ async def revoke_stale_claims(
     revoked: list[RevokedClaim] = []
     async with claim_session(db) as conn:
         await _set_lock_timeout(conn, lock_timeout_ms)
-        from nso_adapter.store.execution_attempt_store import dispose_execution_attempt
+        from nso_adapter.store.execution_attempt_store import AttemptOwnershipLost, dispose_execution_attempt
 
         rows = (
             await conn.execute(
@@ -1044,14 +1044,21 @@ async def revoke_stale_claims(
             )
         ).all()
         for device_id, token, job_id, purpose in rows:
-            revoked.append(RevokedClaim(device_id, token, job_id, purpose))
             if job_id is not None:
                 observed = (
                     await conn.execute(select(Job.job_type, Job.run_attempt).where(Job.id == job_id))
                 ).one_or_none()
                 if observed is not None:
                     job_type, run_attempt = observed
-                    disposition = await dispose_execution_attempt(conn, job_id, run_attempt, token, "claim_expired")
+                    try:
+                        async with conn.begin_nested():
+                            disposition = await dispose_execution_attempt(
+                                conn, job_id, run_attempt, token, "claim_expired"
+                            )
+                    except AttemptOwnershipLost:
+                        # Keep the claim: one lost settlement must not stop recovery of other devices.
+                        logger.error("claim.revoke_ownership_lost", device_id=device_id, job_id=job_id)
+                        continue
                     if disposition == "no_attempt":
                         await terminalize_running(
                             conn,
@@ -1062,6 +1069,7 @@ async def revoke_stale_claims(
                             else None,
                             expected_attempt=run_attempt,
                         )
+            revoked.append(RevokedClaim(device_id, token, job_id, purpose))
             await conn.execute(
                 delete(DeviceClaim).where(DeviceClaim.device_id == device_id, DeviceClaim.claim_token == token)
             )

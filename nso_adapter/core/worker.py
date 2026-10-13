@@ -989,10 +989,16 @@ async def requeue_orphaned_jobs() -> None:
         ).all()
 
         requeued = failed = 0
-        from nso_adapter.store.execution_attempt_store import dispose_execution_attempt
+        from nso_adapter.store.execution_attempt_store import AttemptOwnershipLost, dispose_execution_attempt
 
         for job_id, job_type, run_attempt in rows:
-            handled = await dispose_execution_attempt(db, job_id, run_attempt, None, "orphaned")
+            try:
+                async with db.begin_nested():
+                    handled = await dispose_execution_attempt(db, job_id, run_attempt, None, "orphaned")
+            except AttemptOwnershipLost:
+                # One lost settlement must not stop recovery of the other orphaned jobs.
+                logger.error("worker.orphan_ownership_lost", job_id=job_id)
+                continue
             if handled != "no_attempt":
                 failed += handled == "settled"
                 continue

@@ -1739,6 +1739,10 @@ async def test_run_apply_route_policy_capability_recording_is_best_effort(adapte
     from nso_adapter.store.models import RoutePolicyObjectIntent
 
     device_id = await _seed_device("rtr-rp-cap-err", 324)
+    async with session() as db:
+        dev = await db.get(Device, device_id)
+        dev.ned_id = "cisco-ios-cli-6.95"
+        await db.commit()
     job_id = await _seed_apply_job(device_id)
     async with session() as db:
         db.add(
@@ -1753,18 +1757,21 @@ async def test_run_apply_route_policy_capability_recording_is_best_effort(adapte
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock, side_effect=nso_err),
+        patch("nso_adapter.core.capability.parse_rejected_construct", return_value=("route-policy", "RM-X")),
         patch(
-            "nso_adapter.core.capability.refresh_device_capability",
+            "nso_adapter.core.capability.record_capability_rejection",
             new_callable=AsyncMock,
             side_effect=RuntimeError("capability backend down"),
-        ),
+        ) as rec,
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)  # must not raise
 
+    rec.assert_awaited_once()
     async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.result["route_policy_count_by_outcome"]["not_applied"] == 1
+        assert job.error["code"] == "nso_error", "a capability-recording failure must not replace the apply error"
 
 
 async def test_run_apply_route_policy_capability_skips_record_when_unparseable(adapter_client):

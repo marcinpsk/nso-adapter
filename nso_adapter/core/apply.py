@@ -872,7 +872,12 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
             attributed = resolve_refusals(exc.classification.records, body.origins)
             if not isinstance(attributed, AttributionFailure):
                 records = tuple(attributed_catalog_records(attributed, body.origins, "pre_commit_dry_run"))
-                return ApplyPreview({}, *identity, "refused", records)
+                return ApplyPreview(
+                    {PREVIEW_KEY: "!! preview unavailable: NSO refused the device document"},
+                    *identity,
+                    "refused",
+                    records,
+                )
             return ApplyPreview({PREVIEW_KEY: "!! preview unavailable: refusal attribution failed"}, *identity, "error")
         reason = _apply_error_summary(exc)
         logger.warning("apply_diff.failed", **device_fields(device_id=device_id), error=reason)

@@ -10,7 +10,7 @@ import pytest
 
 from nso_adapter.nso.apply import NsoApplyError, apply_device_intent
 from nso_adapter.nso.refusal_protocol import refusal, render_refusals, row_ref
-from nso_adapter.nso.refusals import DefiniteRefusal, ProtocolFault
+from nso_adapter.nso.refusals import DefiniteRefusal, ProtocolFault, Unavailable
 from tests._secret_discipline import assert_chain_free_of
 from tests.nso.test_apply_send import _client_with
 
@@ -110,7 +110,7 @@ async def test_post_commit_malformed_500_is_protocol_fault():
     await _post_commit_error(500, b"opaque " + CANARY.encode(), ProtocolFault)
 
 
-@pytest.mark.parametrize("status", [502, 503])
+@pytest.mark.parametrize("status", [302, 502, 503])
 @pytest.mark.parametrize("body", [b"{", b"opaque"])
 async def test_post_commit_malformed_unclaimed_error_is_unavailable(status, body):
     checkpoints = []
@@ -125,6 +125,31 @@ async def test_post_commit_malformed_unclaimed_error_is_unavailable(status, body
         "commit acknowledgement must reach the worker before inconclusive verification"
     )
     assert checkpoints[-1][0] == "post_commit_verification"
+
+
+@pytest.mark.parametrize("status", [302, 307])
+@pytest.mark.parametrize("dry_run", [False, True, "cli"])
+async def test_redirect_is_unavailable_at_its_checkpoint(status, dry_run):
+    checkpoints = []
+
+    async def checkpoint(phase, classification, acknowledged):
+        checkpoints.append((phase, type(classification).__name__, acknowledged))
+
+    transport = ErrorTransport(status, b"opaque " + CANARY.encode())
+    send = apply_device_intent(
+        _client_with(transport), "placeholder-device", {}, device_id=1, dry_run=dry_run, checkpoint=checkpoint
+    )
+    if dry_run:
+        assert await send is None
+        assert checkpoints == [("pre_commit_dry_run", "Unavailable", False)]
+    else:
+        with pytest.raises(NsoApplyError) as caught:
+            await send
+        assert isinstance(caught.value.classification, Unavailable)
+        assert not caught.value.commit_acknowledged
+        assert_chain_free_of(caught.value, [CANARY])
+        assert checkpoints == [("commit", "Unavailable", False)]
+    assert len(transport.requests) == 1
 
 
 @pytest.mark.parametrize("status", [200, 201, 204, 400, 503])

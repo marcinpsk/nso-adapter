@@ -154,4 +154,5 @@ def classify_error(status: int | None, body: bytes | str | None) -> ErrorClassif
         return OrdinaryRejection()
     if 200 <= status < 300:
         return None
-    raise ValueError("classify_error requires a supported HTTP status")
+    # A 1xx or 3xx (for example a proxy redirect) proves no delivery outcome.
+    return Unavailable()
