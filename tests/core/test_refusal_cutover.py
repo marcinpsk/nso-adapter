@@ -482,6 +482,24 @@ async def test_recovery_lane_isolates_an_attempt_that_lost_ownership(adapter_cli
     assert (await job_row(attempts[-1].job_correlation_id)).status == JobStatus.running
 
 
+async def test_attempt_membership_excludes_a_carried_stream_the_job_did_not_promote(adapter_client, monkeypatch):
+    device_id, transport = await setup(adapter_client, monkeypatch)
+    transport.refuse = False
+    await run_next(device_id)
+    response = await put_vlans(adapter_client, device_id, [101, 102, 103], seq=42)
+    assert response.status_code == 200
+    response = await _apply(adapter_client, device_id, {"vlan": 42})
+    assert response.status_code == 202, response.text
+    transport.refuse = True
+    transport.documents.clear()
+    await run_next(device_id)
+    assert "interface" in json.dumps(transport.documents[-1]), "the document must still carry interface_config"
+    job = await terminal(adapter_client, device_id)
+    attempts, _outcomes = await evidence(device_id)
+    assert {logical["stream"] for logical in attempts[-1].logical_membership} == {"vlan"}
+    assert all(row["stream"] == "vlan" for row in job.result["row_outcomes"])
+
+
 @pytest.mark.parametrize("field", ["auth-credential-ref", "priv-credential-ref"])
 async def test_first_apply_missing_snmp_reference_refuses_only_user(adapter_client, monkeypatch, field):
     device_id, transport = await setup(adapter_client, monkeypatch, admit=False)
