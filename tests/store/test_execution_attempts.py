@@ -48,7 +48,7 @@ def test_refusal_schema_parity(pg_provisioner, pg_sync_session):
     assert_schema_parity(pg_provisioner)
 
 
-async def _seed(db, *, attribute=False, prior_state=SyncState.in_sync, coalescible=False):
+async def _seed(db, *, attribute=False, prior_state=SyncState.in_sync, coalescible=False, attributes=("description",)):
     device = Device(nso_instance="test", nso_device_name="placeholder-device")
     db.add(device)
     await db.flush()
@@ -63,23 +63,30 @@ async def _seed(db, *, attribute=False, prior_state=SyncState.in_sync, coalescib
         interface = DbInterface(device_id=device.id, name="Ethernet1")
         db.add(interface)
         await db.flush()
-        row = InterfaceIntent(
-            interface_id=interface.id,
-            attribute="description",
-            intent_value="placeholder intent",
-            accepted_at=ACCEPTED,
-            last_apply_at=APPLIED,
-            last_apply_error={"code": "prior"},
-        )
-        state = InterfaceAttrState(
-            interface_id=interface.id,
-            attribute="description",
-            sync_state=prior_state,
-            last_checked_at=APPLIED,
-            nso_value="placeholder observation",
-            netbox_value="placeholder intent",
-        )
-        db.add(state)
+        rows = [
+            InterfaceIntent(
+                interface_id=interface.id,
+                attribute=name,
+                intent_value="placeholder intent",
+                accepted_at=ACCEPTED,
+                last_apply_at=APPLIED,
+                last_apply_error={"code": "prior"},
+            )
+            for name in attributes
+        ]
+        states = [
+            InterfaceAttrState(
+                interface_id=interface.id,
+                attribute=name,
+                sync_state=prior_state,
+                last_checked_at=APPLIED,
+                nso_value="placeholder observation",
+                netbox_value="placeholder intent",
+            )
+            for name in attributes
+        ]
+        db.add_all(states)
+        row, state = rows[0], states[0]
         section = "interface_config"
     else:
         row = VlanIntent(
@@ -90,14 +97,17 @@ async def _seed(db, *, attribute=False, prior_state=SyncState.in_sync, coalescib
             last_apply_at=APPLIED,
             last_apply_error={"code": "prior"},
         )
+        rows = [row]
         state = None
         section = "vlan"
-    db.add(row)
+    db.add_all(rows)
     await db.flush()
-    tables = {row.__tablename__: [_row_dict(row)]}
+    tables = {row.__tablename__: [_row_dict(each) for each in rows]}
     execution = {"context": {"ned_id": None, "dialect": community_dialect_for(None).name}}
     if attribute:
-        execution["proof"] = build_interface_proof(section, tables, [interface], {(interface.id, "description"): True})
+        execution["proof"] = build_interface_proof(
+            section, tables, [interface], {(interface.id, name): True for name in attributes}
+        )
     db.add(DeviceProjectionStream(device_id=device.id, stream=section, desired_revision=7, authorized_revision=7))
     generation = DeploymentGeneration(
         device_id=device.id,
@@ -116,6 +126,10 @@ async def _seed(db, *, attribute=False, prior_state=SyncState.in_sync, coalescib
     path = (("interface", ("Ethernet1",)),) if attribute else (("vlan", (10,)),)
     logical = recorder.logical(subject, path, recorder.source(row, row.__tablename__, section), section)
     recorder.emit(subject, path, (logical,))
+    for extra in rows[1:]:
+        extra_subject = "interface." + extra.attribute
+        source = recorder.source(extra, extra.__tablename__, section)
+        recorder.emit(extra_subject, path, (recorder.logical(extra_subject, path, source, section),))
     origins = recorder.finish({}).origins
     await db.commit()
     return job, generation, row, state, token, origins, logical
@@ -520,6 +534,30 @@ async def test_prior_bookkeeping_snapshot_is_durable(db_session, rival_engine, p
     await db_session.refresh(seeded[2])
     assert seeded[3].sync_state == prior_state
     assert (seeded[2].last_apply_at, seeded[2].last_apply_error) == (APPLIED, {"code": "prior"})
+
+
+@pytest.mark.anyio
+async def test_prior_bookkeeping_snapshot_hydrates_the_interface_proof_once(db_session, monkeypatch):
+    from nso_adapter.store import execution_attempt_store, execution_bookkeeping
+
+    hydrations = []
+    hydrate = execution_bookkeeping.hydrate_interface_execution
+    monkeypatch.setattr(
+        execution_bookkeeping,
+        "hydrate_interface_execution",
+        lambda document: hydrations.append(document) or hydrate(document),
+    )
+    job, generation, _row, _state, token, origins, _logical = await _seed(
+        db_session, attribute=True, attributes=("description", "enabled")
+    )
+    logicals = tuple(
+        dict.fromkeys(logical for binding in origins.bindings.values() for logical in binding.logical_rows)
+    )
+    attempt = await execution_attempt_store.prepare_execution_attempt(
+        db_session, job.id, job.run_attempt, token, generation.id, origins=origins, logical_rows=logicals
+    )
+    assert len(attempt.prior_bookkeeping) == 2
+    assert len(hydrations) == 1
 
 
 async def _wait_for_block(db, pid):

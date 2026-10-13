@@ -172,6 +172,7 @@ async def snapshot_bookkeeping(
             ):
                 targets.add((*source.live_stamp_join, carrier.stream, carrier.frozen_revision))
     result = []
+    proof = None
     for table, identity, stream, revision in sorted(targets):
         if revision is None:
             raise ValueError("Bookkeeping target requires a frozen stream revision")
@@ -181,9 +182,9 @@ async def snapshot_bookkeeping(
         if not await _authorized(db, generation.device_id, stream, revision):
             continue
         tree = _tree(original, frozen)
-        proof = None
         if isinstance(original, InterfaceIntent):
-            proof = hydrate_interface_execution(generation.document)
+            if proof is None:
+                proof = hydrate_interface_execution(generation.document)
             if (original.interface_id, original.attribute) not in proof.eligible_attributes:
                 continue
             interface = proof.interfaces[original.interface_id]
