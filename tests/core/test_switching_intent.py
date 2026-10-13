@@ -19,8 +19,6 @@ from nso_adapter.core.switching_intent import (
     LagBundleSnapshot,
     LagMemberSnapshot,
     SwitchportSnapshot,
-    encode_lag_section,
-    encode_switchport_section,
     replace_lag_snapshot,
     replace_switchport_snapshot,
 )
@@ -33,6 +31,7 @@ from nso_adapter.store.models import (
 )
 from tests._secret_discipline import assert_chain_free_of
 from tests.conftest import seed_device, session
+from tests.core.projection_helpers import encode_hydrated_section
 
 _source_revisions = itertools.count(1)
 
@@ -280,7 +279,7 @@ async def test_switchport_replacement_rejects_invalid_graph_before_mutation(adap
 
 
 @pytest.mark.anyio
-async def test_the_encoders_are_canonical_and_omit_empty_values_and_families(adapter_client):
+async def test_registered_encoders_preserve_snapshot_order_and_omit_unset_values(adapter_client):
     """Snapshot -> hydrate -> encode: the wire form is a pure function of the stored rows."""
     device_id = await seed_device(nso_device_name="switching-render", netbox_device_id=1614)
     async with session() as db:
@@ -322,28 +321,28 @@ async def test_the_encoders_are_canonical_and_omit_empty_values_and_families(ada
         counter = await db.get(DeviceGenerationCounter, device_id)
         await db.rollback()
 
-    assert encode_lag_section(hydrate_section(lag_document, "lag"), context) == {
+    assert encode_hydrated_section("lag", hydrate_section(lag_document, "lag"), context).body == {
         "bundle": [
+            {"name": "Port-channel2", "lag-id": 7},
             {
                 "name": "Port-channel1",
                 "member": [
-                    {"interface-name": "Gi0/1", "mode": "active"},
                     {"interface-name": "Gi0/2"},
+                    {"interface-name": "Gi0/1", "mode": "active"},
                 ],
             },
-            {"name": "Port-channel2", "lag-id": 7},
         ]
     }
-    assert encode_switchport_section(hydrate_section(switchport_document, "switchport"), context) == {
+    assert encode_hydrated_section("switchport", hydrate_section(switchport_document, "switchport"), context).body == {
         "interface": [
-            {"interface-name": "Gi0/1", "mode": "access", "untagged-vlan": 10},
             {"interface-name": "Gi0/2", "tagged-vlan": [20, 30]},
+            {"interface-name": "Gi0/1", "mode": "access", "untagged-vlan": 10},
         ]
     }
     # The preparation takes the projection lock, so the counter row exists after it.
     assert counter is not None
-    assert encode_lag_section({}, context) == {}
-    assert encode_switchport_section({}, context) == {}
+    assert encode_hydrated_section("lag", {}, context).body == {"bundle": []}
+    assert encode_hydrated_section("switchport", {}, context).body == {"interface": []}
 
 
 @pytest.mark.anyio
@@ -596,7 +595,7 @@ async def test_the_encoders_accept_a_fragment_carrying_its_frozen_execution_cont
     context = {"ned_id": None, "dialect": "identity"}
     rows = hydrate_section({"lag": {**tables, "_execution": {"context": context}}}, "lag")
 
-    assert encode_lag_section(rows, context) == {"bundle": [{"name": "Port-channel1", "lag-id": 1}]}
+    assert encode_hydrated_section("lag", rows, context).body == {"bundle": [{"name": "Port-channel1", "lag-id": 1}]}
 
 
 @pytest.mark.anyio

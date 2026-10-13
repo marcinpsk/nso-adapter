@@ -447,7 +447,7 @@ def _retained_body(rows, extra_entries=None) -> dict:
 
     body = encode_static_route({"static_route_intent": rows}, _CONTEXT_FREE_EXECUTION)
     overlay_retained_routes(body, extra_entries or [])
-    return body
+    return body.body
 
 
 def test_c1_7_retained_entries_ride_verbatim_and_never_override_a_rendered_row():

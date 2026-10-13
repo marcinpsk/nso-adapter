@@ -50,6 +50,15 @@ from nso_adapter.domain.asn import AsnRuleViolation, validate_asn_rows
 from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.apply import NsoApplyError
 from nso_adapter.nso.client import failure_detail
+from nso_adapter.nso.origins import (
+    EncodedSection,
+    OriginConstructionError,
+    OriginContext,
+    OriginIndex,
+    PriorContribution,
+    RemovalAuthority,
+)
+from nso_adapter.nso.refusal_protocol import row_ref
 from nso_adapter.store.models import (
     DbInterface,
     Device,
@@ -551,7 +560,7 @@ def _carried(rows: list) -> list:
     return [row for row in rows if not hasattr(row, "accepted_at") or row.accepted_at is not None]
 
 
-def section_execution(document: dict, section: str, proof: Any = None):
+def section_execution(document: dict, section: str, proof: Any = None, origin_context: OriginContext | None = None):
     """Return the frozen facts *section*'s encoder reads besides its rows (memo A9).
 
     The NED id and the dialect come from the section's own context and from no device row,
@@ -561,7 +570,7 @@ def section_execution(document: dict, section: str, proof: Any = None):
     from nso_adapter.nso.apply import SectionExecution
 
     context = section_context(document, section)
-    return SectionExecution(context["ned_id"], community_dialect_by_name(context["dialect"]), proof)
+    return SectionExecution(context["ned_id"], community_dialect_by_name(context["dialect"]), proof, origin_context)
 
 
 def _hydrated_proof(document: dict, section: str):
@@ -569,7 +578,14 @@ def _hydrated_proof(document: dict, section: str):
     return hydrate_interface_execution(document) if section == "interface_config" else None
 
 
-def encode_section(document: dict, section: str, *, rows: Mapping[str, list] | None = None, proof: Any = None) -> dict:
+def encode_section(
+    document: dict,
+    section: str,
+    *,
+    rows: Mapping[str, list] | None = None,
+    proof: Any = None,
+    origin_context: OriginContext | None = None,
+) -> EncodedSection:
     """Encode ONE section into its YANG container body.
 
     *rows* lets an executing deployment hand in the rows it already collected (the
@@ -589,10 +605,15 @@ def encode_section(document: dict, section: str, *, rows: Mapping[str, list] | N
         refuse_gated_local_levels(table_rows)
     if proof is None:
         proof = _hydrated_proof(document, section)
-    return entry.encode(table_rows, section_execution(document, section, proof))
+    try:
+        return entry.encode(table_rows, section_execution(document, section, proof, origin_context))
+    except OriginConstructionError as exc:
+        # The message is fixed text; raised outside the handler so no context rides along.
+        failure = NsoApplyError("origin_construction", str(exc))
+    raise failure
 
 
-def overlay_retained_routes(body: dict, retained: list[dict]) -> set:
+def overlay_retained_routes(encoded: EncodedSection, retained: list[dict]) -> set:
     """Add the entries an unconsumed carrier still claims to a static-route body → its keys.
 
     Kept VERBATIM: metric, tag and NED-specific leaves live only in the live copy, so
@@ -601,28 +622,28 @@ def overlay_retained_routes(body: dict, retained: list[dict]) -> set:
     """
     from nso_adapter.nso.apply import static_route_entry_key
 
-    routes = body["route"]
+    routes = encoded.body["route"]
     keys = {static_route_entry_key(entry) for entry in routes}
     for entry in retained:
         key = static_route_entry_key(entry)
         if key in keys:
             continue
         keys.add(key)
+        encoded.origins.record_retained(entry)
         routes.append(entry)
     return keys
 
 
-def encode_device_document(document: dict) -> dict[str, dict]:
-    """Encode every section the document carries into ``{YANG container: body}``.
-
-    The registry binds each section to its container and its encoder, so this walk is the
-    whole family fan-out: a family the document does not carry is absent from the body and,
-    under a full-document PUT, therefore owns nothing.
-    """
-    registry = section_registry()
-    return {
-        registry[section].container: encode_section(document, section) for section in registry if section in document
-    }
+def encode_device_document(document: dict, *, origin_context: OriginContext | None = None) -> EncodedSection:
+    """Encode the carried containers and combine their exact origins."""
+    containers = {}
+    origins = OriginIndex()
+    for section, entry in section_registry().items():
+        if section in document:
+            encoded = encode_section(document, section, origin_context=origin_context)
+            containers[entry.container] = encoded.body
+            origins.merge(encoded.origins)
+    return EncodedSection(containers, origins)
 
 
 class DeviceBody(NamedTuple):
@@ -636,6 +657,7 @@ class DeviceBody(NamedTuple):
     containers: dict[str, dict]
     sent_route_keys: set | None
     errors: dict[str, NsoApplyError]
+    origins: OriginIndex
     static_route: Any = None
 
     @property
@@ -653,6 +675,19 @@ def _operation_selected_routes(document: dict) -> frozenset:
 
     removal = section_operation(document, "static_route").get("removal") or {}
     return frozenset(key for raw in (removal.get("authorized_removal_keys") or []) if (key := as_triple(raw)))
+
+
+def _record_route_omissions(
+    origins: OriginIndex, document: dict, sent_keys: set, context: OriginContext | None
+) -> None:
+    for key in _operation_selected_routes(document) - sent_keys:
+        row = row_ref("static-route", "static-route.route", (("route", key),))
+        authority = None
+        if context is not None and context.generation_id is not None and "static_route" in context.stream_revisions:
+            authority = RemovalAuthority(
+                context.generation_id, "static_route", context.stream_revisions["static_route"], "removal", row
+            )
+        origins.record_omission(PriorContribution("static-route", row, authority))
 
 
 async def _static_route_snapshot(client, device, document: dict, plan) -> tuple[Any, list[dict]]:
@@ -695,6 +730,7 @@ async def build_device_containers(
     proof_by_section: Mapping[str, Any] | None = None,
     static_route_plan: SrPlan | None = None,
     retain_static_routes: bool = True,
+    origin_context: OriginContext | None = None,
 ) -> DeviceBody:
     """Build one device's whole PUT body → ``({container: body}, route keys sent, build errors)``.
 
@@ -718,6 +754,7 @@ async def build_device_containers(
     """
     registry = section_registry()
     containers: dict[str, dict] = {}
+    origins = OriginIndex()
     errors: dict[str, NsoApplyError] = {}
     sent_route_keys: set | None = None
     certified: Any = None
@@ -725,18 +762,20 @@ async def build_device_containers(
         if section not in document:
             continue
         try:
-            body = encode_section(
+            encoded = encode_section(
                 document,
                 section,
                 rows=(rows_by_section or {}).get(section),
                 proof=(proof_by_section or {}).get(section),
+                origin_context=origin_context,
             )
             if section == "static_route":
                 retained: list[dict] = []
                 if retain_static_routes:
                     plan = static_route_plan or hydrate_static_route_apply_plan(document)
                     certified, retained = await _static_route_snapshot(client, device, document, plan)
-                sent_route_keys = overlay_retained_routes(body, retained)
+                sent_route_keys = overlay_retained_routes(encoded, retained)
+                _record_route_omissions(encoded.origins, document, sent_route_keys, origin_context)
         except NsoApplyError as exc:
             logger.error(
                 "apply.section_build_failed",
@@ -746,8 +785,9 @@ async def build_device_containers(
             )
             errors[section] = exc
             continue
-        containers[entry.container] = body
-    return DeviceBody(containers, sent_route_keys, errors, certified)
+        containers[entry.container] = encoded.body
+        origins.merge(encoded.origins)
+    return DeviceBody(containers, sent_route_keys, errors, origins, certified)
 
 
 async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = "native") -> ApplyPreview:
@@ -791,7 +831,11 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
         fmt: bool | str = "cli" if outformat == "cli" else True
         policy = execution_policy(generation)
         body = await build_device_containers(
-            client, device, generation.document, retain_static_routes=policy.retain_static_routes
+            client,
+            device,
+            generation.document,
+            retain_static_routes=policy.retain_static_routes,
+            origin_context=OriginContext.from_generation(generation),
         )
         if body.errors:
             raise next(iter(body.errors.values()))
@@ -1481,6 +1525,7 @@ class _ApplyPlan(NamedTuple):
     #: The keys this deployment may drop, per section and guarded list — the guard's authority.
     allowed: dict
     any_eligible: bool
+    origin_context: OriginContext | None = None
 
 
 @cache
@@ -1749,6 +1794,7 @@ async def _run_document_apply(db, device, client, device_name, job, job_id, now,
             rows_by_section={section: rows.rows for section, rows in plan.sections.items()},
             proof_by_section={"interface_config": plan.interface.execution},
             static_route_plan=plan.static_route,
+            origin_context=plan.origin_context,
         )
     except ClaimLostError:
         raise
@@ -2381,6 +2427,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         static_route=sr_plan if "static_route" in execution_sections else None,
         allowed=guard_allowed(generation, route_keys=sr_plan.allowed if sr_plan is not None else None),
         any_eligible=any_eligible,
+        origin_context=OriginContext.from_generation(generation),
     )
     if not any_eligible:
         await _finalize_job(db, job_id, device_id, False, {}, {}, reg=reg)

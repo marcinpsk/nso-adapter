@@ -50,6 +50,10 @@ _RETIRE_SCHEMA = {
 }
 
 _KEEP_SCHEMA = {
+    # Execution evidence survives authority reset and job pruning.
+    "apply_execution_attempt": frozenset(
+        "id device_id generation_id job_id job_correlation_id run_attempt operation_kind document_digest claim_token stream_revisions generation_authorities manual_attempt_id removal_tombstone_ids logical_membership attempted_carriers safe_origins prior_bookkeeping phase response_phase response_classification commit_acknowledged created_at".split()
+    ),
     # Desired intent survives for a later authorization.
     "bfd_intent": frozenset(
         "id device_id interface_name min_tx min_rx multiplier micro_bfd accepted_at last_apply_at last_apply_error".split()

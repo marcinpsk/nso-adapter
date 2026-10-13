@@ -376,7 +376,7 @@ async def test_static_route_container_carries_the_route_list():
         SimpleNamespace(vrf="", prefix="10.0.0.0/8", next_hop="192.0.2.1", metric=10, permanent=True, tag=None),
         SimpleNamespace(vrf="MGMT", prefix="0.0.0.0/0", next_hop="192.0.2.254", metric=None, permanent=False, tag=5),
     ]
-    body = encode_static_route({"static_route_intent": rows}, _PLAIN)
+    body = encode_static_route({"static_route_intent": rows}, _PLAIN).body
     delta = await apply_device_intent(
         client,
         "sw03",
@@ -421,7 +421,7 @@ async def test_static_route_emits_interface_and_next_hop_vrf():
         ),
         SimpleNamespace(vrf="", prefix="10.0.0.0/8", next_hop="192.0.2.1", metric=None, permanent=False, tag=None),
     ]
-    body = encode_static_route({"static_route_intent": rows}, _PLAIN)
+    body = encode_static_route({"static_route_intent": rows}, _PLAIN).body
     await apply_device_intent(client, "ra1xr", {"static-route": body}, device_id=_DEVICE_ID, dry_run=True)
 
     routes = _sent(transport, "static-route")["route"]
@@ -443,7 +443,7 @@ async def test_bfd_container_carries_the_interface_list():
     await apply_device_intent(
         client,
         "sw03",
-        {"bfd": encode_bfd({"bfd_intent": rows}, _PLAIN)},
+        {"bfd": encode_bfd({"bfd_intent": rows}, _PLAIN).body},
         device_id=_DEVICE_ID,
         dry_run=True,
     )
@@ -460,7 +460,7 @@ async def test_mtu_container_carries_the_interface_list():
         SimpleNamespace(interface_name="Gi0/1", mtu=9000, ip_mtu=8986, mpls_mtu=None),
         SimpleNamespace(interface_name="Gi0/2", mtu=None, ip_mtu=None, mpls_mtu=1500),
     ]
-    body = encode_interface_mtu({"interface_mtu_intent": rows}, _PLAIN)
+    body = encode_interface_mtu({"interface_mtu_intent": rows}, _PLAIN).body
     await apply_device_intent(client, "sw03", {"mtu": body}, device_id=_DEVICE_ID, dry_run=True)
 
     ifaces = _sent(transport, "mtu")["interface"]
@@ -520,7 +520,7 @@ async def test_snmp_container_uses_vault_triples_and_yang_enums():
             "snmp_system_info_intent": [system],
         },
         _PLAIN,
-    )
+    ).body
     await apply_device_intent(client, "sw03", {"snmp": body}, device_id=_DEVICE_ID, dry_run=True)
 
     entry = _sent(transport, "snmp")
@@ -588,7 +588,7 @@ def test_snmp_accepts_the_bare_2_version_spelling():
             "snmp_system_info_intent": [],
         },
         _PLAIN,
-    )
+    ).body
 
     assert body["host"][0]["version"] == "v2c"
 
@@ -608,7 +608,7 @@ def test_snmp_host_without_binding_omits_community_or_user():
             "snmp_system_info_intent": [],
         },
         _PLAIN,
-    )
+    ).body
 
     assert body["host"] == [{"address": "192.0.2.99", "version": "v2c", "notify-type": "traps", "port": 162}]
 
@@ -639,7 +639,7 @@ def test_snmp_rejects_a_malformed_vault_ref(bad_ref):
                 "snmp_system_info_intent": [],
             },
             _PLAIN,
-        )
+        ).body
 
     from tests._secret_discipline import assert_chain_free_of
 
@@ -664,7 +664,7 @@ async def test_logging_container_carries_the_host_list():
         ),
         SimpleNamespace(address="192.0.2.6", port=None, severity="", facility="", transport="", vrf="", source=""),
     ]
-    body = encode_logging({"logging_host_intent": rows, "logging_levels_intent": []}, _PLAIN)
+    body = encode_logging({"logging_host_intent": rows, "logging_levels_intent": []}, _PLAIN).body
     await apply_device_intent(client, "sw03", {"logging": body}, device_id=_DEVICE_ID, dry_run=True)
 
     hosts = _sent(transport, "logging")["host"]
@@ -690,7 +690,7 @@ def test_logging_emits_the_set_local_levels():
     body = encode_logging(
         {"logging_host_intent": [], "logging_levels_intent": [_levels_row(console="CRITICAL", module="NOTICE")]},
         _PLAIN,
-    )
+    ).body
 
     assert body["local-levels"] == {"console-severity": "CRITICAL", "module-severity": "NOTICE"}
 
@@ -710,7 +710,7 @@ def test_the_send_gate_refuses_local_levels_while_it_is_closed(monkeypatch):
     with pytest.raises(NsoApplyError, match="NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE"):
         refuse_gated_local_levels(rows)
     # The encoder itself is unconditional: the same rows encode the same bytes either way.
-    assert encode_logging(rows, _PLAIN)["local-levels"] == {"console-severity": "CRITICAL"}
+    assert encode_logging(rows, _PLAIN).body["local-levels"] == {"console-severity": "CRITICAL"}
 
 
 def test_the_open_gate_admits_local_levels(monkeypatch):
@@ -730,7 +730,7 @@ def test_the_gate_ignores_a_body_with_no_levels(monkeypatch):
     }
 
     refuse_gated_local_levels(rows)  # no raise
-    body = encode_logging(rows, _PLAIN)
+    body = encode_logging(rows, _PLAIN).body
     assert "local-levels" not in body
     assert body["host"] == [{"address": "192.0.2.7"}]
 
@@ -767,7 +767,7 @@ async def test_isis_container_carries_process_and_interface_config():
             "redistribution_intent": [],
         },
         _PLAIN,
-    )
+    ).body
     await apply_device_intent(client, "sw03", {"isis": body}, device_id=_DEVICE_ID, dry_run=True)
 
     sent = _sent(transport, "isis")
@@ -814,7 +814,7 @@ async def test_ospf_container_carries_process_interface_and_redistribute():
         metric=20,
         metric_type="type-1",
     )
-    body = encode_ospf(_ospf_rows([proc], [iface], [redist]), _PLAIN)
+    body = encode_ospf(_ospf_rows([proc], [iface], [redist]), _PLAIN).body
     await apply_device_intent(client, "sw03", {"ospf": body}, device_id=_DEVICE_ID, dry_run=True)
 
     sent = _sent(transport, "ospf")
@@ -833,7 +833,7 @@ def test_ospf_interface_only_omits_process_config():
     """With no process rows the body carries interface-config but no process-config key."""
     iface = OspfInterfaceIntent(interface_name="Gi0/9", process_id="1", area_id="0", passive=False)
 
-    body = encode_ospf(_ospf_rows([], [iface]), _PLAIN)
+    body = encode_ospf(_ospf_rows([], [iface]), _PLAIN).body
 
     assert "process-config" not in body
     assert body["interface-config"][0]["interface-name"] == "Gi0/9"
@@ -846,7 +846,7 @@ async def test_a_real_ospf_commit_puts_then_verifies():
     proc = OspfInstanceIntent(process_id="1", vrf="", enabled=False)  # operator-down preserved
     iface = OspfInterfaceIntent(interface_name="Gi0/1", process_id="1", area_id="0", passive=False)
 
-    body = encode_ospf(_ospf_rows([proc], [iface]), _PLAIN)
+    body = encode_ospf(_ospf_rows([proc], [iface]), _PLAIN).body
     result = await apply_device_intent(client, "sw03", {"ospf": body}, device_id=_DEVICE_ID)
 
     assert result == VERIFY_CONCLUSIVE  # the verdict rides out of the committing send
@@ -883,7 +883,7 @@ async def test_bgp_container_carries_the_router_scope_peer_tree():
     redist = SimpleNamespace(
         dest_ref="65000::ipv4-unicast", source_protocol="connected", source_ref="", route_map=None, metric=None
     )
-    body = encode_bgp({"bgp_router_intent": [router], "redistribution_intent": [redist]}, _PLAIN)
+    body = encode_bgp({"bgp_router_intent": [router], "redistribution_intent": [redist]}, _PLAIN).body
     await apply_device_intent(client, "sw03", {"bgp": body}, device_id=_DEVICE_ID, dry_run=True)
 
     r = _sent(transport, "bgp")["router"][0]

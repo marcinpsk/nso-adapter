@@ -31,7 +31,7 @@ async def test_route_policy_readers_refuse_invalid_stored_members(adapter_client
         execution = SectionExecution(None, community_dialect_for(None))
         with pytest.raises(NsoApplyError) as error:
             if reader == "encode":
-                encode_route_policy(rows, execution)
+                encode_route_policy(rows, execution).body
             else:
                 unrenderable_route_policy_members(rows, execution.dialect)
         assert error.value.code == "invalid_route_policy_intent"

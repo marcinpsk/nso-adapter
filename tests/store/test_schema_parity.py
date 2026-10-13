@@ -116,6 +116,15 @@ def _snapshot(engine) -> dict:
             _TRIGGER_SQL, {"table": "read_observation", "trigger": "read_observation_immutable"}
         ).one_or_none()
         snap["__observation_trigger__"] = tuple(observation_trigger) if observation_trigger is not None else ()
+        snap["__execution_evidence_triggers__"] = {
+            table: tuple(trigger)
+            if (trigger := conn.execute(_TRIGGER_SQL, {"table": table, "trigger": name}).one_or_none())
+            else ()
+            for table, name in (
+                ("apply_execution_attempt", "execution_attempt_immutable"),
+                ("row_outcome", "row_outcome_immutable"),
+            )
+        }
     # PostgreSQL ENUM types are schema-level, not per-table: compare their label sets so an
     # enum value-set divergence (a migration adding/renaming a member) is caught too.
     snap["__enums__"] = {e["name"]: tuple(e["labels"]) for e in insp.get_enums()}

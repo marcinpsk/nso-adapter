@@ -427,7 +427,7 @@ async def test_bgp_snapshot_hydrates_the_relationship_graph_for_the_writer(adapt
     rows = hydrate_section({"bgp": fragment}, "bgp")
     body = encode_bgp(
         {"bgp_router_intent": rows[BgpRouterIntent], "redistribution_intent": []}, _CONTEXT_FREE_EXECUTION
-    )
+    ).body
 
     router = body["router"][0]
     assert router == {

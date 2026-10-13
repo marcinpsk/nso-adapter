@@ -14,6 +14,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.core.projection_helpers import encode_hydrated_section
 from tests.core.removal_helpers import authorize_static_route, authorize_stream
 from tests.core.test_generation_protocol import put_vlans, seed_settings
 
@@ -335,12 +336,7 @@ async def test_switching_writer_commits_before_real_offboard(adapter_client, riv
 async def test_document_snapshot_waits_for_a_switching_replacement(adapter_client, rival_engine):
     from nso_adapter.core.generation import lock_device_document
     from nso_adapter.core.projection import hydrate_section
-    from nso_adapter.core.switching_intent import (
-        LagBundleSnapshot,
-        LagMemberSnapshot,
-        encode_lag_section,
-        replace_lag_snapshot,
-    )
+    from nso_adapter.core.switching_intent import LagBundleSnapshot, LagMemberSnapshot, replace_lag_snapshot
     from nso_adapter.store.db import get_engine
     from tests.core.projection_helpers import freeze_snapshot
 
@@ -368,9 +364,9 @@ async def test_document_snapshot_waits_for_a_switching_replacement(adapter_clien
             await lock_device_document(reader, device_id)
             fragment = await freeze_snapshot(reader, device_id, "lag")
             await reader.rollback()
-            return encode_lag_section(
-                hydrate_section({"lag": fragment}, "lag"), {"ned_id": None, "dialect": "identity"}
-            )
+            return encode_hydrated_section(
+                "lag", hydrate_section({"lag": fragment}, "lag"), {"ned_id": None, "dialect": "identity"}
+            ).body
 
         reading = asyncio.create_task(read_document())
         try:
