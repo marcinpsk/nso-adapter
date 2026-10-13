@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Private bookkeeping snapshots and live content fences for execution evidence."""
 
+from functools import cache
 from typing import Any
 
 from sqlalchemy import select
@@ -23,38 +24,50 @@ from nso_adapter.store.models import (
     SyncState,
 )
 
+_SPECS = {spec.model: spec for section in section_registry().values() for spec in section.tables}
+
 
 def _models() -> dict[str, Any]:
     return {spec.model.__tablename__: spec.model for section in section_registry().values() for spec in section.tables}
 
 
-def _tree(row, frozen: dict) -> dict:
+@cache
+def _parent_column(spec) -> str:
+    foreign_keys = [
+        column
+        for column in spec.model.__table__.columns
+        if any(fk.column.table is spec.parent.__table__ for fk in column.foreign_keys)
+    ]
+    if len(foreign_keys) != 1:
+        raise ValueError("Bookkeeping content fence requires one parent join")
+    return foreign_keys[0].key
+
+
+def _frozen_children(frozen: dict) -> dict:
+    children: dict[tuple, list] = {}
+    for row in frozen.values():
+        spec = _SPECS[type(row)]
+        if spec.parent is None:
+            continue
+        column = _parent_column(spec)
+        children.setdefault((row.__tablename__, column, getattr(row, column)), []).append(row)
+    for rows in children.values():
+        rows.sort(key=lambda row: row.id)
+    return children
+
+
+def _tree(row, frozen_children: dict) -> dict:
     children = []
-    specs = {spec.model: spec for section in section_registry().values() for spec in section.tables}
-    for spec in specs.values():
+    for spec in _SPECS.values():
         if spec.parent is not type(row):
             continue
-        foreign_keys = [
-            column
-            for column in spec.model.__table__.columns
-            if any(fk.column.table is row.__table__ for fk in column.foreign_keys)
-        ]
-        if len(foreign_keys) != 1:
-            raise ValueError("Bookkeeping content fence requires one parent join")
-        column = foreign_keys[0].key
-        rows = sorted(
-            (
-                child
-                for (table, _identity), child in frozen.items()
-                if table == spec.model.__tablename__ and getattr(child, column) == row.id
-            ),
-            key=lambda child: child.id,
-        )
+        column = _parent_column(spec)
+        rows = frozen_children.get((spec.model.__tablename__, column, row.id), [])
         children.append(
             {
                 "table": spec.model.__tablename__,
                 "parent_column": column,
-                "rows": [_tree(child, frozen) for child in rows],
+                "rows": [_tree(child, frozen_children) for child in rows],
             }
         )
     return {
@@ -145,6 +158,39 @@ def _bookkeeping(row) -> dict:
     }
 
 
+def _snapshot_indexes(
+    origins: OriginIndex, logicals: tuple[LogicalRow, ...]
+) -> tuple[set[tuple], dict[tuple, list[dict]]]:
+    sources = {source for binding in origins.bindings.values() for source in binding.sources}
+    carrier_joins: dict[tuple[str, str], set[tuple[str, int]]] = {}
+    for source in sources:
+        if source.live_stamp_join:
+            carrier_joins.setdefault((source.source_table, source.content_identity), set()).add(source.live_stamp_join)
+    targets = {
+        (*source.live_stamp_join, logical.stream, logical.frozen_revision)
+        for logical in logicals
+        for source in logical.source_refs
+        if source.live_stamp_join
+    }
+    for carrier in {logical.carrier for logical in logicals}:
+        targets.update(
+            (*join, carrier.stream, carrier.frozen_revision)
+            for join in carrier_joins.get((carrier.source_table, carrier.content_identity), ())
+        )
+    contributors: dict[tuple, list[dict]] = {}
+    for logical in logicals:
+        joins = {source.live_stamp_join for source in logical.source_refs if source.live_stamp_join}
+        joins.update(carrier_joins.get((logical.carrier.source_table, logical.carrier.content_identity), ()))
+        record = {
+            "stream": logical.stream,
+            "row": logical.public_record()["row"],
+            "settlement_cohort": logical.settlement_cohort,
+        }
+        for join in joins:
+            contributors.setdefault((*join, logical.stream, logical.frozen_revision), []).append(record)
+    return targets, contributors
+
+
 async def snapshot_bookkeeping(
     db: AsyncSession, generation: DeploymentGeneration, origins: OriginIndex, logicals: tuple[LogicalRow, ...]
 ) -> list[dict]:
@@ -156,21 +202,8 @@ async def snapshot_bookkeeping(
         for rows in hydrate_section(generation.document, section).values()
         for row in rows
     }
-    sources = {source for binding in origins.bindings.values() for source in binding.sources}
-    targets = {
-        (*source.live_stamp_join, logical.stream, logical.frozen_revision)
-        for logical in logicals
-        for source in logical.source_refs
-        if source.live_stamp_join
-    }
-    for carrier in {logical.carrier for logical in logicals}:
-        for source in sources:
-            if (
-                source.source_table == carrier.source_table
-                and source.content_identity == carrier.content_identity
-                and source.live_stamp_join
-            ):
-                targets.add((*source.live_stamp_join, carrier.stream, carrier.frozen_revision))
+    frozen_children = _frozen_children(frozen)
+    targets, contributors = _snapshot_indexes(origins, logicals)
     result = []
     proof = None
     for table, identity, stream, revision in sorted(targets):
@@ -181,7 +214,7 @@ async def snapshot_bookkeeping(
             raise ValueError("Bookkeeping target is absent from the frozen generation")
         if not await _authorized(db, generation.device_id, stream, revision):
             continue
-        tree = _tree(original, frozen)
+        tree = _tree(original, frozen_children)
         if isinstance(original, InterfaceIntent):
             if proof is None:
                 proof = hydrate_interface_execution(generation.document)
@@ -206,25 +239,6 @@ async def snapshot_bookkeeping(
                 attribute = {"id": state.id, "prior_sync_state": prior_state, "expected": _attribute_observation(state)}
         prior = _bookkeeping(row)
         if prior or attribute is not None:
-            contributors = [
-                {
-                    "stream": logical.stream,
-                    "row": logical.public_record()["row"],
-                    "settlement_cohort": logical.settlement_cohort,
-                }
-                for logical in logicals
-                if logical.stream == stream
-                and logical.frozen_revision == revision
-                and (
-                    any(source.live_stamp_join == (table, identity) for source in logical.source_refs)
-                    or any(
-                        source.live_stamp_join == (table, identity)
-                        and source.source_table == logical.carrier.source_table
-                        and source.content_identity == logical.carrier.content_identity
-                        for source in sources
-                    )
-                )
-            ]
             result.append(
                 {
                     "stream": stream,
@@ -233,7 +247,7 @@ async def snapshot_bookkeeping(
                     "prior": prior,
                     "expected": prior,
                     "attribute": attribute,
-                    "contributors": contributors,
+                    "contributors": contributors.get((table, identity, stream, revision), []),
                 }
             )
     return result

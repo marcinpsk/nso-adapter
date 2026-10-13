@@ -8,7 +8,7 @@ from typing import Literal
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.apply import encode_device_document
+from nso_adapter.core.apply import encode_section
 from nso_adapter.core.projection import section_operation, stream_section
 from nso_adapter.core.static_route_plan import CLEAR_WIRE_LEAF
 from nso_adapter.core.static_route_reader import CertifiedSection
@@ -55,8 +55,12 @@ async def record_acknowledged_origins(
     generation = await db.get(DeploymentGeneration, attempt.generation_id)
     if generation is None:
         raise ValueError("Acknowledged history requires its frozen generation")
-    encoded = encode_device_document(generation.document)
-    emitted = _fingerprints((encoded.body.get("static-route") or {}).get("route", []))
+    routes = (
+        encode_section(generation.document, "static_route").body.get("route", [])
+        if "static_route" in generation.document
+        else []
+    )
+    emitted = _fingerprints(routes)
     observed = {} if certified is None or certified.inconclusive else _fingerprints(certified.routes)
     origins = origins_from_records(attempt.safe_origins)
     history = OriginIndex()

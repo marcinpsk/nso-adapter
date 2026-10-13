@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from nso_adapter.core.apply import encode_device_document, overlay_retained_routes
 from nso_adapter.core.projection import _row_dict
 from nso_adapter.core.static_route_reader import certified_static_route_section
-from nso_adapter.nso.apply import apply_device_intent
+from nso_adapter.nso.apply import NsoApplyError, apply_device_intent
 from nso_adapter.nso.origins import (
     AttributionFailure,
     EncodedSection,
@@ -49,6 +49,7 @@ from nso_adapter.store.models import (
     Job,
     JobStatus,
     JobType,
+    LoggingLevelsIntent,
     RowOutcome,
     StaticRouteIntent,
     StaticRouteTombstone,
@@ -93,7 +94,7 @@ class RouteTransport(_RecordingTransport):
         return response
 
 
-async def _route_baseline(db, *, acknowledge=True):
+async def _route_baseline(db, *, acknowledge=True, logging=False):
     device = Device(nso_instance="test", nso_device_name="placeholder-device")
     db.add(device)
     await db.flush()
@@ -126,6 +127,20 @@ async def _route_baseline(db, *, acknowledge=True):
             }
         },
     )
+    if logging:
+        levels = LoggingLevelsIntent(device_id=device.id, console_severity="warnings", accepted_at=ACCEPTED)
+        db.add(levels)
+        await db.flush()
+        generation.document = {
+            **generation.document,
+            "logging": {
+                "logging_levels_intent": [_row_dict(levels)],
+                "_execution": {"context": {"ned_id": None, "dialect": "identity"}},
+            },
+        }
+        generation.stream_revisions = {**generation.stream_revisions, "logging": 7}
+        generation.source_push_seq = {**generation.source_push_seq, "logging": 41}
+        db.add(DeviceProjectionStream(device_id=device.id, stream="logging", desired_revision=7, authorized_revision=7))
     db.add(generation)
     await db.flush()
     encoded = encode_device_document(generation.document, origin_context=OriginContext.from_generation(generation))
@@ -150,6 +165,40 @@ async def _route_baseline(db, *, acknowledge=True):
         await record_acknowledged_origins(db, attempt.id, job.id, 1, token, certified)
         await db.commit()
     return device, job, generation, token, encoded, logical, attempt, client, transport
+
+
+async def test_acknowledged_history_survives_closed_send_gate(db_session, monkeypatch):
+    monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "1")
+    device, job, gen, token, encoded, logical, attempt, client, transport = await _route_baseline(
+        db_session, acknowledge=False, logging=True
+    )
+    assert encoded.body["logging"]["local-levels"] == {"console-severity": "warnings"}
+    await apply_device_intent(client, device.nso_device_name, encoded.body, device_id=device.id)
+    await record_classified_response(
+        db_session, attempt.id, job.id, 1, token, None, sender_phase="commit", commit_acknowledged=True
+    )
+    await db_session.commit()
+    assert len(transport.recorder.commits) == 1 and attempt.commit_acknowledged
+    assert "origin_history" not in attempt.response_classification
+    certified = await certified_static_route_section(client, device)
+    monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "0")
+    with pytest.raises(NsoApplyError, match="NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE"):
+        encode_device_document(gen.document)
+    await record_acknowledged_origins(db_session, attempt.id, job.id, 1, token, certified)
+    await db_session.commit()
+    await db_session.refresh(attempt)
+    assert attempt.response_classification["origin_history"]
+    assert all(
+        record["entry_fingerprint"]
+        for record in attempt.response_classification["origin_history"]
+        if record["family"] == "static-route"
+    )
+    retained = EncodedSection({"route": []}, OriginIndex())
+    overlay_retained_routes(retained, certified.routes)
+    await bind_historical_origins(db_session, device.id, retained.origins, gen)
+    result = resolve_refusals((refusal("static-route", logical.row, "write-blocked"),), retained.origins)
+    assert not isinstance(result, AttributionFailure)
+    assert result[0].logical_rows == (logical,)
 
 
 async def test_retained_route_uses_certified_baseline_origin(db_session):
