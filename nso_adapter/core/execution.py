@@ -4,11 +4,16 @@
 
 from collections.abc import Iterable
 
+import httpx
+import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import ClaimLostError, JobError, lock_claim
+from nso_adapter.core.static_route_reader import CertifiedSection, certified_static_route_section
+from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.apply import ResponseCheckpoint
+from nso_adapter.nso.client import failure_detail
 from nso_adapter.nso.origins import LogicalRow
 from nso_adapter.store.execution_attempt_store import (
     AttemptOwnershipLost,
@@ -18,6 +23,8 @@ from nso_adapter.store.execution_attempt_store import (
     record_classified_response,
 )
 from nso_adapter.store.models import ApplyExecutionAttempt, DeploymentGeneration, Job
+
+logger = structlog.get_logger(__name__)
 
 
 async def prepare_send(
@@ -106,18 +113,28 @@ async def settle_unsent(db: AsyncSession, generation, origins, logicals, reg, er
     await dispose_execution_attempt(db, generation.job_id, reg.run_attempt, reg.token, "disposed", terminal_error=error)
 
 
-async def record_send_history(db: AsyncSession, job_id: int, reg, client, device) -> None:
-    """Record acknowledged origin history in the same terminal transaction."""
-    from nso_adapter.core.static_route_reader import certified_static_route_section
+async def read_send_history(db: AsyncSession, job_id: int, client, device) -> CertifiedSection | None:
+    """Read optional certified history before terminal settlement takes locks."""
+    # no_autoflush: a flushed dirty row here would take row locks before the claim lock.
+    with db.no_autoflush:
+        attempt = await active_attempt(db, job_id)
+        if attempt is None or not attempt.commit_acknowledged:
+            return None
+        generation = await db.get(DeploymentGeneration, attempt.generation_id)
+    if generation is None or "static_route" not in generation.document:
+        return None
+    try:
+        return await certified_static_route_section(client, device)
+    except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+        logger.warning("execution.history_read_failed", **device_fields(device_id=device.id), error=failure_detail(exc))
+        return CertifiedSection("inconclusive", None)
+
+
+async def record_send_history(db: AsyncSession, job_id: int, reg, certified: CertifiedSection | None) -> None:
+    """Record pre-read acknowledged origin history in the terminal transaction."""
     from nso_adapter.store.execution_attempt_store import record_acknowledged_origins
 
     attempt = await active_attempt(db, job_id)
     if attempt is None or not attempt.commit_acknowledged:
         return
-    generation = await db.get(DeploymentGeneration, attempt.generation_id)
-    certified = (
-        await certified_static_route_section(client, device)
-        if generation is not None and "static_route" in generation.document
-        else None
-    )
     await record_acknowledged_origins(db, attempt.id, job_id, reg.run_attempt, reg.token, certified)

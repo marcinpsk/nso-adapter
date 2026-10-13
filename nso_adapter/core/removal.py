@@ -1076,6 +1076,7 @@ async def _finalize_static_route_removal(db, job_id: int, device, client, out: S
     Returns whether the job ended ``succeeded``.
     """
     from nso_adapter.core.claim import ClaimRegistration, lock_claim, terminalize
+    from nso_adapter.core.execution import active_attempt, read_send_history, record_send_history
     from nso_adapter.store.models import DeploymentGeneration, JobStatus
 
     result: dict = {"scope": "static_route", "removal_branch": out.branch}
@@ -1113,6 +1114,7 @@ async def _finalize_static_route_removal(db, job_id: int, device, client, out: S
     promoted_context = bool(out.authorized) and bool(promotes_static_route)
     owns_carrier = bool(out.tombstone_ids) or bool(out.clears) or promoted_context
     consume = proven and not residue_found
+    certified = await read_send_history(db, job_id, client, device)
 
     # The lock FIRST and held to COMMIT. no_autoflush is the lock ORDER: an ORM SELECT that
     # autoflushed a dirtied intent row would take row locks before the claim lock, the reverse
@@ -1162,10 +1164,9 @@ async def _finalize_static_route_removal(db, job_id: int, device, client, out: S
             verify=out.verify,
             residue=result.get("residue_check"),
         )
-    from nso_adapter.core.execution import active_attempt, record_send_history
     from nso_adapter.store.execution_attempt_store import complete_execution_result
 
-    await record_send_history(db, job_id, reg, client, device)
+    await record_send_history(db, job_id, reg, certified)
     attempt = await active_attempt(db, job_id)
     if attempt is not None:
         dispositions = {
@@ -1764,11 +1765,11 @@ async def enqueue_static_route_removals(
     return list(jobs.values())
 
 
-async def _completed_removal_result(db: AsyncSession, job_id: int, reg, client, device) -> dict:
+async def _completed_removal_result(db: AsyncSession, job_id: int, reg, certified) -> dict:
     from nso_adapter.core.execution import active_attempt, record_send_history
     from nso_adapter.store.execution_attempt_store import complete_execution_result
 
-    await record_send_history(db, job_id, reg, client, device)
+    await record_send_history(db, job_id, reg, certified)
     execution = await active_attempt(db, job_id)
     if execution is None:
         return {}
@@ -1868,7 +1869,10 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
                             result["sync_from"] = "failed"
             else:
                 await _record_residue(result, client, device, scope, context, job_id=job_id, device_id=device_id)
-            result.update(await _completed_removal_result(db, job_id, reg, client, device))
+            from nso_adapter.core.execution import read_send_history
+
+            certified = await read_send_history(db, job_id, client, device)
+            result.update(await _completed_removal_result(db, job_id, reg, certified))
             if (
                 await terminalize(
                     db,

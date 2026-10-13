@@ -273,7 +273,6 @@ async def _static_route_bookkeeping(
     job_id: int,
     reg=None,
     send_failed: bool,
-    stamp_of: dict | None = None,
 ) -> tuple[list[dict], tuple[int, int] | None, list[dict]]:
     """Consume, CAS and record — the ONE transaction §4.6 requires, minus its commit.
 
@@ -315,7 +314,9 @@ async def _static_route_bookkeeping(
         raise ValueError("Route bookkeeping requires its prepared execution attempt")
     await _owned_attempt(db, attempt.id, job_id, reg.run_attempt, reg.token)
     targets = await matching_bookkeeping_rows(db, device.id, attempt.prior_bookkeeping)
-    stamp_of = {(type(row), row.id): row for row in targets.values() if isinstance(row, StaticRouteIntent)}
+    stamp_of: dict[tuple[type, object], StaticRouteIntent] = {
+        (type(row), row.id): row for row in targets.values() if isinstance(row, StaticRouteIntent)
+    }
 
     conclusive = proof.verify == VERIFY_CONCLUSIVE
     residue_blocks = proof.residue is not None and proof.residue != "clean"
@@ -342,7 +343,7 @@ async def _static_route_bookkeeping(
 
     results: list[dict] = []
     for row in plan.rows:
-        stamp = row if stamp_of is None else stamp_of.get(_stamp_key(row))
+        stamp = stamp_of.get(_stamp_key(row))
         outcome = SR_UNPROVEN
         if send_failed or residue_found:
             outcome = SR_APPLY_FAILED
@@ -490,7 +491,6 @@ async def _settle_static_routes(
     scope_outcomes: dict,
     scope_failures: dict,
     reg=None,
-    stamp_of: dict | None = None,
 ) -> list[dict] | None:
     """Run §4.4's proof and §4.5/§4.6's bookkeeping for the static-route scope.
 
@@ -526,7 +526,6 @@ async def _settle_static_routes(
         job_id=job_id,
         reg=reg,
         send_failed=send_failed,
-        stamp_of=stamp_of,
     )
     if adjusted is not None:
         scope_outcomes["static_route"] = adjusted
@@ -1538,10 +1537,12 @@ async def _run_document_apply(db, device, client, device_name, job, job_id, now,
 async def _settle_document_success(
     db, device, client, device_name, job_id, now, plan, body, membership, verify, reg
 ) -> None:
+    from nso_adapter.core.execution import read_send_history, record_send_history
     from nso_adapter.nso.apply import VERIFY_CONCLUSIVE
     from nso_adapter.store.execution_attempt_store import complete_execution_result
     from nso_adapter.store.execution_evidence import logical_record
 
+    certified = await read_send_history(db, job_id, client, device)
     outcomes = {
         key: (len(rows.sent), 0)
         for section, rows in plan.sections.items()
@@ -1570,7 +1571,6 @@ async def _settle_document_success(
             scope_outcomes=outcomes,
             scope_failures=failures,
             reg=reg,
-            stamp_of=plan.sections["static_route"].stamp_of,
         )
     certified_routes = {record["row_id"] for record in (sr_results or []) if record["outcome"] == SR_IN_SYNC}
     carrier_sources = {
@@ -1592,9 +1592,7 @@ async def _settle_document_success(
         identity = logical_record(logical)
         key = identity["stream"], identity["row"]["subject"], identity["row"]["key"], identity["settlement_cohort"]
         dispositions[key] = "in_sync" if successful else "unavailable"
-    from nso_adapter.core.execution import record_send_history
-
-    await record_send_history(db, job_id, reg, client, device)
+    await record_send_history(db, job_id, reg, certified)
     result = await complete_execution_result(db, job_id, reg.run_attempt, reg.token, dispositions, now)
     result["reader_compare"] = reader_compare
     if unverifiable:
