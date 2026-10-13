@@ -134,6 +134,10 @@ class HistoryTransport(RuntimeTransport):
                     raise httpx.ReadError(CANARY, request=request)
                 if self.history_error == "http":
                     return httpx.Response(503, content=CANARY.encode(), request=request)
+                if self.history_error == "decoding":
+                    return httpx.Response(
+                        200, headers={"content-encoding": "gzip"}, content=CANARY.encode(), request=request
+                    )
         response = await super().handle_async_request(request)
         if request.method == "PUT" and "dry-run=" not in str(request.url) and response.is_success:
             self.post_commit_reads = 0
@@ -142,7 +146,7 @@ class HistoryTransport(RuntimeTransport):
 
 
 @pytest.mark.parametrize("operation", ["apply", "static_route_removal", "vlan_removal"])
-@pytest.mark.parametrize("history_error", ["transport", "http", None])
+@pytest.mark.parametrize("history_error", ["transport", "http", "decoding", None])
 async def test_acknowledged_history_read_precedes_settlement(
     adapter_client, monkeypatch, debug_logs, operation, history_error
 ):

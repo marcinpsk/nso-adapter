@@ -125,7 +125,7 @@ async def read_send_history(db: AsyncSession, job_id: int, client, device) -> Ce
         return None
     try:
         return await certified_static_route_section(client, device)
-    except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+    except httpx.HTTPError as exc:
         logger.warning("execution.history_read_failed", **device_fields(device_id=device.id), error=failure_detail(exc))
         return CertifiedSection("inconclusive", None)
 
