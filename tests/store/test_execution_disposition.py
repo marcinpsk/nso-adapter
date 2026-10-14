@@ -226,6 +226,63 @@ async def test_retained_route_without_history_is_not_guessed(db_session):
     assert not transport.recorder.commits
 
 
+async def test_retained_route_does_not_use_history_before_latest_acknowledgement(db_session):
+    device, job, gen, token, encoded, logical, older, client, transport = await _route_baseline(db_session)
+    assert older.commit_acknowledged and older.response_classification["origin_history"]
+    await dispose_execution_attempt(db_session, job.id, 1, token, "disposed")
+    await db_session.commit()
+    newer_job = Job(
+        device_id=device.id, job_type=JobType.apply, status=JobStatus.running, run_attempt=1, coalescible=False
+    )
+    db_session.add(newer_job)
+    await db_session.flush()
+    newer_gen = DeploymentGeneration(
+        device_id=device.id,
+        job_id=newer_job.id,
+        seq=gen.seq + 1,
+        mode=gen.mode,
+        status=GenerationStatus.running,
+        digest=gen.digest,
+        stream_revisions=gen.stream_revisions,
+        source_push_seq=gen.source_push_seq,
+        document=gen.document,
+    )
+    db_session.add(newer_gen)
+    claim = await db_session.get(DeviceClaim, device.id)
+    claim.job_id = newer_job.id
+    await db_session.flush()
+    newer_encoded = encode_device_document(newer_gen.document, origin_context=OriginContext.from_generation(newer_gen))
+    newer_logical = next(
+        binding.logical_rows[0]
+        for key, binding in newer_encoded.origins.bindings.items()
+        if key.row.subject == "static-route.route"
+    )
+    newer = await prepare_execution_attempt(
+        db_session,
+        newer_job.id,
+        1,
+        token,
+        newer_gen.id,
+        origins=newer_encoded.origins,
+        logical_rows=(newer_logical,),
+    )
+    await apply_device_intent(client, device.nso_device_name, newer_encoded.body, device_id=device.id)
+    await record_classified_response(
+        db_session, newer.id, newer_job.id, 1, token, None, sender_phase="commit", commit_acknowledged=True
+    )
+    await db_session.commit()
+    assert newer.id > older.id and newer.commit_acknowledged
+    assert "origin_history" not in newer.response_classification
+    certified = await certified_static_route_section(client, device)
+    retained = EncodedSection({"route": []}, OriginIndex())
+    overlay_retained_routes(retained, certified.routes)
+    await bind_historical_origins(db_session, device.id, retained.origins, newer_gen)
+    result = resolve_refusals((refusal("static-route", logical.row, "write-blocked"),), retained.origins)
+    assert isinstance(result, AttributionFailure) and result.reason == "missing_baseline_provenance"
+    assert retained.body["route"] == certified.routes
+    assert len(transport.recorder.commits) == 2
+
+
 async def test_changed_retained_entry_is_not_misattributed(db_session):
     device, job, gen, token, encoded, logical, attempt, client, transport = await _route_baseline(db_session)
     assert "origin_history" in attempt.response_classification, (
