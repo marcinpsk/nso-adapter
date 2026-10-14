@@ -67,7 +67,7 @@ def test_encoder_source_policy_uses_section_execution(protocol, ned_id):
     execution = SectionExecution(ned_id, community_dialect_for(ned_id))
     encode = section_registry()[protocol].encode
     if ned_id in _ALLOWED_NEDS:
-        assert list(_wire_sources(encode(rows, execution))) == [""]
+        assert list(_wire_sources(encode(rows, execution).body)) == [""]
     else:
         with pytest.raises(AsnRuleViolation) as caught:
             encode(rows, execution)

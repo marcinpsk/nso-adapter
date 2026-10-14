@@ -15,3 +15,15 @@ async def freeze_snapshot(db, device_id, stream):
     from nso_adapter.core.projection import snapshot_stream
 
     return await freeze_tables(db, device_id, stream, await snapshot_stream(db, device_id, stream))
+
+
+def encode_hydrated_section(section, rows, context):
+    """Render real hydrated rows through the section's registered encoder."""
+    from nso_adapter.core.community_dialect import community_dialect_by_name
+    from nso_adapter.core.projection import section_registry
+    from nso_adapter.nso.apply import SectionExecution
+
+    entry = section_registry()[section]
+    tables = {spec.model.__tablename__: rows.get(spec.model, []) for spec in entry.tables}
+    execution = SectionExecution(context["ned_id"], community_dialect_by_name(context["dialect"]))
+    return entry.encode(tables, execution)

@@ -2534,6 +2534,36 @@ async def test_a_body_build_failure_reverts_deploying(adapter_client):
         assert attr_state.sync_state == SyncState.accepted
 
 
+async def test_an_origin_construction_failure_fails_its_family_not_the_job_build(adapter_client):
+    """Global and named VRF rows on one interface fail the interface family, and nothing is sent."""
+    from nso_adapter.store.models import InterfaceIpIntent
+
+    device_id = await _seed_device("rtr-vrf-mix", 327)
+    iface_id = await _seed_iface(device_id, "GigabitEthernet0/8")
+    job_id = await _seed_apply_job(device_id)
+    await _seed_ip_intent(iface_id, address="10.7.0.1/24")
+    await _seed_ip_intent(iface_id, address="10.8.0.1/24", secondary=True, vrf="RED")
+
+    sender = AsyncMock(return_value=None)
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, sender),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    assert [call for call in sender.await_args_list if not call.kwargs.get("dry_run")] == []
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.result["ip_count_by_outcome"] == {"in_sync": 0, "apply_failed": 2}
+        rows = (
+            (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface_id)))
+            .scalars()
+            .all()
+        )
+        assert [row.last_apply_error["code"] for row in rows] == ["origin_construction"] * 2
+
+
 def test_capability_scopes_for_interface_config_covers_attribute_and_ip():
     """The interface container carries BOTH the attribute and IP scopes, so a rejection of it
     records capability under both — else a preflight for interface_attribute sees a false

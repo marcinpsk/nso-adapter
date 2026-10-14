@@ -76,7 +76,7 @@ def _interface_body(attr_rows=(), ip_rows=(), interfaces=None, eligible=None) ->
     execution = SectionExecution(None, community_dialect_for(None), InterfaceExecution(ifaces, keys))
     return encode_interface_config(
         {"interface_intent": list(attr_rows), "interface_ip_intent": list(ip_rows)}, execution
-    )
+    ).body
 
 
 def _sent_document(client, index: int = 0) -> dict:
@@ -252,7 +252,7 @@ def test_the_l2_sap_container_carries_the_sap_list():
         _SapRow("701", "vpls", "1/1/c31/3:701.10", port="1/1/c31/3", outer_tag=701, inner_tag=10),
     ]
 
-    body = encode_l2_sap({"l2_sap_intent": rows}, _PLAIN)
+    body = encode_l2_sap({"l2_sap_intent": rows}, _PLAIN).body
 
     saps = {s["sap-id"]: s for s in body["sap"]}
     assert saps["lag-60:3999"]["service-type"] == "epipe"
@@ -542,7 +542,7 @@ async def test_a_committed_document_that_did_not_land_raises_verify_mismatch():
     _stub_pool(client, mock_http)
 
     row = SimpleNamespace(vrf="", prefix="100.64.0.0/10", next_hop="172.16.0.1", metric=1, permanent=False, tag=None)
-    body = encode_static_route({"static_route_intent": [row]}, _PLAIN)
+    body = encode_static_route({"static_route_intent": [row]}, _PLAIN).body
     with pytest.raises(NsoApplyError) as exc_info:
         await apply_device_intent(client, "sw03", {"static-route": body}, device_id=_DEVICE_ID)
     assert exc_info.value.code == "verify_mismatch"
@@ -552,7 +552,7 @@ async def test_a_committed_document_that_did_not_land_raises_verify_mismatch():
 
 
 def _bgp_body(routers, redistribution=()):
-    return encode_bgp({"bgp_router_intent": list(routers), "redistribution_intent": list(redistribution)}, _PLAIN)
+    return encode_bgp({"bgp_router_intent": list(routers), "redistribution_intent": list(redistribution)}, _PLAIN).body
 
 
 def test_the_bgp_container_uses_the_yang_key_spellings():
@@ -796,7 +796,7 @@ def test_ospf_orphan_redistribute_synthesizes_a_process():
 
     body = encode_ospf(
         {"ospf_instance_intent": [], "ospf_interface_intent": [], "redistribution_intent": [redist]}, _PLAIN
-    )
+    ).body
 
     procs = body["process-config"]
     assert [p["process-id"] for p in procs] == ["1"]
@@ -812,7 +812,7 @@ def test_ospf_omits_an_empty_interface_config():
 
     body = encode_ospf(
         {"ospf_instance_intent": [proc], "ospf_interface_intent": [], "redistribution_intent": []}, _PLAIN
-    )
+    ).body
 
     assert "interface-config" not in body
     assert body["process-config"][0]["process-id"] == "1"
@@ -987,7 +987,7 @@ def test_snmp_enum_rejection_does_not_echo_the_owner_or_value():
                 "snmp_system_info_intent": [],
             },
             _PLAIN,
-        )
+        ).body
     assert_chain_free_of(caught.value, [owner, value])
 
 
@@ -1006,7 +1006,7 @@ def test_snmp_vault_ref_rejection_does_not_echo_the_owner():
                 "snmp_system_info_intent": [],
             },
             _PLAIN,
-        )
+        ).body
     assert_chain_free_of(caught.value, [owner, reference, "placeholder path"])
 
 
@@ -1218,7 +1218,7 @@ async def test_the_document_put_targets_the_keyed_instance_with_reconcile():
     await apply_device_intent(
         client,
         "sw3",
-        {"vlan": encode_vlan({"vlan_intent": []}, _PLAIN)},
+        {"vlan": encode_vlan({"vlan_intent": []}, _PLAIN).body},
         device_id=_DEVICE_ID,
     )
 
@@ -1240,7 +1240,7 @@ async def test_a_dropped_row_is_simply_absent_from_the_document():
     await apply_device_intent(
         client,
         "sw3",
-        {"vlan": encode_vlan({"vlan_intent": rows}, _PLAIN)},
+        {"vlan": encode_vlan({"vlan_intent": rows}, _PLAIN).body},
         device_id=_DEVICE_ID,
     )
 
@@ -1251,7 +1251,7 @@ async def test_a_dropped_row_is_simply_absent_from_the_document():
 
 def _community_list(name, entries, ned_id, **kwargs):
     rows = [SimpleNamespace(family="community_list", name=name, entries=entries, **kwargs)]
-    body = encode_route_policy({"route_policy_object_intent": rows}, _dialect_for(ned_id))
+    body = encode_route_policy({"route_policy_object_intent": rows}, _dialect_for(ned_id)).body
     return body["community-list"][0]
 
 
@@ -1365,7 +1365,9 @@ def test_ospf_always_asserts_enabled_as_a_delete_guard():
         SimpleNamespace(process_id="2", router_id="10.0.0.2", vrf="", enabled=False),
     ]
 
-    body = encode_ospf({"ospf_instance_intent": rows, "ospf_interface_intent": [], "redistribution_intent": []}, _PLAIN)
+    body = encode_ospf(
+        {"ospf_instance_intent": rows, "ospf_interface_intent": [], "redistribution_intent": []}, _PLAIN
+    ).body
 
     by_pid = {p["process-id"]: p for p in body["process-config"]}
     assert by_pid["1"]["enabled"] is True  # None → default enable (guard)
@@ -1563,7 +1565,7 @@ def test_build_subif_interfaces_refuses_missing_tag():
 def test_encode_svi_refuses_invalid_vlan_id(vlan_id):
     rows = {"svi_intent": [SimpleNamespace(interface_name="irb.7", vlan_id=vlan_id, svi_type="irb", vrf="")]}
     with pytest.raises(ValueError, match="vlan_id"):
-        apply_mod.encode_svi(rows, _PLAIN)
+        apply_mod.encode_svi(rows, _PLAIN).body
 
 
 @pytest.mark.parametrize("vlan_id", [0, 4095])
@@ -1576,14 +1578,14 @@ def test_encode_subinterface_refuses_invalid_dot1q_vlan(vlan_id):
         ]
     }
     with pytest.raises(ValueError, match="dot1q_vlan"):
-        apply_mod.encode_subinterface(rows, _PLAIN)
+        apply_mod.encode_subinterface(rows, _PLAIN).body
 
 
 @pytest.mark.parametrize("vlan_id", [0, 4095])
 def test_encode_vlan_refuses_invalid_vlan_id(vlan_id):
     rows = {"vlan_intent": [SimpleNamespace(vlan_id=vlan_id, name="")]}
     with pytest.raises(ValueError, match="vlan_id"):
-        apply_mod.encode_vlan(rows, _PLAIN)
+        apply_mod.encode_vlan(rows, _PLAIN).body
 
 
 @pytest.mark.parametrize("field", ["untagged_vlan", "tagged_vlans"])
@@ -1595,7 +1597,7 @@ def test_encode_switchport_refuses_invalid_vlan_id(field, vlan_id):
     else:
         row.untagged_vlan = vlan_id
     with pytest.raises(ValueError, match=field):
-        apply_mod.encode_switchport({"switchport_intent": [row]}, _PLAIN)
+        apply_mod.encode_switchport({"switchport_intent": [row]}, _PLAIN).body
 
 
 def test_build_interface_ip_body_ipv4():

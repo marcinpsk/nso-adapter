@@ -137,3 +137,75 @@ def observation_immutability_drop_ddl() -> tuple[str, ...]:
         "DROP TRIGGER IF EXISTS read_observation_immutable ON read_observation",
         "DROP FUNCTION IF EXISTS read_observation_reject_update()",
     )
+
+
+EXECUTION_ATTEMPT_IMMUTABLE_COLUMNS = (
+    "device_id",
+    "generation_id",
+    "job_correlation_id",
+    "run_attempt",
+    "operation_kind",
+    "document_digest",
+    "claim_token",
+    "stream_revisions",
+    "generation_authorities",
+    "manual_attempt_id",
+    "removal_tombstone_ids",
+    "logical_membership",
+    "attempted_carriers",
+    "safe_origins",
+    "prior_bookkeeping",
+    "created_at",
+)
+
+
+def execution_evidence_immutability_ddl() -> tuple[str, ...]:
+    """Freeze preparation, recorded responses, and logical outcome evidence."""
+    predicate = "\n        OR ".join(
+        f"NEW.{column} IS DISTINCT FROM OLD.{column}" for column in EXECUTION_ATTEMPT_IMMUTABLE_COLUMNS
+    )
+    return (
+        f"""
+CREATE OR REPLACE FUNCTION execution_attempt_reject_rewrite() RETURNS trigger AS $$
+BEGIN
+    IF {predicate}
+        OR (NEW.job_id IS DISTINCT FROM OLD.job_id AND NEW.job_id IS NOT NULL)
+        OR (OLD.phase = 'terminal' AND
+            (NEW.phase IS DISTINCT FROM OLD.phase OR NEW.response_phase IS DISTINCT FROM OLD.response_phase
+             OR NEW.response_classification IS DISTINCT FROM OLD.response_classification
+             OR NEW.commit_acknowledged IS DISTINCT FROM OLD.commit_acknowledged))
+        OR (OLD.phase = 'response_recorded' AND NEW.phase = 'prepared')
+        OR (OLD.commit_acknowledged AND NOT NEW.commit_acknowledged)
+        OR EXISTS (SELECT 1 FROM jsonb_each(OLD.response_classification) checkpoint
+                   WHERE NEW.response_classification -> checkpoint.key IS DISTINCT FROM checkpoint.value) THEN
+        RAISE EXCEPTION USING ERRCODE = 'integrity_constraint_violation',
+            MESSAGE = 'execution attempt evidence is immutable';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+""".strip(),
+        "DROP TRIGGER IF EXISTS execution_attempt_immutable ON apply_execution_attempt",
+        "CREATE TRIGGER execution_attempt_immutable BEFORE UPDATE ON apply_execution_attempt "
+        "FOR EACH ROW EXECUTE FUNCTION execution_attempt_reject_rewrite()",
+        """
+CREATE OR REPLACE FUNCTION row_outcome_reject_update() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION USING ERRCODE = 'integrity_constraint_violation',
+        MESSAGE = 'row outcome evidence is immutable';
+END;
+$$ LANGUAGE plpgsql;
+""".strip(),
+        "DROP TRIGGER IF EXISTS row_outcome_immutable ON row_outcome",
+        "CREATE TRIGGER row_outcome_immutable BEFORE UPDATE ON row_outcome "
+        "FOR EACH ROW EXECUTE FUNCTION row_outcome_reject_update()",
+    )
+
+
+def execution_evidence_immutability_drop_ddl() -> tuple[str, ...]:
+    return (
+        "DROP TRIGGER IF EXISTS row_outcome_immutable ON row_outcome",
+        "DROP FUNCTION IF EXISTS row_outcome_reject_update()",
+        "DROP TRIGGER IF EXISTS execution_attempt_immutable ON apply_execution_attempt",
+        "DROP FUNCTION IF EXISTS execution_attempt_reject_rewrite()",
+    )

@@ -65,7 +65,7 @@ async def test_put_ospf_intent_admin_state(adapter_client):
         body = encode_ospf(
             {"ospf_instance_intent": [inst], "ospf_interface_intent": [], "redistribution_intent": []},
             _CONTEXT_FREE_EXECUTION,
-        )
+        ).body
         assert body["process-config"][0]["enabled"] is True
 
 

@@ -508,68 +508,6 @@ async def replace_switchport_snapshot(
     )
 
 
-#: LAG bundle store field -> its YANG leaf. Emitted only when the value is set.
-_LAG_WIRE_FIELDS: tuple[tuple[str, str], ...] = (
-    ("lag_id", "lag-id"),
-    ("min_links", "min-links"),
-    ("system_priority", "system-priority"),
-    ("system_id", "system-id"),
-    ("timer", "timer"),
-    ("admin_key", "admin-key"),
-)
-
-
-def encode_lag_section(rows: dict[type, list], context: dict) -> dict:
-    """Encode hydrated LAG rows into the section's wire container body.
-
-    Pure: the rows plus the frozen encoding context are the whole input. This section
-    declares no proof metadata and reads no live state, so *context* carries only the NED
-    identity C9's registry hands every encoder; nothing in the LAG wire form depends on it.
-    """
-    bundles = rows.get(LagBundleIntent) or []
-    if not bundles:
-        return {}
-    encoded_bundles: list[dict[str, object]] = []
-    for bundle in sorted(bundles, key=lambda item: item.name):
-        body: dict[str, object] = {"name": bundle.name}
-        for field, leaf in _LAG_WIRE_FIELDS:
-            if (value := getattr(bundle, field)) is not None:
-                body[leaf] = value
-        members: list[dict[str, object]] = []
-        for member in sorted(bundle.members, key=lambda item: item.interface_name):
-            encoded_member: dict[str, object] = {"interface-name": member.interface_name}
-            if member.mode is not None:
-                encoded_member["mode"] = member.mode
-            if member.port_priority is not None:
-                encoded_member["port-priority"] = member.port_priority
-            members.append(encoded_member)
-        if members:
-            body["member"] = members
-        encoded_bundles.append(body)
-    return {"bundle": encoded_bundles}
-
-
-def encode_switchport_section(rows: dict[type, list], context: dict) -> dict:
-    """Encode hydrated switchport rows into the section's wire container body.
-
-    Pure, for the same reason as :func:`encode_lag_section`.
-    """
-    interfaces = rows.get(SwitchportIntent) or []
-    if not interfaces:
-        return {}
-    encoded: list[dict[str, object]] = []
-    for interface in sorted(interfaces, key=lambda item: item.interface_name):
-        body: dict[str, object] = {"interface-name": interface.interface_name}
-        if interface.mode is not None:
-            body["mode"] = interface.mode
-        if interface.untagged_vlan is not None:
-            body["untagged-vlan"] = interface.untagged_vlan
-        if tagged_vlans := sorted(tag.vlan_id for tag in interface.tagged_vlans):
-            body["tagged-vlan"] = tagged_vlans
-        encoded.append(body)
-    return {"interface": encoded}
-
-
 __all__ = [
     "DELETION_GROUPS",
     "LAG_STREAM",
@@ -580,8 +518,6 @@ __all__ = [
     "SwitchingRefusal",
     "SwitchingRequestRefused",
     "SwitchportSnapshot",
-    "encode_lag_section",
-    "encode_switchport_section",
     "replace_lag_snapshot",
     "replace_switchport_snapshot",
 ]

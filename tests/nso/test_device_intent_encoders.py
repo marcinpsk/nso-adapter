@@ -58,7 +58,7 @@ def _rows(section: str) -> dict[str, list]:
 @pytest.mark.parametrize("section", sorted(_GOLDEN))
 def test_each_section_encodes_its_golden_body(section):
     entry = section_registry()[section]
-    assert entry.encode(_rows(section), _execution(section)) == _GOLDEN[section]
+    assert entry.encode(_rows(section), _execution(section)).body == _GOLDEN[section]
 
 
 def test_the_golden_covers_every_registered_section():
@@ -67,7 +67,7 @@ def test_the_golden_covers_every_registered_section():
 
 def test_an_ineligible_attribute_never_reaches_the_wire():
     rows = _rows("interface_config")
-    body = section_registry()["interface_config"].encode(rows, _execution("interface_config"))
+    body = section_registry()["interface_config"].encode(rows, _execution("interface_config")).body
     nokia = next(entry for entry in body["interface"] if entry["interface-name"] == "1/1/1:100")
     # Interface 2's `enabled` row is authorized but ineligible; its description is eligible.
     assert "enabled" not in nokia
@@ -76,11 +76,15 @@ def test_an_ineligible_attribute_never_reaches_the_wire():
 
 def test_route_policy_encodes_through_the_frozen_dialect_not_a_device_row():
     rows = _rows("route_policy")
-    nokia = section_registry()["route_policy"].encode(
-        rows, SectionExecution(NOKIA_NED, community_dialect_for(NOKIA_NED))
+    nokia = (
+        section_registry()["route_policy"]
+        .encode(rows, SectionExecution(NOKIA_NED, community_dialect_for(NOKIA_NED)))
+        .body
     )
-    identity = section_registry()["route_policy"].encode(
-        rows, SectionExecution(NOKIA_NED, community_dialect_by_name("identity"))
+    identity = (
+        section_registry()["route_policy"]
+        .encode(rows, SectionExecution(NOKIA_NED, community_dialect_by_name("identity")))
+        .body
     )
     large = next(entry for entry in nokia["community-list"] if entry["name"] == "CL-LARGE")
     assert large["entry"][0]["community"] == "64512:1:2"
@@ -104,7 +108,7 @@ def test_flipping_the_local_levels_gate_cannot_change_an_encoded_body(monkeypatc
     document differently, and a retry of a frozen generation send different bytes.
     """
     monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", gate)
-    body = section_registry()["logging"].encode(_rows("logging"), _execution("logging"))
+    body = section_registry()["logging"].encode(_rows("logging"), _execution("logging")).body
     assert body == _GOLDEN["logging"]
     assert body["local-levels"] == {"console-severity": "warnings", "module-severity": "errors"}
 
@@ -128,7 +132,7 @@ def test_an_encoder_refuses_a_row_set_missing_one_of_its_declared_tables():
     rows = _rows("snmp")
     del rows["snmp_host_intent"]
     with pytest.raises(KeyError):
-        section_registry()["snmp"].encode(rows, _execution("snmp"))
+        section_registry()["snmp"].encode(rows, _execution("snmp")).body
 
 
 def test_section_rows_by_table_fills_every_declared_table():
@@ -169,6 +173,23 @@ def test_every_section_declares_a_capability_scope_and_a_result_counter():
         assert entry.result_keys, section
     assert section_registry()["interface_config"].capability_scopes == ("interface_attribute", "interface_ip")
     assert section_registry()["interface_config"].result_keys == ("attribute", "ip")
+
+
+def test_every_stream_counts_under_a_counter_of_its_section():
+    from nso_adapter.core.projection import projection_streams, stream_result_key, stream_section
+
+    for stream in projection_streams():
+        assert stream_result_key(stream) in section_registry()[stream_section(stream)].result_keys, stream
+    assert stream_result_key("isis_flex_algo") == "isis"
+    assert (stream_result_key("interface_config"), stream_result_key("ip")) == ("attribute", "ip")
+
+
+def test_a_split_stream_without_a_counter_fails_at_startup(monkeypatch):
+    from nso_adapter.core import projection
+
+    monkeypatch.setattr(projection, "_STREAM_RESULT_KEYS", {"interface_config": "attribute"})
+    with pytest.raises(RuntimeError, match="'ip' names no job-result counter"):
+        projection._validate_section_registry(frozenset({"switchport", "lag"}))
 
 
 def test_a_registry_whose_containers_collide_fails_at_startup(monkeypatch):
@@ -379,5 +400,5 @@ def test_static_route_legacy_body_paths_are_deleted():
 
 
 def test_isis_fixture_encodes_a_supported_circuit_type():
-    body = section_registry()["isis"].encode(_rows("isis"), _execution("isis"))
+    body = section_registry()["isis"].encode(_rows("isis"), _execution("isis")).body
     assert body["interface-config"][0]["circuit-type"] == "level-2-only"

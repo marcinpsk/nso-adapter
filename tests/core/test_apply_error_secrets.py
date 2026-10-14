@@ -161,7 +161,7 @@ async def test_snmp_rejections_keep_no_resolved_secret_or_vault_reference(
                 "snmp_system_info_intent": [],
             },
             SectionExecution(None, community_dialect_for(None)),
-        )
+        ).body
     }
     with pytest.raises(NsoApplyError) as caught:
         await apply_device_intent(client, _DEVICE, containers, device_id=device_id)
