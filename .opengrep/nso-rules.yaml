@@ -885,3 +885,18 @@ rules:
                   if $SECOND:
                       ...
                       raise $ERROR
+  - id: nso-worker-dispose-unguarded
+    languages: [python]
+    severity: ERROR
+    message: Catch a dispose_run failure in a worker cleanup, roll back, and return ClaimOutcome.ABORT_KNOWN; an escaped exception ends the worker loop.
+    paths:
+      include:
+        - nso_adapter/core/worker.py
+        - review-patterns.py
+    patterns:
+      - pattern: await dispose_run(...)
+      - pattern-not-inside: |
+          try:
+              ...
+          except Exception as $E:
+              ...

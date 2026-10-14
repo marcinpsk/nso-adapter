@@ -861,12 +861,9 @@ async def _dispose(job_id: int, job_type: JobType, reg: ClaimRegistration, exit_
     """Disposition a cancelled run, claimed or claimless depending on the live registration."""
     if reg.registered:
         return await dispose_cancelled(job_id, job_type, reg, exit_reason=exit_reason)
-    from nso_adapter.core.claim import _commit_outcome
-    from nso_adapter.core.execution import dispose_run
-
-    async with session() as db:
-        if await dispose_run(db, job_id, reg, exit_reason):
-            return await _commit_outcome(db)
+    settled = await _dispose_claimless(job_id, reg, exit_reason)
+    if settled is not None:
+        return settled
     # The claimless lane: status only, nothing to release. The registration is unregistered
     # here but still carries this run's attempt, which is the only ownership proof available.
     if disposition_for(job_type) is JobStatus.queued:
@@ -881,14 +878,28 @@ async def _fail_and_release(job_id: int, exc: BaseException, reg: ClaimRegistrat
     error = error_envelope(exc)
     if reg.registered:
         return await mark_failed_and_release(job_id, error["code"], error["message"], reg)
+    settled = await _dispose_claimless(job_id, reg, "runner_failed")
+    if settled is not None:
+        return settled
+    await _mark_failed(job_id, error["code"], error["message"], reg)
+    return ClaimOutcome.COMMIT_ACKNOWLEDGED
+
+
+async def _dispose_claimless(job_id: int, reg: ClaimRegistration, reason: str) -> ClaimOutcome | None:
+    """Settle a claimless run's prepared attempt; ``None`` when it has none to settle."""
     from nso_adapter.core.claim import _commit_outcome
     from nso_adapter.core.execution import dispose_run
 
     async with session() as db:
-        if await dispose_run(db, job_id, reg, "runner_failed"):
+        try:
+            handled = await dispose_run(db, job_id, reg, reason)
+        except Exception as exc:  # noqa: BLE001 - before COMMIT, so provably aborted
+            logger.warning("worker.dispose_aborted", job_id=job_id, exception_type=type(exc).__name__)
+            await db.rollback()
+            return ClaimOutcome.ABORT_KNOWN
+        if handled:
             return await _commit_outcome(db)
-    await _mark_failed(job_id, error["code"], error["message"], reg)
-    return ClaimOutcome.COMMIT_ACKNOWLEDGED
+    return None
 
 
 async def _release(reg: ClaimRegistration, job_id: int | None = None) -> ClaimOutcome:

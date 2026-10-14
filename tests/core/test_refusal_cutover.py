@@ -427,8 +427,9 @@ async def test_capability_write_preserves_apply_error_and_disposal(
             )
 
 
+@pytest.mark.parametrize("ending", ["succeeds", "raises", "cancelled"])
 @pytest.mark.parametrize("through_loop", [False, True])
-async def test_claimless_disposal_error_is_known_abort(adapter_client, monkeypatch, debug_logs, through_loop):
+async def test_claimless_disposal_error_is_known_abort(adapter_client, monkeypatch, debug_logs, through_loop, ending):
     async with session() as db:
         jobs = [Job(job_type=JobType.provision, status=JobStatus.queued, coalescible=False) for _ in range(2)]
         db.add_all(jobs)
@@ -443,12 +444,16 @@ async def test_claimless_disposal_error_is_known_abort(adapter_client, monkeypat
     async def runner(job_id, device_id, reg):
         assert not reg.registered
         seen.append(job_id)
+        if len(seen) == 2:
+            stop.set()
+        if ending == "raises":
+            raise RuntimeError("runner crashed")
+        if ending == "cancelled":
+            raise asyncio.CancelledError
         async with session() as db:
             job = await db.get(Job, job_id)
             job.status = JobStatus.succeeded
             await db.commit()
-        if len(seen) == 2:
-            stop.set()
 
     try:
         if through_loop:
@@ -457,13 +462,19 @@ async def test_claimless_disposal_error_is_known_abort(adapter_client, monkeypat
             await asyncio.wait_for(task, 5)
             assert seen == job_ids
             for job_id in job_ids:
-                assert (await job_row(job_id)).status == JobStatus.succeeded
+                expected = JobStatus.succeeded if ending == "succeeds" else JobStatus.running
+                assert (await job_row(job_id)).status == expected
             abandoned = [record for record in debug_logs if record["event"] == "claim.abandoned_to_staleness"]
             assert len(abandoned) == 2 and all(record["outcome"] == "abort_known" for record in abandoned)
         else:
             reg = ClaimRegistration()
             reg.run_attempt = 1
-            assert await worker._release(reg, job_ids[0]) is ClaimOutcome.ABORT_KNOWN
+            cleanup = {
+                "succeeds": lambda: worker._release(reg, job_ids[0]),
+                "raises": lambda: worker._fail_and_release(job_ids[0], RuntimeError("runner crashed"), reg),
+                "cancelled": lambda: worker._dispose(job_ids[0], JobType.provision, reg),
+            }[ending]
+            assert await cleanup() is ClaimOutcome.ABORT_KNOWN
     finally:
         stop.set()
         if task is not None:

@@ -746,3 +746,36 @@ def projection_diagnostics(device, data, project_bfd, project_entries, log_skipp
     if rejected:
         raise ValueError("bfd item is invalid")
     return rows, entries, sources, skipped, measured, total, blocking, kept, strict
+
+
+async def unguarded_worker_disposal(db, dispose_run, job_id, reg):
+    # ruleid: nso-worker-dispose-unguarded
+    if await dispose_run(db, job_id, reg, "runner_failed"):
+        return True
+    # ruleid: nso-worker-dispose-unguarded
+    handled = await dispose_run(db, job_id, reg, "cancelled")
+    try:
+        # ruleid: nso-worker-dispose-unguarded
+        await dispose_run(db, job_id, reg, "disposed")
+    except ClaimLostError:
+        await db.rollback()
+    return handled
+
+
+async def guarded_worker_disposal(db, dispose_run, job_id, reg, logger):
+    try:
+        # ok: nso-worker-dispose-unguarded
+        handled = await dispose_run(db, job_id, reg, "runner_failed")
+    except Exception as exc:
+        logger.warning("worker.dispose_aborted", exception_type=type(exc).__name__)
+        await db.rollback()
+        return None
+    try:
+        # ok: nso-worker-dispose-unguarded
+        await dispose_run(db, job_id, reg, "disposed")
+    except ClaimLostError:
+        await db.rollback()
+    except Exception as exc:
+        logger.warning("worker.release_aborted", exception_type=type(exc).__name__)
+        await db.rollback()
+    return handled
