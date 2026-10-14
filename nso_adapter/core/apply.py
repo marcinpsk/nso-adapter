@@ -1356,7 +1356,6 @@ class _ApplyPlan(NamedTuple):
     #: The keys this deployment may drop, per section and guarded list — the guard's authority.
     allowed: dict
     any_eligible: bool
-    origin_context: OriginContext | None = None
 
 
 @cache
@@ -2047,7 +2046,6 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         static_route=sr_plan if "static_route" in execution_sections else None,
         allowed=guard_allowed(generation, route_keys=sr_plan.allowed if sr_plan is not None else None),
         any_eligible=any_eligible,
-        origin_context=OriginContext.from_generation(generation),
     )
     if not any_eligible:
         await _finalize_empty_job(db, job_id, device_id, reg)
