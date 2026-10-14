@@ -538,8 +538,8 @@ async def test_c4_8_service_absent_still_runs_the_proof(adapter_client):
     assert await tombstone_ids(device_id) == [tomb], "consuming here strands the route permanently"
 
 
-async def test_c4_9_residue_found_fails_the_job_and_the_next_sweep_reissues(adapter_client):
-    """C4.9 — a ``succeeded`` job would make the tombstone permanently un-sweepable (G17)."""
+async def test_c4_9_residue_found_fails_the_job_and_waits_for_explicit_retry(adapter_client):
+    """C4.9 — residue fails the job; the tombstone stays and only an explicit retry reissues it."""
     from structlog.testing import capture_logs
 
     from nso_adapter.core.tombstone_sweep import sweep_tombstones
