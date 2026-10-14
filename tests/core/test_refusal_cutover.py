@@ -768,6 +768,7 @@ async def test_attempt_membership_excludes_a_carried_stream_the_job_did_not_prom
     job = await terminal(adapter_client, device_id)
     attempts, _outcomes = await evidence(device_id)
     assert {logical["stream"] for logical in attempts[-1].logical_membership} == {"vlan"}
+    assert len(job.result["row_outcomes"]) == len(attempts[-1].logical_membership)
     assert all(row["stream"] == "vlan" for row in job.result["row_outcomes"])
 
 
@@ -1118,10 +1119,11 @@ async def test_post_commit_refusal_exposes_verification_without_rollback(adapter
     await run_next(device_id)
     attempts, outcomes = await evidence(device_id)
     assert attempts[-1].commit_acknowledged
-    assert all(row.disposition == "unavailable" for row in outcomes)
+    assert outcomes and all(row.disposition == "unavailable" for row in outcomes)
     job = await job_row(attempts[-1].job_correlation_id)
     assert job.result["refusals"], "a verification refusal must remain public evidence"
     assert job.result["refusals"][0]["sender_phase"] == "post_commit_verification"
+    assert len(job.result["row_outcomes"]) == len(outcomes)
     assert all(not row["refusals"] for row in job.result["row_outcomes"])
     async with session() as db:
         for row in await db.scalars(select(VlanIntent).where(VlanIntent.device_id == device_id)):
