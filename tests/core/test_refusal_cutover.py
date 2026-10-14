@@ -772,6 +772,56 @@ async def test_attempt_membership_excludes_a_carried_stream_the_job_did_not_prom
     assert all(row["stream"] == "vlan" for row in job.result["row_outcomes"])
 
 
+async def test_coalesced_attempt_keeps_each_stream_generation(adapter_client, monkeypatch):
+    name = "placeholder-coalesced-device"
+    device_id = await seed_device(nso_device_name=name, netbox_device_id=None)
+    await seed_settings(device_id, auto_apply=True)
+    transport = RuntimeTransport(name)
+    transport.refuse = False
+    client = _client_with(transport)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda _instance: client)
+    response = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/intent",
+        json={
+            "attributes": [
+                {"interface": "Ethernet1", "attribute": "description", "intent_value": "placeholder description"}
+            ]
+        },
+        headers=AUTH | push_seq(51),
+    )
+    assert response.status_code == 200
+    response = await put_vlans(adapter_client, device_id, [101, 102], seq=52)
+    assert response.status_code == 200
+    first, highest = await generations(device_id)
+    assert first.job_id == highest.job_id
+    assert highest.seq == first.seq + 1
+    assert set(first.stream_revisions) == {"interface_config"}
+    assert set(highest.stream_revisions) == {"vlan"}
+    assert "interface_config" in highest.document
+    assert await run_next(device_id) == highest.job_id
+    attempts, _outcomes = await evidence(device_id)
+    attempt = attempts[-1]
+    expected = {
+        "interface_config": {row_ref("interface", "interface.description", (("interface", ("Ethernet1",)),))},
+        "vlan": {row_ref("vlan", "vlan.vlan", (("vlan", (vid,)),)) for vid in (101, 102)},
+    }
+    assert {row["stream"] for row in attempt.logical_membership} == set(expected)
+    assert len(attempt.logical_membership) == 3
+    for stream, generation in (("interface_config", first), ("vlan", highest)):
+        rows = [row for row in attempt.logical_membership if row["stream"] == stream]
+        assert {RowRef(row["row"]["subject"], row["row"]["key"]) for row in rows} == expected[stream]
+        assert generation.source_push_seq[stream] == (51 if stream == "interface_config" else 52)
+        for row in rows:
+            assert row["generation_id"] == generation.id
+            assert row["frozen_revision"] == generation.stream_revisions[stream]
+            assert row["source_push_seq"] == generation.source_push_seq[stream]
+    job = await job_row(highest.job_id)
+    assert job.status == JobStatus.succeeded, job.error
+    assert attempt.generation_id == highest.id
+    assert attempt.phase == "terminal" and attempt.commit_acknowledged
+    assert len(transport.documents) == 1
+
+
 @pytest.mark.parametrize("field", ["auth-credential-ref", "priv-credential-ref"])
 async def test_first_apply_missing_snmp_reference_refuses_only_user(adapter_client, monkeypatch, field):
     device_id, transport = await setup(adapter_client, monkeypatch, admit=False)
