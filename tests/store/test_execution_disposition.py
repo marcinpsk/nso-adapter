@@ -942,6 +942,25 @@ async def test_disposition_rollback_preserves_recoverable_attempt(db_session):
     await db_session.commit()
 
 
+@pytest.mark.parametrize("exit_reason", ["cancelled", "timeout", "claim_expired", "orphaned", "disposed"])
+async def test_disposed_not_applied_route_carries_the_job_error(db_session, exit_reason):
+    from nso_adapter.nso.refusals import OrdinaryRejection
+
+    device, job, gen, token, encoded, logical, attempt, client, transport = await _route_baseline(
+        db_session, acknowledge=False
+    )
+    await record_classified_response(
+        db_session, attempt.id, job.id, 1, token, OrdinaryRejection(), sender_phase="commit"
+    )
+    await db_session.commit()
+    assert await dispose_execution_attempt(db_session, job.id, 1, token, exit_reason) == "settled"
+    await db_session.commit()
+    await db_session.refresh(job)
+    [route] = job.result["static_route_results"]
+    assert route["outcome"] == "apply_failed"
+    assert route["error"] == job.error and job.error["code"] == "rejected", "an apply_failed route needs its error"
+
+
 async def test_acknowledged_origin_history_survives_job_pruning(db_session):
     device, job, gen, token, encoded, logical, attempt, client, transport = await _route_baseline(db_session)
     ids = (job.id, gen.id, device.id)

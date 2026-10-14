@@ -544,7 +544,12 @@ async def dispose_execution_attempt(
         "settlement_owners": carriers,
         "commit_acknowledged": attempt.commit_acknowledged,
     }
-    routes = await _route_outcome_evidence(db, attempt, outcomes, terminal_error)
+    job_error = (
+        {"code": "attribution_failed", "message": "Refusal attribution failed", "detail": {}}
+        if kind == "attribution_failed"
+        else terminal_error or {"code": kind, "message": _EXIT_MESSAGES[exit_reason], "detail": {}}
+    )
+    routes = await _route_outcome_evidence(db, attempt, outcomes, job_error)
     if routes:
         result["static_route_results"] = routes
     from nso_adapter.core.claim import terminalize
@@ -556,9 +561,7 @@ async def dispose_execution_attempt(
         expect=JobStatus.running,
         run_attempt=run_attempt,
         result=result,
-        error={"code": "attribution_failed", "message": "Refusal attribution failed", "detail": {}}
-        if kind == "attribution_failed"
-        else terminal_error or {"code": kind, "message": _EXIT_MESSAGES[exit_reason], "detail": {}},
+        error=job_error,
         generation_outcome=GenerationStatus.failed
         if kind in {"refused", "rejected"}
         else GenerationStatus.outcome_unknown,
