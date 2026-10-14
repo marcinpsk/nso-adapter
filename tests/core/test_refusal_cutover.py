@@ -1717,6 +1717,53 @@ async def test_removal_unsent_failure_retains_attempt_evidence(adapter_client, m
         assert row.last_apply_at is not None and row.last_apply_error is None
 
 
+async def test_apply_build_failure_excludes_ineligible_carried_rows(adapter_client, monkeypatch):
+    from nso_adapter.core.apply import run_apply
+
+    device_id, transport = await setup(adapter_client, monkeypatch, admit=False)
+    async with session() as db:
+        row = await db.scalar(select(VlanIntent).where(VlanIntent.device_id == device_id, VlanIntent.vlan_id == 101))
+        row.last_apply_error = None
+        await db.commit()
+    monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "1")
+    response = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/logging-intent",
+        json={"hosts": [], "local_levels": {"console_severity": "CRITICAL"}},
+        headers=AUTH | push_seq(41),
+    )
+    assert response.status_code == 200
+    response = await _apply(adapter_client, device_id, {"vlan": 41, "interface_config": 41, "logging": 41})
+    assert response.status_code == 202
+    monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "0")
+
+    async def run_pending(job_id, device_id, reg):
+        await run_apply(job_id, device_id, force=False, reg=reg)
+
+    job_id = await run_next(device_id, runner=run_pending)
+    job = await job_row(job_id)
+    assert job.status == JobStatus.failed
+    assert job.error["code"] == "local_levels_gated"
+    assert transport.documents == []
+    attempts, outcomes = await evidence(device_id)
+    attempt = attempts[-1]
+    excluded = row_ref("vlan", "vlan.vlan", (("vlan", (101,)),))
+    expected = {
+        row_ref("vlan", "vlan.vlan", (("vlan", (102,)),)),
+        row_ref("logging", "logging.local-levels", ()),
+        *(
+            row_ref("interface", "interface.description", (("interface", (name,)),))
+            for name in ("Ethernet1", "Ethernet2")
+        ),
+    }
+    assert {RowRef(row["row"]["subject"], row["row"]["key"]) for row in job.result["row_outcomes"]} == expected
+    assert {RowRef(row["row"]["subject"], row["row"]["key"]) for row in attempt.logical_membership} == expected
+    assert attempt.phase == "terminal" and not attempt.commit_acknowledged
+    own = [row for row in outcomes if row.execution_attempt_id == attempt.id]
+    assert len(own) == len(expected)
+    assert all(row.disposition == "not_applied" for row in own)
+    assert all(RowRef(row.row_subject, row.row_key) != excluded for row in own)
+
+
 @pytest.mark.parametrize("failure", ["logging_gate", "retention_read"])
 async def test_apply_build_failure_preserves_selected_unsent_rows(adapter_client, monkeypatch, failure):
     device_id, transport = await setup(adapter_client, monkeypatch, admit=False)

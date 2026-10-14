@@ -1443,20 +1443,6 @@ async def _run_document_apply(db, device, client, device_name, job, job_id, now,
     )
     await bind_historical_origins(db, device.id, body.origins, generation)
     membership = current_membership(body.origins, context)
-    if body.errors:
-        from nso_adapter.core.execution import settle_unsent
-
-        error = next(iter(body.errors.values()))
-        await settle_unsent(
-            db,
-            generation,
-            body.origins,
-            membership,
-            reg,
-            {"code": error.code, "message": _apply_error_summary(error), "detail": error.detail},
-        )
-        await _commit_terminal(db, job_id)
-        return
     eligible = {(row.__tablename__, row.id) for section in plan.sections.values() for row in section.sent}
     eligible.update((item.push.__tablename__, item.push.id) for item in plan.interface.attributes)
     eligible.update((row.__tablename__, row.id) for row in plan.interface.ip_rows)
@@ -1471,6 +1457,20 @@ async def _run_document_apply(db, device, client, device_name, job, job_id, now,
         )
     }
     membership = tuple(logical for logical in membership if logical.carrier in carriers)
+    if body.errors:
+        from nso_adapter.core.execution import settle_unsent
+
+        error = next(iter(body.errors.values()))
+        await settle_unsent(
+            db,
+            generation,
+            body.origins,
+            membership,
+            reg,
+            {"code": error.code, "message": _apply_error_summary(error), "detail": error.detail},
+        )
+        await _commit_terminal(db, job_id)
+        return
     checkpoint = await prepare_send(db, generation, body.origins, membership, reg)
     try:
         await _maybe_sync_from(db, client, device_name, device.id)
