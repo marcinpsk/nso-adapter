@@ -1144,6 +1144,7 @@ async def test_f4_a_a_successors_changed_row_is_not_stamped_by_the_older_documen
     job_id = await run_head(device_id, client)
     assert job_id is not None
     job = await job_row(job_id)
+    assert len(job.result["row_outcomes"]) == 2
     assert all(row["disposition"] == "in_sync" for row in job.result["row_outcomes"])
     assert job.result["vlan_count_by_outcome"] == {"in_sync": 2, "apply_failed": 0, "not_applied": 0, "unavailable": 0}
 
@@ -1179,6 +1180,7 @@ async def test_f5_a_atomic_mode_pushes_the_document_and_stamps_the_live_rows(ada
     assert job_id is not None
     job = await job_row(job_id)
     assert job.status.value == "succeeded"
+    assert len(job.result["row_outcomes"]) == 1
     assert all(row["disposition"] == "in_sync" for row in job.result["row_outcomes"])
     assert job.result["vlan_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0, "not_applied": 0, "unavailable": 0}
 

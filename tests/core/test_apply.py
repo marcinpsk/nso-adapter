@@ -1010,7 +1010,7 @@ async def test_run_apply_ip_intent_success(adapter_client):
 
 @pytest.mark.anyio
 async def test_run_apply_ip_intent_failure_marks_error(adapter_client):
-    """When the document PUT is rejected, every address row records the error."""
+    """When the document PUT is rejected, every address row settles not_applied with no row error."""
     from sqlalchemy import select
 
     from nso_adapter.nso.apply import NsoApplyError
@@ -1196,7 +1196,10 @@ _SCOPE_CASES = [
 async def test_run_apply_family_is_transmitted_and_stamped(
     adapter_client, model_name, kwargs, container, label, result_key
 ):
-    """Each single-list family reaches the wire under its container and reports in_sync."""
+    """Each single-list family reaches the wire under its container and reports in_sync.
+
+    A static route has no proof here, so it counts as unavailable and is not stamped.
+    """
     from nso_adapter.store import models as m
 
     device_id = await _seed_device(f"rtr-{result_key}", 300)
@@ -1224,7 +1227,7 @@ async def test_run_apply_family_is_transmitted_and_stamped(
             "not_applied": 0,
             "unavailable": 1 if result_key == "static_route" else 0,
         }
-        # the row was stamped applied
+        # the row was stamped applied, except the unproven static route
         rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
         assert (rows[0].last_apply_at is None) == (result_key == "static_route")
         assert rows[0].last_apply_error is None
@@ -2164,8 +2167,8 @@ async def _seed_route_map_intent(device_id, ned_id):
 async def test_run_apply_misconfig_device_rejection_records_no_capability(adapter_client):
     """A generic device rejection that no per-scope dry-run localises — e.g. a route-map
     referencing a prefix-list not included in the push (a MISCONFIGURATION, not a NED limit) —
-    must NOT record capability; that would be a false 'unsupported' verdict. The job still fails
-    and last_apply_error carries the real device error. (The live IOS-XR-route-map→Junos case:
+    must NOT record capability; that would be a false 'unsupported' verdict. The job still fails,
+    and each row settles with no row error. (The live IOS-XR-route-map→Junos case:
     'prefix-list referenced but not defined'.)"""
     from nso_adapter.nso.apply import NsoApplyError
     from nso_adapter.store.models import DeviceCapability, RoutePolicyObjectIntent
@@ -2203,7 +2206,7 @@ async def test_run_apply_misconfig_device_rejection_records_no_capability(adapte
     async with session() as db:
         assert (await db.execute(select(DeviceCapability))).scalars().all() == []  # NOT a capability gap
         rp = (await db.execute(select(RoutePolicyObjectIntent))).scalars().all()
-        assert all(r.last_apply_error is None for r in rp)  # but the apply did fail + recorded the error
+        assert all(r.last_apply_error is None for r in rp)  # the attempt settles rows, no row error
         assert (await db.get(Job, job_id)).status == JobStatus.failed
 
 
@@ -2392,7 +2395,8 @@ def _rc_action(device_name: str, scope: str, section: dict) -> dict:
 
 async def test_run_apply_reader_compare_flags_silent_drop(adapter_client):
     """The #26 scenario: the static-route writer 'succeeds' but the device view never
-    gains the route → the job FAILS and the row carries reader_compare_missing."""
+    gains the route → the job FAILS, reader_compare reports missing, and the row counts as
+    unavailable with no row error."""
     from nso_adapter.store.models import StaticRouteIntent
 
     device_id = await _seed_device("rtr-rc-drop", 401)
@@ -2600,7 +2604,8 @@ async def test_run_apply_reader_compare_absent_reader_surface_is_not_a_drop(adap
     writer dropped everything".
 
     The device-state action declares status=unsupported for a family the NED has no export
-    surface for — absence there proves nothing, so the scope stays "unknown" and green. The
+    surface for — absence there proves nothing, so the scope stays "unknown", the job succeeds,
+    and the row counts as unavailable because nothing proves it. The
     legacy None→{} coercion classified every intended key a silent writer drop and pinned the
     scope permanently apply_failed on a device where NSO had committed the intent; the
     envelope's status closes that blind spot.
@@ -2803,8 +2808,8 @@ async def test_run_apply_reader_compare_still_fails_a_representable_community_li
 
 
 async def test_run_apply_reader_compare_reader_error_is_nonfatal(adapter_client):
-    """The check must never fail a good apply: a reader exception records 'error' and
-    leaves the scope green (transparency without false alarms)."""
+    """The check must never fail a good apply: a reader exception records 'error', the job
+    succeeds, and the row counts as unavailable because nothing proves it."""
     from nso_adapter.store.models import StaticRouteIntent
 
     device_id = await _seed_device("rtr-rc-err", 403)
