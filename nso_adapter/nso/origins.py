@@ -210,6 +210,23 @@ class OriginIndex:
             self.unsupported[key] = UnsupportedOrigin(reason)
 
 
+def current_membership(origins: OriginIndex, context: OriginContext) -> tuple[LogicalRow, ...]:
+    """Return the current logical rows that match their stream's frozen generation, revision and push."""
+    carried = context.stream_contexts
+    return tuple(
+        dict.fromkeys(
+            logical
+            for binding in origins.bindings.values()
+            if binding.provenance == "current"
+            for logical in binding.logical_rows
+            if logical.stream in carried
+            and logical.generation_id == carried[logical.stream].generation_id
+            and logical.frozen_revision == carried[logical.stream].stream_revisions.get(logical.stream)
+            and logical.source_push_seq == carried[logical.stream].source_push_seq.get(logical.stream)
+        )
+    )
+
+
 class EncodedSection(NamedTuple):
     body: dict
     origins: OriginIndex

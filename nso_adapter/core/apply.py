@@ -52,6 +52,7 @@ from nso_adapter.nso.origins import (
     OriginIndex,
     PriorContribution,
     RemovalAuthority,
+    current_membership,
 )
 from nso_adapter.nso.refusal_protocol import row_ref
 from nso_adapter.store.models import (
@@ -1441,18 +1442,7 @@ async def _run_document_apply(db, device, client, device_name, job, job_id, now,
         origin_context=context,
     )
     await bind_historical_origins(db, device.id, body.origins, generation)
-    membership = tuple(
-        dict.fromkeys(
-            logical
-            for binding in body.origins.bindings.values()
-            if binding.provenance == "current"
-            for logical in binding.logical_rows
-            if logical.stream in context.stream_contexts
-            and logical.generation_id == context.for_stream(logical.stream).generation_id
-            and logical.frozen_revision == context.for_stream(logical.stream).stream_revisions[logical.stream]
-            and logical.source_push_seq == context.for_stream(logical.stream).source_push_seq[logical.stream]
-        )
-    )
+    membership = current_membership(body.origins, context)
     if body.errors:
         from nso_adapter.core.execution import settle_unsent
 

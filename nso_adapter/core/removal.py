@@ -826,6 +826,7 @@ async def _put_removal_document(
     from nso_adapter.core.apply import _refuse_unverifiable_recorded_put, build_device_containers
     from nso_adapter.core.execution import prepare_send
     from nso_adapter.core.generation import execution_policy, generation_execution_context
+    from nso_adapter.nso.origins import current_membership
     from nso_adapter.nso.refusals import OrdinaryRejection
 
     generation = await _executing_document(db, job_id, scope)
@@ -844,17 +845,7 @@ async def _put_removal_document(
         retain_static_routes=policy.retain_static_routes,
         origin_context=context_origins,
     )
-    membership = tuple(
-        dict.fromkeys(
-            logical
-            for binding in body.origins.bindings.values()
-            if binding.provenance == "current"
-            for logical in binding.logical_rows
-            if logical.stream in context_origins.stream_contexts
-            and logical.generation_id == context_origins.for_stream(logical.stream).generation_id
-            and logical.frozen_revision == context_origins.for_stream(logical.stream).stream_revisions[logical.stream]
-        )
-    )
+    membership = current_membership(body.origins, context_origins)
     if body.errors:
         checkpoint = await prepare_send(db, generation, body.origins, membership, reg)
         await checkpoint("pre_commit_dry_run", OrdinaryRejection(), False)
