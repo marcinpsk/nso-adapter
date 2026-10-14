@@ -12,7 +12,7 @@ from typing import Literal
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.projection import section_operation, section_registry
+from nso_adapter.core.projection import section_operation, section_registry, stream_result_key
 from nso_adapter.nso.origins import AttributionFailure, LogicalRow, OriginIndex, resolve_refusals
 from nso_adapter.nso.refusal_protocol import Refusal
 from nso_adapter.nso.refusals import DefiniteRefusal, ErrorClassification, OrdinaryRejection, ProtocolFault, Unavailable
@@ -401,7 +401,7 @@ def _carrier_results(attempt: ApplyExecutionAttempt, outcomes: list[RowOutcome])
             raise ValueError("An attempted carrier requires logical outcomes")
         disposition = max((outcome.disposition for outcome in members), key=priority.__getitem__)
         carriers.append({**public, "disposition": disposition})
-        key = "attribute" if carrier["stream"] == "interface_config" else carrier["stream"]
+        key = stream_result_key(carrier["stream"])
         count = counts.setdefault(
             f"{key}_count_by_outcome", {"in_sync": 0, "apply_failed": 0, "not_applied": 0, "unavailable": 0}
         )

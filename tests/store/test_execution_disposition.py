@@ -646,6 +646,64 @@ async def test_historical_split_stream_removal_keeps_stream_authorization(db_ses
         assert omitted.bindings[OriginKey(family, logical.row)].stream == stream
 
 
+@pytest.mark.parametrize(("stream", "counter"), [("ip", "ip"), ("isis_flex_algo", "isis")])
+async def test_disposed_split_stream_carrier_counts_under_its_section_counter(db_session, stream, counter):
+    from nso_adapter.core.projection import build_interface_proof, section_registry, stream_section
+    from nso_adapter.store.models import DbInterface, InterfaceIpIntent, IsisFlexAlgoIntent
+
+    job, _, _, _, token, _, _ = await _seed(db_session)
+    await create_counter(db_session, job.device_id)
+    section = stream_section(stream)
+    execution = {"context": {"ned_id": None, "dialect": "identity"}}
+    if stream == "ip":
+        interface = DbInterface(device_id=job.device_id, name="Ethernet1")
+        db_session.add(interface)
+        await db_session.flush()
+        row = InterfaceIpIntent(interface_id=interface.id, address="192.0.2.1/24", family="ipv4", accepted_at=ACCEPTED)
+    else:
+        row = IsisFlexAlgoIntent(device_id=job.device_id, process_tag="CORE", algo_id=128, accepted_at=ACCEPTED)
+    db_session.add(row)
+    db_session.add(
+        DeviceProjectionStream(device_id=job.device_id, stream=stream, desired_revision=7, authorized_revision=7)
+    )
+    await db_session.flush()
+    tables = {row.__tablename__: [_row_dict(row)]}
+    if stream == "ip":
+        execution["proof"] = build_interface_proof(section, tables, [interface], {})
+    generation = DeploymentGeneration(
+        device_id=job.device_id,
+        job_id=job.id,
+        seq=2,
+        mode=GenerationMode.networked,
+        digest="b" * 64,
+        stream_revisions={stream: 7},
+        source_push_seq={stream: 41},
+        document={section: {**tables, "_execution": execution}},
+    )
+    db_session.add(generation)
+    await db_session.flush()
+    encoded = encode_device_document(generation.document, origin_context=OriginContext.from_generation(generation))
+    logicals = tuple(
+        dict.fromkeys(
+            logical
+            for binding in encoded.origins.bindings.values()
+            for logical in binding.logical_rows
+            if logical.stream == stream
+        )
+    )
+    await prepare_execution_attempt(
+        db_session, job.id, 1, token, generation.id, origins=encoded.origins, logical_rows=logicals
+    )
+    await db_session.commit()
+    assert await dispose_execution_attempt(db_session, job.id, 1, token, "cancelled") == "settled"
+    await db_session.commit()
+    await db_session.refresh(job)
+    registered = {f"{key}_count_by_outcome" for entry in section_registry().values() for key in entry.result_keys}
+    counters = {key for key in job.result if key.endswith("_count_by_outcome")}
+    assert counters <= registered, f"{stream} carriers must count under a registry counter, not {counters}"
+    assert job.result[f"{counter}_count_by_outcome"]["unavailable"] == 1
+
+
 @pytest.mark.parametrize(
     "authority_stream,revision_delta,authorized",
     [

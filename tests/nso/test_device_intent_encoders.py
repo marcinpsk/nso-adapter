@@ -175,6 +175,23 @@ def test_every_section_declares_a_capability_scope_and_a_result_counter():
     assert section_registry()["interface_config"].result_keys == ("attribute", "ip")
 
 
+def test_every_stream_counts_under_a_counter_of_its_section():
+    from nso_adapter.core.projection import projection_streams, stream_result_key, stream_section
+
+    for stream in projection_streams():
+        assert stream_result_key(stream) in section_registry()[stream_section(stream)].result_keys, stream
+    assert stream_result_key("isis_flex_algo") == "isis"
+    assert (stream_result_key("interface_config"), stream_result_key("ip")) == ("attribute", "ip")
+
+
+def test_a_split_stream_without_a_counter_fails_at_startup(monkeypatch):
+    from nso_adapter.core import projection
+
+    monkeypatch.setattr(projection, "_STREAM_RESULT_KEYS", {"interface_config": "attribute"})
+    with pytest.raises(RuntimeError, match="'ip' names no job-result counter"):
+        projection._validate_section_registry(frozenset({"switchport", "lag"}))
+
+
 def test_a_registry_whose_containers_collide_fails_at_startup(monkeypatch):
     from nso_adapter.core import projection
 

@@ -483,6 +483,18 @@ _SPLIT_SECTION_STREAMS: dict[str, _SplitSection] = {
 }
 
 
+#: The job-result counter of each stream whose section names more than one ``result_keys`` entry.
+_STREAM_RESULT_KEYS = {"interface_config": "attribute", "ip": "ip"}
+
+
+def _stream_result_key(stream: str, section: str) -> str:
+    keys = section_registry()[section].result_keys
+    key = keys[0] if len(keys) == 1 else _STREAM_RESULT_KEYS.get(stream)
+    if key is None or key not in keys:
+        raise RuntimeError(f"stream {stream!r} names no job-result counter of section {section!r}")
+    return key
+
+
 @cache
 def _stream_tables() -> dict[str, tuple[_Spec, ...]]:
     """Stream name -> the intent tables it owns. Built once, validated on the way."""
@@ -622,6 +634,8 @@ def _validate_section_registry(out_of_protocol: frozenset[str]) -> None:
         owner = containers.setdefault(entry.container, section)
         if owner != section:
             raise RuntimeError(f"sections {owner!r} and {section!r} both claim container {entry.container!r}")
+    for stream, section in _stream_section().items():
+        _stream_result_key(stream, section)
     if out_of_protocol != CLAIM_LESS_SECTIONS:
         raise RuntimeError(
             f"the out-of-protocol streams {sorted(out_of_protocol)} are not the two claim-less "
@@ -652,6 +666,11 @@ def stream_section(stream: str) -> str:
     if stream not in projection_streams():
         raise ValueError(f"unknown projection stream {stream!r}")
     return _stream_section()[stream]
+
+
+def stream_result_key(stream: str) -> str:
+    """Return the ``<key>_count_by_outcome`` counter key that *stream*'s carriers count under."""
+    return _stream_result_key(stream, stream_section(stream))
 
 
 def section_streams(section: str) -> tuple[str, ...]:
@@ -1521,6 +1540,7 @@ __all__ = [
     "section_streams",
     "freeze_fragment",
     "snapshot_stream",
+    "stream_result_key",
     "stream_section",
     "stream_tables",
 ]
