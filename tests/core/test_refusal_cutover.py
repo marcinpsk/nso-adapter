@@ -1854,6 +1854,37 @@ async def test_apply_build_failure_excludes_ineligible_carried_rows(adapter_clie
     assert all(RowRef(row.row_subject, row.row_key) != excluded for row in own)
 
 
+@pytest.mark.parametrize("sent", [True, False])
+async def test_document_apply_binds_historical_origins_once(adapter_client, monkeypatch, sent):
+    import nso_adapter.core.execution as execution
+    import nso_adapter.store.execution_history as history
+
+    calls = []
+    bind = history.bind_historical_origins
+
+    async def counted(*args, **kwargs):
+        calls.append(args[3].id)
+        return await bind(*args, **kwargs)
+
+    monkeypatch.setattr(history, "bind_historical_origins", counted)
+    monkeypatch.setattr(execution, "bind_historical_origins", counted)
+    device_id, transport = await setup(adapter_client, monkeypatch, admit=sent)
+    if not sent:
+        monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "1")
+        response = await adapter_client.put(
+            f"/api/v1/devices/{device_id}/logging-intent",
+            json={"hosts": [{"address": "192.0.2.99"}], "local_levels": {"console_severity": "CRITICAL"}},
+            headers=AUTH | push_seq(41),
+        )
+        assert response.status_code == 200
+        response = await _apply(adapter_client, device_id, {"vlan": 41, "interface_config": 41, "logging": 41})
+        assert response.status_code == 202
+        monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "0")
+    await run_next(device_id)
+    assert bool(transport.documents) is sent
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("failure", ["logging_gate", "retention_read"])
 async def test_apply_build_failure_preserves_selected_unsent_rows(adapter_client, monkeypatch, failure):
     device_id, transport = await setup(adapter_client, monkeypatch, admit=False)

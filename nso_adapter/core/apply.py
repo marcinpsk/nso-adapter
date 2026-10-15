@@ -1440,7 +1440,6 @@ async def _run_document_apply(db, device, client, device_name, job, job_id, now,
         static_route_plan=plan.static_route,
         origin_context=context,
     )
-    await bind_historical_origins(db, device.id, body.origins, generation)
     membership = current_membership(body.origins, context)
     eligible = {(row.__tablename__, row.id) for section in plan.sections.values() for row in section.sent}
     eligible.update((item.push.__tablename__, item.push.id) for item in plan.interface.attributes)
@@ -1460,6 +1459,7 @@ async def _run_document_apply(db, device, client, device_name, job, job_id, now,
         from nso_adapter.core.execution import settle_unsent
 
         error = next(iter(body.errors.values()))
+        await bind_historical_origins(db, device.id, body.origins, generation)
         await settle_unsent(
             db,
             generation,
