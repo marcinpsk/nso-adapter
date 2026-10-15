@@ -746,3 +746,73 @@ def projection_diagnostics(device, data, project_bfd, project_entries, log_skipp
     if rejected:
         raise ValueError("bfd item is invalid")
     return rows, entries, sources, skipped, measured, total, blocking, kept, strict
+
+
+async def unguarded_worker_disposal(db, dispose_run, job_id, reg):
+    # ruleid: nso-worker-dispose-unguarded
+    if await dispose_run(db, job_id, reg, "runner_failed"):
+        return True
+    # ruleid: nso-worker-dispose-unguarded
+    handled = await dispose_run(db, job_id, reg, "cancelled")
+    try:
+        # ruleid: nso-worker-dispose-unguarded
+        await dispose_run(db, job_id, reg, "disposed")
+    except ClaimLostError:
+        await db.rollback()
+    return handled
+
+
+async def guarded_worker_disposal(db, dispose_run, job_id, reg, logger):
+    try:
+        # ok: nso-worker-dispose-unguarded
+        handled = await dispose_run(db, job_id, reg, "runner_failed")
+    except Exception as exc:
+        logger.warning("worker.dispose_aborted", exception_type=type(exc).__name__)
+        await db.rollback()
+        return None
+    try:
+        # ok: nso-worker-dispose-unguarded
+        await dispose_run(db, job_id, reg, "disposed")
+    except ClaimLostError:
+        await db.rollback()
+    except Exception as exc:
+        logger.warning("worker.release_aborted", exception_type=type(exc).__name__)
+        await db.rollback()
+    return handled
+
+
+async def raw_abort_rollback(db, logger, reg):
+    try:
+        await lock_claim(db, reg)
+    except ClaimLostError:
+        # ruleid: nso-abort-known-raw-rollback
+        await db.rollback()
+        return ClaimOutcome.ABORT_KNOWN
+    except Exception as exc:
+        # ruleid: nso-abort-known-raw-rollback
+        await db.rollback()
+        logger.warning("claim.release_aborted", exception_type=type(exc).__name__)
+        return ClaimOutcome.ABORT_KNOWN
+    return None
+
+
+async def guarded_abort_rollback(db, logger, reg, rollback_abort_known):
+    try:
+        await lock_claim(db, reg)
+    except ClaimLostError:
+        # ok: nso-abort-known-raw-rollback
+        return await rollback_abort_known(db, device_id=reg.device_id)
+    except Exception:
+        # ok: nso-abort-known-raw-rollback
+        await db.rollback()
+        raise
+    return None
+
+
+async def rollback_abort_known(db, logger):
+    try:
+        # ok: nso-abort-known-raw-rollback
+        await db.rollback()
+    except Exception as exc:
+        logger.warning("claim.abort_rollback_failed", exception_type=type(exc).__name__)
+    return ClaimOutcome.ABORT_KNOWN

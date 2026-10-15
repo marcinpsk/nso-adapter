@@ -56,6 +56,7 @@ from nso_adapter.core.claim import (
     lock_claim,
     mark_failed_and_release,
     release_claim,
+    rollback_abort_known,
     terminalize,
     terminalize_running,
 )
@@ -747,6 +748,7 @@ async def _run_one_job(
     hb = asyncio.create_task(_heartbeat(job_id, reg))
     seen = _CancelSeen()
     ownership = "drained"
+    exit_reason = "cancelled"
     outcome = ClaimOutcome.ABORT_KNOWN
     drain_kwargs: _DrainKwargs = {"job_id": job_id, "device_id": device_id, "job_type": str(job_type)}
 
@@ -761,6 +763,7 @@ async def _run_one_job(
         try:
             _done, pending = await asyncio.wait({task}, timeout=JOB_EXECUTION_BUDGET)
             if pending:
+                exit_reason = "timeout"
                 logger.error("worker.execution_budget_expired", budget=JOB_EXECUTION_BUDGET, **drain_kwargs)
                 ownership = await _absorb(_drain_handle(task, **drain_kwargs), seen)
         except asyncio.CancelledError:
@@ -791,14 +794,16 @@ async def _run_one_job(
             # loop has more jobs to run and this run's disposition is now recovery's.
             logger.error("worker.bookkeeping_outcome_unknown", worker_id=worker_id, **drain_kwargs)
         except asyncio.CancelledError:
-            outcome = await _bounded_cleanup(_dispose(job_id, job_type, reg), seen, job_id=job_id, device_id=device_id)
+            outcome = await _bounded_cleanup(
+                _dispose(job_id, job_type, reg, exit_reason), seen, job_id=job_id, device_id=device_id
+            )
         except Exception as exc:
-            logger.exception("worker.job_crashed", worker_id=worker_id, job_id=job_id, error=repr(exc))
+            logger.error("worker.job_crashed", worker_id=worker_id, job_id=job_id, exception_type=type(exc).__name__)
             outcome = await _bounded_cleanup(
                 _fail_and_release(job_id, exc, reg), seen, job_id=job_id, device_id=device_id
             )
         else:
-            outcome = await _bounded_cleanup(_release(reg), seen, job_id=job_id, device_id=device_id)
+            outcome = await _bounded_cleanup(_release(reg, job_id), seen, job_id=job_id, device_id=device_id)
     finally:
         # NEVER a standalone release after a disposition that did not commit: a rolled-back
         # status write with a deleted claim is invisible to the reaper forever. This branch
@@ -853,10 +858,13 @@ async def _advance_generations(device_id: int) -> None:
             await asyncio.sleep(0.5 * attempt)
 
 
-async def _dispose(job_id: int, job_type: JobType, reg: ClaimRegistration) -> ClaimOutcome:
+async def _dispose(job_id: int, job_type: JobType, reg: ClaimRegistration, exit_reason="cancelled") -> ClaimOutcome:
     """Disposition a cancelled run, claimed or claimless depending on the live registration."""
     if reg.registered:
-        return await dispose_cancelled(job_id, job_type, reg)
+        return await dispose_cancelled(job_id, job_type, reg, exit_reason=exit_reason)
+    settled = await _dispose_claimless(job_id, reg, exit_reason)
+    if settled is not None:
+        return settled
     # The claimless lane: status only, nothing to release. The registration is unregistered
     # here but still carries this run's attempt, which is the only ownership proof available.
     if disposition_for(job_type) is JobStatus.queued:
@@ -871,13 +879,47 @@ async def _fail_and_release(job_id: int, exc: BaseException, reg: ClaimRegistrat
     error = error_envelope(exc)
     if reg.registered:
         return await mark_failed_and_release(job_id, error["code"], error["message"], reg)
+    settled = await _dispose_claimless(job_id, reg, "runner_failed")
+    if settled is not None:
+        return settled
     await _mark_failed(job_id, error["code"], error["message"], reg)
     return ClaimOutcome.COMMIT_ACKNOWLEDGED
 
 
-async def _release(reg: ClaimRegistration) -> ClaimOutcome:
-    """Normal-success release. A no-op on the claimless lane."""
-    return await release_claim(reg)
+async def _dispose_claimless(job_id: int, reg: ClaimRegistration, reason: str) -> ClaimOutcome | None:
+    """Settle a claimless run's prepared attempt; ``None`` when it has none to settle."""
+    from nso_adapter.core.claim import _commit_outcome
+    from nso_adapter.core.execution import dispose_run
+
+    async with session() as db:
+        try:
+            handled = await dispose_run(db, job_id, reg, reason)
+        except Exception as exc:  # noqa: BLE001 - before COMMIT, so provably aborted
+            logger.warning("worker.dispose_aborted", job_id=job_id, exception_type=type(exc).__name__)
+            return await rollback_abort_known(db, job_id=job_id)
+        if handled:
+            return await _commit_outcome(db)
+    return None
+
+
+async def _release(reg: ClaimRegistration, job_id: int | None = None) -> ClaimOutcome:
+    """Consult prepared evidence before normal ownership release."""
+    from nso_adapter.core.claim import _commit_outcome
+    from nso_adapter.core.execution import dispose_run
+
+    if job_id is None:
+        return await release_claim(reg)
+    async with session() as db:
+        try:
+            await dispose_run(db, job_id, reg, "disposed")
+        except ClaimLostError:
+            return await rollback_abort_known(db, job_id=job_id)
+        except Exception as exc:
+            logger.warning("worker.release_aborted", job_id=job_id, exception_type=type(exc).__name__)
+            return await rollback_abort_known(db, job_id=job_id)
+        if reg.registered:
+            return await release_claim(reg, db=db)
+        return await _commit_outcome(db)
 
 
 async def _requeue_own_claim(job_id: int, job_type: JobType, *, run_attempt: int | None = None) -> None:
@@ -960,7 +1002,19 @@ async def requeue_orphaned_jobs() -> None:
         ).all()
 
         requeued = failed = 0
+        from nso_adapter.store.execution_attempt_store import AttemptOwnershipLost, dispose_execution_attempt
+
         for job_id, job_type, run_attempt in rows:
+            try:
+                async with db.begin_nested():
+                    handled = await dispose_execution_attempt(db, job_id, run_attempt, None, "orphaned")
+            except AttemptOwnershipLost:
+                # One lost settlement must not stop recovery of the other orphaned jobs.
+                logger.error("worker.orphan_ownership_lost", job_id=job_id)
+                continue
+            if handled != "no_attempt":
+                failed += handled == "settled"
+                continue
             target = disposition_for(job_type)
             error = None
             if target is JobStatus.failed:

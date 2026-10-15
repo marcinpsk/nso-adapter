@@ -48,7 +48,8 @@ async def test_apply_diff_envelope_golden(adapter_client):
     from nso_adapter.core.apply import ApplyPreview
 
     with patch(
-        "nso_adapter.core.apply.collect_apply_diff", new=AsyncMock(return_value=ApplyPreview(canned, None, None))
+        "nso_adapter.core.apply.collect_apply_diff",
+        new=AsyncMock(return_value=ApplyPreview(canned, None, None, "ready")),
     ):
         resp = await adapter_client.get(
             f"/api/v1/devices/{device_id}/actions/apply-diff", params={"outformat": "cli"}, headers=AUTH
@@ -60,4 +61,6 @@ async def test_apply_diff_envelope_golden(adapter_client):
         "diffs": canned,
         "generation_id": None,
         "document_digest": None,
+        "status": "ready",
+        "refusals": [],
     }

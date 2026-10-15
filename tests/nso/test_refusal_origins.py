@@ -612,3 +612,29 @@ def test_duplicate_origin_check_stays_linear_in_the_section_rows():
     assert CountingStream.comparisons < 300
     with pytest.raises(OriginConstructionError, match="duplicate origin"):
         recorder.logical("static-route.route", path, source, stream)
+
+
+@pytest.mark.parametrize(
+    ("carried", "member"),
+    [
+        ({"vlan": (5, {"vlan": 7}, {"vlan": 41})}, True),
+        ({"vlan": (5, {"vlan": 7}, {"vlan": 42})}, False),
+        ({"vlan": (5, {"vlan": 7}, {})}, False),
+        ({"vlan": (5, {}, {"vlan": 41})}, False),
+        ({"vlan": (6, {"vlan": 7}, {"vlan": 41})}, False),
+        ({}, False),
+    ],
+)
+def test_current_membership_requires_the_stream_generation_revision_and_push(carried, member):
+    from nso_adapter.nso.origins import OriginContext, OriginRecorder, SourceRef, current_membership
+
+    recorder = OriginRecorder("vlan", OriginContext(5, {"vlan": 41}, {"vlan": 7}))
+    path = (("vlan", (10,)),)
+    logical = recorder.logical("vlan.vlan", path, SourceRef("vlan_intent", (1,), "digest", 7, None, None), "vlan")
+    recorder.emit("vlan.vlan", path, (logical,))
+    origins = recorder.finish({}).origins
+    contexts = {
+        stream: OriginContext(generation, push, revisions) for stream, (generation, revisions, push) in carried.items()
+    }
+    context = OriginContext(5, {"vlan": 41}, {"vlan": 7}, None, contexts)
+    assert current_membership(origins, context) == ((logical,) if member else ())

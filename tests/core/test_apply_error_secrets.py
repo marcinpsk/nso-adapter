@@ -14,7 +14,6 @@ import structlog
 from sqlalchemy import select
 from structlog.testing import capture_logs
 
-from nso_adapter.core.apply import run_apply
 from nso_adapter.core.community_dialect import community_dialect_for
 from nso_adapter.nso.apply import NsoApplyError, SectionExecution, apply_device_intent, encode_snmp
 from nso_adapter.nso.client import DEVICE_INTENT_ROOT
@@ -27,6 +26,7 @@ from tests._secret_discipline import (
     assert_text_omits,
 )
 from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
+from tests.core.execution_helpers import run_apply
 from tests.core.test_static_route_put import seed_apply_job
 from tests.nso.test_apply_send import _client_with
 
@@ -94,7 +94,6 @@ def test_collateral_refusal_exceptions_do_not_echo_live_orphan_keys():
 
 def _assert_safe(exc, job, row_error, logs, secrets):
     assert job.status == JobStatus.failed
-    assert row_error is not None
     assert logs.records
     surfaces = [
         str(exc),
@@ -224,13 +223,11 @@ async def test_unexpected_commit_exception_keeps_secret_out_of_logs_and_errors(a
 
     for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error)):
         assert_text_free_of(surface, [_SECRET])
-    assert stored.last_apply_error["code"] == "internal"
-    assert stored.last_apply_error["message"] == "apply error (internal); see the server log"
+    assert stored.last_apply_error is None
+    assert job.result["snmp_count_by_outcome"]["unavailable"] == 1
     internal = next(record for record in logs if record["event"] == "apply.commit_internal_error")
-    failed = next(record for record in logs if record["event"] == "apply.atomic_failed")
     assert internal["device_id"] == device_id
-    assert failed["device_id"] == device_id
-    assert_records_free_of([internal, failed], [_SECRET, _DEVICE])
+    assert_records_free_of([internal], [_SECRET, _DEVICE])
 
 
 async def test_typed_commit_failure_keeps_its_message_out_of_logs_and_errors(
@@ -249,11 +246,8 @@ async def test_typed_commit_failure_keeps_its_message_out_of_logs_and_errors(
 
     for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error), _log_surface(recorded_logs)):
         assert_text_free_of(surface, [_SECRET])
-    assert stored.last_apply_error == {
-        "code": "nso_error",
-        "message": "apply error (nso_error); see the server log",
-        "detail": {"stage": "commit"},
-    }
+    assert stored.last_apply_error is None
+    assert job.error["code"] == "nso_error"
 
 
 async def test_projection_refusal_keeps_malformed_value_out_of_logs_and_errors(adapter_client, recorded_logs):
@@ -301,47 +295,29 @@ async def test_a_non_reference_secret_never_reaches_the_projection_refusal_chain
 
 
 async def test_malformed_snmp_reference_keeps_no_reference_in_exception_or_row(adapter_client, recorded_logs):
-    from nso_adapter.core.apply import (
-        _NO_INTERFACE,
-        _ApplyPlan,
-        _finalize_unsent,
-        _SectionApply,
-        build_device_containers,
-    )
+    from nso_adapter.core.apply import build_device_containers
     from nso_adapter.store.models import Device
     from tests.core.projection_helpers import freeze_snapshot
 
     device_id, row = await _community()
-    job_id = await seed_apply_job(device_id)
     bad_ref = "placeholder-mount/placeholder path#placeholder-key"
-    requests = []
-
-    def respond(request):
-        requests.append(request)
-        return httpx.Response(404)
-
-    client = _client_with(httpx.MockTransport(respond))
+    client = _client_with(httpx.MockTransport(lambda request: httpx.Response(404)))
     async with session() as db:
         document = {"snmp": await freeze_snapshot(db, device_id, "snmp")}
         document["snmp"]["snmp_community_intent"][0]["vault_ref"] = bad_ref
-        device = await db.get(Device, device_id)
-        body = await build_device_containers(client, device, document)
-        exc = body.errors["snmp"]
+        body = await build_device_containers(client, await db.get(Device, device_id), document)
         stored = await db.get(SnmpCommunityIntent, row.id)
-        section = _SectionApply({}, [stored], [stored], {}, None)
-        plan = _ApplyPlan(device_id, document, {"snmp": section}, _NO_INTERFACE, None, {}, True)
-        await _finalize_unsent(db, plan, body.errors, job_id=job_id, reg=None)
-    async with session() as db:
-        job = await db.get(Job, job_id)
-        stored = await db.get(SnmpCommunityIntent, row.id)
-        _assert_safe(
-            exc,
-            job,
-            stored.last_apply_error,
-            recorded_logs,
-            [bad_ref, "placeholder-mount", "placeholder path", "placeholder-key"],
-        )
-    assert not requests
+        assert stored.last_apply_at is None and stored.last_apply_error is None
+    exc = body.errors["snmp"]
+    assert_chain_free_of(exc, [bad_ref, "placeholder-mount", "placeholder path", "placeholder-key"])
+    assert_text_free_of(_log_surface(recorded_logs), [bad_ref])
+    response = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/snmp-intent",
+        json={"communities": [{"label": "ro", "vault_ref": bad_ref}]},
+        headers={"Authorization": f"Bearer {VALID_TOKEN}"} | push_seq(),
+    )
+    assert_text_free_of(response.text, [bad_ref])
+    assert response.status_code == 422
 
 
 # ── the collateral guard: a refusal names the orphans, never the device delta ──
@@ -374,22 +350,24 @@ async def test_a_blocked_apply_keeps_the_device_delta_out_of_the_job_and_row_err
     for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error), _log_surface(recorded_logs)):
         assert_text_free_of(surface, [_SECRET])
     assert job.status == JobStatus.failed
-    assert stored.last_apply_error["code"] == "removal_blocked_collateral"
-    assert stored.last_apply_error["detail"]["orphans"] == {"snmp/community": [["legacy"]]}
+    assert stored.last_apply_error is None
+    assert job.error["code"] == "removal_blocked_collateral"
+    assert job.error["detail"]["orphans"] == {"snmp/community": [["legacy"]]}
 
 
 async def test_a_blocked_removal_keeps_the_device_delta_out_of_the_job_error(adapter_client, recorded_logs):
     """The removal worker persists the same orphan identifiers, and no native delta."""
     from unittest.mock import patch
 
-    from nso_adapter.core import removal as removal_mod
     from tests.core.test_removal import _seed_removal_job
 
     device_id, _row = await _community()
     job_id = await _seed_removal_job(device_id, scope="snmp")
     client = _blocked_client(f"snmp-server community {_SECRET} RO\n")
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
-        await removal_mod.run_removal(job_id, device_id)
+        from tests.core.execution_helpers import run_removal
+
+        await run_removal(job_id, device_id)
     async with session() as db:
         job = await db.get(Job, job_id)
     assert_text_free_of(json.dumps(job.error), [_SECRET])
@@ -537,7 +515,9 @@ async def test_a_failed_residue_read_keeps_the_server_reason_out_of_the_log_and_
     job_id = await _seed_removal_job(device_id, scope="snmp", context_extra=removed)
     client = _residue_error_client()
     with capture_logs() as logs, patch("nso_adapter.core.importer.get_nso_client", return_value=client):
-        await removal_mod.run_removal(job_id, device_id)
+        from tests.core.execution_helpers import run_removal
+
+        await run_removal(job_id, device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)

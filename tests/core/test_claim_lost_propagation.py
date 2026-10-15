@@ -44,11 +44,10 @@ _ROOT = pathlib.Path(__file__).resolve().parents[2] / "nso_adapter"
 # their stamping now runs unwrapped, where an exception reaches ``run_apply`` and is re-raised
 # there instead of being swallowed.
 INVENTORY = [
-    ("core/apply.py", "_run_document_apply", "_rollback_and_revert_deploying"),
     ("core/apply.py", "_static_route_device_state", "static_route.device_state_read_failed"),
     ("core/apply.py", "_post_apply_refresh_and_notify", "apply.post_refresh_failed"),
     ("core/apply.py", "run_apply", "apply.unexpected_error"),
-    ("core/apply.py", "_record_rp_capability", "apply.capability_record_skipped"),
+    ("core/apply.py", "_record_ordinary_capability", "apply.capability_record_failed"),
     ("core/removal.py", "run_removal", "removal.failed"),
     ("core/removal.py", "run_removal", "removal.followup_sync_enqueue_failed"),
     ("core/jobs.py", "_run_with_db", "job.failed"),

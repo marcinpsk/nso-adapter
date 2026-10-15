@@ -126,7 +126,7 @@ def _claimed_records(decoded: object) -> tuple[Refusal, ...] | None:
     return records
 
 
-def classify_error(status: int | None, body: bytes | str | None) -> ErrorClassification:
+def classify_error(status: int | None, body: bytes | str | None) -> ErrorClassification | None:
     """Classify claims before HTTP errors, without retaining external text.
 
     Successful responses stay with the native and CLI decoders. Transport failures
@@ -152,4 +152,7 @@ def classify_error(status: int | None, body: bytes | str | None) -> ErrorClassif
         return Unavailable()
     if 400 <= status < 500:
         return OrdinaryRejection()
-    raise ValueError("classify_error requires an HTTP error status")
+    if 200 <= status < 300:
+        return None
+    # A 1xx or 3xx (for example a proxy redirect) proves no delivery outcome.
+    return Unavailable()

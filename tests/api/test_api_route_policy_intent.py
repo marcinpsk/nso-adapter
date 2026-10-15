@@ -241,7 +241,6 @@ async def test_put_route_policy_intent_creates_objects(adapter_client):
 
 @pytest.mark.anyio
 async def test_put_route_policy_intent_auto_apply_creates_generation(adapter_client):
-    from nso_adapter.core.apply import run_apply
     from nso_adapter.store.models import (
         DeploymentGeneration,
         DeviceSettings,
@@ -250,6 +249,7 @@ async def test_put_route_policy_intent_auto_apply_creates_generation(adapter_cli
         JobStatus,
         JobType,
     )
+    from tests.core.execution_helpers import run_apply
 
     device_id = await seed_device(nso_device_name="rp-auto-apply", netbox_device_id=7965)
     async with session() as db:

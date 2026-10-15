@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
-"""Inert execution evidence helpers in a caller-owned transaction.
+"""Execution evidence helpers in a caller-owned transaction.
 
 The caller commits preparation before sending. It commits response checkpoints before
 settlement. The terminal writer owns outcomes, restoration, stamps, and lifecycle writes.
@@ -18,6 +18,7 @@ from nso_adapter.nso.refusal_protocol import Refusal
 from nso_adapter.nso.refusals import DefiniteRefusal, ErrorClassification, OrdinaryRejection, ProtocolFault, Unavailable
 from nso_adapter.store.execution_bookkeeping import restore_bookkeeping, snapshot_bookkeeping, stamp_refused_bookkeeping
 from nso_adapter.store.execution_evidence import (
+    attributed_catalog_records,
     catalog_records,
     logical_from_record,
     logical_record,
@@ -249,6 +250,8 @@ async def record_classified_response(
         checkpoint = {"kind": "unavailable"}
     elif isinstance(classification, OrdinaryRejection):
         checkpoint = {"kind": "rejected"}
+    elif classification is None and sender_phase == "post_commit_verification":
+        checkpoint = {"kind": "verified"}
     elif classification is None and sender_phase == "commit" and commit_acknowledged:
         checkpoint = {"kind": "acknowledged"}
     else:
@@ -382,9 +385,18 @@ def _disposition_evidence(attempt: ApplyExecutionAttempt) -> tuple[str, dict, li
         for site in attributed:
             for logical in site.logical_rows:
                 causes.setdefault(_identity(logical.public_record()), []).extend(catalog_records((site.refusal,)))
-        return "refused", causes, catalog_records(records)
+        document_records = attributed_catalog_records(attributed, origins_from_records(attempt.safe_origins), phase)
+        return "refused", causes, document_records
     if attempt.commit_acknowledged:
-        return "post_commit_unavailable", {}, []
+        verification = attempt.response_classification.get("post_commit_verification", {})
+        verification_records: list[dict] = []
+        if verification.get("kind") == "refused":
+            origins = origins_from_records(attempt.safe_origins)
+            attributed = resolve_refusals(refusals_from_payload(verification["refusals"]), origins)
+            if isinstance(attributed, AttributionFailure):
+                return "attribution_failed", {}, []
+            verification_records = attributed_catalog_records(attributed, origins, "post_commit_verification")
+        return "post_commit_unavailable", {}, verification_records
     if checkpoint.get("kind") == "rejected":
         return "rejected", {}, []
     return "unavailable", {}, []
@@ -392,7 +404,11 @@ def _disposition_evidence(attempt: ApplyExecutionAttempt) -> tuple[str, dict, li
 
 def _carrier_results(attempt: ApplyExecutionAttempt, outcomes: list[RowOutcome]) -> tuple[list, dict]:
     carriers: list[dict] = []
-    counts: dict[str, dict[str, int]] = {}
+    counts: dict[str, dict[str, int]] = {
+        f"{key}_count_by_outcome": {"in_sync": 0, "apply_failed": 0, "not_applied": 0, "unavailable": 0}
+        for section in section_registry().values()
+        for key in section.result_keys
+    }
     priority = {"in_sync": 0, "not_applied": 1, "unavailable": 2, "refused": 3}
     for carrier in attempt.attempted_carriers:
         public = {key: value for key, value in carrier.items() if key not in {"source_table", "content_identity"}}
@@ -409,12 +425,59 @@ def _carrier_results(attempt: ApplyExecutionAttempt, outcomes: list[RowOutcome])
     return carriers, counts
 
 
+async def _route_outcome_evidence(
+    db: AsyncSession, attempt: ApplyExecutionAttempt, outcomes: list[RowOutcome], error: dict | None = None
+) -> list[dict]:
+    from nso_adapter.core.apply import static_route_fingerprint
+    from nso_adapter.core.projection import hydrate_section
+    from nso_adapter.core.static_route_plan import triple_of
+    from nso_adapter.store.models import StaticRouteIntent
+
+    generation = await db.get(DeploymentGeneration, attempt.generation_id)
+    if generation is None:
+        raise ValueError("Route evidence requires its frozen generation")
+    rows = (
+        hydrate_section(generation.document, "static_route").get(StaticRouteIntent, [])
+        if "static_route" in generation.document
+        else []
+    )
+    by_id = {
+        source["frozen_row_identity"][0]: outcome
+        for outcome in outcomes
+        for source in outcome.source_identity
+        if source["source_table"] == StaticRouteIntent.__tablename__
+    }
+    return [
+        {
+            "route_id": row.route_id,
+            "row_id": row.id,
+            "key": list(triple_of(row)),
+            "fingerprint": static_route_fingerprint(row),
+            "generation": row.intent_generation,
+            "outcome": "apply_failed" if by_id[row.id].disposition in {"refused", "not_applied"} else "unproven",
+            "error": {
+                "code": "refused",
+                "message": "The device refused this route",
+                "detail": {"refusals": by_id[row.id].refusals},
+            }
+            if by_id[row.id].disposition == "refused"
+            else error
+            if by_id[row.id].disposition == "not_applied"
+            else None,
+        }
+        for row in rows
+        if row.id in by_id
+    ]
+
+
 async def dispose_execution_attempt(
     db: AsyncSession,
     job_id: int,
     run_attempt: int,
     claim_token: str | None,
     exit_reason: ExitReason,
+    *,
+    terminal_error: dict | None = None,
 ) -> Literal["no_attempt", "terminal", "settled"]:
     """Stage one terminal transaction. Caller commits once, then disposes ownership.
 
@@ -481,6 +544,14 @@ async def dispose_execution_attempt(
         "settlement_owners": carriers,
         "commit_acknowledged": attempt.commit_acknowledged,
     }
+    job_error = (
+        {"code": "attribution_failed", "message": "Refusal attribution failed", "detail": {}}
+        if kind == "attribution_failed"
+        else terminal_error or {"code": kind, "message": _EXIT_MESSAGES[exit_reason], "detail": {}}
+    )
+    routes = await _route_outcome_evidence(db, attempt, outcomes, job_error)
+    if routes:
+        result["static_route_results"] = routes
     from nso_adapter.core.claim import terminalize
 
     write = await terminalize(
@@ -490,7 +561,7 @@ async def dispose_execution_attempt(
         expect=JobStatus.running,
         run_attempt=run_attempt,
         result=result,
-        error={"code": kind, "message": _EXIT_MESSAGES[exit_reason], "detail": {}},
+        error=job_error,
         generation_outcome=GenerationStatus.failed
         if kind in {"refused", "rejected"}
         else GenerationStatus.outcome_unknown,
@@ -500,3 +571,40 @@ async def dispose_execution_attempt(
     attempt.phase = "terminal"
     await db.flush()
     return "settled"
+
+
+async def complete_execution_result(
+    db: AsyncSession, job_id: int, run_attempt: int, token: str, dispositions: dict, now
+) -> dict:
+    """Stage certified outcomes and carrier bookkeeping in the terminal transaction."""
+    from nso_adapter.store.execution_bookkeeping import stamp_certified_bookkeeping
+
+    attempt_id = await db.scalar(
+        select(ApplyExecutionAttempt.id).where(
+            ApplyExecutionAttempt.job_id == job_id, ApplyExecutionAttempt.run_attempt == run_attempt
+        )
+    )
+    if attempt_id is None:
+        raise ValueError("Terminal execution requires its prepared attempt")
+    attempt = await _owned_attempt(db, attempt_id, job_id, run_attempt, token)
+    outcomes = []
+    for frozen in attempt.logical_membership:
+        logical = logical_from_record(frozen)
+        disposition = dispositions.get(_identity(frozen), "unavailable")
+        if disposition not in {"in_sync", "not_applied", "unavailable"}:
+            raise ValueError("Completion requires a certified logical disposition")
+        outcomes.append(await _stage_outcome(db, attempt, logical, disposition, ()))
+    await _restore_attempt_bookkeeping(db, attempt)
+    await stamp_certified_bookkeeping(db, attempt.device_id, attempt.prior_bookkeeping, dispositions, now)
+    carriers, counts = _carrier_results(attempt, outcomes)
+    attempt.phase = "terminal"
+    await db.flush()
+    return {
+        **counts,
+        "row_outcomes": [
+            {**outcome.logical_identity, "disposition": outcome.disposition, "refusals": []} for outcome in outcomes
+        ],
+        "refusals": [],
+        "settlement_owners": carriers,
+        "commit_acknowledged": attempt.commit_acknowledged,
+    }
