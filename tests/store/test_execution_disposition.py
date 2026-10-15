@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from nso_adapter.core.apply import encode_device_document, overlay_retained_routes
 from nso_adapter.core.projection import _row_dict
 from nso_adapter.core.static_route_reader import certified_static_route_section
-from nso_adapter.nso.apply import NsoApplyError, apply_device_intent
+from nso_adapter.nso.apply import apply_device_intent
 from nso_adapter.nso.origins import (
     AttributionFailure,
     EncodedSection,
@@ -182,8 +182,6 @@ async def test_acknowledged_history_survives_closed_send_gate(db_session, monkey
     assert "origin_history" not in attempt.response_classification
     certified = await certified_static_route_section(client, device)
     monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "0")
-    with pytest.raises(NsoApplyError, match="NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE"):
-        encode_device_document(gen.document)
     await record_acknowledged_origins(db_session, attempt.id, job.id, 1, token, certified)
     await db_session.commit()
     await db_session.refresh(attempt)
@@ -226,6 +224,63 @@ async def test_retained_route_without_history_is_not_guessed(db_session):
     assert isinstance(result, AttributionFailure) and result.reason == "missing_baseline_provenance"
     assert retained.body["route"] == certified.routes
     assert not transport.recorder.commits
+
+
+async def test_retained_route_does_not_use_history_before_latest_acknowledgement(db_session):
+    device, job, gen, token, encoded, logical, older, client, transport = await _route_baseline(db_session)
+    assert older.commit_acknowledged and older.response_classification["origin_history"]
+    await dispose_execution_attempt(db_session, job.id, 1, token, "disposed")
+    await db_session.commit()
+    newer_job = Job(
+        device_id=device.id, job_type=JobType.apply, status=JobStatus.running, run_attempt=1, coalescible=False
+    )
+    db_session.add(newer_job)
+    await db_session.flush()
+    newer_gen = DeploymentGeneration(
+        device_id=device.id,
+        job_id=newer_job.id,
+        seq=gen.seq + 1,
+        mode=gen.mode,
+        status=GenerationStatus.running,
+        digest=gen.digest,
+        stream_revisions=gen.stream_revisions,
+        source_push_seq=gen.source_push_seq,
+        document=gen.document,
+    )
+    db_session.add(newer_gen)
+    claim = await db_session.get(DeviceClaim, device.id)
+    claim.job_id = newer_job.id
+    await db_session.flush()
+    newer_encoded = encode_device_document(newer_gen.document, origin_context=OriginContext.from_generation(newer_gen))
+    newer_logical = next(
+        binding.logical_rows[0]
+        for key, binding in newer_encoded.origins.bindings.items()
+        if key.row.subject == "static-route.route"
+    )
+    newer = await prepare_execution_attempt(
+        db_session,
+        newer_job.id,
+        1,
+        token,
+        newer_gen.id,
+        origins=newer_encoded.origins,
+        logical_rows=(newer_logical,),
+    )
+    await apply_device_intent(client, device.nso_device_name, newer_encoded.body, device_id=device.id)
+    await record_classified_response(
+        db_session, newer.id, newer_job.id, 1, token, None, sender_phase="commit", commit_acknowledged=True
+    )
+    await db_session.commit()
+    assert newer.id > older.id and newer.commit_acknowledged
+    assert "origin_history" not in newer.response_classification
+    certified = await certified_static_route_section(client, device)
+    retained = EncodedSection({"route": []}, OriginIndex())
+    overlay_retained_routes(retained, certified.routes)
+    await bind_historical_origins(db_session, device.id, retained.origins, newer_gen)
+    result = resolve_refusals((refusal("static-route", logical.row, "write-blocked"),), retained.origins)
+    assert isinstance(result, AttributionFailure) and result.reason == "missing_baseline_provenance"
+    assert retained.body["route"] == certified.routes
+    assert len(transport.recorder.commits) == 2
 
 
 async def test_changed_retained_entry_is_not_misattributed(db_session):
@@ -447,7 +502,9 @@ async def test_disposition_keeps_post_commit_evidence(db_session, verification):
     outcomes = list(await db_session.scalars(sa.select(RowOutcome)))
     assert [outcome.disposition for outcome in outcomes] == ["unavailable"]
     assert attempt.commit_acknowledged and job.result["commit_acknowledged"]
-    assert job.result["refusals"] == [] and job.error["code"] == "post_commit_unavailable"
+    assert bool(job.result["refusals"]) == bool(verification)
+    assert job.error["code"] == "post_commit_unavailable"
+    assert all(record["sender_phase"] == "post_commit_verification" for record in job.result["refusals"])
     assert generation.status == GenerationStatus.outcome_unknown
 
 
@@ -838,7 +895,10 @@ async def test_disposition_requires_complete_attribution(db_session, attribution
         ["unavailable", "unavailable"] if attribution_fault else ["refused", "not_applied"]
     )
     assert rows[1].last_apply_error == {"code": "prior BGP"} and rows[1].last_apply_at == APPLIED
-    assert job.result["refusals"] == ([] if attribution_fault else outcomes[0].refusals)
+    assert [
+        {key: value for key, value in record.items() if key not in {"logical_rows", "provenance", "sender_phase"}}
+        for record in job.result["refusals"]
+    ] == ([] if attribution_fault else outcomes[0].refusals)
     assert rows[0].last_apply_error["code"] == ("prior" if attribution_fault else "refused")
     assert all(generation.carrier_job_result == job.result for generation in generations)
 
@@ -937,6 +997,25 @@ async def test_disposition_rollback_preserves_recoverable_attempt(db_session):
     assert await db_session.scalar(sa.select(DeviceClaim.claim_token)) == token
     assert await dispose_execution_attempt(db_session, job.id, 1, token, "timeout") == "settled"
     await db_session.commit()
+
+
+@pytest.mark.parametrize("exit_reason", ["cancelled", "timeout", "claim_expired", "orphaned", "disposed"])
+async def test_disposed_not_applied_route_carries_the_job_error(db_session, exit_reason):
+    from nso_adapter.nso.refusals import OrdinaryRejection
+
+    device, job, gen, token, encoded, logical, attempt, client, transport = await _route_baseline(
+        db_session, acknowledge=False
+    )
+    await record_classified_response(
+        db_session, attempt.id, job.id, 1, token, OrdinaryRejection(), sender_phase="commit"
+    )
+    await db_session.commit()
+    assert await dispose_execution_attempt(db_session, job.id, 1, token, exit_reason) == "settled"
+    await db_session.commit()
+    await db_session.refresh(job)
+    [route] = job.result["static_route_results"]
+    assert route["outcome"] == "apply_failed"
+    assert route["error"] == job.error and job.error["code"] == "rejected", "an apply_failed route needs its error"
 
 
 async def test_acknowledged_origin_history_survives_job_pruning(db_session):

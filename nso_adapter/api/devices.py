@@ -24,6 +24,7 @@ from nso_adapter.api.errors import (
     RESP_500_INTERNAL,
     api_error,
 )
+from nso_adapter.api.execution import AttributedRefusalOut, RowOutcomeOut, evidence_projection
 from nso_adapter.api.pagination import DEFAULT_PAGE, LIMIT_MAX, LIMIT_MIN, validate_page_limit
 from nso_adapter.api.timestamps import iso_z
 from nso_adapter.domain.diagnostics import DEVICE_REF_PATTERN, device_ref
@@ -261,6 +262,8 @@ class DeploymentEvidenceGenerationOut(BaseModel):
     carrier_job_id: int | None
     carrier_job_status: str | None
     carrier_job_result: dict | None
+    row_outcomes: list[RowOutcomeOut] | None
+    refusals: list[AttributedRefusalOut] | None
     carrier_job_error: dict | None
     updated_at: str
 
@@ -285,6 +288,8 @@ class DeploymentEvidenceHeadOut(BaseModel):
     carrier_job_id: int | None
     carrier_job_status: str | None
     carrier_job_result: dict | None
+    row_outcomes: list[RowOutcomeOut] | None
+    refusals: list[AttributedRefusalOut] | None
     carrier_job_error: dict | None
     created_at: str
     updated_at: str
@@ -384,6 +389,7 @@ def _attempt_generation_out(generation: DeploymentGeneration) -> dict:
         "carrier_job_id": generation.carrier_job_id,
         "carrier_job_status": generation.carrier_job_status,
         "carrier_job_result": generation.carrier_job_result,
+        **evidence_projection(generation.carrier_job_result),
         "carrier_job_error": generation.carrier_job_error,
         "updated_at": iso_z(generation.updated_at),
     }

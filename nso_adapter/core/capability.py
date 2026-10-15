@@ -148,7 +148,6 @@ async def record_capability_rejection(
     if not ned_id:
         return
     await _upsert(db, ned_id, sw_version, scope, name, "unsupported", str(detail)[:256], "apply")
-    await db.commit()
 
 
 async def clear_capability_rejections(db: AsyncSession, ned_id: str, sw_version: str, scopes) -> int:

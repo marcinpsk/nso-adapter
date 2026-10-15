@@ -17,9 +17,8 @@ from __future__ import annotations
 
 import json
 import os
-import re
-from collections.abc import Mapping
-from typing import Any, NamedTuple, cast
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any, Literal, NamedTuple, cast
 
 import structlog
 
@@ -38,6 +37,14 @@ from nso_adapter.nso.origins import (
     UnsupportedOrigin,
 )
 from nso_adapter.nso.refusal_protocol import SUBJECTS, row_ref
+from nso_adapter.nso.refusals import (
+    DefiniteRefusal,
+    ErrorClassification,
+    OrdinaryRejection,
+    ProtocolFault,
+    Unavailable,
+    classify_error,
+)
 from nso_adapter.nso.shape import require_vlan_id
 from nso_adapter.secrets.refs import VaultRefError, parse_vault_ref
 
@@ -103,14 +110,30 @@ def _commit_url(url: str, *, dry_run: bool | str = False, no_networking: bool = 
     return f"{url}{sep}{'&'.join(params)}"
 
 
+SenderPhase = Literal["pre_commit_dry_run", "commit", "post_commit_verification"]
+ResponseCheckpoint = Callable[[SenderPhase, ErrorClassification | None, bool], Awaitable[None]]
+
+
 class NsoApplyError(Exception):
     """Raised when a NSO commit fails for a specific attribute."""
 
-    def __init__(self, code: str, message: str, detail: dict | None = None):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        detail: dict | None = None,
+        *,
+        classification: ErrorClassification | None = None,
+        sender_phase: SenderPhase = "commit",
+        commit_acknowledged: bool = False,
+    ):
         super().__init__(message)
         self.code = code
         self.message = message
         self.detail = detail or {}
+        self.classification = classification
+        self.sender_phase = sender_phase
+        self.commit_acknowledged = commit_acknowledged
 
 
 def _device_delta_from_dry_run(body: object, device_name: str, *, device_id: int) -> str | None:
@@ -175,6 +198,28 @@ def _cli_delta_from_dry_run(body: object) -> str | None:
     return node.get("data") or ""
 
 
+def _classified_apply_error(
+    classification: ErrorClassification, phase: SenderPhase, *, detail: dict | None = None
+) -> NsoApplyError:
+    if isinstance(classification, DefiniteRefusal):
+        code, message = "refused", "NSO refused the device document"
+    elif isinstance(classification, ProtocolFault):
+        code, message = "refusal_protocol_fault", ProtocolFault.message
+    elif isinstance(classification, Unavailable):
+        code, message = "nso_unavailable", "NSO delivery outcome is unavailable"
+    else:
+        code = "dry_run_rejected" if phase != "commit" else "nso_put_failed"
+        message = "NSO rejected the device document"
+    return NsoApplyError(
+        code,
+        message,
+        detail,
+        classification=classification,
+        sender_phase=phase,
+        commit_acknowledged=phase == "post_commit_verification",
+    )
+
+
 async def native_dry_run(
     client: NsoClient,
     url: str,
@@ -186,60 +231,55 @@ async def native_dry_run(
     strict: bool = False,
     outformat: str = "native",
     no_networking: bool = False,
+    sender_phase: SenderPhase = "pre_commit_dry_run",
+    checkpoint: ResponseCheckpoint | None = None,
 ) -> str | None:
-    """Issue *payload* to *url* as a dry-run and return the delta (no commit).
-
-    ``outformat="native"`` (default): the device-native southbound delta (CLI lines for
-    cli NEDs, edit-config XML for netconf NEDs). ``outformat="cli"``: NSO's NED-uniform
-    ``+``/``-`` config-tree diff — the apply-preview "diff -u" rendering.
-
-    No commit happens — NSO computes the native device config the intent *would* push and
-    returns it. The returned string is the device-native delta (``""`` = no change), or
-    ``None`` when the dry-run was inconclusive (non-2xx / transport / unparseable / wrong
-    shape). Same machinery as the post-apply verify guard, surfaced for the pre-apply preview.
-
-    ``strict=True`` (the post-apply verify path): a CONCLUSIVE ``4xx`` rejection raises
-    :class:`NsoApplyError` (carrying the RESTCONF error body) rather than being swallowed as
-    an inconclusive ``None`` — a 4xx means NSO/the device would reject the intent, i.e. the
-    apply did NOT land. Transport errors and ``5xx`` stay inconclusive (never block) either way.
-    """
+    """Decode a dry-run after claim-first classification, for both strict settings."""
     dry_url = _commit_url(url, dry_run="cli" if outformat == "cli" else True, no_networking=no_networking)
+    response = None
+    exception_type = None
     try:
         async with client._client(timeout=client._action_timeout) as c:
-            resp = await getattr(c, method)(
-                dry_url,
-                content=payload,
-                headers={"Content-Type": "application/yang-data+json"},
+            response = await getattr(c, method)(
+                dry_url, content=payload, headers={"Content-Type": "application/yang-data+json"}
             )
-    except Exception:  # network/transport — inconclusive, never block
-        return None
-    if resp.status_code not in (200, 201, 204):
-        # Surface the device error rather than silently discarding it as "inconclusive".
-        try:
-            err = resp.json()
-        except ValueError:
-            err = {"raw": "[redacted]"}
-        err = _sanitized_nso_error(err)
+    except Exception as exc:
+        response = None
+        exception_type = type(exc).__name__
+    classification = None
+    if response is None:
+        classification = classify_error(None, None)
+    else:
+        classification = classify_error(response.status_code, response.content)
+    if classification is not None:
         logger.warning(
             "nso.apply.dry_run_non_2xx",
             **device_fields(device_id=device_id),
-            status=resp.status_code,
-            body=err,
+            status=response.status_code if response is not None else None,
+            exception_type=exception_type,
         )
-        if strict and 400 <= resp.status_code < 500:
-            raise NsoApplyError(
-                "dry_run_rejected",
-                "NSO rejected the dry-run request",
-                detail={"nso_error": err},
-            )
+        if checkpoint is not None:
+            await checkpoint(sender_phase, classification, False)
+        if isinstance(classification, (DefiniteRefusal, ProtocolFault)) or (
+            strict and isinstance(classification, OrdinaryRejection)
+        ):
+            detail = _ordinary_error_detail(response) if isinstance(classification, OrdinaryRejection) else None
+            error = _classified_apply_error(classification, sender_phase, detail=detail)
+            raise error
         return None
+    body = None
     try:
-        body = resp.json()
-    except Exception:  # unparseable body — inconclusive
-        return None
-    if outformat == "cli":
-        return _cli_delta_from_dry_run(body)
-    return _device_delta_from_dry_run(body, device_name, device_id=device_id)
+        body = response.json() if response is not None else None
+    except ValueError:
+        pass
+    delta = (
+        _cli_delta_from_dry_run(body)
+        if outformat == "cli"
+        else _device_delta_from_dry_run(body, device_name, device_id=device_id)
+    )
+    if delta is None and checkpoint is not None:
+        await checkpoint(sender_phase, Unavailable(), False)
+    return delta
 
 
 async def _verify_native_or_raise(
@@ -250,6 +290,7 @@ async def _verify_native_or_raise(
     *,
     device_id: int,
     scope: str,
+    checkpoint: ResponseCheckpoint | None = None,
     method: str = "patch",
     no_networking: bool = False,
 ) -> str:
@@ -260,9 +301,8 @@ async def _verify_native_or_raise(
     dry-run uses the same *method* as the apply (PUT for a replace, so a still-present
     removed entry is also caught).
 
-    Fail-safe: transport errors, non-2xx, unparseable bodies or unexpected shapes
-    are logged and treated as inconclusive (no raise) so verification never blocks
-    an otherwise-successful apply. Compares against NSO's CDB, so out-of-band
+    Unavailable responses leave verification inconclusive. Claimed refusals and
+    protocol faults raise with an acknowledged commit and preserve that phase. Compares against NSO's CDB, so out-of-band
     device drift (CDB vs physical) is out of scope here — that needs sync-from.
 
     Returns the verdict (:data:`VERIFY_CONCLUSIVE` / :data:`VERIFY_INCONCLUSIVE` /
@@ -271,6 +311,8 @@ async def _verify_native_or_raise(
     for the bookkeeping that follows it (R2 §4.4).
     """
     if not VERIFY_AFTER_APPLY:
+        if checkpoint is not None:
+            await checkpoint("post_commit_verification", Unavailable(), False)
         return VERIFY_DISABLED
 
     # strict=True: a conclusive 4xx on the re-dry-run raises (the apply did not land),
@@ -285,6 +327,8 @@ async def _verify_native_or_raise(
         method=method,
         strict=True,
         no_networking=no_networking,
+        sender_phase="post_commit_verification",
+        checkpoint=checkpoint,
     )
     if delta is None:
         logger.warning(
@@ -294,13 +338,20 @@ async def _verify_native_or_raise(
         )
         return VERIFY_INCONCLUSIVE
     if delta.strip():
+        if checkpoint is not None:
+            await checkpoint("post_commit_verification", Unavailable(), False)
         delta = "[redacted]"
         logger.error("nso.apply.verify_mismatch", scope=scope, **device_fields(device_id=device_id), delta=delta)
         raise NsoApplyError(
             "verify_mismatch",
             f"{scope}: applied intent did not land; NSO would still push changes to the device",
             detail={"device_delta": delta},
+            classification=Unavailable(),
+            sender_phase="post_commit_verification",
+            commit_acknowledged=True,
         )
+    if checkpoint is not None:
+        await checkpoint("post_commit_verification", None, False)
     logger.info("nso.apply.verify_ok", scope=scope, **device_fields(device_id=device_id))
     return VERIFY_CONCLUSIVE
 
@@ -315,25 +366,12 @@ def device_intent_instance(device_name: str, containers: Mapping[str, dict]) -> 
 
 
 def _diagnostic_message(value: object) -> str:
-    """Keep only a recognized refusal family and construct from opaque server text.
-
-    The construct is the reason redaction cannot be total: a device parser rejects an
-    unsupported route-policy or interface construct only on a real commit, so this message is
-    the single source of the capability verdict. Both kept parts are rebuilt from the
-    registry and the capability allowlist, never sliced out of the server's own text.
-    """
+    """Keep only allowlisted ordinary device-parser constructs."""
     from nso_adapter.core.capability import allowlisted_rejection_fragment
-    from nso_adapter.core.projection import section_registry
 
     if not isinstance(value, str):
         return "[redacted]"
-    kept = "[redacted]"
-    match = re.search(r"device-intent:\s*refused\s*\[\s*family=([A-Za-z0-9._-]+)(?=\s|\])", value)
-    if match and match.group(1) in {entry.container for entry in section_registry().values()}:
-        kept = f"device-intent: refused [family={match.group(1)}]: [redacted]"
-    fragment = allowlisted_rejection_fragment(value)
-    # Last, and never followed by anything: parse_rejected_construct captures to end of line.
-    return f"{kept}; {fragment}" if fragment else kept
+    return allowlisted_rejection_fragment(value) or "[redacted]"
 
 
 def _sanitized_nso_error(value: object) -> object:
@@ -353,6 +391,15 @@ def _sanitized_nso_error(value: object) -> object:
     return _diagnostic_message(value)
 
 
+def _ordinary_error_detail(response) -> dict:
+    body = None
+    try:
+        body = response.json() if response is not None else None
+    except ValueError:
+        pass
+    return {"nso_error": _sanitized_nso_error(body)}
+
+
 async def apply_device_intent(
     client: NsoClient,
     device_name: str,
@@ -362,30 +409,11 @@ async def apply_device_intent(
     dry_run: bool | str = False,
     no_networking: bool = False,
     strict: bool = False,
+    checkpoint: ResponseCheckpoint | None = None,
 ) -> str | None:
-    """PUT one device's whole ``device-intent`` instance — the ONE sender.
-
-    *containers* maps a YANG container name under ``list device-intent`` to its encoded
-    body. A PUT replaces the keyed instance, so the mapping is complete desired state and an
-    absent family is a retraction; merge-PATCH could never express that (it never drops) and
-    per-family PUTs would put N transactions and the ordering problem back.
-
-    One request is one NSO transaction is one device commit, so FASTMAP resolves every
-    cross-family dependency inside it (a subinterface unit and its address land together).
-
-    ``dry_run=True`` returns the native device delta the commit would push and commits
-    nothing; ``dry_run="cli"`` returns the NED-uniform tree diff instead. ``no_networking``
-    commits to CDB only — the detach path (#106), which drops service governance without
-    touching the device. ``strict`` (dry-run only) makes a conclusive 4xx rejection raise, so
-    failure localisation can tell a real rejection from a transient blip.
-
-    Returns the delta under ``dry_run``, else the R2 §4.4 proof verdict of the commit — ONE
-    verdict, shared by every family in the document. Raises :class:`NsoApplyError` on a
-    non-2xx commit.
-    """
+    """Send one document, preserving classification, phase, and commit acknowledgement."""
     payload = boundary_safe_dumps({DEVICE_INTENT_ROOT: [device_intent_instance(device_name, containers)]})
     url = f"{client._base}{DEVICE_INTENT_PATH}={_url_key(device_name)}"
-
     if dry_run:
         return await native_dry_run(
             client,
@@ -397,37 +425,39 @@ async def apply_device_intent(
             strict=strict,
             no_networking=no_networking,
             outformat="cli" if dry_run == "cli" else "native",
+            checkpoint=checkpoint,
         )
-
-    async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.put(
-            _commit_url(url, no_networking=no_networking),
-            content=payload,
-            headers={"Content-Type": "application/yang-data+json"},
+    response = None
+    exception_type = None
+    try:
+        async with client._client(timeout=client._action_timeout) as c:
+            response = await c.put(
+                _commit_url(url, no_networking=no_networking),
+                content=payload,
+                headers={"Content-Type": "application/yang-data+json"},
+            )
+    except Exception as exc:
+        response = None
+        exception_type = type(exc).__name__
+    classification = None
+    if response is None:
+        classification = classify_error(None, None)
+    else:
+        classification = classify_error(response.status_code, response.content)
+    if checkpoint is not None:
+        await checkpoint("commit", classification, classification is None)
+    if classification is not None:
+        detail = _ordinary_error_detail(response) if isinstance(classification, OrdinaryRejection) else None
+        logger.error(
+            "nso.apply.device_intent_failed",
+            **device_fields(device_id=device_id),
+            families=sorted(containers),
+            status=response.status_code if response is not None else None,
+            exception_type=exception_type,
         )
-        if resp.status_code not in (200, 201, 204):
-            try:
-                err = resp.json()
-            except ValueError:
-                err = {"raw": "[redacted]"}
-            err = _sanitized_nso_error(err)
-            logger.error(
-                "nso.apply.device_intent_failed",
-                **device_fields(device_id=device_id),
-                families=sorted(containers),
-                status=resp.status_code,
-                body=err,
-            )
-            raise NsoApplyError(
-                "nso_put_failed",
-                f"NSO device-intent PUT failed with status {resp.status_code}",
-                detail={"nso_error": err},
-            )
-    logger.info(
-        "nso.apply.device_intent_sent",
-        **device_fields(device_id=device_id),
-        families=sorted(containers),
-    )
+        error = _classified_apply_error(classification, "commit", detail=detail)
+        raise error
+    logger.info("nso.apply.device_intent_sent", **device_fields(device_id=device_id), families=sorted(containers))
     return await _verify_native_or_raise(
         client,
         url,
@@ -437,6 +467,7 @@ async def apply_device_intent(
         scope="device-intent",
         method="put",
         no_networking=no_networking,
+        checkpoint=checkpoint,
     )
 
 

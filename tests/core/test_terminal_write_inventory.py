@@ -226,7 +226,7 @@ async def _apply_job(device_id: int) -> int:
 
 async def _t11_apply_nothing_eligible() -> tuple[int, int]:
     """``core/apply.py`` ``_finalize_job``'s nothing-eligible early return."""
-    from nso_adapter.core.apply import run_apply
+    from tests.core.execution_helpers import run_apply
 
     device_id = await seed_device(nso_device_name="inv-t11", netbox_device_id=8311)
     job_id = await _apply_job(device_id)
@@ -241,9 +241,12 @@ async def _t11_apply_nothing_eligible() -> tuple[int, int]:
     finally:
         await release_claim(reg)
     job = await _job_row(job_id)
-    assert job.result["static_route_count_by_outcome"] == {"in_sync": 0, "apply_failed": 0}, (
-        "T11 no longer drives the nothing-eligible early return"
-    )
+    assert job.result["static_route_count_by_outcome"] == {
+        "in_sync": 0,
+        "apply_failed": 0,
+        "not_applied": 0,
+        "unavailable": 0,
+    }, "T11 no longer drives the nothing-eligible early return"
     return device_id, job_id
 
 
@@ -276,7 +279,7 @@ def _apply_client() -> AsyncMock:
 
 async def _t12_apply_all_ok() -> tuple[int, int]:
     """``core/apply.py`` ``_finalize_job``'s all-ok success — the writer carrying the route results."""
-    from nso_adapter.core.apply import run_apply
+    from tests.core.execution_helpers import run_apply
 
     device_id = await seed_device(nso_device_name="inv-t12", netbox_device_id=8312)
     job_id = await _apply_job(device_id)
@@ -293,14 +296,19 @@ async def _t12_apply_all_ok() -> tuple[int, int]:
     finally:
         await release_claim(reg)
     job = await _job_row(job_id)
-    assert job.result["static_route_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
+    assert job.result["static_route_count_by_outcome"] == {
+        "in_sync": 0,
+        "apply_failed": 0,
+        "not_applied": 0,
+        "unavailable": 1,
+    }
     return device_id, job_id
 
 
 async def _t13_apply_any_failed() -> tuple[int, int]:
     """``core/apply.py`` ``_finalize_job``'s any-failed branch."""
-    from nso_adapter.core.apply import run_apply
     from nso_adapter.nso.apply import NsoApplyError
+    from tests.core.execution_helpers import run_apply
 
     device_id = await seed_device(nso_device_name="inv-t13", netbox_device_id=8313)
     job_id = await _apply_job(device_id)
@@ -318,13 +326,18 @@ async def _t13_apply_any_failed() -> tuple[int, int]:
     finally:
         await release_claim(reg)
     job = await _job_row(job_id)
-    assert job.result["static_route_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
+    assert job.result["static_route_count_by_outcome"] == {
+        "in_sync": 0,
+        "apply_failed": 0,
+        "not_applied": 1,
+        "unavailable": 0,
+    }
     return device_id, job_id
 
 
 async def _t14_run_apply_fallback() -> tuple[int, int]:
     """``core/apply.py`` ``run_apply``'s generic except, after the rollback and re-fetch."""
-    from nso_adapter.core.apply import run_apply
+    from tests.core.execution_helpers import run_apply
 
     device_id = await seed_device(nso_device_name="inv-t14", netbox_device_id=8314)
     job_id = await _apply_job(device_id)

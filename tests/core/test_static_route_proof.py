@@ -164,7 +164,7 @@ def proof_client(device_name: str, *, state, section: dict, dry_run_status: int 
 
 
 async def run_the_apply(device_id: int, client, *, force: bool = True, reg=None) -> Job:
-    from nso_adapter.core.apply import run_apply
+    from tests.core.execution_helpers import run_apply
 
     job_id = await seed_apply_job(device_id)
     with (
@@ -713,7 +713,7 @@ async def test_c3_10_a_field_with_no_wire_leaf_does_not_move_the_fingerprint(ada
 # ── C3.11 / C3.12 — the terminal transaction and its in-doubt COMMIT ─────────
 
 
-async def test_c3_11_the_cas_and_the_terminal_status_are_one_transaction(adapter_client):
+async def test_c3_11_the_cas_and_the_terminal_status_are_one_transaction(adapter_client, monkeypatch):
     """C3.11 — the connection dies between the device commit and the bookkeeping commit.
 
     All-or-nothing: a ``deployed_key`` that moved under a job that never went terminal is a
@@ -723,20 +723,31 @@ async def test_c3_11_the_cas_and_the_terminal_status_are_one_transaction(adapter
     await seed_rows(device_id, [{"triple": B, "route_id": 7, "deployed_key": list(A)}])
     client, _rec = proof_client("sr-proof", state=present(wire(A), device_name="sr-proof"), section=dev_state(wire(B)))
 
-    with patch(
-        "nso_adapter.core.apply._commit_terminal", new=AsyncMock(side_effect=RuntimeError("connection reset by peer"))
-    ):
-        job = await run_the_apply(device_id, client)
+    from tests.core.test_refusal_cutover import CommitGate
 
-    assert job.status == JobStatus.failed
-    assert job.error["code"] == "internal"
+    gate = CommitGate(monkeypatch, "terminal", before=True, failure=RuntimeError("placeholder abort"))
+    gate.release.set()
+    try:
+        from nso_adapter.core.claim import BookkeepingOutcomeUnknown
+
+        with pytest.raises(BookkeepingOutcomeUnknown):
+            await run_the_apply(device_id, client)
+        async with session() as db:
+            job = await db.scalar(select(Job).where(Job.device_id == device_id).order_by(Job.id.desc()))
+    finally:
+        gate.close()
+
+    assert job.status == JobStatus.running
+    assert job.error is None
     assert await deployed_keys(device_id) == {B: list(A)}, "the CAS rolled back with the status"
 
 
 async def _acquire(device_id: int, job_id: int):
     from nso_adapter.core.claim import acquire_claim
 
-    return await acquire_claim(device_id, "job", job_id=job_id)
+    reg = await acquire_claim(device_id, "job", job_id=job_id)
+    reg.run_attempt = (await read_job(job_id)).run_attempt
+    return reg
 
 
 async def _revoke(device_id: int) -> None:
@@ -833,7 +844,7 @@ async def test_c3_12b_a_commit_that_did_not_land_is_re_dispositioned(adapter_cli
     await revoke_stale_claims()
     job = await read_job(job_id)
     assert job.status == JobStatus.failed
-    assert job.error["code"] == "orphaned"
+    assert job.error["code"] == "post_commit_unavailable"
 
 
 async def test_c3_12c_a_pre_commit_failure_takes_the_ordinary_fallback(adapter_client):
@@ -880,7 +891,7 @@ async def test_a_revoked_claim_stops_the_bookkeeping_transaction(adapter_client)
     reg = await _acquire(device_id, job_id)
     await _revoke(device_id)
 
-    from nso_adapter.core.apply import run_apply
+    from tests.core.execution_helpers import run_apply
 
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=client),
@@ -1104,11 +1115,15 @@ async def test_the_claim_lock_is_taken_before_any_intent_row_lock(adapter_client
     client, _rec = proof_client("sr-proof", state=present(wire(A), device_name="sr-proof"), section=dev_state(wire(B)))
     from nso_adapter.core.claim import acquire_claim
 
-    reg = await acquire_claim(device_id, "job")  # a REGISTERED claim: lock_claim really runs
+    job_id = await seed_apply_job(device_id)
+    reg = await acquire_claim(device_id, "job", job_id=job_id)
 
     event.listen(Engine, "before_cursor_execute", _record)
     try:
-        await run_the_apply(device_id, client, reg=reg)
+        from tests.core.execution_helpers import run_apply
+
+        with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
+            await run_apply(job_id, device_id, reg=reg)
     finally:
         event.remove(Engine, "before_cursor_execute", _record)
 
@@ -1116,7 +1131,7 @@ async def test_the_claim_lock_is_taken_before_any_intent_row_lock(adapter_client
     assert "intent-write" in statements, "the pass really did write intent rows"
 
 
-async def test_a_later_scope_failure_cannot_commit_the_static_stamps_early(adapter_client):
+async def test_a_later_scope_failure_cannot_commit_the_static_stamps_early(adapter_client, monkeypatch):
     """Nothing may commit this session between a scope's row stamps and the terminal write.
 
     Route-policy is pushed AFTER static routes, and its device-parser-rejection recording
@@ -1139,12 +1154,21 @@ async def test_a_later_scope_failure_cannot_commit_the_static_stamps_early(adapt
     client, rec = proof_client("sr-proof", state=present(wire(A), device_name="sr-proof"), section=dev_state(wire(B)))
     rec.reject_route_policy = True
 
-    with patch(
-        "nso_adapter.core.apply._commit_terminal", new=AsyncMock(side_effect=RuntimeError("connection reset by peer"))
-    ):
-        job = await run_the_apply(device_id, client)
+    from tests.core.test_refusal_cutover import CommitGate
 
-    assert job.status == JobStatus.failed
+    gate = CommitGate(monkeypatch, "terminal", before=True, failure=RuntimeError("placeholder abort"))
+    gate.release.set()
+    try:
+        from nso_adapter.core.claim import BookkeepingOutcomeUnknown
+
+        with pytest.raises(BookkeepingOutcomeUnknown):
+            await run_the_apply(device_id, client)
+        async with session() as db:
+            job = await db.scalar(select(Job).where(Job.device_id == device_id).order_by(Job.id.desc()))
+    finally:
+        gate.close()
+
+    assert job.status == JobStatus.running
     async with session() as db:
         row = (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id))).scalar_one()
         assert row.last_apply_at is None, "a capability commit must not persist another scope's stamps"

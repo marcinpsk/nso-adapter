@@ -1,36 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Apply worker — push accepted intent to NSO (Phase 2).
+"""Apply one frozen device document under a device claim.
 
-Follows the flow described in docs/nso-adapter.md §7a:
-  1. Snapshot intent into job.context
-  2. Mark each in-scope attribute as 'deploying'
-  3. Commit each (interface, attribute) via NSO reconcile-commit service
-  4. On success: status → in_sync, update last_apply_at
-  5. On failure: status → apply_failed, capture error in last_apply_error
-
-DeviceClaim serializes execution. Auto-Apply admission joins only queued coalescible
-Apply jobs, so running Apply jobs and other types permit successors.
+Prepare durable origins before delivery. Checkpoint classified responses before
+settling logical outcomes and matching live bookkeeping in one transaction.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import re
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from functools import cache
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 import structlog
-from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, JobError, internal_error, terminalize
 from nso_adapter.core.community_dialect import community_dialect_for
-from nso_adapter.core.generation import executing_generation, generation_execution_sections
+from nso_adapter.core.generation import (
+    executing_generation,
+    generation_execution_context,
+    generation_execution_sections,
+)
 from nso_adapter.core.projection import (
     NoComparison,
     TableCompare,
@@ -57,6 +52,7 @@ from nso_adapter.nso.origins import (
     OriginIndex,
     PriorContribution,
     RemovalAuthority,
+    current_membership,
 )
 from nso_adapter.nso.refusal_protocol import row_ref
 from nso_adapter.store.models import (
@@ -70,7 +66,6 @@ from nso_adapter.store.models import (
     JobStatus,
     RedistributionIntent,
     StaticRouteIntent,
-    SyncState,
 )
 
 logger = structlog.get_logger(__name__)
@@ -86,6 +81,8 @@ class ApplyPreview(NamedTuple):
     diffs: dict[str, str]
     generation_id: int | None
     document_digest: str | None
+    status: Literal["ready", "refused", "unavailable", "error"] = "unavailable"
+    refusals: tuple[dict, ...] = ()
 
 
 def _apply_error_summary(exc: NsoApplyError) -> str:
@@ -277,7 +274,6 @@ async def _static_route_bookkeeping(
     job_id: int,
     reg=None,
     send_failed: bool,
-    stamp_of: dict | None = None,
 ) -> tuple[list[dict], tuple[int, int] | None, list[dict]]:
     """Consume, CAS and record — the ONE transaction §4.6 requires, minus its commit.
 
@@ -310,6 +306,19 @@ async def _static_route_bookkeeping(
     with db.no_autoflush:
         await lock_claim(db, reg if reg is not None else ClaimRegistration())
 
+    from nso_adapter.core.execution import active_attempt
+    from nso_adapter.store.execution_attempt_store import _owned_attempt
+    from nso_adapter.store.execution_bookkeeping import matching_bookkeeping_rows
+
+    attempt = await active_attempt(db, job_id)
+    if attempt is None:
+        raise ValueError("Route bookkeeping requires its prepared execution attempt")
+    await _owned_attempt(db, attempt.id, job_id, reg.run_attempt, reg.token)
+    targets = await matching_bookkeeping_rows(db, device.id, attempt.prior_bookkeeping)
+    stamp_of: dict[tuple[type, object], StaticRouteIntent] = {
+        (type(row), row.id): row for row in targets.values() if isinstance(row, StaticRouteIntent)
+    }
+
     conclusive = proof.verify == VERIFY_CONCLUSIVE
     residue_blocks = proof.residue is not None and proof.residue != "clean"
     residue_found = proof.residue == "found"
@@ -335,7 +344,7 @@ async def _static_route_bookkeeping(
 
     results: list[dict] = []
     for row in plan.rows:
-        stamp = row if stamp_of is None else stamp_of.get(_stamp_key(row))
+        stamp = stamp_of.get(_stamp_key(row))
         outcome = SR_UNPROVEN
         if send_failed or residue_found:
             outcome = SR_APPLY_FAILED
@@ -483,7 +492,6 @@ async def _settle_static_routes(
     scope_outcomes: dict,
     scope_failures: dict,
     reg=None,
-    stamp_of: dict | None = None,
 ) -> list[dict] | None:
     """Run §4.4's proof and §4.5/§4.6's bookkeeping for the static-route scope.
 
@@ -519,7 +527,6 @@ async def _settle_static_routes(
         job_id=job_id,
         reg=reg,
         send_failed=send_failed,
-        stamp_of=stamp_of,
     )
     if adjusted is not None:
         scope_outcomes["static_route"] = adjusted
@@ -593,22 +600,15 @@ def encode_section(
     reads a live intent row or the device row.
     """
     from nso_adapter.core.projection import section_rows_by_table
-    from nso_adapter.nso.apply import refuse_gated_local_levels
 
     entry = section_registry()[section]
     source = rows if rows is not None else section_rows_by_table(document, section)
     table_rows = {table: _carried(table_rows) for table, table_rows in source.items()}
-    if section == "logging":
-        # A send-boundary refusal, never the encoder's: one document must encode the same
-        # bytes in every process, and a weaker host-only body would stamp the levels row
-        # in_sync with no severity landing.
-        refuse_gated_local_levels(table_rows)
     if proof is None:
         proof = _hydrated_proof(document, section)
     try:
         return entry.encode(table_rows, section_execution(document, section, proof, origin_context))
     except OriginConstructionError as exc:
-        # The message is fixed text; raised outside the handler so no context rides along.
         failure = NsoApplyError("origin_construction", str(exc))
     raise failure
 
@@ -752,6 +752,9 @@ async def build_device_containers(
     decides. It is never silently omitted: under a full-document PUT an omitted family is a
     RETRACTED family, so a body with a build error is not sendable at all.
     """
+    from nso_adapter.core.projection import section_rows_by_table
+    from nso_adapter.nso.apply import refuse_gated_local_levels
+
     registry = section_registry()
     containers: dict[str, dict] = {}
     origins = OriginIndex()
@@ -761,6 +764,7 @@ async def build_device_containers(
     for section, entry in registry.items():
         if section not in document:
             continue
+        encoded = None
         try:
             encoded = encode_section(
                 document,
@@ -769,6 +773,10 @@ async def build_device_containers(
                 proof=(proof_by_section or {}).get(section),
                 origin_context=origin_context,
             )
+            if section == "logging":
+                rows = (rows_by_section or {}).get(section)
+                source = rows if rows is not None else section_rows_by_table(document, section)
+                refuse_gated_local_levels({table: _carried(table_rows) for table, table_rows in source.items()})
             if section == "static_route":
                 retained: list[dict] = []
                 if retain_static_routes:
@@ -777,6 +785,9 @@ async def build_device_containers(
                 sent_route_keys = overlay_retained_routes(encoded, retained)
                 _record_route_omissions(encoded.origins, document, sent_route_keys, origin_context)
         except NsoApplyError as exc:
+            # An unsent section keeps the logical rows its encoder identified.
+            if encoded is not None:
+                origins.merge(encoded.origins)
             logger.error(
                 "apply.section_build_failed",
                 **device_fields(device_id=device.id),
@@ -835,10 +846,15 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
             device,
             generation.document,
             retain_static_routes=policy.retain_static_routes,
-            origin_context=OriginContext.from_generation(generation),
+            origin_context=await generation_execution_context(db, generation.job_id)
+            if generation.job_id is not None
+            else OriginContext.from_generation(generation),
         )
         if body.errors:
             raise next(iter(body.errors.values()))
+        from nso_adapter.store.execution_attempt_store import bind_historical_origins
+
+        await bind_historical_origins(db, device_id, body.origins, generation)
         delta = await apply_device_intent(
             client,
             device.nso_device_name,
@@ -848,29 +864,37 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
             no_networking=policy.no_networking,
         )
     except NsoApplyError as exc:
+        from nso_adapter.nso.origins import AttributionFailure, resolve_refusals
+        from nso_adapter.nso.refusals import DefiniteRefusal
+        from nso_adapter.store.execution_evidence import attributed_catalog_records
+
+        if isinstance(exc.classification, DefiniteRefusal):
+            attributed = resolve_refusals(exc.classification.records, body.origins)
+            if not isinstance(attributed, AttributionFailure):
+                records = tuple(attributed_catalog_records(attributed, body.origins, "pre_commit_dry_run"))
+                return ApplyPreview(
+                    {PREVIEW_KEY: "!! preview unavailable: NSO refused the device document"},
+                    *identity,
+                    "refused",
+                    records,
+                )
+            return ApplyPreview({PREVIEW_KEY: "!! preview unavailable: refusal attribution failed"}, *identity, "error")
         reason = _apply_error_summary(exc)
         logger.warning("apply_diff.failed", **device_fields(device_id=device_id), error=reason)
-        return ApplyPreview({PREVIEW_KEY: f"!! preview unavailable: {reason}"}, *identity)
+        return ApplyPreview({PREVIEW_KEY: f"!! preview unavailable: {reason}"}, *identity, "error")
     except AsnRuleViolation:
         raise
     except Exception as exc:  # noqa: BLE001 — the preview must never fail hard
         internal = internal_error(exc)
         logger.warning("apply_diff.failed", **device_fields(device_id=device_id), error=internal["message"])
         reason = internal["message"]
-        return ApplyPreview({PREVIEW_KEY: f"!! preview unavailable: {reason}"}, *identity)
+        return ApplyPreview({PREVIEW_KEY: f"!! preview unavailable: {reason}"}, *identity, "error")
     if delta is None:
         return ApplyPreview({PREVIEW_KEY: "!! preview unavailable: NSO dry-run was inconclusive"}, *identity)
-    return ApplyPreview({PREVIEW_KEY: delta} if delta.strip() else {}, *identity)
+    return ApplyPreview({PREVIEW_KEY: delta} if delta.strip() else {}, *identity, "ready")
 
 
-# ── run_apply: shared eligibility + per-scope batch-commit helpers ────────────
-#
-# An "apply pass" pushes one scope's accepted intent to NSO and stamps the
-# outcome back onto the rows. Every scope shares the same eligibility filter and
-# the same success/failure bookkeeping, so that logic lives in the helpers below
-# and ``run_apply`` just wires the scopes together. Each scope commits as one
-# unit: on success every row gets ``last_apply_at`` and a cleared error; on any
-# failure every row records the error payload and the scope reports one item.
+# Shared eligibility selects frozen attempted carriers for one device document.
 
 
 def _is_eligible(row, force: bool) -> bool:
@@ -931,37 +955,6 @@ def _stamp_join(document_rows: Sequence, live_rows: Sequence) -> dict[tuple[type
         for row in document_rows
         if (live := live_by_id.get(row.id)) is not None and intent_state(live) == intent_state(row)
     }
-
-
-def _combine_rows(*groups: _Rows) -> _Rows:
-    """Combine one section's model collections without losing their stamp joins."""
-    push = [row for group in groups for row in group.push]
-    stamp = [row for group in groups for row in group.stamp]
-    if all(group.stamp_of is None for group in groups):
-        return _Rows(push=push, stamp=stamp)
-    stamp_of = {
-        key: row
-        for group in groups
-        for key, row in (group.stamp_of or {_stamp_key(live): live for live in group.stamp}).items()
-    }
-    return _Rows(push=push, stamp=stamp, stamp_of=stamp_of)
-
-
-def _reject_transient_stamps(scope_label: str, rows) -> None:
-    """Refuse to stamp a document-hydrated row. Both apply implementations call this.
-
-    A hydrated row is TRANSIENT: setting ``last_apply_at`` on it writes to an object no
-    session will ever flush, so the stamp vanishes and the row stays pending for ever while
-    the job reports success. A scope that joins :data:`DOCUMENT_EXECUTED_SECTIONS` must pass
-    its LIVE rows here; this makes getting that wrong a loud failure on the first apply
-    instead of a silent one, on the per-scope path AND on the atomic one.
-    """
-    transient = [row for row in rows if sa_inspect(row).transient]
-    if transient:
-        raise RuntimeError(
-            f"scope {scope_label!r} offered {len(transient)} transient row(s) to stamp — "
-            "pass the live rows the generation's document carried, not the hydrated ones"
-        )
 
 
 class _Projection:
@@ -1060,7 +1053,7 @@ class _InterfaceApply(NamedTuple):
     """
 
     execution: Any  # projection.InterfaceExecution — the frozen writer context + eligibility
-    attributes: list  # _AttributeApply, the eligible attribute rows and their live stamps
+    attributes: list[_AttributeApply]
     ip_by_iface: dict
     ip_stamp_of: dict | None
     intent_snapshot: list
@@ -1158,105 +1151,9 @@ def _device_error_message(exc) -> str | None:
     return None
 
 
-#: The container the route-policy family writes under. Its rejections are the one class the
-#: device names in the COMMIT error while every dry-run renders clean.
-_RP_CONTAINER = section_registry()["route_policy"].container
-
-#: The family a refusal from the aggregate names for itself, from the ratified refusal shape
-#: ``device-intent: refused [family=<container> field=<field_id>]: <reason>``.
-_REFUSED_FAMILY = re.compile(r"device-intent:\s*refused\s*\[\s*family=([A-Za-z0-9._-]+)")
-
-
 @cache
 def _section_by_container() -> dict[str, str]:
-    """YANG container -> the document section that owns it, off the registry."""
     return {entry.container: section for section, entry in section_registry().items()}
-
-
-def _refused_family(message: str | None, containers) -> str | None:
-    """Return the container a refusal names itself, when the document carries it."""
-    match = _REFUSED_FAMILY.search(message or "")
-    family = match.group(1) if match else None
-    return family if family in containers else None
-
-
-async def _localize_document_failure(
-    client,
-    device_name,
-    containers,
-    device_err,
-    *,
-    device_id: int,
-) -> tuple[dict[str, str], tuple]:
-    """Localise a failed document commit → ({offender container: its rejection message}, rp).
-
-    ``rp`` is the route-policy ``(scope, name)`` construct parse. Three signals, cheapest
-    first: (1) the aggregate's own refusal names its family in the message; (2) the
-    empty-one-family dry-run — the family whose REMOVAL lets the document pass is the one the
-    device rejected; (3) the route-policy device-parser rejection, which renders clean in
-    dry-run and is only named in the *device* error. A dry-run that stays rejected, or comes
-    back inconclusive, accuses nobody: a transient blip must never brand a family a false
-    ``unsupported`` that a later probe cannot downgrade.
-
-    The loop runs ONLY when the whole document's own dry-run reproduces the failure. A
-    commit that fails for a reason dry-run cannot see — a transport blip, or a device-side
-    misconfiguration that renders clean — lets EVERY trial pass, and every family would be
-    named an offender: sixteen false ``unsupported`` verdicts per ``(ned, sw)`` from one
-    timeout. Not reproducible means not attributable.
-
-    No recording here — the caller decides attribution (including the fall-back to every
-    family in the document) and whether this was a real device rejection.
-    """
-    from nso_adapter.core.capability import parse_rejected_construct
-    from nso_adapter.nso.apply import NsoApplyError, apply_device_intent
-
-    rp = parse_rejected_construct(device_err or "")
-    named = _refused_family(device_err, containers)
-    if named is not None:
-        return {named: device_err or ""}, rp
-
-    def _unattributable():
-        logger.info("apply.localize.not_reproducible", **device_fields(device_id=device_id))
-        return ({_RP_CONTAINER: device_err or ""} if rp[1] and _RP_CONTAINER in containers else {}), rp
-
-    try:
-        await apply_device_intent(client, device_name, containers, device_id=device_id, dry_run=True, strict=True)
-    except NsoApplyError:
-        pass  # the document is conclusively rejected as it stands: the loop can attribute it
-    except Exception:  # noqa: BLE001 — a transport blip reproduces nothing, and must not escape
-        logger.debug("apply.localize.inconclusive", **device_fields(device_id=device_id))
-        return _unattributable()
-    else:
-        return _unattributable()
-
-    offenders: dict[str, str] = {}
-    for container in containers:
-        trial = {name: body for name, body in containers.items() if name != container}
-        try:
-            delta = await apply_device_intent(
-                client,
-                device_name,
-                trial,
-                device_id=device_id,
-                dry_run=True,
-                strict=True,
-            )
-        except NsoApplyError:
-            continue  # still rejected without this family — not the offender
-        except Exception:  # noqa: BLE001 — transient/transport during localisation → inconclusive
-            logger.debug(
-                "apply.localize.inconclusive",
-                **device_fields(device_id=device_id),
-                family=container,
-            )
-            continue
-        if delta is None:  # inconclusive, not a clean pass
-            continue
-        offenders[container] = device_err or ""
-
-    if rp[1] and _RP_CONTAINER in containers:
-        offenders.setdefault(_RP_CONTAINER, device_err or "")
-    return offenders, rp
 
 
 def _capability_scopes_for(container: str) -> list[str]:
@@ -1271,51 +1168,29 @@ def _capability_scopes_for(container: str) -> list[str]:
     return list(section_registry()[section].capability_scopes) if section else []
 
 
-async def _record_atomic_capability(db, client, device, device_name, offenders, exc, rp, device_err) -> None:
-    """Record a capability rejection for the attributed offender families.
-
-    A family whose REMOVAL lets the document compile is one the NED cannot compile on this
-    ``(ned, sw)``; a device-parser rejection (``device_err``) means the device itself refused
-    the commit — both are real, reactive capability gaps, recorded at scope granularity (or
-    fine-grained for route-policy when ``rp = (scope, name)`` parses). H2: the interface
-    container carries TWO scopes — when the rejection message names a construct, only the
-    offending half is recorded (construct-named); an unattributable message falls back to the
-    coarse both-scopes record. The ``(ned, sw)`` key is read from the device row, learned +
-    persisted via the capability probe only when not already known.
-    """
+async def _record_ordinary_capability(db, client, device, exc) -> None:
+    """Record only explicit ordinary device-parser construct evidence."""
     from nso_adapter.core.capability import (
-        _clean_capability_key,
+        parse_rejected_construct,
         parse_rejected_iface_construct,
         record_capability_rejection,
-        refresh_device_capability,
     )
+    from nso_adapter.nso.refusals import OrdinaryRejection
 
-    # Guard both keys against the literal 'None' (see _clean_capability_key) so a device row
-    # carrying a stringified-None ned_id never becomes a bogus capability key.
-    ned_id = _clean_capability_key(device.ned_id)
-    sw = _clean_capability_key(device.sw_version)
-    if not ned_id:
-        info = await refresh_device_capability(db, client, device_name, device)
-        if info:
-            ned_id, sw = info.get("ned_id", ""), info.get("sw_version", "")
-    if not ned_id:
+    if not isinstance(exc.classification, OrdinaryRejection):
         return
-
-    rp_scope, rp_name = rp
-    iface_container = section_registry()["interface_config"].container
-    for container in offenders:
-        own_msg = offenders.get(container, "") if isinstance(offenders, dict) else ""
-        detail = (own_msg or device_err or exc.message or "")[:256]
-        if container == _RP_CONTAINER and rp_name:
-            await record_capability_rejection(db, ned_id, sw, rp_scope, rp_name, detail)
-            continue
-        if container == iface_container:
-            scope, name = parse_rejected_iface_construct(own_msg or device_err or exc.message or "")
-            if scope:
-                await record_capability_rejection(db, ned_id, sw, scope, name, detail)
-                continue
-        for scope in _capability_scopes_for(container):
-            await record_capability_rejection(db, ned_id, sw, scope, scope, detail)
+    message = _device_error_message(exc) or ""
+    scope, construct = parse_rejected_construct(message)
+    if not construct:
+        scope, construct = parse_rejected_iface_construct(message)
+    if construct and device.ned_id:
+        try:
+            async with db.begin_nested():
+                await record_capability_rejection(db, device.ned_id, device.sw_version or "", scope, construct, message)
+        except ClaimLostError:
+            raise
+        except Exception as error:
+            logger.warning("apply.capability_record_failed", device_id=device.id, exception_type=type(error).__name__)
 
 
 async def _clear_atomic_capability(db, device, containers) -> None:
@@ -1339,53 +1214,9 @@ async def _clear_atomic_capability(db, device, containers) -> None:
     await clear_capability_rejections(db, ned_id, sw, scopes)
 
 
-def _stamp_attr_atomic(attr_eligible, commit_error, iface_failed, err, msg, now, snapshot) -> tuple[int, int, list]:
-    """Stamp interface-attribute rows from the single atomic outcome.
-
-    Pending (rolled-back, non-offender) attrs revert from ``deploying`` to their pre-apply
-    snapshot state.
-    """
-    ok = failed = 0
-    failures: list[dict] = []
-    for attr_state, intent_row, iface, stamp in attr_eligible:
-        if commit_error is None:
-            if attr_state is not None and stamp is not None:
-                attr_state.sync_state = SyncState.in_sync
-                stamp.last_apply_at = now
-                stamp.last_apply_error = None
-            ok += 1
-        elif iface_failed:
-            if attr_state is not None and stamp is not None:
-                attr_state.sync_state = SyncState.apply_failed
-                stamp.last_apply_error = err
-            failed += 1
-            failures.append({"interface": iface.name, "attribute": intent_row.attribute, "error": msg})
-        elif attr_state is not None:
-            attr_state.sync_state = snapshot[attr_state]
-    return ok, failed, failures
-
-
-def _stamp_ip_atomic(ip_rows_flat, commit_error, iface_failed, err, msg, now, stamp_of=None) -> tuple[int, int, list]:
-    """Stamp IP rows from the single atomic outcome (pending rows untouched, retried next apply)."""
-    if commit_error is None:
-        for row in ip_rows_flat:
-            stamp = row if stamp_of is None else stamp_of.get(_stamp_key(row))
-            if stamp is not None:
-                stamp.last_apply_at = now
-                stamp.last_apply_error = None
-        return len(ip_rows_flat), 0, []
-    if iface_failed:
-        for row in ip_rows_flat:
-            stamp = row if stamp_of is None else stamp_of.get(_stamp_key(row))
-            if stamp is not None:
-                stamp.last_apply_error = err
-        return 0, len(ip_rows_flat), ([{"error": msg}] if ip_rows_flat else [])
-    return 0, 0, []
-
-
 async def _document_reader_compare(
     client, device, sections, outcomes, failures, *, job_id, device_name
-) -> tuple[dict[str, str], dict[str, list[str]], dict[str, dict[int, str]]]:
+) -> tuple[dict[str, str], dict[str, list[str]], dict[str, dict[tuple[str, int], str]]]:
     """#108 presence check per family after a clean commit.
 
     Each family's expected keys come from what its body CARRIED and from the section's own
@@ -1440,7 +1271,7 @@ async def _document_reader_compare(
 
     reader_compare: dict[str, str] = {}
     reader_compare_unverifiable: dict[str, list[str]] = {}
-    evidence_by_section: dict[str, dict[int, str]] = {}
+    evidence_by_section: dict[str, dict[tuple[str, int], str]] = {}
     for section, prep in preps.items():
         key = registry[section].result_keys[0]
         s_ok, _s_failed = outcomes.get(key, (0, 0))
@@ -1450,7 +1281,7 @@ async def _document_reader_compare(
             reader_compare[section] = "error"
             continue
         translated, unverifiable, lists, wire = prep
-        evidence: dict[int, str] = {}
+        evidence: dict[tuple[str, int], str] = {}
         fails: list[Any]
         if not translated:  # every key Vault-unverifiable → nothing to look for
             n_ok, n_failed, fails, status = s_ok, 0, [], "unknown"
@@ -1469,7 +1300,7 @@ async def _document_reader_compare(
                     s_ok,
                     job_id=job_id,
                     device_id=device.id,
-                    stamp_of=sections[section].stamp_of,
+                    stamp_of={},
                 )
             except AsnRuleViolation:
                 raise
@@ -1525,7 +1356,6 @@ class _ApplyPlan(NamedTuple):
     #: The keys this deployment may drop, per section and guarded list — the guard's authority.
     allowed: dict
     any_eligible: bool
-    origin_context: OriginContext | None = None
 
 
 @cache
@@ -1590,310 +1420,199 @@ async def _collect_sections(
     return sections
 
 
-def _revert_deploying(snapshot: dict) -> None:
-    """Put the attribute states this run marked ``deploying`` back where they were."""
-    for attr_state, state in snapshot.items():
-        attr_state.sync_state = state
-
-
-async def _rollback_and_revert_deploying(db, snapshot: dict, reg) -> None:
-    """Restore attribute states only while this run owns the claim."""
-    from nso_adapter.core.claim import ClaimRegistration, lock_claim
-
-    await db.rollback()
-    with db.no_autoflush:
-        await lock_claim(db, reg if reg is not None else ClaimRegistration())
-    _revert_deploying(snapshot)
-    await db.commit()
-
-
-async def _finalize_unsent(db, plan: _ApplyPlan, build_errors: dict, *, job_id: int, reg) -> None:
-    """Fail the families whose body could not be built. Nothing reached the device."""
-    registry = section_registry()
-    outcomes: dict[str, tuple[int, int]] = dict.fromkeys(_result_keys(), (0, 0))
-    failures: dict[str, list] = {}
-    for section, exc in build_errors.items():
-        message = _apply_error_summary(exc)
-        error = {"code": exc.code, "message": message, "detail": exc.detail}
-        if section == "interface_config":
-            for item in plan.interface.attributes:
-                if item.stamp is not None:
-                    item.stamp.last_apply_error = error
-            for row in (plan.interface.ip_stamp_of or {}).values():
-                row.last_apply_error = error
-            outcomes["attribute"] = (0, len(plan.interface.attributes))
-            outcomes["ip"] = (0, len(plan.interface.ip_rows))
-            failures["attribute"] = [{"error": message}]
-            continue
-        apply_rows = plan.sections[section]
-        _reject_transient_stamps(section, apply_rows.stamp)
-        for row in apply_rows.sent:
-            row.last_apply_error = error
-        for row in apply_rows.stamp:
-            row.last_apply_error = error
-        key = registry[section].result_keys[0]
-        # Counted against what the body WOULD have carried: a family whose live rows a
-        # successor rewrote stamps none of them, and a (0, 0) outcome is a silent success.
-        outcomes[key] = (0, len(apply_rows.sent))
-        failures[key] = [{"error": message}]
-    await _finalize_job(db, job_id, plan.device_id, True, outcomes, failures, reg=reg, document_failed=True)
-
-
-async def _commit_document(
-    db, client, device, device_name, body, *, allowed: dict, job_id: int
-) -> tuple[NsoApplyError | None, str | None, dict, dict | None, str]:
-    """PUT the device's document behind the guard and localise its failure → stamping inputs.
-
-    Returns ``(commit_error, verify, offenders, err, msg)``. *verify* is the commit's §4.4
-    proof verdict, shared by every family in the document because they landed in ONE
-    transaction (G39).
-
-    The collateral guard runs HERE too, not only on a removal: one PUT makes every omission a
-    retraction, so an apply can flush an orphaned service row exactly as a removal can. A
-    blocked write sent nothing, so it fails the job without accusing any single family.
-    """
+async def _run_document_apply(db, device, client, device_name, job, job_id, now, plan, *, reg=None) -> None:
+    """Prepare, checkpoint, and settle one complete device document."""
+    from nso_adapter.core.execution import dispose_run, prepare_send
+    from nso_adapter.core.generation import generation_execution_context
     from nso_adapter.core.removal import RemovalBlockedError, guarded_device_write
+    from nso_adapter.store.execution_history import bind_historical_origins
 
-    containers = body.containers
-    commit_error: NsoApplyError | None = None
-    verify: str | None = None
-    blocked = False
+    generation = await executing_generation(db, job_id)
+    if generation is None:
+        raise JobError("apply_generation_missing", "Execution requires a generation")
+    context = await generation_execution_context(db, job_id)
+    body = await build_device_containers(
+        client,
+        device,
+        plan.document,
+        rows_by_section={section: rows.rows for section, rows in plan.sections.items()},
+        proof_by_section={"interface_config": plan.interface.execution},
+        static_route_plan=plan.static_route,
+        origin_context=context,
+    )
+    membership = current_membership(body.origins, context)
+    eligible = {(row.__tablename__, row.id) for section in plan.sections.values() for row in section.sent}
+    eligible.update((item.push.__tablename__, item.push.id) for item in plan.interface.attributes)
+    eligible.update((row.__tablename__, row.id) for row in plan.interface.ip_rows)
+    carriers = {
+        logical.carrier
+        for logical in membership
+        if any(
+            source.live_stamp_join in eligible
+            and source.source_table == logical.carrier.source_table
+            and source.content_identity == logical.carrier.content_identity
+            for source in logical.source_refs
+        )
+    }
+    membership = tuple(logical for logical in membership if logical.carrier in carriers)
+    if body.errors:
+        from nso_adapter.core.execution import settle_unsent
+
+        error = next(iter(body.errors.values()))
+        await bind_historical_origins(db, device.id, body.origins, generation)
+        await settle_unsent(
+            db,
+            generation,
+            body.origins,
+            membership,
+            reg,
+            {"code": error.code, "message": _apply_error_summary(error), "detail": error.detail},
+        )
+        await _commit_terminal(db, job_id)
+        return
+    checkpoint = await prepare_send(db, generation, body.origins, membership, reg)
     try:
-        verify = await guarded_device_write(client, device, containers, allowed=allowed, current=body.snapshot)
+        await _maybe_sync_from(db, client, device_name, device.id)
+        from nso_adapter.core.claim import lock_claim
+
+        await lock_claim(db, reg)
+        verify = await guarded_device_write(
+            client, device, body.containers, allowed=plan.allowed, current=body.snapshot, checkpoint=checkpoint
+        )
+    except NsoApplyError as exc:
+        logger.error(
+            "apply.atomic_failed", job_id=job_id, **device_fields(device_id=device.id), error=_apply_error_summary(exc)
+        )
+        await _record_ordinary_capability(db, client, device, exc)
+        if await dispose_run(
+            db,
+            job_id,
+            reg,
+            "disposed",
+            terminal_error={"code": exc.code, "message": _apply_error_summary(exc), "detail": exc.detail},
+        ):
+            await _commit_terminal(db, job_id)
+        return
     except RemovalBlockedError as exc:
         logger.error("apply.blocked_collateral", job_id=job_id, **device_fields(device_id=device.id))
-        commit_error = NsoApplyError(
-            "removal_blocked_collateral",
-            "PUT-replace would retract rows not in intent",
-            detail={"orphans": exc.orphans},
-        )
-        blocked = True
-    except NsoApplyError as exc:
-        commit_error = exc
-    except AsnRuleViolation:
+        if await dispose_run(
+            db,
+            job_id,
+            reg,
+            "disposed",
+            terminal_error={
+                "code": "removal_blocked_collateral",
+                "message": "PUT-replace would retract rows not in intent",
+                "detail": {"orphans": exc.orphans},
+            },
+        ):
+            await _commit_terminal(db, job_id)
+        return
+    except (ClaimLostError, BookkeepingOutcomeUnknown):
         raise
-    except Exception as exc:  # noqa: BLE001 — surface as a job-level failure
-        # The TYPE only: exception text can carry credentials (a RESTCONF error echoes the
-        # request, an httpx error its headers) and this payload is persisted on every row.
-        internal = internal_error(exc)
+    except Exception as exc:
+        terminal_error = internal_error(exc)
         logger.error(
             "apply.commit_internal_error",
             job_id=job_id,
             **device_fields(device_id=device.id),
-            error=internal["message"],
+            error=terminal_error["message"],
         )
-        commit_error = NsoApplyError("internal", internal["message"], detail=internal["detail"])
-
-    if commit_error is None:
-        # Positive signal (I2): a clean commit clears any stale reactive 'unsupported' for the
-        # families in the document — a probe cannot downgrade an apply-rejection, so without
-        # this the gap would stick forever even after the device is fixed and the intent lands.
-        try:
-            await _clear_atomic_capability(db, device, containers)
-        except Exception:  # noqa: BLE001 — capability bookkeeping is best-effort
-            logger.debug("apply.atomic.capability_clear_skipped", job_id=job_id)
-        return None, verify, {}, None, ""
-
-    message = _apply_error_summary(commit_error)
-    logger.error("apply.atomic_failed", job_id=job_id, **device_fields(device_id=device.id), error=message)
-    device_err = _device_error_message(commit_error)
-    # A guard refusal never reached the device, so there is nothing to localise and no
-    # capability verdict to draw: the whole unsent document is the failure.
-    offenders, rp = (
-        ({}, (None, None))
-        if blocked
-        else await _localize_document_failure(
-            client,
-            device_name,
-            containers,
-            device_err,
-            device_id=device.id,
-        )
-    )
-    # Capability (I2): record ONLY reliably-localised offenders — a family whose removal lets
-    # the document compile, a refusal that names its own family, or a parse_rejected_construct
-    # match. A generic device rejection is NOT a capability signal: it may be a MISCONFIGURATION
-    # (a route-map referencing a prefix-list the push does not carry), not a NED limit, and
-    # recording it would be a false "unsupported" verdict. Such failures still fail the job and
-    # stamp last_apply_error with a stable summary.
-    if offenders:
-        try:
-            await _record_atomic_capability(db, client, device, device_name, offenders, commit_error, rp, device_err)
-        except Exception:  # noqa: BLE001 — capability recording is best-effort
-            logger.debug("apply.atomic.capability_record_skipped", job_id=job_id)
-    if not offenders:
-        offenders = dict.fromkeys(containers, "")
-    err = {"code": commit_error.code, "message": message, "detail": commit_error.detail}
-    return commit_error, verify, offenders, err, message
-
-
-def _stamp_batch_sections(sections, offenders, commit_error, err, msg, now) -> tuple[dict, dict]:
-    """Stamp every batch family from the single commit outcome → (outcomes, failures).
-
-    Keyed by result key, in registry order. Every transmitted family fails when the
-    transaction rolls back. Localization identifies the culprit only.
-    """
-    registry = section_registry()
-    outcomes: dict[str, tuple[int, int]] = {}
-    failures: dict[str, list] = {}
-    for section, apply_rows in sections.items():
-        if section == "interface_config":
-            continue  # its two counters come from the per-attribute and per-address halves
-        key = registry[section].result_keys[0]
-        outcomes.setdefault(key, (0, 0))
-        if not apply_rows.sent:
-            continue
-        _reject_transient_stamps(section, apply_rows.stamp)
-        if commit_error is None:
-            for row in apply_rows.stamp:
-                row.last_apply_at = now
-                row.last_apply_error = None
-            outcomes[key] = (len(apply_rows.sent), 0)
-        else:
-            for row in apply_rows.sent:
-                row.last_apply_error = err
-            for row in apply_rows.stamp:
-                row.last_apply_error = err
-            outcomes[key] = (0, len(apply_rows.sent))
-            failures[key] = [{"error": msg}]
-    return outcomes, failures
-
-
-async def _run_document_apply(db, device, client, device_name, job, job_id, now, plan, *, reg=None) -> None:
-    """Deploy one device's document: encode every family, PUT once, stamp the one outcome.
-
-    On success every row the body carried is stamped in_sync; on failure the whole
-    transaction rolled back. Fail every transmitted row and localize only for attribution
-    and capability recording.
-
-    §4.4: the commit's verify verdict is threaded out of the sender rather than discarded and
-    is shared by every family. §4.9's PATCH-versus-PUT split is gone with the per-family
-    services: one PUT IS the replacement, so a static-route replacement is delivered in the
-    same transaction as everything else instead of after it.
-    """
-    attr_eligible = plan.interface.attributes
-    ip_rows_flat = [row for rows in plan.interface.ip_by_iface.values() for row in rows]
-
-    # Snapshot attr states, then mark deploying; a pending (rolled-back, non-offender) attr is
-    # reverted to its snapshot rather than left deploying.
-    attr_stamps = [item.stamp for item in attr_eligible if item.stamp is not None]
-    ip_stamps = list((plan.interface.ip_stamp_of or {}).values())
-    _reject_transient_stamps("interface_config", [*attr_stamps, *ip_stamps])
-    snapshot = {
-        item.state: item.state.sync_state for item in attr_eligible if item.state is not None and item.stamp is not None
-    }
-    for attr_state in snapshot:
-        attr_state.sync_state = SyncState.deploying
-    await db.commit()
-
-    try:
-        body = await build_device_containers(
-            client,
-            device,
-            plan.document,
-            rows_by_section={section: rows.rows for section, rows in plan.sections.items()},
-            proof_by_section={"interface_config": plan.interface.execution},
-            static_route_plan=plan.static_route,
-            origin_context=plan.origin_context,
-        )
-    except ClaimLostError:
-        raise
-    except Exception:
-        # An UNEXPECTED error while building the body (before any commit) — a real bug, not a
-        # family's own bad intent, which the builder isolates. Revert the attrs just marked
-        # 'deploying' so they are not stuck forever, then re-raise so run_apply fails the job
-        # with the real error.
-        await _rollback_and_revert_deploying(db, snapshot, reg)
-        raise
-
-    if body.errors:
-        # NOTHING was sent: an omitted family is a retracted family under a full-document PUT,
-        # so a body that could not be built whole is not sendable at all. Fail exactly the
-        # families that could not be built and leave every other row pending.
-        _revert_deploying(snapshot)
-        await _finalize_unsent(db, plan, body.errors, job_id=job_id, reg=reg)
+        if await dispose_run(db, job_id, reg, "runner_failed", terminal_error=terminal_error):
+            await _commit_terminal(db, job_id)
         return
+    await _settle_document_success(db, device, client, device_name, job_id, now, plan, body, membership, verify, reg)
 
-    try:
-        commit_error, verify, offenders, err, msg = await _commit_document(
-            db, client, device, device_name, body, allowed=plan.allowed, job_id=job_id
+
+async def _settle_document_success(
+    db, device, client, device_name, job_id, now, plan, body, membership, verify, reg
+) -> None:
+    from nso_adapter.core.execution import read_send_history, record_send_history
+    from nso_adapter.nso.apply import VERIFY_CONCLUSIVE
+    from nso_adapter.store.execution_attempt_store import complete_execution_result
+    from nso_adapter.store.execution_evidence import logical_record
+
+    certified = await read_send_history(db, job_id, client, device)
+    outcomes = {
+        key: (len(rows.sent), 0)
+        for section, rows in plan.sections.items()
+        for key in section_registry()[section].result_keys
+    }
+    failures: dict[str, list] = {}
+    reader_compare, unverifiable, evidence = await _document_reader_compare(
+        client, device, plan.sections, outcomes, failures, job_id=job_id, device_name=device_name
+    )
+    sr_results = None
+    if plan.static_route is not None:
+        sr_results = await _settle_static_routes(
+            db,
+            device,
+            client,
+            plan.static_route,
+            job_id=job_id,
+            outbox={"verify": verify, "sent_keys": body.sent_route_keys},
+            evidence={
+                identity: verdict
+                for (table, identity), verdict in evidence.get("static_route", {}).items()
+                if table == StaticRouteIntent.__tablename__
+            },
+            put_delivered=True,
+            send_failed=False,
+            scope_outcomes=outcomes,
+            scope_failures=failures,
+            reg=reg,
         )
-
-        iface_container = section_registry()["interface_config"].container
-        iface_failed = commit_error is not None and iface_container in body.containers
-        attr_outcome = _stamp_attr_atomic(attr_eligible, commit_error, iface_failed, err, msg, now, snapshot)
-        ip_outcome = _stamp_ip_atomic(
-            ip_rows_flat, commit_error, iface_failed, err, msg, now, stamp_of=plan.interface.ip_stamp_of
-        )
-        outcomes, failures = _stamp_batch_sections(plan.sections, offenders, commit_error, err, msg, now)
-        outcomes["attribute"] = attr_outcome[:2]
-        outcomes["ip"] = ip_outcome[:2]
-        if attr_outcome[2]:
-            failures["attribute"] = list(attr_outcome[2])
-        if ip_outcome[2]:
-            failures["ip"] = list(ip_outcome[2])
-
-        # The SEND's own verdict, before reader-compare folds per-row findings into the same
-        # counter: "nothing landed" and "one row of several is missing" are different facts, and
-        # reading the merged counter would make one dropped route block its proven sibling's CAS.
-        sr_key = section_registry()["static_route"].result_keys[0]
-        sr_send_failed = bool(outcomes.get(sr_key, (0, 0))[1])
-
-        # #108: the document rides the same FASTMAP writers — run the post-apply presence check
-        # per family and re-flag any silently-dropped keys. A family the body could not carry is
-        # excluded: it was never pushed, so "not on the device" is not a drop.
-        reader_compare: dict[str, str] = {}
-        reader_compare_unverifiable: dict[str, list[str]] = {}
-        evidence_by_section: dict[str, dict[int, str]] = {}
-        if commit_error is None:
-            reader_compare, reader_compare_unverifiable, evidence_by_section = await _document_reader_compare(
-                client,
-                device,
-                plan.sections,
-                outcomes,
-                failures,
-                job_id=job_id,
-                device_name=device_name,
-            )
-
-        sr_results = None
-        if plan.static_route is not None:
-            sr_results = await _settle_static_routes(
-                db,
-                device,
-                client,
-                plan.static_route,
-                job_id=job_id,
-                outbox={"verify": verify, "sent_keys": body.sent_route_keys},
-                evidence=evidence_by_section.get("static_route", {}),
-                # One PUT is the replacement: the document either landed or nothing did.
-                put_delivered=commit_error is None,
-                send_failed=sr_send_failed,
-                scope_outcomes=outcomes,
-                scope_failures=failures,
-                reg=reg,
-                stamp_of=plan.sections["static_route"].stamp_of if "static_route" in plan.sections else None,
-            )
-
-    except ClaimLostError:
-        raise
-    except Exception:
-        await _rollback_and_revert_deploying(db, snapshot, reg)
-        raise
-
-    await _finalize_job(
+    certified_routes = {record["row_id"] for record in (sr_results or []) if record["outcome"] == SR_IN_SYNC}
+    carrier_sources = {
+        logical.carrier: source.live_stamp_join
+        for logical in membership
+        for source in logical.source_refs
+        if source.source_table == logical.carrier.source_table
+        and source.content_identity == logical.carrier.content_identity
+    }
+    dispositions = {}
+    for logical in membership:
+        successful = verify == VERIFY_CONCLUSIVE
+        if logical.stream == "static_route":
+            successful = any(source.frozen_row_identity[0] in certified_routes for source in logical.source_refs)
+        section = _section_by_container().get(logical.row.subject.split(".")[0])
+        carrier_join = carrier_sources.get(logical.carrier)
+        if section and carrier_join is not None and evidence.get(section, {}).get(carrier_join) == "missing":
+            successful = False
+        identity = logical_record(logical)
+        key = identity["stream"], identity["row"]["subject"], identity["row"]["key"], identity["settlement_cohort"]
+        dispositions[key] = "in_sync" if successful else "unavailable"
+    await record_send_history(db, job_id, reg, certified)
+    result = await complete_execution_result(db, job_id, reg.run_attempt, reg.token, dispositions, now)
+    result["reader_compare"] = reader_compare
+    if unverifiable:
+        result["reader_compare_unverifiable"] = unverifiable
+    if sr_results is not None:
+        result["static_route_results"] = sr_results
+    failed = any(failures.values())
+    if verify == VERIFY_CONCLUSIVE and not failed:
+        await _clear_atomic_capability(db, device, body.containers)
+    if await _write_terminal(
         db,
         job_id,
-        device.id,
-        plan.any_eligible,
-        outcomes,
-        failures,
-        reader_compare=reader_compare,
-        reader_compare_unverifiable=reader_compare_unverifiable,
-        static_route_results=sr_results,
-        reg=reg,
-        document_failed=commit_error is not None,
-    )
+        JobStatus.failed if failed else JobStatus.succeeded,
+        result,
+        {
+            "code": "nso_commit_failed",
+            "message": "Device document proof failed",
+            "detail": {
+                "items": [
+                    {"type": key, **error} if isinstance(error, dict) else {"type": key, "error": str(error)}
+                    for key, errors in failures.items()
+                    for error in errors
+                ]
+            },
+        }
+        if failed
+        else None,
+        reg,
+    ):
+        await _commit_terminal(db, job_id)
 
 
 def _unrenderable_community_list(row, ned_id: str | None) -> bool:
@@ -2066,7 +1785,7 @@ def _reader_compare_walk(
     scope; it just leaves no ``last_apply_error`` behind, because stamping the transient
     hydrated row would write to an object no session flushes.
 
-    *evidence* is the R2 §4.4 PER-ROW map ``{row pk: "present" | "missing"}``, returned
+    *evidence* uses the source table and row identity for each proof, returned
     alongside the unchanged aggregate. The aggregate collapses a two-row walk with one
     missing key into ``missing`` for BOTH, so a consumer that reads it CASes neither row —
     while the rule that a proven sibling must still CAS demands the opposite. A row absent
@@ -2078,7 +1797,7 @@ def _reader_compare_walk(
     guards = {gl.label: gl for gl in lists}
     row_by_id: dict[int, Any] = {}
     missing: dict[int, list[str]] = {}
-    evidence: dict[int, str] = {}
+    evidence: dict[tuple[str, int], str] = {}
     for row, label, key in translated:
         pk = getattr(row, "id", None)
         if _norm_key(key, scope, guards[label]) in present.get(label, set()):
@@ -2086,10 +1805,10 @@ def _reader_compare_walk(
             # (an IS-IS interface per address family), and one present grain must not
             # overwrite a sibling grain already found missing.
             if pk is not None:
-                evidence.setdefault(pk, "present")
+                evidence.setdefault((row.__tablename__, pk), "present")
             continue
         if pk is not None:
-            evidence[pk] = "missing"
+            evidence[(row.__tablename__, pk)] = "missing"
         row_by_id[id(row)] = row
         missing.setdefault(id(row), []).append(f"{label} {list(key)}")
     if not missing:
@@ -2174,38 +1893,6 @@ def _classify_fetched_section(
     )
 
 
-async def _record_rp_capability_now(db, client, device, device_name, errors, *, job_id: int) -> None:
-    """Record the route-policy scope's device-parser rejections — AFTER the terminal commit.
-
-    The device parser only rejects an unsupported construct on a real commit (a dry-run
-    renders it), so this is the only place the fact can be learned. It commits on the apply's
-    own session, which is why it must not run mid-loop: route-policy is pushed after static
-    routes, so a commit there would land an earlier scope's row stamps without the CAS,
-    per-route results and terminal status §4.6 requires to be one transaction. Nothing is
-    lost by waiting — it records a ``(ned, sw)`` fact, not this job's outcome.
-    """
-    from nso_adapter.core.capability import (
-        parse_rejected_construct,
-        record_capability_rejection,
-        refresh_device_capability,
-    )
-
-    for exc in errors:
-        try:
-            info = await refresh_device_capability(db, client, device_name, device)
-            scope, name = parse_rejected_construct(exc.message)
-            if info and name:
-                await record_capability_rejection(
-                    db, info["ned_id"], info["sw_version"], scope, name, exc.message[:256]
-                )
-        except ClaimLostError:
-            # A nested suppressor is as load-bearing as the runner boundary: swallowing a
-            # revocation here lets the run continue under ownership it has lost.
-            raise
-        except Exception:  # noqa: BLE001 — capability recording is best-effort
-            logger.debug("apply.capability_record_skipped", job_id=job_id)
-
-
 async def _commit_terminal(db: AsyncSession, job_id: int) -> None:
     """Commit the apply's terminal transaction under the three-state contract (R2 §4.6).
 
@@ -2226,7 +1913,7 @@ async def _commit_terminal(db: AsyncSession, job_id: int) -> None:
 async def _write_terminal(
     db: AsyncSession, job_id: int, status: JobStatus, result: dict | None, error: dict | None, reg
 ) -> bool:
-    """Write the apply's terminal status under its ownership predicate. False on a refusal.
+    """Write terminal status or raise ownership loss after discarding staged effects.
 
     A refusal means another execution owns this job — recovery re-dispositioned it while
     this run was in flight. The per-route results and CAS in this transaction belong to
@@ -2244,89 +1931,20 @@ async def _write_terminal(
     )
     if write is None:
         await db.rollback()
-        return False
+        raise ClaimLostError("Execution terminal ownership was lost")
     return True
 
 
-async def _finalize_job(
-    db: AsyncSession,
-    job_id: int,
-    device_id: int,
-    any_eligible: bool,
-    outcomes: dict[str, tuple[int, int]],
-    failures: dict[str, list],
-    reader_compare: dict | None = None,
-    reader_compare_unverifiable: dict | None = None,
-    static_route_results: list | None = None,
-    reg=None,
-    document_failed: bool = False,
-) -> None:
-    """Assemble job.result/status from the deployment's outcomes and commit.
-
-    The counters are the registry's ``result_keys``, in registry order (memo A8): one
-    ``<key>_count_by_outcome`` each, names unchanged, so a new family gets its counter from
-    the registry instead of a hand-kept list. With nothing eligible the job succeeds with an
-    all-zero result and returns early.
-
-    Also emitted: the per-family post-apply ``reader_compare`` statuses (#108) and any
-    ``reader_compare_unverifiable`` labels — the keys a family's presence check could not
-    verify, mirroring the residue path. Any failure flips the job to failed and collects the
-    per-item errors.
-
-    *static_route_results* is R2 §4.5's per-route record. It rides here rather than in a
-    commit of its own because this IS the terminal transaction: the CAS, the row stamps, the
-    results and the status must land together or not at all (§4.6).
-
-    The commit goes through the three-state contract. A COMMIT that raises may still have
-    been applied, and the caller's fallback — roll back, write ``failed`` in a SECOND
-    transaction — would then produce exactly the torn state the atomicity rule exists to
-    prevent: a consumed carrier or a closed replacement under a failed job. So an unknown
-    outcome raises :class:`BookkeepingOutcomeUnknown` instead, and recovery decides.
-    """
-    keys = _result_keys()
-    if not any_eligible and not document_failed:
-        logger.info("apply.nothing_eligible", job_id=job_id, device_id=device_id)
-        empty_result = {f"{key}_count_by_outcome": {"in_sync": 0, "apply_failed": 0} for key in keys}
-        if not await _write_terminal(db, job_id, JobStatus.succeeded, empty_result, None, reg):
-            return
+async def _finalize_empty_job(db: AsyncSession, job_id: int, device_id: int, reg) -> None:
+    """Publish a completed no-op with all four count keys."""
+    logger.info("apply.nothing_eligible", job_id=job_id, device_id=device_id)
+    result: dict[str, Any] = {
+        f"{key}_count_by_outcome": {"in_sync": 0, "apply_failed": 0, "not_applied": 0, "unavailable": 0}
+        for key in _result_keys()
+    }
+    result.update(row_outcomes=[], refusals=[], settlement_owners=[], commit_acknowledged=False)
+    if await _write_terminal(db, job_id, JobStatus.succeeded, result, None, reg):
         await _commit_terminal(db, job_id)
-        return
-
-    result: dict[str, Any] = {}
-    for key in keys:
-        key_ok, key_failed = outcomes.get(key, (0, 0))
-        result[f"{key}_count_by_outcome"] = {"in_sync": key_ok, "apply_failed": key_failed}
-    if reader_compare:
-        result["reader_compare"] = reader_compare
-    if reader_compare_unverifiable:
-        result["reader_compare_unverifiable"] = reader_compare_unverifiable
-    if static_route_results is not None:
-        result["static_route_results"] = static_route_results
-
-    total_failed = sum(failed for _ok, failed in outcomes.values())
-    error = None
-    if total_failed == 0 and not document_failed:
-        status = JobStatus.succeeded
-    else:
-        status = JobStatus.failed
-        all_failed = [{"type": key, **item} for key in keys for item in failures.get(key, [])]
-        error = {
-            "code": "nso_commit_failed",
-            "message": "Device document failed to apply"
-            if document_failed
-            else f"{total_failed} item(s) failed to apply",
-            "detail": {"items": all_failed},
-        }
-    if not await _write_terminal(db, job_id, status, result, error, reg):
-        return
-    await _commit_terminal(db, job_id)
-    logger.info(
-        "apply.done",
-        job_id=job_id,
-        device_id=device_id,
-        failed=total_failed,
-        counts={key: outcomes.get(key, (0, 0)) for key in keys if outcomes.get(key, (0, 0)) != (0, 0)},
-    )
 
 
 def _refuse_unverifiable_recorded_put(generation) -> None:
@@ -2388,9 +2006,6 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     client = get_nso_client(device.nso_instance)
     device_name = device.nso_device_name
 
-    # ── Step 0: sync-from before apply (best-effort) ──
-    await _maybe_sync_from(db, client, device_name, device_id)
-
     document = generation.document
     source = _Projection(db, device_id, force, document, execution_sections)
 
@@ -2403,6 +2018,10 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     sr_plan = hydrate_static_route_apply_plan(document) if "static_route" in document else None
     sections = await _collect_sections(db, source, document, static_route_plan=sr_plan)
 
+    from nso_adapter.core.claim import lock_claim
+
+    with db.no_autoflush:
+        await lock_claim(db, reg)
     job.context = {
         "force": force,
         "intent_snapshot": interface.intent_snapshot,
@@ -2427,10 +2046,9 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         static_route=sr_plan if "static_route" in execution_sections else None,
         allowed=guard_allowed(generation, route_keys=sr_plan.allowed if sr_plan is not None else None),
         any_eligible=any_eligible,
-        origin_context=OriginContext.from_generation(generation),
     )
     if not any_eligible:
-        await _finalize_job(db, job_id, device_id, False, {}, {}, reg=reg)
+        await _finalize_empty_job(db, job_id, device_id, reg)
         return
     await _run_document_apply(db, device, client, device_name, job, job_id, now, plan, reg=reg)
 
@@ -2511,15 +2129,27 @@ async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -
         except (JobError, AsnRuleViolation) as exc:
             logger.warning("apply.refused", job_id=job_id, device_id=device_id, code=exc.error["code"])
             await db.rollback()
+            from nso_adapter.core.execution import dispose_run
+
+            if await dispose_run(db, job_id, reg, "runner_failed", terminal_error=exc.error):
+                await _commit_terminal(db, job_id)
+                return
             if await _write_terminal(db, job_id, JobStatus.failed, None, exc.error, reg):
                 await _commit_terminal(db, job_id)
         except Exception as exc:
-            logger.exception("apply.unexpected_error", job_id=job_id, device_id=device_id)
+            logger.error(
+                "apply.unexpected_error", job_id=job_id, device_id=device_id, exception_type=type(exc).__name__
+            )
             # Roll back first: if the failure came from a DB error the session is in a
             # needs-rollback state and the failed-status commit below would itself throw,
             # leaving the job stuck 'running' and masking the real error. Re-fetch the job
             # after rollback (it may have been expired) so the status change persists.
             await db.rollback()
+            from nso_adapter.core.execution import dispose_run
+
+            if await dispose_run(db, job_id, reg, "runner_failed", terminal_error=internal_error(exc)):
+                await _commit_terminal(db, job_id)
+                return
             # Commit only a landed write; on a refusal _write_terminal has already rolled back.
             if await _write_terminal(db, job_id, JobStatus.failed, None, internal_error(exc), reg):
                 await db.commit()

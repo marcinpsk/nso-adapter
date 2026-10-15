@@ -636,6 +636,54 @@ async def test_lock_contention_reports_abort_known(adapter_client, rival_engine)
     assert (await _claim_row(device_id)).claim_token == reg.token
 
 
+@pytest.mark.parametrize("failure", ["claim_lost", "lock_timeout"])
+@pytest.mark.parametrize("helper", ["release_claim", "dispose_cancelled", "mark_failed_and_release"])
+async def test_failed_abort_rollback_still_reports_abort_known(
+    adapter_client, rival_engine, monkeypatch, debug_logs, helper, failure
+):
+    """A rollback that fails after a pre-COMMIT abort must not escape: it would end the worker loop."""
+    from nso_adapter.core import claim
+    from nso_adapter.store.models import DeviceClaim, JobStatus, JobType
+
+    device_id = await seed_device(nso_device_name=f"cl-rb-{helper}-{failure}", netbox_device_id=9980)
+    job_id = await _seed_job(device_id, JobType.sync, JobStatus.running)
+    reg = await acquire_claim(device_id, "job", job_id=job_id)
+    rival = async_sessionmaker(rival_engine, expire_on_commit=False)
+    real_lock_claim = claim.lock_claim
+
+    async def lock_then_lose_connection(conn, registration):
+        pid = await conn.scalar(sa.text("SELECT pg_backend_pid()"))
+        try:
+            return await real_lock_claim(conn, registration)
+        except Exception:
+            # The real failure, then a real connection loss before the helper rolls back.
+            async with rival() as killer:
+                await killer.execute(sa.text("SELECT pg_terminate_backend(:pid, 5000)"), {"pid": pid})
+            raise
+
+    monkeypatch.setattr(claim, "lock_claim", lock_then_lose_connection)
+    call = {
+        "release_claim": lambda: release_claim(reg, lock_timeout_ms=250),
+        "dispose_cancelled": lambda: dispose_cancelled(job_id, JobType.sync, reg, lock_timeout_ms=250),
+        "mark_failed_and_release": lambda: mark_failed_and_release(
+            job_id, "internal", "boom", reg, lock_timeout_ms=250
+        ),
+    }[helper]
+    async with rival() as blocker:
+        if failure == "claim_lost":
+            await blocker.execute(sa.delete(DeviceClaim).where(DeviceClaim.device_id == device_id))
+            await blocker.commit()
+        else:
+            await blocker.execute(sa.select(DeviceClaim).where(DeviceClaim.device_id == device_id).with_for_update())
+        assert await call() is ClaimOutcome.ABORT_KNOWN
+        await blocker.rollback()
+
+    assert await _job_status(job_id) is JobStatus.running
+    assert [record["event"] for record in debug_logs if record["event"] == "claim.abort_rollback_failed"] == [
+        "claim.abort_rollback_failed"
+    ]
+
+
 class _LostAckSession:
     """A REAL session whose COMMIT lands and whose acknowledgement is then lost.
 

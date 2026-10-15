@@ -1141,7 +1141,12 @@ async def test_f4_a_a_successors_changed_row_is_not_stamped_by_the_older_documen
         assert resp.status_code == 200
 
     client, rec = recorded_client("gen-stamp-changed", on_sync_from=successor)
-    assert await run_head(device_id, client) is not None
+    job_id = await run_head(device_id, client)
+    assert job_id is not None
+    job = await job_row(job_id)
+    assert len(job.result["row_outcomes"]) == 2
+    assert all(row["disposition"] == "in_sync" for row in job.result["row_outcomes"])
+    assert job.result["vlan_count_by_outcome"] == {"in_sync": 2, "apply_failed": 0, "not_applied": 0, "unavailable": 0}
 
     assert rec.vlan_ids() == [[10, 20]]
     rows = await vlan_rows(device_id)
@@ -1173,7 +1178,11 @@ async def test_f5_a_atomic_mode_pushes_the_document_and_stamps_the_live_rows(ada
     client, rec = recorded_client("gen-atomic-doc", on_sync_from=successor)
     job_id = await run_head(device_id, client)
     assert job_id is not None
-    assert (await job_row(job_id)).status.value == "succeeded"
+    job = await job_row(job_id)
+    assert job.status.value == "succeeded"
+    assert len(job.result["row_outcomes"]) == 1
+    assert all(row["disposition"] == "in_sync" for row in job.result["row_outcomes"])
+    assert job.result["vlan_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0, "not_applied": 0, "unavailable": 0}
 
     assert rec.vlan_ids() == [[10]], "the atomic commit carried the successor's state"
     rows = await vlan_rows(device_id)
@@ -1267,7 +1276,7 @@ async def test_f9_a_a_rejected_send_fails_the_job_even_with_nothing_to_stamp(ada
 
     job = await job_row(job_id)
     assert job.status.value == "failed", "a rejected deployment reported success"
-    assert job.result["vlan_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
+    assert job.result["vlan_count_by_outcome"] == {"in_sync": 0, "apply_failed": 0, "not_applied": 1, "unavailable": 0}
     assert (await _generation_statuses(device_id))[0] == "failed"
 
 
@@ -1307,7 +1316,7 @@ async def test_atomic_rejected_send_fails_the_job_even_with_nothing_to_stamp(ada
 
     job = await job_row(job_id)
     assert job.status.value == "failed", "a rejected atomic document reported success"
-    assert job.result["vlan_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
+    assert job.result["vlan_count_by_outcome"] == {"in_sync": 0, "apply_failed": 0, "not_applied": 1, "unavailable": 0}
     assert (await _generation_statuses(device_id))[0] == "failed"
 
 
