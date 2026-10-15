@@ -237,13 +237,15 @@ async def native_dry_run(
     """Decode a dry-run after claim-first classification, for both strict settings."""
     dry_url = _commit_url(url, dry_run="cli" if outformat == "cli" else True, no_networking=no_networking)
     response = None
+    exception_type = None
     try:
         async with client._client(timeout=client._action_timeout) as c:
             response = await getattr(c, method)(
                 dry_url, content=payload, headers={"Content-Type": "application/yang-data+json"}
             )
-    except Exception:
+    except Exception as exc:
         response = None
+        exception_type = type(exc).__name__
     classification = None
     if response is None:
         classification = classify_error(None, None)
@@ -254,6 +256,7 @@ async def native_dry_run(
             "nso.apply.dry_run_non_2xx",
             **device_fields(device_id=device_id),
             status=response.status_code if response is not None else None,
+            exception_type=exception_type,
         )
         if checkpoint is not None:
             await checkpoint(sender_phase, classification, False)
@@ -425,6 +428,7 @@ async def apply_device_intent(
             checkpoint=checkpoint,
         )
     response = None
+    exception_type = None
     try:
         async with client._client(timeout=client._action_timeout) as c:
             response = await c.put(
@@ -432,8 +436,9 @@ async def apply_device_intent(
                 content=payload,
                 headers={"Content-Type": "application/yang-data+json"},
             )
-    except Exception:
+    except Exception as exc:
         response = None
+        exception_type = type(exc).__name__
     classification = None
     if response is None:
         classification = classify_error(None, None)
@@ -448,6 +453,7 @@ async def apply_device_intent(
             **device_fields(device_id=device_id),
             families=sorted(containers),
             status=response.status_code if response is not None else None,
+            exception_type=exception_type,
         )
         error = _classified_apply_error(classification, "commit", detail=detail)
         raise error
