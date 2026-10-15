@@ -526,12 +526,13 @@ async def terminal(api, device_id, *, refused=True):
     response = await api.get(f"/api/v1/jobs/{job.id}", headers=AUTH)
     assert_text_free_of(response.text, [CANARY])
     assert response.status_code == 200
-    assert response.json()["row_outcomes"] == job.result["row_outcomes"]
+    projection = {key: job.result[key] for key in ("row_outcomes", "refusals")}
+    assert {key: response.json()[key] for key in projection} == projection
     for key, counts in job.result.items():
         if key.endswith("_count_by_outcome"):
             assert set(counts) == {"in_sync", "apply_failed", "not_applied", "unavailable"}
     if refused:
-        assert job.result["refusals"]
+        assert job.result["refusals"] and (job.result["row_outcomes"] or not attempt.logical_membership)
         assert any(outcome.disposition == "refused" for outcome in outcomes) or not attempt.logical_membership
     else:
         assert not job.result["refusals"]
@@ -541,7 +542,7 @@ async def terminal(api, device_id, *, refused=True):
     )
     assert_text_free_of(response.text, [CANARY])
     assert response.status_code == 200
-    assert response.json()["head"]["row_outcomes"] == job.result["row_outcomes"]
+    assert {key: response.json()["head"][key] for key in projection} == projection
     return job
 
 
