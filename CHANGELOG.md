@@ -2,6 +2,22 @@
 
 <!-- version list -->
 
+## v1.13.0 (2026-10-14)
+
+### Bug Fixes
+
+- **store**: Count disposed carriers under their section's result counter
+  ([`18e57cb`](https://github.com/marcinpsk/nso-adapter/commit/18e57cbdc48008e2980ebb3a72ec2420fdef2096))
+
+- **store**: Index snapshots and isolate acknowledged history
+  ([`067c17c`](https://github.com/marcinpsk/nso-adapter/commit/067c17ca1a38eab2d4fce1b9f6fe64e01108a285))
+
+### Chores
+
+- **deps**: Bump the python-minor-patch group with 8 updates
+  ([`665ed6c`](https://github.com/marcinpsk/nso-adapter/commit/665ed6ca40256a0460d142debe9e42c1f6129e5b))
+
+
 ## v1.12.0 (2026-10-09)
 
 ### Bug Fixes
