@@ -816,3 +816,24 @@ async def rollback_abort_known(db, logger):
     except Exception as exc:
         logger.warning("claim.abort_rollback_failed", exception_type=type(exc).__name__)
     return ClaimOutcome.ABORT_KNOWN
+
+
+async def recovery_skips_lost_attempt(db, rows, logger, dispose_execution_attempt):
+    for job_id, run_attempt in rows:
+        # ruleid: nso-ownership-lost-recovery-skip
+        try:
+            await dispose_execution_attempt(db, job_id, run_attempt, None, "orphaned")
+        except AttemptOwnershipLost:
+            logger.error("worker.orphan_ownership_lost", job_id=job_id)
+            continue
+
+
+async def recovery_fails_lost_attempt(db, rows, logger, dispose_execution_attempt, fail_lost_attempt):
+    for job_id, run_attempt in rows:
+        # ok: nso-ownership-lost-recovery-skip
+        try:
+            await dispose_execution_attempt(db, job_id, run_attempt, None, "orphaned")
+        except AttemptOwnershipLost:
+            logger.error("worker.orphan_ownership_lost", job_id=job_id)
+            await fail_lost_attempt(db, job_id, run_attempt)
+            continue

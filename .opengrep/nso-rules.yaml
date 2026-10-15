@@ -900,6 +900,28 @@ rules:
               ...
           except Exception as $E:
               ...
+  - id: nso-ownership-lost-recovery-skip
+    languages: [python]
+    severity: ERROR
+    message: A recovery pass that skips an attempt on AttemptOwnershipLost meets the same durable mismatch on every pass; end the run with fail_lost_attempt().
+    paths:
+      include:
+        - nso_adapter/**/*.py
+        - review-patterns.py
+    patterns:
+      - pattern: |
+          try:
+              ...
+          except AttemptOwnershipLost:
+              ...
+              continue
+      - pattern-not: |
+          try:
+              ...
+          except AttemptOwnershipLost:
+              ...
+              await fail_lost_attempt(...)
+              ...
   - id: nso-abort-known-raw-rollback
     languages: [python]
     severity: ERROR
