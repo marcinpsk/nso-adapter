@@ -364,6 +364,7 @@
         "type": "object"
       },
       "AttributedRefusalOut": {
+        "additionalProperties": false,
         "properties": {
           "family": {
             "title": "Family",
@@ -2270,6 +2271,7 @@
         "type": "object"
       },
       "CatalogRefusalOut": {
+        "additionalProperties": false,
         "properties": {
           "family": {
             "title": "Family",
@@ -10066,6 +10068,7 @@
         "type": "object"
       },
       "LogicalIdentityOut": {
+        "additionalProperties": false,
         "properties": {
           "acceptance_identity": {
             "anyOf": [
@@ -12137,6 +12140,7 @@
         "type": "object"
       },
       "RelatedSiteOut": {
+        "additionalProperties": false,
         "properties": {
           "family": {
             "title": "Family",
@@ -12806,6 +12810,7 @@
         "type": "object"
       },
       "RowOutcomeOut": {
+        "additionalProperties": false,
         "properties": {
           "acceptance_identity": {
             "anyOf": [
@@ -13124,6 +13129,7 @@
         "type": "object"
       },
       "SettlementOwnerOut": {
+        "additionalProperties": false,
         "properties": {
           "accepted_at": {
             "anyOf": [

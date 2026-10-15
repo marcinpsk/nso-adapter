@@ -77,6 +77,24 @@ def test_openapi_matches_committed_snapshot(openapi_schema):
         )
 
 
+def test_execution_evidence_schemas_are_closed(openapi_schema):
+    import inspect
+
+    from pydantic import BaseModel
+
+    from nso_adapter.api import execution
+
+    names = [
+        name
+        for name, model in vars(execution).items()
+        if inspect.isclass(model) and issubclass(model, BaseModel) and model.__module__ == execution.__name__
+    ]
+    schemas = openapi_schema["components"]["schemas"]
+    published = [name for name in names if name in schemas]
+    assert len(published) >= 7
+    assert {name: schemas[name].get("additionalProperties") for name in published} == dict.fromkeys(published, False)
+
+
 @pytest.mark.parametrize(
     ("response_name", "observation_name", "family", "document_name"),
     [

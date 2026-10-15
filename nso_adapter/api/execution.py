@@ -7,19 +7,22 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 
-class RowRefOut(BaseModel):
+class _ClosedOut(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class RowRefOut(_ClosedOut):
     subject: str
     key: str
 
 
-class RelatedSiteOut(BaseModel):
+class RelatedSiteOut(_ClosedOut):
     family: str
     row: RowRefOut | None
     field: str | None
 
 
-class CatalogRefusalOut(BaseModel):
+class CatalogRefusalOut(_ClosedOut):
     family: str
     row: RowRefOut
     field: str | None
@@ -29,7 +32,7 @@ class CatalogRefusalOut(BaseModel):
     related: RelatedSiteOut | None
 
 
-class SettlementOwnerOut(BaseModel):
+class SettlementOwnerOut(_ClosedOut):
     stream: str
     row: RowRefOut
     source_push_seq: int | None
@@ -39,7 +42,7 @@ class SettlementOwnerOut(BaseModel):
     settlement_cohort: int | None
 
 
-class LogicalIdentityOut(BaseModel):
+class LogicalIdentityOut(_ClosedOut):
     stream: str
     row: RowRefOut
     source_push_seq: int | None
