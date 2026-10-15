@@ -250,6 +250,15 @@ async def claim_session(db: AsyncSession | None) -> AsyncIterator[AsyncSession]:
         yield own
 
 
+async def rollback_abort_known(db: AsyncSession, **fields: Any) -> ClaimOutcome:
+    """Roll back a cleanup that aborted before COMMIT; a failed rollback must not end the worker loop."""
+    try:
+        await db.rollback()
+    except Exception as exc:  # noqa: BLE001 - no COMMIT was sent, so the abort stays known
+        logger.warning("claim.abort_rollback_failed", exception_type=type(exc).__name__, **fields)
+    return ClaimOutcome.ABORT_KNOWN
+
+
 async def _commit_outcome(db: AsyncSession) -> ClaimOutcome:
     """Commit and classify, per the three-state contract.
 
@@ -551,12 +560,10 @@ async def release_claim(
             )
         except ClaimLostError:
             # Already revoked and taken over: nothing of ours remains to delete.
-            await conn.rollback()
-            return ClaimOutcome.ABORT_KNOWN
+            return await rollback_abort_known(conn, device_id=reg.device_id)
         except Exception as exc:  # noqa: BLE001 - provably before COMMIT, so provably aborted
             logger.warning("claim.release_aborted", device_id=reg.device_id, error=repr(exc))
-            await conn.rollback()
-            return ClaimOutcome.ABORT_KNOWN
+            return await rollback_abort_known(conn, device_id=reg.device_id)
         return await _commit_outcome(conn)
 
 
@@ -944,12 +951,10 @@ async def mark_failed_and_release(
         except ClaimLostError:
             # Recovery already re-dispositioned this job; writing now would clobber it.
             logger.warning("claim.mark_failed_claim_lost", job_id=job_id, device_id=reg.device_id)
-            await conn.rollback()
-            return ClaimOutcome.ABORT_KNOWN
+            return await rollback_abort_known(conn, job_id=job_id)
         except Exception as exc:  # noqa: BLE001 - before COMMIT, so provably aborted
             logger.warning("claim.mark_failed_aborted", job_id=job_id, error=repr(exc))
-            await conn.rollback()
-            return ClaimOutcome.ABORT_KNOWN
+            return await rollback_abort_known(conn, job_id=job_id)
         return await _commit_outcome(conn)
 
 
@@ -985,12 +990,10 @@ async def dispose_cancelled(
             await _delete_own_claim(conn, reg)
         except ClaimLostError:
             logger.warning("claim.dispose_claim_lost", job_id=job_id, device_id=reg.device_id)
-            await conn.rollback()
-            return ClaimOutcome.ABORT_KNOWN
+            return await rollback_abort_known(conn, job_id=job_id)
         except Exception as exc:  # noqa: BLE001 - before COMMIT, so provably aborted
             logger.warning("claim.dispose_aborted", job_id=job_id, error=repr(exc))
-            await conn.rollback()
-            return ClaimOutcome.ABORT_KNOWN
+            return await rollback_abort_known(conn, job_id=job_id)
         return await _commit_outcome(conn)
 
 

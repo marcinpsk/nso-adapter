@@ -900,3 +900,15 @@ rules:
               ...
           except Exception as $E:
               ...
+  - id: nso-abort-known-raw-rollback
+    languages: [python]
+    severity: ERROR
+    message: Return ClaimOutcome.ABORT_KNOWN through rollback_abort_known(); a raw rollback that raises escapes the cleanup and ends the worker loop.
+    paths:
+      include:
+        - nso_adapter/**/*.py
+        - review-patterns.py
+    pattern: |
+      await $DB.rollback()
+      ...
+      return ClaimOutcome.ABORT_KNOWN

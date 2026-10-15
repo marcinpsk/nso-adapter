@@ -56,6 +56,7 @@ from nso_adapter.core.claim import (
     lock_claim,
     mark_failed_and_release,
     release_claim,
+    rollback_abort_known,
     terminalize,
     terminalize_running,
 )
@@ -895,8 +896,7 @@ async def _dispose_claimless(job_id: int, reg: ClaimRegistration, reason: str) -
             handled = await dispose_run(db, job_id, reg, reason)
         except Exception as exc:  # noqa: BLE001 - before COMMIT, so provably aborted
             logger.warning("worker.dispose_aborted", job_id=job_id, exception_type=type(exc).__name__)
-            await db.rollback()
-            return ClaimOutcome.ABORT_KNOWN
+            return await rollback_abort_known(db, job_id=job_id)
         if handled:
             return await _commit_outcome(db)
     return None
@@ -913,12 +913,10 @@ async def _release(reg: ClaimRegistration, job_id: int | None = None) -> ClaimOu
         try:
             await dispose_run(db, job_id, reg, "disposed")
         except ClaimLostError:
-            await db.rollback()
-            return ClaimOutcome.ABORT_KNOWN
+            return await rollback_abort_known(db, job_id=job_id)
         except Exception as exc:
             logger.warning("worker.release_aborted", job_id=job_id, exception_type=type(exc).__name__)
-            await db.rollback()
-            return ClaimOutcome.ABORT_KNOWN
+            return await rollback_abort_known(db, job_id=job_id)
         if reg.registered:
             return await release_claim(reg, db=db)
         return await _commit_outcome(db)

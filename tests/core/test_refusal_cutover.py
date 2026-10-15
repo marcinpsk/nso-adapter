@@ -427,9 +427,32 @@ async def test_capability_write_preserves_apply_error_and_disposal(
             )
 
 
+async def _terminate_backend(pid):
+    async with session() as db:
+        await db.execute(text("SELECT pg_terminate_backend(:pid, 5000)"), {"pid": pid})
+
+
+@pytest.mark.parametrize("connection", ["kept", "lost"])
 @pytest.mark.parametrize("ending", ["succeeds", "raises", "cancelled"])
 @pytest.mark.parametrize("through_loop", [False, True])
-async def test_claimless_disposal_error_is_known_abort(adapter_client, monkeypatch, debug_logs, through_loop, ending):
+async def test_claimless_disposal_error_is_known_abort(
+    adapter_client, monkeypatch, debug_logs, through_loop, ending, connection
+):
+    if connection == "lost":
+        from nso_adapter.core import execution
+
+        real_dispose_run = execution.dispose_run
+
+        async def dispose_run_then_lose_connection(db, *args, **kwargs):
+            pid = await db.scalar(text("SELECT pg_backend_pid()"))
+            try:
+                return await real_dispose_run(db, *args, **kwargs)
+            except Exception:
+                # The real failure, then a real connection loss before the cleanup rolls back.
+                await _terminate_backend(pid)
+                raise
+
+        monkeypatch.setattr(execution, "dispose_run", dispose_run_then_lose_connection)
     async with session() as db:
         jobs = [Job(job_type=JobType.provision, status=JobStatus.queued, coalescible=False) for _ in range(2)]
         db.add_all(jobs)
@@ -466,6 +489,8 @@ async def test_claimless_disposal_error_is_known_abort(adapter_client, monkeypat
                 assert (await job_row(job_id)).status == expected
             abandoned = [record for record in debug_logs if record["event"] == "claim.abandoned_to_staleness"]
             assert len(abandoned) == 2 and all(record["outcome"] == "abort_known" for record in abandoned)
+            failed = [record for record in debug_logs if record["event"] == "claim.abort_rollback_failed"]
+            assert len(failed) == (2 if connection == "lost" else 0)
         else:
             reg = ClaimRegistration()
             reg.run_attempt = 1
@@ -475,6 +500,8 @@ async def test_claimless_disposal_error_is_known_abort(adapter_client, monkeypat
                 "cancelled": lambda: worker._dispose(job_ids[0], JobType.provision, reg),
             }[ending]
             assert await cleanup() is ClaimOutcome.ABORT_KNOWN
+            failed = [record for record in debug_logs if record["event"] == "claim.abort_rollback_failed"]
+            assert len(failed) == (1 if connection == "lost" else 0)
     finally:
         stop.set()
         if task is not None:
