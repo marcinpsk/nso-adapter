@@ -918,6 +918,21 @@ async def terminalize_running(
     return write.status if write is not None else None
 
 
+async def fail_lost_attempt(db: AsyncSession, job_id: int, run_attempt: int) -> JobStatus | None:
+    """End a run whose attempt no longer matches it; its generation becomes ``outcome_unknown``."""
+    return await terminalize_running(
+        db,
+        job_id,
+        status=JobStatus.failed,
+        error={
+            "code": "attempt_ownership_lost",
+            "message": "Execution attempt no longer matches its job",
+            "detail": {},
+        },
+        expected_attempt=run_attempt,
+    )
+
+
 async def mark_failed_and_release(
     job_id: int,
     code: str,
@@ -1053,16 +1068,18 @@ async def revoke_stale_claims(
                 ).one_or_none()
                 if observed is not None:
                     job_type, run_attempt = observed
+                    lost = False
                     try:
                         async with conn.begin_nested():
                             disposition = await dispose_execution_attempt(
                                 conn, job_id, run_attempt, token, "claim_expired"
                             )
                     except AttemptOwnershipLost:
-                        # Keep the claim: one lost settlement must not stop recovery of other devices.
+                        # The mismatch is durable, so a later pass sees it again: end the run here.
                         logger.error("claim.revoke_ownership_lost", device_id=device_id, job_id=job_id)
-                        continue
-                    if disposition == "no_attempt":
+                        await fail_lost_attempt(conn, job_id, run_attempt)
+                        lost = True
+                    if not lost and disposition == "no_attempt":
                         await terminalize_running(
                             conn,
                             job_id,

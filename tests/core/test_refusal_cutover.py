@@ -736,7 +736,7 @@ async def test_recorded_refusal_recovery_lanes_do_not_resend(adapter_client, mon
 
 
 @pytest.mark.parametrize("lane", ["claimless", "expired"])
-async def test_recovery_lane_isolates_an_attempt_that_lost_ownership(adapter_client, monkeypatch, lane):
+async def test_recovery_lane_terminalizes_an_attempt_that_lost_ownership(adapter_client, monkeypatch, lane):
     device_id, _transport = await setup(adapter_client, monkeypatch)
     gate = CommitGate(monkeypatch, "response_recorded", failure=ClaimLostError("placeholder lost holder"))
     task = asyncio.create_task(run_next(device_id))
@@ -778,17 +778,19 @@ async def test_recovery_lane_isolates_an_attempt_that_lost_ownership(adapter_cli
                 )
             )
         await db.commit()
-    if lane == "claimless":
-        await worker.requeue_orphaned_jobs()
-        assert (await job_row(healthy_job_id)).status == JobStatus.queued
-    else:
-        revoked = await revoke_stale_claims(cutoff_seconds=0)
-        assert [entry.device_id for entry in revoked] == [healthy]
+    for _ in range(2):
+        if lane == "claimless":
+            await worker.requeue_orphaned_jobs()
+            assert (await job_row(healthy_job_id)).status == JobStatus.queued
+        else:
+            await revoke_stale_claims(cutoff_seconds=0)
         async with session() as db:
-            assert set(await db.scalars(select(DeviceClaim.device_id))) == {device_id}
-    attempts, outcomes = await evidence(device_id)
-    assert attempts[-1].phase != "terminal" and not outcomes
-    assert (await job_row(attempts[-1].job_correlation_id)).status == JobStatus.running
+            assert not set(await db.scalars(select(DeviceClaim.device_id)))
+        attempts, outcomes = await evidence(device_id)
+        assert attempts[-1].phase != "terminal" and not outcomes
+        job = await job_row(attempts[-1].job_correlation_id)
+        assert (job.status, job.error["code"]) == (JobStatus.failed, "attempt_ownership_lost")
+        assert (await generations(device_id))[-1].status == GenerationStatus.outcome_unknown
 
 
 async def test_attempt_membership_excludes_a_carried_stream_the_job_did_not_promote(adapter_client, monkeypatch):

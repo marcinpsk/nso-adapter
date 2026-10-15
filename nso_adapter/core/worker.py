@@ -53,6 +53,7 @@ from nso_adapter.core.claim import (
     dispose_cancelled,
     disposition_for,
     error_envelope,
+    fail_lost_attempt,
     lock_claim,
     mark_failed_and_release,
     release_claim,
@@ -1009,8 +1010,9 @@ async def requeue_orphaned_jobs() -> None:
                 async with db.begin_nested():
                     handled = await dispose_execution_attempt(db, job_id, run_attempt, None, "orphaned")
             except AttemptOwnershipLost:
-                # One lost settlement must not stop recovery of the other orphaned jobs.
+                # The mismatch is durable, so a later pass sees it again: end the run here.
                 logger.error("worker.orphan_ownership_lost", job_id=job_id)
+                failed += await fail_lost_attempt(db, job_id, run_attempt) is not None
                 continue
             if handled != "no_attempt":
                 failed += handled == "settled"
