@@ -437,8 +437,8 @@ async def test_a_successor_refuses_an_omission_the_cleanup_never_authorized(adap
     writes = len(fake.writes)
     job = await job_row(await run_head(device_id, client))
     assert job.status.value == "failed", job.result
-    (blocked,) = {item["error"] for item in job.error["detail"]["items"]}
-    assert blocked == "apply error (removal_blocked_collateral); see the server log"
+    assert job.error["code"] == "removal_blocked_collateral"
+    assert job.error["detail"]["orphans"]
     assert len(fake.writes) == writes, "a refused document must not commit"
 
 
@@ -511,7 +511,7 @@ async def test_worker_retains_carrier_when_service_members_are_null(adapter_clie
     from nso_adapter.core.removal import enqueue_removal
 
     async with session() as db:
-        await enqueue_removal(
+        job = await enqueue_removal(
             db,
             device_id,
             "static_route",
@@ -520,6 +520,11 @@ async def test_worker_retains_carrier_when_service_members_are_null(adapter_clie
             promotes=("static_route",),
             static_route_tombstone_ids=(tomb,),
         )
+        assert job is not None
+        from nso_adapter.store.models import StaticRouteTombstone
+
+        tombstone = await db.get(StaticRouteTombstone, tomb)
+        tombstone.job_id = job.id
         await db.commit()
     fake = SrFake("null-service-member", service=[], device=[])
     fake.state = lambda: ServiceInstanceState("present", {"device": "null-service-member", **entry})

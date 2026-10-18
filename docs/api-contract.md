@@ -1071,9 +1071,9 @@ them again and refuses if the head, digest, or preview changed.
 
 One document is one transaction, so there is ONE delta: `diffs` carries a single
 `device_intent` entry covering every family the document holds, the two switching sections
-included. An empty `diffs` means the device already holds the document. Where no preview can
-be rendered (no generation to deploy, an inconclusive dry-run, a body the adapter could not
-build), that one entry carries a `!! preview unavailable: <reason>` line instead of a delta.
+included. An empty `diffs` with `status=ready` means the device already holds the document. Where no preview can
+be rendered (no generation to deploy, an inconclusive dry-run, a refused document, a body the
+adapter could not build), that one entry carries a `!! preview unavailable: <reason>` line instead of a delta.
 Malformed AS content in the frozen document returns a 409 `asn_rule_violation`
 `ErrorEnvelope` instead of a preview-unavailable entry.
 `outformat=cli` renders NSO's NED-uniform `+`/`-` tree diff instead of device-native config.
@@ -1081,6 +1081,7 @@ Malformed AS content in the frozen document returns a 409 `asn_rule_violation`
 ```json
 { "device_id": 1, "outformat": "native", "generation_id": 7,
   "document_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "status": "ready", "refusals": [],
   "diffs": { "device_intent": "interface GigabitEthernet0/1\n description uplink\n!" } }
 ```
 
@@ -1109,6 +1110,7 @@ directions* under §Conventions.
   "result": { "interfaces_written": 12, "interfaces_created": 2,
               "changes_detected": 1 },
   "error": null,
+  "row_outcomes": null, "refusals": null,
   "context": null,
   "created_at": "2026-05-20T10:05:30Z",
   "updated_at": "2026-05-20T10:06:00Z",
@@ -1118,7 +1120,7 @@ directions* under §Conventions.
 ```
 
 Every key is always present; nullables are emitted as `null`.
-`failed` jobs carry `error` in the standard error shape; `result` is `null`.
+`failed` jobs carry `error` in the standard error shape. Failed apply and removal jobs can also carry terminal execution evidence in `result`.
 
 `settle_seq` is this job's position in its **device's** settlement order, described under
 [The ordered settlement feed](#the-ordered-settlement-feed). It is `null` while the job is
@@ -1746,9 +1748,10 @@ written by this pass, so nothing is lost by the scoping.
 
 `unproven` is **not** a failure: the job still succeeds — a transient read failure must not
 fail an apply whose device write landed — but nothing is recorded as deployed and no green is
-reported for that route. Note that `result.static_route_count_by_outcome` is the older
-per-scope *send* counter: it counts a route the device accepted as `in_sync` even where the
-per-route outcome is `unproven`. `static_route_results` is the authoritative per-route record.
+reported for that route. `result.static_route_count_by_outcome` counts its logical
+carrier as `unavailable` when proof is incomplete. `static_route_results` retains the
+specialized per-route proof. A structured refusal derives its route error from the same
+logical outcome and never satisfies the proof.
 
 #### Clearing a leaf
 
@@ -2953,3 +2956,77 @@ registry.
 OSPF redistribution inventories use process ID and VRF as their identity. Flat
 observation entries also carry `dest_vrf`. Mirror destination references keep
 the process ID format.
+
+
+### Structured execution outcomes and refusal evidence
+
+Every `<scope>_count_by_outcome` has exactly four keys: `in_sync`, `apply_failed`,
+`not_applied`, and `unavailable`. Empty results contain all four zero values.
+Counts use unique attempted count and stamp carriers. They do not count child outcomes.
+A carrier with a refused contributor counts as `apply_failed`. Otherwise, an unavailable
+contributor takes precedence over `not_applied`. A carrier is `in_sync` only when all
+required contributors have certified success.
+
+Terminal `result.row_outcomes` contains one record per attempted logical row. Each record
+contains `stream`, `row` (`subject`, SHA-256 `key`), `source_push_seq`, `frozen_revision`,
+`acceptance_identity`, `generation_id`, `settlement_cohort`, `carrier`, `disposition`, and
+`refusals`. Its disposition is `in_sync`, `refused`, `not_applied`, or `unavailable`.
+The `carrier` contains its own `stream`, `row`, `source_push_seq`, `frozen_revision`,
+`accepted_at`, `generation_id`, and `settlement_cohort`. A child without a separate
+acceptance timestamp carries its accepted parent's identity. It does not invent a timestamp.
+
+BGP peers and LAG members have independent logical outcomes and share their parent's
+carrier. Redistribution retains an independent carrier. Peer address families settle at
+peer grain. Switchport tagged membership settles at interface grain. Route-policy entries
+settle at policy-object grain. The exact refusal construct can therefore differ from the
+logical row. Consumers must join each outcome to its frozen accepted payload. They must
+never settle a child from a carrier aggregate or overwrite a successor's acceptance.
+
+Each refusal has `family`, `row`, `field`, `reason`, `message_id`, `message`, and `related`.
+The reason and message come from the canonical catalog. Logical outcome refusals name their
+exact cause. `result.refusals` also contains fully attributed document causes, with
+`logical_rows`, `provenance` (`current`, `retained`, or `prior`), and `sender_phase`
+(`pre_commit_dry_run`, `commit`, or `post_commit_verification`). A passive or retained
+cause does not grant permission to stamp or count that historical row.
+
+Job responses expose typed `row_outcomes` and `refusals` projections beside `result`.
+Deployment-evidence generation and head responses expose the same projections from the
+terminal carrier snapshot. Job pruning preserves this evidence. Before terminal evidence
+exists, both fields are `null`. A completed attempt with no logical rows exposes `[]`.
+API reads do not reconstruct attribution from live intent.
+
+Preview exposes `status`: `ready`, `refused`, `unavailable`, or `error`. A canonical,
+fully attributed refusal returns `refused` and catalog causes. Protocol and attribution
+faults return `error`. An inconclusive ordinary dry-run returns `unavailable`. A stale
+head invalidates the status, refusals, generation identity, and delta together.
+
+A durable prepared attempt precedes every mutating device-intent PUT. Safe response
+checkpoints and commit acknowledgement precede terminal settlement. A validated commit
+refusal fails named logical rows and gives every other attempted logical row `not_applied`.
+Attribution failure records a safe `attribution_failed` job error and makes all attempted rows `unavailable`.
+It restores only attempt-owned deploying state. It preserves prior successful timestamps
+and unnamed errors. Protocol faults and unresolved delivery produce `unavailable`.
+A post-commit verification refusal does not prove rollback of the acknowledged commit.
+It remains an attributed document cause with its verification phase. Logical outcomes
+remain `unavailable`, with no fabricated `not_applied` or `refused` dispositions.
+
+Cancellation, execution timeout, runner failure, and both recovery lanes consult the same
+attempt evidence before terminalization or claim disposal. Recovery never sends another PUT.
+A prepared removal with unresolved delivery or recorded refusal cannot automatically requeue.
+The tombstone sweeper and reclaimer consult durable tombstone authority, including after job
+pruning. An explicit authorized generation retry creates a new attempt and snapshot.
+
+A refusal does not prove a static-route deployed key, clear, or tombstone consumption.
+Accepted send and certified row success remain separate. The existing policy allows an
+accepted static-route send with inconclusive proof to succeed at job level. Its logical
+row outcome remains `unavailable` until proof supports `in_sync`.
+
+Raw NSO responses, parsing exceptions, private bookkeeping snapshots, claim tokens, credential
+natural keys, and resolved credentials never enter public execution evidence. Credential
+identity uses digest row references. Structured refusals do not feed inferred capability
+negatives. Only explicit ordinary device-parser constructs can record a negative capability.
+
+Step D must consume this exact count and outcome contract before paired activation.
+The adapter cutover merges to develop only after that consumer is review-ready. Adapter
+main and deployment wait for D. Quiesce apply and settlement during paired activation.
+There is one schema and no compatibility flag.

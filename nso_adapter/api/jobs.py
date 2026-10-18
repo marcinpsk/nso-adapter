@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404, RESP_422_VALIDATION, ResponseSpec, api_error
+from nso_adapter.api.execution import AttributedRefusalOut, RowOutcomeOut, evidence_projection
 from nso_adapter.api.pagination import DEFAULT_PAGE, validate_page_limit
 from nso_adapter.api.timestamps import iso_z
 from nso_adapter.store.meta import get_store_incarnation
@@ -38,6 +39,8 @@ class JobOut(BaseModel):
     device_id: int | None
     status: str
     result: dict | None
+    row_outcomes: list[RowOutcomeOut] | None
+    refusals: list[AttributedRefusalOut] | None
     error: dict | None
     context: dict | None
     created_at: str
@@ -55,6 +58,7 @@ def _job_out(j: Job) -> dict:
         "device_id": j.device_id,
         "status": j.status.value,
         "result": j.result,
+        **evidence_projection(j.result),
         "error": j.error,
         "context": j.context,
         "created_at": iso_z(j.created_at),

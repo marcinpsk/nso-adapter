@@ -359,8 +359,8 @@ async def test_put_removal_enqueues_async_removal_job(adapter_client, monkeypatc
     """s3-23: dropping a row must ENQUEUE an async removal job (not block the PUT on an inline
     replace-mode device commit that can stall past the plugin timeout). The worker then
     PUT-replaces the snmp service with the remaining accepted intent (replace=True)."""
-    from nso_adapter.core.removal import run_removal
     from nso_adapter.store.models import Job, JobStatus, JobType
+    from tests.core.execution_helpers import run_removal
 
     device_id = await seed_device(nso_device_name="snmp-prop-dev", netbox_device_id=967)
 

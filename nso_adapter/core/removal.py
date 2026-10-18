@@ -22,6 +22,7 @@ from __future__ import annotations
 import ipaddress
 import json
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from functools import cache
 from typing import NamedTuple
 from uuid import UUID
@@ -43,7 +44,6 @@ from nso_adapter.core.request_flags import (
 from nso_adapter.domain.asn import AsnRuleViolation, checked_asn, validate_asn_rows, validate_source_as_numbers
 from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.nso.client import failure_detail
-from nso_adapter.nso.origins import OriginContext
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device
 
@@ -679,6 +679,7 @@ async def guarded_device_write(
     context: dict | None = None,
     current=_NO_SNAPSHOT,
     no_networking: bool = False,
+    checkpoint=None,
 ):
     """PUT the device's document behind the device-wide collateral guard (the ra1 lo0 incident).
 
@@ -699,6 +700,7 @@ async def guarded_device_write(
     caller unable to tell a proven commit from an unverified one.
     """
     from nso_adapter.nso.apply import NsoApplyError, apply_device_intent
+    from nso_adapter.nso.refusals import OrdinaryRejection
 
     context = context or {}
     device_name = device.nso_device_name
@@ -708,6 +710,8 @@ async def guarded_device_write(
         if current is _NO_SNAPSHOT:
             state = await client.service_instance_state(device_name)
             if state.inconclusive:
+                if checkpoint is not None:
+                    await checkpoint("pre_commit_dry_run", OrdinaryRejection(), False)
                 raise NsoApplyError(
                     "service_snapshot_inconclusive",
                     "could not certify the live service instance; refusing the device-intent PUT",
@@ -716,6 +720,8 @@ async def guarded_device_write(
         if current:
             orphans = _document_orphans(current, containers, allowed)
             if orphans:
+                if checkpoint is not None:
+                    await checkpoint("pre_commit_dry_run", OrdinaryRejection(), False)
                 raise RemovalBlockedError(orphans)
     return await apply_device_intent(
         client,
@@ -723,6 +729,7 @@ async def guarded_device_write(
         containers,
         device_id=device.id,
         no_networking=no_networking,
+        checkpoint=checkpoint,
     )
 
 
@@ -812,10 +819,15 @@ def _classify_static_route_removal(generation, context: dict) -> SrRemoval:
     )
 
 
-async def _put_removal_document(db: AsyncSession, device, client, scope: str, context: dict | None, *, job_id):
+async def _put_removal_document(
+    db: AsyncSession, device, client, scope: str, context: dict | None, *, job_id, reg=None
+):
     """Build and send the aggregate once, with the frozen operation's settlement proof."""
     from nso_adapter.core.apply import _refuse_unverifiable_recorded_put, build_device_containers
-    from nso_adapter.core.generation import execution_policy
+    from nso_adapter.core.execution import prepare_send
+    from nso_adapter.core.generation import execution_policy, generation_execution_context
+    from nso_adapter.nso.origins import current_membership
+    from nso_adapter.nso.refusals import OrdinaryRejection
 
     generation = await _executing_document(db, job_id, scope)
     policy = execution_policy(generation)
@@ -825,15 +837,22 @@ async def _put_removal_document(db: AsyncSession, device, client, scope: str, co
         return out
     if not policy.no_networking:
         _refuse_unverifiable_recorded_put(generation)
+    context_origins = await generation_execution_context(db, job_id)
     body = await build_device_containers(
         client,
         device,
         generation.document,
         retain_static_routes=policy.retain_static_routes,
-        origin_context=OriginContext.from_generation(generation),
+        origin_context=context_origins,
     )
+    membership = current_membership(body.origins, context_origins)
     if body.errors:
-        raise next(iter(body.errors.values()))
+        checkpoint = await prepare_send(db, generation, body.origins, membership, reg)
+        await checkpoint("pre_commit_dry_run", OrdinaryRejection(), False)
+        error = next(iter(body.errors.values()))
+        error.sender_phase = "pre_commit_dry_run"
+        error.classification = OrdinaryRejection()
+        raise error
     if out is not None:
         if body.sent_route_keys is None:
             raise RuntimeError("static-route removal document has no static-route section")
@@ -846,6 +865,10 @@ async def _put_removal_document(db: AsyncSession, device, client, scope: str, co
         )
         if out.branch != "force" and not out.authorized and not delivered:
             return out._replace(branch="superseded", sent_keys=frozenset())
+    from nso_adapter.core.claim import lock_claim
+
+    checkpoint = await prepare_send(db, generation, body.origins, membership, reg)
+    await lock_claim(db, reg)
     verdict = await guarded_device_write(
         client,
         device,
@@ -854,6 +877,7 @@ async def _put_removal_document(db: AsyncSession, device, client, scope: str, co
         context=context,
         current=body.snapshot,
         no_networking=policy.no_networking,
+        checkpoint=checkpoint,
     )
     return out._replace(put_issued=True, verify=verdict) if out is not None else None
 
@@ -1043,6 +1067,7 @@ async def _finalize_static_route_removal(db, job_id: int, device, client, out: S
     Returns whether the job ended ``succeeded``.
     """
     from nso_adapter.core.claim import ClaimRegistration, lock_claim, terminalize
+    from nso_adapter.core.execution import active_attempt, read_send_history, record_send_history
     from nso_adapter.store.models import DeploymentGeneration, JobStatus
 
     result: dict = {"scope": "static_route", "removal_branch": out.branch}
@@ -1080,6 +1105,7 @@ async def _finalize_static_route_removal(db, job_id: int, device, client, out: S
     promoted_context = bool(out.authorized) and bool(promotes_static_route)
     owns_carrier = bool(out.tombstone_ids) or bool(out.clears) or promoted_context
     consume = proven and not residue_found
+    certified = await read_send_history(db, job_id, client, device)
 
     # The lock FIRST and held to COMMIT. no_autoflush is the lock ORDER: an ORM SELECT that
     # autoflushed a dirtied intent row would take row locks before the claim lock, the reverse
@@ -1129,6 +1155,20 @@ async def _finalize_static_route_removal(db, job_id: int, device, client, out: S
             verify=out.verify,
             residue=result.get("residue_check"),
         )
+    from nso_adapter.store.execution_attempt_store import complete_execution_result
+
+    await record_send_history(db, job_id, reg, certified)
+    attempt = await active_attempt(db, job_id)
+    if attempt is not None:
+        dispositions = {
+            (row["stream"], row["row"]["subject"], row["row"]["key"], row["settlement_cohort"]): "in_sync"
+            if proven and not residue_found
+            else "unavailable"
+            for row in attempt.logical_membership
+        }
+        result.update(
+            await complete_execution_result(db, job_id, reg.run_attempt, reg.token, dispositions, datetime.now(UTC))
+        )
     write = await terminalize(
         db,
         job_id,
@@ -1171,7 +1211,7 @@ async def _dispatch_scope(
     """
     if scope not in valid_removal_scopes():
         raise ValueError(f"Unknown removal scope {scope!r}")
-    return await _put_removal_document(db, device, client, scope, context, job_id=job_id)
+    return await _put_removal_document(db, device, client, scope, context, job_id=job_id, reg=reg)
 
 
 def _refuse_force_incompatible(
@@ -1716,6 +1756,35 @@ async def enqueue_static_route_removals(
     return list(jobs.values())
 
 
+async def _completed_removal_result(db: AsyncSession, job_id: int, reg, certified, *, residue_found: bool) -> dict:
+    from nso_adapter.core.execution import active_attempt, record_send_history
+    from nso_adapter.store.execution_attempt_store import complete_execution_result
+
+    await record_send_history(db, job_id, reg, certified)
+    execution = await active_attempt(db, job_id)
+    if execution is None:
+        return {}
+    verified = execution.response_classification.get("post_commit_verification", {}).get("kind") == "verified"
+    dispositions = {
+        (row["stream"], row["row"]["subject"], row["row"]["key"], row["settlement_cohort"]): "in_sync"
+        if verified and not residue_found
+        else "unavailable"
+        for row in execution.logical_membership
+    }
+    return await complete_execution_result(db, job_id, reg.run_attempt, reg.token, dispositions, datetime.now(UTC))
+
+
+async def _fail_removal_execution(db: AsyncSession, job_id: int, reg, error: dict) -> None:
+    from nso_adapter.core.execution import dispose_run
+    from nso_adapter.core.jobs import _mark_job_failed
+
+    await db.rollback()
+    if await dispose_run(db, job_id, reg, "removal_failed", terminal_error=error):
+        await _commit_terminal_removal(db, job_id)
+    else:
+        await _mark_job_failed(db, job_id, error, reg)
+
+
 async def run_removal(job_id: int, device_id: int, reg=None) -> None:
     """Execute a queued ``removal`` job: PUT-replace the scope's reconciler service.
 
@@ -1791,6 +1860,14 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
                             result["sync_from"] = "failed"
             else:
                 await _record_residue(result, client, device, scope, context, job_id=job_id, device_id=device_id)
+            from nso_adapter.core.execution import read_send_history
+
+            certified = await read_send_history(db, job_id, client, device)
+            result.update(
+                await _completed_removal_result(
+                    db, job_id, reg, certified, residue_found=result.get("residue_check") == "found"
+                )
+            )
             if (
                 await terminalize(
                     db,
@@ -1804,11 +1881,9 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
             ):
                 await db.rollback()
                 return
-            await db.commit()
+            await _commit_terminal_removal(db, job_id)
             await _enqueue_followup_sync(db, job_id, device_id)
         except RemovalBlockedError as blocked:
-            from nso_adapter.core.jobs import _mark_job_failed
-
             logger.error(
                 "removal.blocked_collateral",
                 job_id=job_id,
@@ -1816,9 +1891,10 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
                 scope=scope,
                 error=failure_detail(blocked),
             )
-            await _mark_job_failed(
+            await _fail_removal_execution(
                 db,
                 job_id,
+                reg,
                 {
                     "code": "removal_blocked_collateral",
                     "message": str(blocked),
@@ -1832,7 +1908,6 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
                         ),
                     },
                 },
-                reg,
             )
         except ClaimLostError:
             # Revocation is not a runner error: recovery already owns the disposition.
@@ -1844,8 +1919,6 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
             # re-dispositions only a job still `running` (G38).
             raise
         except Exception as exc:  # noqa: BLE001 — record on the job, never crash the worker
-            from nso_adapter.core.jobs import _mark_job_failed
-
             logger.error(
                 "removal.failed",
                 job_id=job_id,
@@ -1853,7 +1926,15 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
                 scope=scope,
                 error=failure_detail(exc),
             )
-            await _mark_job_failed(db, job_id, error_envelope(exc, code="removal_failed", detail={"scope": scope}), reg)
+            from nso_adapter.core.apply import _apply_error_summary
+            from nso_adapter.nso.apply import NsoApplyError
+
+            error = (
+                {"code": exc.code, "message": _apply_error_summary(exc), "detail": exc.detail}
+                if isinstance(exc, NsoApplyError) and exc.sender_phase == "pre_commit_dry_run"
+                else error_envelope(exc, code="removal_failed", detail={"scope": scope})
+            )
+            await _fail_removal_execution(db, job_id, reg, error)
 
 
 async def _enqueue_followup_sync(db: AsyncSession, job_id: int, device_id: int) -> None:

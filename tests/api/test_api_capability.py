@@ -192,6 +192,7 @@ async def test_apply_preflight_flags_unsupported_scope(adapter_client_with_nso, 
         await db.commit()
     async with session() as db:
         await record_capability_rejection(db, _NED, "17.15.4c", "static_route", "static_route", "NED rejected")
+        await db.commit()
 
     resp = await adapter_client_with_nso.post(
         f"/api/v1/devices/{device_id}/apply/preflight?refresh=false",

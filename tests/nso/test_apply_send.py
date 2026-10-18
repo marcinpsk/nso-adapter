@@ -153,6 +153,24 @@ async def test_native_dry_run_none_on_transport_error():
     assert await native_dry_run(client, "http://nso/x", "{}", "sw03", device_id=_DEVICE_ID) is None
 
 
+@pytest.mark.parametrize("phase", ["dry_run", "commit"])
+async def test_transport_failure_diagnostic_names_only_the_exception_type(phase):
+    secret = "placeholder-secret transport detail"
+    client = _client_with(_RecordingTransport(raise_exc=httpx.ConnectError(secret)))
+
+    with capture_logs() as logs:
+        if phase == "dry_run":
+            assert await native_dry_run(client, "http://nso/x", "{}", "sw03", device_id=74) is None
+        else:
+            with pytest.raises(NsoApplyError):
+                await apply_device_intent(client, "sw03", {"snmp": {}}, device_id=74)
+
+    event = "nso.apply.dry_run_non_2xx" if phase == "dry_run" else "nso.apply.device_intent_failed"
+    record = next(record for record in logs if record["event"] == event)
+    assert (record["status"], record["exception_type"]) == (None, "ConnectError")
+    assert_records_free_of([record], [secret])
+
+
 async def test_native_dry_run_absent_device_diagnostic_uses_id_and_count(debug_logs):
     requested = "placeholder-requested-device"
     provider_name = "placeholder-provider-device"

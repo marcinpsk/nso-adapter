@@ -199,3 +199,18 @@ def origins_from_records(records: list[dict]) -> OriginIndex:
 def refusals_from_payload(payload: list[dict]) -> tuple[Refusal, ...]:
     validate_catalog_payload(payload)
     return tuple(_refusal_from_record(record) for record in payload)
+
+
+def attributed_catalog_records(attributed, origins: OriginIndex, sender_phase: str) -> list[dict]:
+    """Publish exact document causes through the same catalog and identity projection."""
+    return [
+        {
+            **catalog_records((site.refusal,))[0],
+            "logical_rows": [logical.public_record() for logical in site.logical_rows],
+            "provenance": origins.bindings[
+                OriginKey(site.refusal.family, site.refusal.row, site.refusal.field)
+            ].provenance,
+            "sender_phase": sender_phase,
+        }
+        for site in attributed
+    ]

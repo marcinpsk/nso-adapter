@@ -45,10 +45,10 @@ async def _jobs_ordered(device_id: int) -> list[tuple[int, str]]:
 
 async def _run_apply_job(device_id: int, job_id: int, client):
     """Run the apply job the endpoint enqueued, as the worker would."""
-    from nso_adapter.core.apply import run_apply
     from nso_adapter.core.claim import acquire_claim, release_claim
     from nso_adapter.store.models import Job
     from tests.conftest import start_job
+    from tests.core.execution_helpers import run_apply
 
     attempt = await start_job(job_id)
     reg = await acquire_claim(device_id, "job", job_id=job_id)

@@ -285,7 +285,7 @@ async def test_a_rejected_commit_with_a_non_json_body_still_raises():
     with pytest.raises(NsoApplyError) as exc_info:
         await apply_device_intent(client, "ra1", {"l2-sap": {"sap": []}}, device_id=_DEVICE_ID)
     assert exc_info.value.code == "nso_put_failed"
-    assert exc_info.value.detail["nso_error"] == {"raw": "[redacted]"}
+    assert exc_info.value.detail["nso_error"] == "[redacted]"
 
 
 def test_nso_apply_error_str():

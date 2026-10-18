@@ -12,7 +12,9 @@ from nso_adapter.core.projection import (
     hydrate_interface_execution,
     hydrate_section,
     intent_state,
+    section_context,
     section_registry,
+    stream_section,
 )
 from nso_adapter.nso.origins import LogicalRow, OriginIndex, content_digest
 from nso_adapter.store.models import (
@@ -121,14 +123,31 @@ async def _lock_tree(db: AsyncSession, tree: dict):
     return row
 
 
-async def _authorized(db: AsyncSession, device_id: int, stream: str, revision: int) -> bool:
+async def _authorized(
+    db: AsyncSession, device_id: int, stream: str, revision: int, *, certified_snapshot: dict | None = None
+) -> bool:
     current = await db.scalar(
-        select(DeviceProjectionStream.authorized_revision)
+        select(DeviceProjectionStream)
         .where(DeviceProjectionStream.device_id == device_id, DeviceProjectionStream.stream == stream)
         .with_for_update()
-        .execution_options(autoflush=False)
+        .execution_options(populate_existing=True, autoflush=False)
     )
-    return current == revision
+    if current is None:
+        return False
+    if current.authorized_revision == revision:
+        return True
+    if certified_snapshot is None or current.authorized_document is None:
+        return False
+    section = stream_section(stream)
+    document = {section: current.authorized_document}
+    if content_digest(section_context(document, section)) != certified_snapshot["writer_context_identity"]:
+        return False
+    frozen = {(row.__tablename__, row.id): row for rows in hydrate_section(document, section).values() for row in rows}
+    tree = certified_snapshot["fence"]
+    original = frozen.get((tree["table"], tree["id"]))
+    return original is not None and _tree(original, _frozen_children(frozen)) == {
+        key: value for key, value in tree.items() if key != "interface_context"
+    }
 
 
 async def _lock_attribute(db: AsyncSession, row) -> InterfaceAttrState | None:
@@ -243,6 +262,9 @@ async def snapshot_bookkeeping(
                 {
                     "stream": stream,
                     "frozen_revision": revision,
+                    "writer_context_identity": content_digest(
+                        section_context(generation.document, stream_section(stream))
+                    ),
                     "fence": tree,
                     "prior": prior,
                     "expected": prior,
@@ -253,22 +275,46 @@ async def snapshot_bookkeeping(
     return result
 
 
+async def _bookkeeping_target(db: AsyncSession, device_id: int, snapshot: dict, *, certified: bool = False):
+    if not await _authorized(
+        db,
+        device_id,
+        snapshot["stream"],
+        snapshot["frozen_revision"],
+        certified_snapshot=snapshot if certified else None,
+    ):
+        return None, None
+    row = await _lock_tree(db, snapshot["fence"])
+    if row is None or _bookkeeping(row) != snapshot["expected"]:
+        return None, None
+    attribute = snapshot["attribute"]
+    state = None
+    if attribute is not None:
+        state = await _lock_attribute(db, row)
+        if state is None or state.id != attribute["id"] or _attribute_observation(state) != attribute["expected"]:
+            return None, None
+    return row, state
+
+
+async def matching_bookkeeping_rows(db: AsyncSession, device_id: int, snapshots: list) -> dict:
+    """Re-read owned targets under the same terminal fences before route bookkeeping."""
+    targets = {}
+    for snapshot in snapshots:
+        row, _state = await _bookkeeping_target(db, device_id, snapshot)
+        if row is not None:
+            targets[(row.__tablename__, row.id)] = row
+    return targets
+
+
 async def restore_bookkeeping(db: AsyncSession, device_id: int, snapshots: list) -> set[tuple[str, int]]:
     """Restore only fields preparation changed, preserving all other bookkeeping."""
     restored = set()
     for snapshot in snapshots:
-        stream = snapshot["stream"]
-        if not await _authorized(db, device_id, stream, snapshot["frozen_revision"]):
+        row, state = await _bookkeeping_target(db, device_id, snapshot)
+        if row is None:
             continue
-        row = await _lock_tree(db, snapshot["fence"])
-        if row is None or _bookkeeping(row) != snapshot["expected"]:
-            continue
-        attribute = snapshot["attribute"]
-        if attribute is not None:
-            state = await _lock_attribute(db, row)
-            if state is None or state.id != attribute["id"] or _attribute_observation(state) != attribute["expected"]:
-                continue
-            state.sync_state = SyncState(attribute["prior_sync_state"])
+        if state is not None:
+            state.sync_state = SyncState(snapshot["attribute"]["prior_sync_state"])
         restored.add((row.__tablename__, row.id))
     await db.flush()
     return restored
@@ -290,17 +336,11 @@ async def stamp_refused_bookkeeping(db: AsyncSession, device_id: int, snapshots:
                 [],
             )
         ]
-        if not records or not await _authorized(db, device_id, snapshot["stream"], snapshot["frozen_revision"]):
+        if not records:
             continue
-        row = await _lock_tree(db, snapshot["fence"])
-        if row is None or _bookkeeping(row) != snapshot["expected"]:
+        row, state = await _bookkeeping_target(db, device_id, snapshot)
+        if row is None:
             continue
-        attribute = snapshot["attribute"]
-        state = None
-        if attribute is not None:
-            state = await _lock_attribute(db, row)
-            if state is None or state.id != attribute["id"] or _attribute_observation(state) != attribute["expected"]:
-                continue
         if hasattr(row, "last_apply_error"):
             row.last_apply_error = {
                 "code": "refused",
@@ -308,4 +348,28 @@ async def stamp_refused_bookkeeping(db: AsyncSession, device_id: int, snapshots:
             }
         if state is not None:
             state.sync_state = SyncState.apply_failed
+    await db.flush()
+
+
+async def stamp_certified_bookkeeping(
+    db: AsyncSession, device_id: int, snapshots: list, dispositions: dict, now
+) -> None:
+    """Stamp a carrier only when every logical contributor has certified success."""
+    for snapshot in snapshots:
+        if not all(
+            dispositions.get(
+                (logical["stream"], logical["row"]["subject"], logical["row"]["key"], logical["settlement_cohort"])
+            )
+            == "in_sync"
+            for logical in snapshot["contributors"]
+        ):
+            continue
+        row, state = await _bookkeeping_target(db, device_id, snapshot, certified=True)
+        if row is None:
+            continue
+        if hasattr(row, "last_apply_at"):
+            row.last_apply_at = now
+            row.last_apply_error = None
+        if state is not None:
+            state.sync_state = SyncState.in_sync
     await db.flush()

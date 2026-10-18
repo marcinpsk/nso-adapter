@@ -38,6 +38,9 @@ def _envelope(message, root="ietf-restconf:errors", tags=_REFUSAL_TAGS):
         (400, _envelope("ordinary rejection"), "OrdinaryRejection"),
         (404, "opaque response", "OrdinaryRejection"),
         (None, None, "Unavailable"),
+        (101, "", "Unavailable"),
+        (302, "opaque response", "Unavailable"),
+        (307, _envelope(_message()), "ProtocolFault"),
     ],
 )
 def test_classify_error_table(status, body, expected):

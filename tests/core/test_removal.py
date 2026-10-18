@@ -313,11 +313,18 @@ async def _dispatch(device_id: int, scope: str, *, context_extra: dict | None = 
         job_id = await _seed_removal_job(device_id, scope, context_extra)
     client = _guard_client(instance)
     sender = _sender()
-    async with session() as db:
-        device = await db.get(Device, device_id)
-        context = {"scope": scope, **(context_extra or {})}
-        with patch("nso_adapter.nso.apply.apply_device_intent", sender):
-            await removal_mod._dispatch_scope(db, device, client, scope, context, job_id=job_id)
+    from nso_adapter.core.claim import acquire_claim, release_claim
+
+    reg = await acquire_claim(device_id, "job", job_id=job_id)
+    reg.run_attempt = 1
+    try:
+        async with session() as db:
+            device = await db.get(Device, device_id)
+            context = {"scope": scope, **(context_extra or {})}
+            with patch("nso_adapter.nso.apply.apply_device_intent", sender):
+                await removal_mod._dispatch_scope(db, device, client, scope, context, job_id=job_id, reg=reg)
+    finally:
+        await release_claim(reg)
     assert len(_commits(sender)) == 1
     return _sent(sender)
 
@@ -624,7 +631,7 @@ async def test_dispatch_scope_unknown_raises(adapter_client):
 
 async def test_run_removal_dispatches_and_marks_succeeded(adapter_client):
     """run_removal runs the scope handler and marks the real job succeeded."""
-    from nso_adapter.core.removal import run_removal
+    from tests.core.execution_helpers import run_removal
 
     device_id = await _seed_device(nso_device_name="sw3")
     job_id = await _seed_removal_job(device_id, "vlan")
@@ -655,8 +662,8 @@ async def test_run_removal_records_failure(adapter_client):
     """A handler error is classified in the log and recorded on the real job."""
     from structlog.testing import capture_logs
 
-    from nso_adapter.core.removal import run_removal
     from tests._secret_discipline import assert_records_free_of, assert_text_free_of
+    from tests.core.execution_helpers import run_removal
 
     device_id = await _seed_device(nso_device_name="sw3")
     job_id = await _seed_removal_job(device_id, "vlan")
@@ -689,7 +696,7 @@ async def test_run_removal_refuses_a_job_that_carries_no_generation(adapter_clie
     """
     from structlog.testing import capture_logs
 
-    from nso_adapter.core.removal import run_removal
+    from tests.core.execution_helpers import run_removal
 
     device_id = await _seed_device(nso_device_name=f"sw-no-generation-{scope}")
     async with session() as db:
@@ -722,7 +729,7 @@ async def test_run_removal_refuses_a_static_route_force_job_that_carries_no_gene
     """A static-route force job cannot fall back to deploying the live store."""
     from structlog.testing import capture_logs
 
-    from nso_adapter.core.removal import run_removal
+    from tests.core.execution_helpers import run_removal
 
     device_id = await _seed_device(nso_device_name="sw-no-generation-static-route-force")
     async with session() as db:
@@ -760,7 +767,7 @@ async def test_run_removal_marks_failed_even_when_session_poisoned(adapter_clien
     """A DB-origin error in dispatch poisons the session (needs-rollback); the failure handler
     must rollback before the failed-status commit, or that commit re-raises and the job is
     stranded 'running' (s3-5 — same fix as run_apply #11)."""
-    from nso_adapter.core.removal import run_removal
+    from tests.core.execution_helpers import run_removal
 
     device_id = await _seed_device(nso_device_name="sw-poison")
     job_id = await _seed_removal_job(device_id, "vlan")
@@ -994,7 +1001,11 @@ def _sender():
         dry_run=False,
         no_networking=False,
         strict=False,
+        checkpoint=None,
     ):
+        if checkpoint is not None:
+            await checkpoint("commit", None, True)
+            await checkpoint("post_commit_verification", None, False)
         return "native delta" if dry_run else "conclusive"
 
     return AsyncMock(side_effect=_impl)
@@ -1015,7 +1026,9 @@ async def _run_removal_with(device_id: int, job_id: int, client, sender):
         patch("nso_adapter.nso.apply.apply_device_intent", sender),
         patch("nso_adapter.core.importer.get_nso_client", return_value=client),
     ):
-        await removal_mod.run_removal(job_id, device_id)
+        from tests.core.execution_helpers import run_removal
+
+        await run_removal(job_id, device_id)
 
 
 async def _seed_snmp_community(device_id: int, label: str) -> None:
@@ -1343,7 +1356,7 @@ class _ReaderClient:
 
 
 async def _run(job_id: int, device_id: int, client) -> None:
-    from nso_adapter.core.removal import run_removal
+    from tests.core.execution_helpers import run_removal
 
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=client),
@@ -1907,7 +1920,7 @@ async def test_run_removal_enqueues_followup_sync(adapter_client):
 
 async def test_run_removal_failure_skips_residue_and_sync(adapter_client):
     """A failed removal changed nothing on the device — no residue claim, no sync."""
-    from nso_adapter.core.removal import run_removal
+    from tests.core.execution_helpers import run_removal
 
     device_id = await _seed_device(nso_device_name="sw3")
     job_id = await _seed_removal_job(device_id, "svi", {"removed": {"interface": [["Vlan987"]]}})
@@ -2119,7 +2132,7 @@ async def test_run_removal_detach_syncs_from_and_skips_residue(adapter_client):
         patch("nso_adapter.core.removal._dispatch_scope", new=AsyncMock()),
         patch("nso_adapter.nso.actions.sync_from", new=sync_from),
     ):
-        from nso_adapter.core.removal import run_removal
+        from tests.core.execution_helpers import run_removal
 
         await run_removal(job_id=job_id, device_id=device_id)
 
@@ -2157,7 +2170,7 @@ async def test_run_removal_real_retraction_does_not_sync_from(adapter_client):
         patch("nso_adapter.core.removal._dispatch_scope", new=AsyncMock()),
         patch("nso_adapter.nso.actions.sync_from", new=sync_from),
     ):
-        from nso_adapter.core.removal import run_removal
+        from tests.core.execution_helpers import run_removal
 
         await run_removal(job_id=job_id, device_id=device_id)
 
