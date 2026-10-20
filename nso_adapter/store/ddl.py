@@ -2,11 +2,10 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Database objects the ORM metadata cannot express, defined ONCE (#1522 §G1).
 
-The generation-immutability trigger has to exist on both schema paths — ``create_all`` (the
-startup convenience) and alembic (the production run) — and the schema-parity test compares
-tables, not triggers, so a second hand-written copy in the migration could drift unnoticed.
-Both paths render the SQL from here instead. This module imports nothing from the app, so a
-migration importing it cannot be broken by model drift.
+Each trigger has to exist on both schema paths: ``create_all`` (the startup convenience)
+renders it from here, and each alembic revision installs a frozen literal copy of this output
+at its own schema. A later change here needs a new revision; the schema-parity test compares
+the head triggers of both paths, and ruff (TID251) refuses a revision that imports this module.
 """
 
 from __future__ import annotations

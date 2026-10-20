@@ -12,12 +12,67 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 from alembic import op
-from nso_adapter.store.ddl import execution_evidence_immutability_ddl, execution_evidence_immutability_drop_ddl
 
 revision: str = "c39b7d2e4a61"
 down_revision: str | Sequence[str] | None = "8a86079e0dfe"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
+
+# Frozen copy of the store.ddl output at this revision: a later helper change needs its own revision.
+_EXECUTION_EVIDENCE_IMMUTABILITY_DDL = (
+    """CREATE OR REPLACE FUNCTION execution_attempt_reject_rewrite() RETURNS trigger AS $$
+BEGIN
+    IF NEW.device_id IS DISTINCT FROM OLD.device_id
+        OR NEW.generation_id IS DISTINCT FROM OLD.generation_id
+        OR NEW.job_correlation_id IS DISTINCT FROM OLD.job_correlation_id
+        OR NEW.run_attempt IS DISTINCT FROM OLD.run_attempt
+        OR NEW.operation_kind IS DISTINCT FROM OLD.operation_kind
+        OR NEW.document_digest IS DISTINCT FROM OLD.document_digest
+        OR NEW.claim_token IS DISTINCT FROM OLD.claim_token
+        OR NEW.stream_revisions IS DISTINCT FROM OLD.stream_revisions
+        OR NEW.generation_authorities IS DISTINCT FROM OLD.generation_authorities
+        OR NEW.manual_attempt_id IS DISTINCT FROM OLD.manual_attempt_id
+        OR NEW.removal_tombstone_ids IS DISTINCT FROM OLD.removal_tombstone_ids
+        OR NEW.logical_membership IS DISTINCT FROM OLD.logical_membership
+        OR NEW.attempted_carriers IS DISTINCT FROM OLD.attempted_carriers
+        OR NEW.safe_origins IS DISTINCT FROM OLD.safe_origins
+        OR NEW.prior_bookkeeping IS DISTINCT FROM OLD.prior_bookkeeping
+        OR NEW.created_at IS DISTINCT FROM OLD.created_at
+        OR (NEW.job_id IS DISTINCT FROM OLD.job_id AND NEW.job_id IS NOT NULL)
+        OR (OLD.phase = 'terminal' AND
+            (NEW.phase IS DISTINCT FROM OLD.phase OR NEW.response_phase IS DISTINCT FROM OLD.response_phase
+             OR NEW.response_classification IS DISTINCT FROM OLD.response_classification
+             OR NEW.commit_acknowledged IS DISTINCT FROM OLD.commit_acknowledged))
+        OR (OLD.phase = 'response_recorded' AND NEW.phase = 'prepared')
+        OR (OLD.commit_acknowledged AND NOT NEW.commit_acknowledged)
+        OR EXISTS (SELECT 1 FROM jsonb_each(OLD.response_classification) checkpoint
+                   WHERE NEW.response_classification -> checkpoint.key IS DISTINCT FROM checkpoint.value) THEN
+        RAISE EXCEPTION USING ERRCODE = 'integrity_constraint_violation',
+            MESSAGE = 'execution attempt evidence is immutable';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;""",
+    "DROP TRIGGER IF EXISTS execution_attempt_immutable ON apply_execution_attempt",
+    "CREATE TRIGGER execution_attempt_immutable BEFORE UPDATE ON apply_execution_attempt "
+    "FOR EACH ROW EXECUTE FUNCTION execution_attempt_reject_rewrite()",
+    """CREATE OR REPLACE FUNCTION row_outcome_reject_update() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION USING ERRCODE = 'integrity_constraint_violation',
+        MESSAGE = 'row outcome evidence is immutable';
+END;
+$$ LANGUAGE plpgsql;""",
+    "DROP TRIGGER IF EXISTS row_outcome_immutable ON row_outcome",
+    "CREATE TRIGGER row_outcome_immutable BEFORE UPDATE ON row_outcome "
+    "FOR EACH ROW EXECUTE FUNCTION row_outcome_reject_update()",
+)
+
+_EXECUTION_EVIDENCE_IMMUTABILITY_DROP_DDL = (
+    "DROP TRIGGER IF EXISTS row_outcome_immutable ON row_outcome",
+    "DROP FUNCTION IF EXISTS row_outcome_reject_update()",
+    "DROP TRIGGER IF EXISTS execution_attempt_immutable ON apply_execution_attempt",
+    "DROP FUNCTION IF EXISTS execution_attempt_reject_rewrite()",
+)
 
 
 def upgrade() -> None:
@@ -101,12 +156,12 @@ def upgrade() -> None:
         ),
     )
     op.create_index("ix_row_outcome_attempt", "row_outcome", ["execution_attempt_id"])
-    for statement in execution_evidence_immutability_ddl():
+    for statement in _EXECUTION_EVIDENCE_IMMUTABILITY_DDL:
         op.execute(statement)
 
 
 def downgrade() -> None:
-    for statement in execution_evidence_immutability_drop_ddl():
+    for statement in _EXECUTION_EVIDENCE_IMMUTABILITY_DROP_DDL:
         op.execute(statement)
     op.drop_table("row_outcome")
     op.drop_table("apply_execution_attempt")
