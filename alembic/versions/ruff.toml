@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
+extend = "../../pyproject.toml"
+# Keep the root import sections: alembic/ at the repo root is first-party there.
+src = ["../.."]
+
+[lint]
+extend-select = ["TID251"]
+
+[lint.flake8-tidy-imports.banned-api]
+"nso_adapter.store.ddl".msg = "A revision installs a frozen DDL literal: copy the helper output into the revision."

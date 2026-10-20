@@ -2672,6 +2672,14 @@
           "status": {
             "$ref": "#/components/schemas/GenerationStatus"
           },
+          "stream_revisions": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "description": "Stream revision each generation carries, keyed by intent stream.",
+            "title": "Stream Revisions",
+            "type": "object"
+          },
           "updated_at": {
             "title": "Updated At",
             "type": "string"
@@ -2685,6 +2693,7 @@
           "settlement_cohort",
           "sections",
           "source_push_seq",
+          "stream_revisions",
           "apply_attempt_id",
           "carrier_job_id",
           "carrier_job_status",
@@ -2969,6 +2978,28 @@
       "DeviceGenerationOut": {
         "description": "One deployment generation, with every receipt-facing field always present.",
         "properties": {
+          "carrier_job_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Carrier Job Id"
+          },
+          "carrier_job_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Carrier Job Status"
+          },
           "created_at": {
             "title": "Created At",
             "type": "string"
@@ -3044,6 +3075,8 @@
           "seq",
           "status",
           "job_id",
+          "carrier_job_id",
+          "carrier_job_status",
           "mode",
           "settlement_cohort",
           "digest",
