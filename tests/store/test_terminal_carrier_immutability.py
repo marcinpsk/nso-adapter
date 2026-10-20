@@ -71,6 +71,7 @@ def test_terminal_job_evidence_rewrites_are_refused(pg_sync_session, status, rew
     with pytest.raises(sa.exc.IntegrityError) as excinfo:
         pg_sync_session.execute(sa.text(f"UPDATE jobs SET {rewrite} WHERE id = :id"), {"id": job_id})
     assert excinfo.value.orig.pgcode == "23000"
+    assert "terminal status, result and error may not be updated" in str(excinfo.value.orig)
     pg_sync_session.rollback()
 
 
@@ -113,6 +114,7 @@ def test_established_generation_snapshot_rewrites_are_refused(pg_sync_session, s
             {"id": generation_id, "status": target},
         )
     assert excinfo.value.orig.pgcode == "23000"
+    assert "terminal carrier evidence may not be updated" in str(excinfo.value.orig)
     pg_sync_session.rollback()
 
 
@@ -136,6 +138,7 @@ def test_terminal_generation_refuses_an_incomplete_snapshot_fill(pg_sync_session
             {"id": generation_id},
         )
     assert excinfo.value.orig.pgcode == "23000"
+    assert "terminal carrier evidence may not be updated" in str(excinfo.value.orig)
     pg_sync_session.rollback()
 
 
