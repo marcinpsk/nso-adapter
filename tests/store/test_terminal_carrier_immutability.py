@@ -183,30 +183,39 @@ def test_terminal_generation_snapshot_can_be_filled_once(pg_sync_session, empty_
 
 
 _MISMATCH = "carrier evidence must be empty or match its terminal carrier job"
-_FILL_FROM_JOB = (
-    "carrier_job_id = job.id, carrier_job_status = job.status::text, "
-    "carrier_job_result = NULLIF(job.result::jsonb, 'null'::jsonb), "
-    "carrier_job_error = NULLIF(job.error::jsonb, 'null'::jsonb)"
-)
+_FILL_FROM_JOB = {
+    "carrier_job_id": "job.id",
+    "carrier_job_status": "job.status::text",
+    "carrier_job_result": "NULLIF(job.result::jsonb, 'null'::jsonb)",
+    "carrier_job_error": "NULLIF(job.error::jsonb, 'null'::jsonb)",
+}
+
+
+def _fill_from_job(**overrides):
+    return ", ".join(f"{column} = {value}" for column, value in {**_FILL_FROM_JOB, **overrides}.items())
 
 
 @pytest.mark.parametrize("target", ["settled", "failed", "outcome_unknown", "abandoned"])
 @pytest.mark.parametrize(
-    "rewrite",
+    "override",
     [
-        "carrier_job_id = job_id + 1, carrier_job_status = 'failed'",
-        "carrier_job_id = job_id, carrier_job_status = 'succeeded'",
-        "carrier_job_id = job_id, carrier_job_status = 'failed', carrier_job_result = '{}'::jsonb",
-        "carrier_job_id = job_id, carrier_job_status = 'failed', carrier_job_error = NULL",
-        "carrier_job_status = 'failed'",
+        {"carrier_job_id": "job.id + 1"},
+        {"carrier_job_status": "'succeeded'"},
+        {"carrier_job_result": "'{}'::jsonb"},
+        {"carrier_job_error": "NULL"},
+        {"carrier_job_id": "NULL"},
     ],
+    ids=["id", "status", "result", "error", "partial"],
 )
-def test_terminalization_refuses_carrier_evidence_that_mismatches_its_job(pg_sync_session, target, rewrite):
+def test_terminalization_refuses_carrier_evidence_that_mismatches_its_job(pg_sync_session, target, override):
     _, generation_id = _seed(pg_sync_session, generation_status=GenerationStatus.running, snapshot=False)
 
     with pytest.raises(sa.exc.IntegrityError) as excinfo:
         pg_sync_session.execute(
-            sa.text(f"UPDATE deployment_generation SET status = :status, {rewrite} WHERE id = :id"),
+            sa.text(
+                f"UPDATE deployment_generation AS generation SET status = :status, {_fill_from_job(**override)} "
+                "FROM jobs AS job WHERE generation.id = :id AND job.id = generation.job_id"
+            ),
             {"id": generation_id, "status": target},
         )
     assert excinfo.value.orig.pgcode == "23000"
@@ -253,7 +262,7 @@ def test_terminalization_refuses_a_previous_carrier_snapshot(pg_sync_session):
 def test_terminalization_accepts_an_empty_or_matching_snapshot(pg_sync_session, fill):
     job_id, generation_id = _seed(pg_sync_session, generation_status=GenerationStatus.running, snapshot=not fill)
     snapshot = (
-        _FILL_FROM_JOB
+        _fill_from_job()
         if fill
         else ("carrier_job_id = NULL, carrier_job_status = NULL, carrier_job_result = NULL, carrier_job_error = NULL")
     )
