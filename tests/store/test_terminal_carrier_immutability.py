@@ -180,3 +180,93 @@ def test_terminal_generation_snapshot_can_be_filled_once(pg_sync_session, empty_
             {"id": generation_id},
         )
     pg_sync_session.rollback()
+
+
+_MISMATCH = "carrier evidence must be empty or match its terminal carrier job"
+_FILL_FROM_JOB = (
+    "carrier_job_id = job.id, carrier_job_status = job.status::text, "
+    "carrier_job_result = NULLIF(job.result::jsonb, 'null'::jsonb), "
+    "carrier_job_error = NULLIF(job.error::jsonb, 'null'::jsonb)"
+)
+
+
+@pytest.mark.parametrize("target", ["settled", "failed", "outcome_unknown", "abandoned"])
+@pytest.mark.parametrize(
+    "rewrite",
+    [
+        "carrier_job_id = job_id + 1, carrier_job_status = 'failed'",
+        "carrier_job_id = job_id, carrier_job_status = 'succeeded'",
+        "carrier_job_id = job_id, carrier_job_status = 'failed', carrier_job_result = '{}'::jsonb",
+        "carrier_job_id = job_id, carrier_job_status = 'failed', carrier_job_error = NULL",
+        "carrier_job_status = 'failed'",
+    ],
+)
+def test_terminalization_refuses_carrier_evidence_that_mismatches_its_job(pg_sync_session, target, rewrite):
+    _, generation_id = _seed(pg_sync_session, generation_status=GenerationStatus.running, snapshot=False)
+
+    with pytest.raises(sa.exc.IntegrityError) as excinfo:
+        pg_sync_session.execute(
+            sa.text(f"UPDATE deployment_generation SET status = :status, {rewrite} WHERE id = :id"),
+            {"id": generation_id, "status": target},
+        )
+    assert excinfo.value.orig.pgcode == "23000"
+    assert _MISMATCH in str(excinfo.value.orig)
+    pg_sync_session.rollback()
+
+
+def test_terminalization_refuses_a_snapshot_of_a_non_terminal_carrier(pg_sync_session):
+    _, generation_id = _seed(
+        pg_sync_session, job_status=JobStatus.queued, generation_status=GenerationStatus.running, snapshot=True
+    )
+
+    with pytest.raises(sa.exc.IntegrityError) as excinfo:
+        pg_sync_session.execute(
+            sa.text("UPDATE deployment_generation SET status = 'outcome_unknown' WHERE id = :id"),
+            {"id": generation_id},
+        )
+    assert _MISMATCH in str(excinfo.value.orig)
+    pg_sync_session.rollback()
+
+
+def test_terminalization_refuses_a_previous_carrier_snapshot(pg_sync_session):
+    job_id, generation_id = _seed(pg_sync_session, generation_status=GenerationStatus.running, snapshot=True)
+    retry = Job(
+        job_type=JobType.apply,
+        status=JobStatus.failed,
+        device_id=pg_sync_session.get(Job, job_id).device_id,
+        coalescible=False,
+        error={"code": "device_refused"},
+    )
+    pg_sync_session.add(retry)
+    pg_sync_session.commit()
+
+    with pytest.raises(sa.exc.IntegrityError) as excinfo:
+        pg_sync_session.execute(
+            sa.text("UPDATE deployment_generation SET status = 'failed', job_id = :retry WHERE id = :id"),
+            {"id": generation_id, "retry": retry.id},
+        )
+    assert _MISMATCH in str(excinfo.value.orig)
+    pg_sync_session.rollback()
+
+
+@pytest.mark.parametrize("fill", [False, True])
+def test_terminalization_accepts_an_empty_or_matching_snapshot(pg_sync_session, fill):
+    job_id, generation_id = _seed(pg_sync_session, generation_status=GenerationStatus.running, snapshot=not fill)
+    snapshot = (
+        _FILL_FROM_JOB
+        if fill
+        else ("carrier_job_id = NULL, carrier_job_status = NULL, carrier_job_result = NULL, carrier_job_error = NULL")
+    )
+
+    pg_sync_session.execute(
+        sa.text(
+            f"UPDATE deployment_generation AS generation SET status = 'settled', {snapshot} FROM jobs AS job "
+            "WHERE generation.id = :id AND job.id = generation.job_id"
+        ),
+        {"id": generation_id},
+    )
+    pg_sync_session.commit()
+    stored = pg_sync_session.scalar(
+        sa.text("SELECT carrier_job_id FROM deployment_generation WHERE id = :id"), {"id": generation_id}
+    )
+    assert stored == (job_id if fill else None)

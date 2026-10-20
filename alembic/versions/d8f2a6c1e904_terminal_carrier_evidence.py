@@ -19,26 +19,39 @@ depends_on: str | Sequence[str] | None = None
 # Frozen copy of the store.ddl output at this revision: a later helper change needs its own revision.
 _GENERATION_CARRIER_IMMUTABILITY_DDL = (
     """CREATE OR REPLACE FUNCTION deployment_generation_reject_carrier_rewrite() RETURNS trigger AS $$
+DECLARE
+    matches_carrier boolean;
 BEGIN
-    IF OLD.status IN ('settled', 'failed', 'outcome_unknown', 'abandoned')
-        AND NEW.status IN ('settled', 'failed', 'outcome_unknown', 'abandoned')
-        AND ROW(NEW.carrier_job_id, NEW.carrier_job_status, NEW.carrier_job_result, NEW.carrier_job_error)
-            IS DISTINCT FROM ROW(OLD.carrier_job_id, OLD.carrier_job_status, OLD.carrier_job_result, OLD.carrier_job_error)
-        AND NOT (
-            OLD.carrier_job_id IS NULL AND OLD.carrier_job_status IS NULL
-            AND OLD.carrier_job_result IS NULL AND OLD.carrier_job_error IS NULL
-            AND EXISTS (
-                SELECT 1 FROM jobs AS job
-                WHERE job.id = NEW.job_id AND job.id = NEW.carrier_job_id
-                    AND job.status IN ('succeeded', 'failed')
-                    AND NEW.carrier_job_status = job.status::text
-                    AND NEW.carrier_job_result IS NOT DISTINCT FROM NULLIF(job.result::jsonb, 'null'::jsonb)
-                    AND NEW.carrier_job_error IS NOT DISTINCT FROM NULLIF(job.error::jsonb, 'null'::jsonb)
-            )
-        ) THEN
+    IF NEW.status NOT IN ('settled', 'failed', 'outcome_unknown', 'abandoned') THEN
+        RETURN NEW;
+    END IF;
+    matches_carrier := EXISTS (
+        SELECT 1 FROM jobs AS job
+        WHERE job.id = NEW.job_id AND job.id = NEW.carrier_job_id
+            AND job.status IN ('succeeded', 'failed')
+            AND NEW.carrier_job_status = job.status::text
+            AND NEW.carrier_job_result IS NOT DISTINCT FROM NULLIF(job.result::jsonb, 'null'::jsonb)
+            AND NEW.carrier_job_error IS NOT DISTINCT FROM NULLIF(job.error::jsonb, 'null'::jsonb)
+    );
+    IF OLD.status IN ('settled', 'failed', 'outcome_unknown', 'abandoned') THEN
+        IF ROW(NEW.carrier_job_id, NEW.carrier_job_status, NEW.carrier_job_result, NEW.carrier_job_error)
+                IS DISTINCT FROM ROW(OLD.carrier_job_id, OLD.carrier_job_status, OLD.carrier_job_result, OLD.carrier_job_error)
+            AND NOT (
+                OLD.carrier_job_id IS NULL AND OLD.carrier_job_status IS NULL
+                AND OLD.carrier_job_result IS NULL AND OLD.carrier_job_error IS NULL
+                AND matches_carrier
+            ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'integrity_constraint_violation',
+                MESSAGE = 'deployment_generation ' || OLD.id || ' is immutable: terminal carrier evidence may not be updated';
+        END IF;
+    ELSIF NOT matches_carrier AND NOT (
+        NEW.carrier_job_id IS NULL AND NEW.carrier_job_status IS NULL
+        AND NEW.carrier_job_result IS NULL AND NEW.carrier_job_error IS NULL
+    ) THEN
         RAISE EXCEPTION USING
             ERRCODE = 'integrity_constraint_violation',
-            MESSAGE = 'deployment_generation ' || OLD.id || ' is immutable: terminal carrier evidence may not be updated';
+            MESSAGE = 'deployment_generation ' || OLD.id || ' carrier evidence must be empty or match its terminal carrier job';
     END IF;
     RETURN NEW;
 END;
