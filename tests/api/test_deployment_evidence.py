@@ -143,6 +143,7 @@ async def test_evidence_serves_terminal_attempt_after_carrier_deletion(adapter_c
             "settlement_cohort": None,
             "sections": ["vlan"],
             "source_push_seq": {"vlan": 71},
+            "stream_revisions": {"vlan": 4},
             "apply_attempt_id": str(attempt_id),
             "carrier_job_id": job_id,
             "carrier_job_status": "failed",
@@ -234,7 +235,7 @@ async def test_evidence_preserves_stream_revisions_and_provenance(
     for served_generation in (body["head"], body["attempts"][0]["generations"][0]):
         assert served_generation["sections"] == sections
         assert served_generation["source_push_seq"] == source_push_seq
-    assert body["attempts"][0]["generations"][0]["stream_revisions"] == stream_revisions
+        assert served_generation["stream_revisions"] == stream_revisions
 
 
 @pytest.mark.parametrize(
@@ -878,11 +879,11 @@ def test_evidence_openapi_pins_the_bound_and_non_actionable_contract():
         assert schema["components"]["schemas"][component]["properties"]["source_push_seq"]["description"] == (
             "Plugin X-Push-Seq keyed by intent stream."
         )
-    generation_schema = schema["components"]["schemas"]["DeploymentEvidenceGenerationOut"]
-    assert generation_schema["properties"]["stream_revisions"]["description"] == (
-        "Stream revision each generation carries, keyed by intent stream."
-    )
-    assert "stream_revisions" in generation_schema["required"]
+        generation_schema = schema["components"]["schemas"][component]
+        assert generation_schema["properties"]["stream_revisions"]["description"] == (
+            "Stream revision each generation carries, keyed by intent stream."
+        )
+        assert "stream_revisions" in generation_schema["required"]
 
 
 def test_api_contract_documents_unknown_attempts_and_retention():

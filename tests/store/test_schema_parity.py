@@ -125,6 +125,15 @@ def _snapshot(engine) -> dict:
                 ("row_outcome", "row_outcome_immutable"),
             )
         }
+        snap["__terminal_carrier_triggers__"] = {
+            table: tuple(trigger)
+            if (trigger := conn.execute(_TRIGGER_SQL, {"table": table, "trigger": name}).one_or_none())
+            else ()
+            for table, name in (
+                ("deployment_generation", "deployment_generation_carrier_immutable"),
+                ("jobs", "job_terminal_evidence_immutable"),
+            )
+        }
     # PostgreSQL ENUM types are schema-level, not per-table: compare their label sets so an
     # enum value-set divergence (a migration adding/renaming a member) is caught too.
     snap["__enums__"] = {e["name"]: tuple(e["labels"]) for e in insp.get_enums()}
@@ -206,6 +215,10 @@ def test_alembic_baseline_matches_create_all(pg_provisioner):
                 f"schema mismatch in {table!r}:\n  create_all={ca_snap[table]}\n  alembic   ={al_snap[table]}"
             )
         _assert_job_queue_class_schema(ca_snap)
+        for table, trigger in ca_snap["__terminal_carrier_triggers__"].items():
+            assert trigger, f"missing terminal carrier trigger on {table}"
+            assert f"BEFORE UPDATE ON {table}" in trigger[1]
+            assert "integrity_constraint_violation" in trigger[3]
         trigger_name, definition, function_name, source = ca_snap["__observation_trigger__"]
         assert trigger_name == "read_observation_immutable"
         assert "BEFORE UPDATE ON read_observation" in definition

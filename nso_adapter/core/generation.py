@@ -58,7 +58,7 @@ from typing import NamedTuple
 from uuid import UUID
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import case, literal, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError
@@ -1864,7 +1864,7 @@ async def _terminalize_generations(
     expected_statuses: tuple[GenerationStatus, ...] | None = None,
     now: datetime | None = None,
 ) -> set[int]:
-    """Set terminal status and snapshot each generation's current carrier. Caller commits."""
+    """Set terminal status and retain each run's terminal carrier evidence. Caller commits."""
     if outcome not in _TERMINAL:
         raise ValueError(f"generation terminalization requires a terminal status, not {outcome.value}")
     if not generations:
@@ -1878,6 +1878,12 @@ async def _terminalize_generations(
         ).all()
     }
     terminalized_at = now or _now()
+    snapshot_needed = (DeploymentGeneration.status.not_in(_TERMINAL)) | (
+        DeploymentGeneration.carrier_job_id.is_(None)
+        & DeploymentGeneration.carrier_job_status.is_(None)
+        & DeploymentGeneration.carrier_job_result.is_(None)
+        & DeploymentGeneration.carrier_job_error.is_(None)
+    )
     landed: set[int] = set()
     for generation in generations:
         values: dict = {"status": outcome, "updated_at": terminalized_at}
@@ -1887,13 +1893,19 @@ async def _terminalize_generations(
         elif error is not None:
             values["last_error"] = error
         carrier = carriers.get(generation.job_id)
-        if carrier is not None:
-            values.update(
+        snapshot: dict = dict.fromkeys(
+            ("carrier_job_id", "carrier_job_status", "carrier_job_result", "carrier_job_error")
+        )
+        if carrier is not None and carrier.status in (JobStatus.succeeded, JobStatus.failed):
+            snapshot.update(
                 carrier_job_id=carrier.id,
                 carrier_job_status=carrier.status.value,
                 carrier_job_result=carrier.result,
                 carrier_job_error=carrier.error,
             )
+        for name, value in snapshot.items():
+            column = getattr(DeploymentGeneration, name)
+            values[name] = case((snapshot_needed, literal(value, type_=column.type)), else_=column)
         conditions = [
             DeploymentGeneration.id == generation.id,
             DeploymentGeneration.job_id.is_not_distinct_from(generation.job_id),

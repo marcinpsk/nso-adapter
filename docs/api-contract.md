@@ -471,6 +471,8 @@ out-of-range limit returns `422 validation_error`; it is never clamped.
     "seq": 4,
     "status": "pending",
     "job_id": null,
+    "carrier_job_id": null,
+    "carrier_job_status": null,
     "mode": "networked",
     "settlement_cohort": null,
     "digest": "7e4a...",
@@ -484,6 +486,8 @@ out-of-range limit returns `422 validation_error`; it is never clamped.
 
 Every object always contains every shown field. An unset field is `null`, never
 missing. `job_id` is `null` while a pending generation is not attached to a job.
+`carrier_job_id` and `carrier_job_status` retain the terminal carrier identity after
+its job row is deleted. Both are `null` when terminal carrier evidence is unavailable.
 `settlement_cohort` is `null` when the generation is not part of a request-atomic
 settlement cohort. `status` is one of `pending`, `running`, `settled`, `failed`,
 `outcome_unknown`, or `abandoned`. `mode` is `networked` or `detach`.
@@ -515,10 +519,13 @@ The response contains:
     "settlement_cohort": null,
     "sections": ["vlan"],
     "source_push_seq": {"vlan": 501},
+    "stream_revisions": {"vlan": 12},
     "apply_attempt_id": "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8",
     "carrier_job_id": 900,
     "carrier_job_status": "failed",
     "carrier_job_result": null,
+    "row_outcomes": null,
+    "refusals": null,
     "carrier_job_error": {"code": "nso_commit_failed", "message": "commit failed", "detail": {}},
     "created_at": "2026-08-25T10:00:00Z",
     "updated_at": "2026-08-25T10:01:00Z"
@@ -549,6 +556,8 @@ The response contains:
           "carrier_job_id": 900,
           "carrier_job_status": "failed",
           "carrier_job_result": null,
+          "row_outcomes": null,
+          "refusals": null,
           "carrier_job_error": {"code": "nso_commit_failed", "message": "commit failed", "detail": {}},
           "updated_at": "2026-08-25T10:01:00Z"
         }
