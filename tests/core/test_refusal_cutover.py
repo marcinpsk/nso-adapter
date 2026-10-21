@@ -308,32 +308,41 @@ async def run_next(device_id, *, runner=None):
 
 
 def expire_budget_after_send(monkeypatch, transport, budget=0.05, preparation=5):
-    """Start the execution budget clock only when the held send is reached, so slow setup cannot expire it."""
+    """Start the execution budget clock only when the held send is reached; return whether each budget wait reached it."""
     real_wait = asyncio.wait
+    held = []
 
     async def wait(tasks, *, timeout=None, **kwargs):
         if timeout == budget:
             sent = asyncio.create_task(transport.before_send.wait())
             try:
-                await real_wait({*tasks, sent}, timeout=preparation, return_when=asyncio.FIRST_COMPLETED)
+                done, _pending = await real_wait(
+                    {*tasks, sent}, timeout=preparation, return_when=asyncio.FIRST_COMPLETED
+                )
             finally:
                 sent.cancel()
+                await asyncio.gather(sent, return_exceptions=True)
+            held.append(sent in done)
+            if sent not in done:
+                return await real_wait(tasks, timeout=0, **kwargs)
         return await real_wait(tasks, timeout=timeout, **kwargs)
 
     transport.release_send.clear()
     monkeypatch.setattr(worker, "JOB_EXECUTION_BUDGET", budget)
     monkeypatch.setattr(worker, "asyncio", SimpleNamespace(**{**vars(asyncio), "wait": wait}))
+    return held
 
 
 async def test_budget_helper_stops_waiting_for_a_send_that_never_comes(monkeypatch):
     transport = SimpleNamespace(before_send=asyncio.Event(), release_send=asyncio.Event())
-    expire_budget_after_send(monkeypatch, transport, preparation=0.1)
+    held = expire_budget_after_send(monkeypatch, transport, budget=30, preparation=0.1)
     stalled = asyncio.create_task(asyncio.Event().wait())
     try:
-        done, pending = await asyncio.wait_for(worker.asyncio.wait({stalled}, timeout=0.05), 10)
+        done, pending = await asyncio.wait_for(worker.asyncio.wait({stalled}, timeout=30), 10)
     finally:
         stalled.cancel()
     assert not done and pending == {stalled}
+    assert held == [False]
 
 
 async def evidence(device_id):
@@ -741,8 +750,9 @@ async def test_removal_cancel_after_refusal_checkpoint_settles_without_resend(ad
 @pytest.mark.parametrize("operation", ["apply", "removal"])
 async def test_execution_budget_uses_attempt_disposition(adapter_client, monkeypatch, operation):
     device_id, transport = await setup(adapter_client, monkeypatch, operation=operation)
-    expire_budget_after_send(monkeypatch, transport)
+    held = expire_budget_after_send(monkeypatch, transport)
     await run_next(device_id)
+    assert held == [True]
     await terminal(adapter_client, device_id, refused=False)
     assert await worker._claim_next_job() is None
 
@@ -1048,8 +1058,10 @@ async def test_refusal_secret_canary_across_the_apply_path(adapter_client, monke
     elif mode == "escaped":
         transport.raw = b'{"message":"device-intent: refu\\u0073ed ' + CANARY.encode()
     elif mode == "transport":
-        expire_budget_after_send(monkeypatch, transport)
+        held = expire_budget_after_send(monkeypatch, transport)
     await run_next(device_id)
+    if mode == "transport":
+        assert held == [True]
     job = await terminal(adapter_client, device_id, refused=mode == "valid")
     attempts, outcomes = await evidence(device_id)
     assert_text_free_of(
