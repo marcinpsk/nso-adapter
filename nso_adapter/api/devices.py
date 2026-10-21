@@ -192,6 +192,8 @@ class DeviceGenerationOut(BaseModel):
     seq: int
     status: GenerationStatus
     job_id: int | None
+    carrier_job_id: int | None
+    carrier_job_status: str | None
     mode: GenerationMode
     settlement_cohort: int | None
     digest: str
@@ -284,6 +286,9 @@ class DeploymentEvidenceHeadOut(BaseModel):
     settlement_cohort: int | None
     sections: list[str]
     source_push_seq: dict[str, int | None] = Field(description="Plugin X-Push-Seq keyed by intent stream.")
+    stream_revisions: dict[str, int] = Field(
+        description="Stream revision each generation carries, keyed by intent stream."
+    )
     apply_attempt_id: UUID | None
     carrier_job_id: int | None
     carrier_job_status: str | None
@@ -616,6 +621,8 @@ async def list_device_generations(
             DeploymentGeneration.seq,
             DeploymentGeneration.status,
             DeploymentGeneration.job_id,
+            DeploymentGeneration.carrier_job_id,
+            DeploymentGeneration.carrier_job_status,
             DeploymentGeneration.mode,
             DeploymentGeneration.settlement_cohort,
             DeploymentGeneration.digest,
@@ -637,6 +644,8 @@ async def list_device_generations(
             "seq": row.seq,
             "status": row.status,
             "job_id": row.job_id,
+            "carrier_job_id": row.carrier_job_id,
+            "carrier_job_status": row.carrier_job_status,
             "mode": row.mode,
             "settlement_cohort": row.settlement_cohort,
             "digest": row.digest,

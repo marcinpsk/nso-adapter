@@ -40,8 +40,10 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from nso_adapter.core.request_flags import PENDING_CLEAR_PROVENANCES, REMOVAL_MARKINGS
 from nso_adapter.store.ddl import (
     execution_evidence_immutability_ddl,
+    generation_carrier_immutability_ddl,
     generation_immutability_ddl,
     job_coalescible_immutability_ddl,
+    job_terminal_evidence_immutability_ddl,
     observation_immutability_ddl,
 )
 from nso_adapter.store.execution_evidence import validate_catalog_payload
@@ -805,6 +807,10 @@ for _statement in job_coalescible_immutability_ddl():
     event.listen(Job.__table__, "after_create", DDL(_statement))
 for _statement in generation_immutability_ddl():
     event.listen(DeploymentGeneration.__table__, "after_create", DDL(_statement))
+for _statement in generation_carrier_immutability_ddl():
+    event.listen(DeploymentGeneration.__table__, "after_create", DDL(_statement))
+for _statement in job_terminal_evidence_immutability_ddl():
+    event.listen(Job.__table__, "after_create", DDL(_statement))
 
 
 class ApplyExecutionAttempt(Base):

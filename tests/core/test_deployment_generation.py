@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from contextlib import asynccontextmanager
+from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -274,6 +275,16 @@ async def test_worker_terminalization_snapshots_the_carrier(
         generation.carrier_job_error,
     ) == (job.id, job.status.value, job.result, job.error)
 
+    async with session() as db:
+        await db.execute(sa.text("DELETE FROM jobs WHERE id = :job_id"), {"job_id": job_id})
+        await db.commit()
+
+    response = await adapter_client.get(f"/api/v1/devices/{device_id}/generations", headers=_AUTH)
+    assert response.status_code == 200, response.text
+    (listed,) = response.json()
+    assert listed["job_id"] is None
+    assert (listed["carrier_job_id"], listed["carrier_job_status"]) == (job_id, job_status)
+
 
 async def test_restart_outcome_unknown_snapshots_the_current_carrier(adapter_client):
     from nso_adapter.core.generation import recover_generations
@@ -365,7 +376,7 @@ async def test_stale_terminalization_cannot_stamp_a_newer_carrier(adapter_client
     ) == (None, None, None, None)
 
 
-async def test_abandon_snapshots_the_current_carrier(adapter_client):
+async def test_abandon_preserves_the_existing_carrier_snapshot(adapter_client):
     from nso_adapter.store.models import DeploymentGeneration, GenerationStatus, Job
 
     device_id = await _blocked_device(adapter_client, "gen-carrier-abandon", 16113)
@@ -373,8 +384,9 @@ async def test_abandon_snapshots_the_current_carrier(adapter_client):
     result = {"operator_evidence": "current"}
     error = {"code": "device_refused", "message": "current carrier evidence", "detail": {}}
     async with session() as db:
-        await db.execute(sa.update(Job).where(Job.id == generation.job_id).values(result=result, error=error))
-        await db.commit()
+        with pytest.raises(sa.exc.IntegrityError):
+            await db.execute(sa.update(Job).where(Job.id == generation.job_id).values(result=result, error=error))
+        await db.rollback()
 
     response = await adapter_client.post(
         f"/api/v1/devices/{device_id}/actions/abandon-generation",
@@ -391,7 +403,12 @@ async def test_abandon_snapshots_the_current_carrier(adapter_client):
         abandoned.carrier_job_status,
         abandoned.carrier_job_result,
         abandoned.carrier_job_error,
-    ) == (generation.job_id, "failed", result, error)
+    ) == (
+        generation.carrier_job_id,
+        generation.carrier_job_status,
+        generation.carrier_job_result,
+        generation.carrier_job_error,
+    )
 
 
 # ── §G1: one generation per authorized write, ordered, immutable ─────────────
@@ -915,7 +932,7 @@ async def test_restart_gives_a_pending_uncovered_generation_a_job(adapter_client
 async def test_restart_marks_a_stranded_running_generation_unknown(adapter_client):
     """A generation left ``running`` by a dead process has an unknown outcome, not a failure."""
     from nso_adapter.core.generation import recover_generations
-    from nso_adapter.store.models import DeploymentGeneration, GenerationStatus
+    from nso_adapter.store.models import DeploymentGeneration, GenerationStatus, Job, JobStatus
 
     device_id = await _device("gen-restart-running", 9731)
     await _vlan(device_id, 71)
@@ -930,7 +947,124 @@ async def test_restart_marks_a_stranded_running_generation_unknown(adapter_clien
         await db.commit()
 
     await recover_generations()
-    assert (await _generations(device_id))[0].status is GenerationStatus.outcome_unknown
+    (recovered,) = await _generations(device_id)
+    assert recovered.status is GenerationStatus.outcome_unknown
+    assert (
+        recovered.carrier_job_id,
+        recovered.carrier_job_status,
+        recovered.carrier_job_result,
+        recovered.carrier_job_error,
+    ) == (None, None, None, None)
+    listing = await adapter_client.get(f"/api/v1/devices/{device_id}/generations", headers=_AUTH)
+    assert listing.status_code == 200, listing.text
+    assert (listing.json()[0]["carrier_job_id"], listing.json()[0]["carrier_job_status"]) == (None, None)
+    assert await _job_status(generation.job_id) is JobStatus.queued
+
+    assert await _finish(device_id, JobStatus.succeeded) == generation.job_id
+
+    async with session() as db:
+        job = await db.get(Job, generation.job_id)
+    assert isinstance(job.result["row_outcomes"], list)
+    assert job.result["row_outcomes"]
+    (settled,) = await _generations(device_id)
+    assert settled.status is GenerationStatus.settled
+    assert (
+        settled.carrier_job_id,
+        settled.carrier_job_status,
+        settled.carrier_job_result,
+        settled.carrier_job_error,
+    ) == (job.id, "succeeded", job.result, job.error)
+    listing = await adapter_client.get(f"/api/v1/devices/{device_id}/generations", headers=_AUTH)
+    assert listing.status_code == 200, listing.text
+    assert (listing.json()[0]["carrier_job_id"], listing.json()[0]["carrier_job_status"]) == (job.id, "succeeded")
+
+    async with session() as db:
+        with pytest.raises(sa.exc.IntegrityError):
+            await db.execute(
+                sa.text(
+                    "UPDATE deployment_generation SET status = 'abandoned', "
+                    "carrier_job_result = '{}'::jsonb WHERE id = :id"
+                ),
+                {"id": settled.id},
+            )
+        await db.rollback()
+
+
+async def test_restart_clears_the_previous_snapshot_when_the_retry_carrier_is_deleted(adapter_client):
+    from nso_adapter.core.generation import recover_generations
+    from nso_adapter.store.models import GenerationStatus
+
+    device_id = await _blocked_device(adapter_client, "gen-retry-carrier-deleted", 16115)
+    (failed,) = await _generations(device_id)
+    assert failed.carrier_job_id == failed.job_id
+    retry_id = await _retry_head_http(adapter_client, device_id)
+    assert retry_id != failed.job_id
+    claimed = await _claim_and_release()
+    assert claimed is not None and claimed[0] == retry_id
+    (running,) = await _generations(device_id)
+    assert running.status is GenerationStatus.running
+    assert running.attempts == 2
+    assert running.carrier_job_id == failed.job_id
+
+    async with session() as db:
+        await db.execute(sa.text("DELETE FROM jobs WHERE id = :job_id"), {"job_id": retry_id})
+        await db.commit()
+
+    assert await recover_generations() == 1
+
+    (recovered,) = await _generations(device_id)
+    assert recovered.status is GenerationStatus.outcome_unknown
+    assert recovered.job_id is None
+    assert (
+        recovered.carrier_job_id,
+        recovered.carrier_job_status,
+        recovered.carrier_job_result,
+        recovered.carrier_job_error,
+    ) == (None, None, None, None)
+    listing = await adapter_client.get(f"/api/v1/devices/{device_id}/generations", headers=_AUTH)
+    assert listing.status_code == 200, listing.text
+    assert (listing.json()[0]["carrier_job_id"], listing.json()[0]["carrier_job_status"]) == (None, None)
+
+
+async def test_a_running_retry_serves_the_previous_carrier_as_the_contract_documents(adapter_client):
+    from nso_adapter.store.models import GenerationStatus, Job
+
+    device_id = await _blocked_device(adapter_client, "gen-retry-carrier-served", 16117)
+    (failed,) = await _generations(device_id)
+    async with session() as db:
+        previous = await db.get(Job, failed.job_id)
+    retry_id = await _retry_head_http(adapter_client, device_id)
+    claimed = await _claim_and_release()
+    assert claimed is not None and claimed[0] == retry_id
+
+    listing = await adapter_client.get(f"/api/v1/devices/{device_id}/generations", headers=_AUTH)
+    assert listing.status_code == 200, listing.text
+    (row,) = listing.json()
+    assert (row["status"], row["job_id"]) == (GenerationStatus.running.value, retry_id)
+    assert (row["carrier_job_id"], row["carrier_job_status"]) == (previous.id, "failed")
+    evidence = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/deployment-evidence", json={"apply_attempt_ids": []}, headers=_AUTH
+    )
+    assert evidence.status_code == 200, evidence.text
+    head = evidence.json()["head"]
+    assert head["status"] == GenerationStatus.running.value
+    assert (head["carrier_job_id"], head["carrier_job_status"], head["carrier_job_error"]) == (
+        previous.id,
+        "failed",
+        previous.error,
+    )
+
+
+def test_api_contract_marks_carrier_fields_authoritative_only_on_terminal_generations():
+    contract = (Path(__file__).resolve().parents[2] / "docs" / "api-contract.md").read_text()
+    for heading in (
+        "### `GET /api/v1/devices/{id}/generations`",
+        "### `POST /api/v1/devices/{id}/deployment-evidence`",
+    ):
+        section = " ".join(contract.split(heading, maxsplit=1)[1].split("\n### ", maxsplit=1)[0].split())
+        assert "authoritative only when `status` is terminal" in section, heading
+        assert "the previous run's carrier snapshot" in section, heading
+    assert "can still expose the previous run's projections" in " ".join(contract.split())
 
 
 # ── concurrent creation: sequence order == commit order ──────────────────────
