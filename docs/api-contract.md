@@ -487,7 +487,10 @@ out-of-range limit returns `422 validation_error`; it is never clamped.
 Every object always contains every shown field. An unset field is `null`, never
 missing. `job_id` is `null` while a pending generation is not attached to a job.
 `carrier_job_id` and `carrier_job_status` retain the terminal carrier identity after
-its job row is deleted. Both are `null` when terminal carrier evidence is unavailable.
+its job row is deleted. They are authoritative only when `status` is terminal. A
+non-terminal generation (for example, a retry in `running`) can still carry the previous
+run's carrier snapshot while `job_id` names the new job. Both are `null` when a generation
+has no carrier snapshot.
 `settlement_cohort` is `null` when the generation is not part of a request-atomic
 settlement cohort. `status` is one of `pending`, `running`, `settled`, `failed`,
 `outcome_unknown`, or `abandoned`. `mode` is `networked` or `detach`.
@@ -582,7 +585,10 @@ This preserves both stream values when `interface_config` and `ip` map to the
 `interface_config` section, or when `isis` and `isis_flex_algo` map to the `isis` section.
 
 The stored attempt `response` is the complete replay body. Terminal generation evidence
-uses the carrier snapshot, so it remains available after the job row is pruned. An attempt
+uses the carrier snapshot, so it remains available after the job row is pruned. The
+`carrier_job_*`, `row_outcomes`, and `refusals` fields are authoritative only when `status`
+is terminal. A non-terminal head or generation (for example, a retry in `running`) can still
+expose the previous run's carrier snapshot. An attempt
 referenced by a generation is never deleted. A deterministic rejection that stamps no
 generation is valid when its replay body omits `generations` or stores it as `null`.
 
@@ -3000,8 +3006,10 @@ cause does not grant permission to stamp or count that historical row.
 
 Job responses expose typed `row_outcomes` and `refusals` projections beside `result`.
 Deployment-evidence generation and head responses expose the same projections from the
-terminal carrier snapshot. Job pruning preserves this evidence. Before terminal evidence
-exists, both fields are `null`. A completed attempt with no logical rows exposes `[]`.
+terminal carrier snapshot. Job pruning preserves this evidence. Both fields are `null`
+when the generation has no carrier snapshot. A non-terminal generation can still expose the
+previous run's projections, so they are authoritative only when its `status` is terminal. A
+completed attempt with no logical rows exposes `[]`.
 API reads do not reconstruct attribution from live intent.
 
 Preview exposes `status`: `ready`, `refused`, `unavailable`, or `error`. A canonical,

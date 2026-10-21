@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from contextlib import asynccontextmanager
+from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -1023,6 +1024,47 @@ async def test_restart_clears_the_previous_snapshot_when_the_retry_carrier_is_de
     listing = await adapter_client.get(f"/api/v1/devices/{device_id}/generations", headers=_AUTH)
     assert listing.status_code == 200, listing.text
     assert (listing.json()[0]["carrier_job_id"], listing.json()[0]["carrier_job_status"]) == (None, None)
+
+
+async def test_a_running_retry_serves_the_previous_carrier_as_the_contract_documents(adapter_client):
+    from nso_adapter.store.models import GenerationStatus, Job
+
+    device_id = await _blocked_device(adapter_client, "gen-retry-carrier-served", 16117)
+    (failed,) = await _generations(device_id)
+    async with session() as db:
+        previous = await db.get(Job, failed.job_id)
+    retry_id = await _retry_head_http(adapter_client, device_id)
+    claimed = await _claim_and_release()
+    assert claimed is not None and claimed[0] == retry_id
+
+    listing = await adapter_client.get(f"/api/v1/devices/{device_id}/generations", headers=_AUTH)
+    assert listing.status_code == 200, listing.text
+    (row,) = listing.json()
+    assert (row["status"], row["job_id"]) == (GenerationStatus.running.value, retry_id)
+    assert (row["carrier_job_id"], row["carrier_job_status"]) == (previous.id, "failed")
+    evidence = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/deployment-evidence", json={"apply_attempt_ids": []}, headers=_AUTH
+    )
+    assert evidence.status_code == 200, evidence.text
+    head = evidence.json()["head"]
+    assert head["status"] == GenerationStatus.running.value
+    assert (head["carrier_job_id"], head["carrier_job_status"], head["carrier_job_error"]) == (
+        previous.id,
+        "failed",
+        previous.error,
+    )
+
+
+def test_api_contract_marks_carrier_fields_authoritative_only_on_terminal_generations():
+    contract = (Path(__file__).resolve().parents[2] / "docs" / "api-contract.md").read_text()
+    for heading in (
+        "### `GET /api/v1/devices/{id}/generations`",
+        "### `POST /api/v1/devices/{id}/deployment-evidence`",
+    ):
+        section = " ".join(contract.split(heading, maxsplit=1)[1].split("\n### ", maxsplit=1)[0].split())
+        assert "authoritative only when `status` is terminal" in section, heading
+        assert "the previous run's carrier snapshot" in section, heading
+    assert "can still expose the previous run's projections" in " ".join(contract.split())
 
 
 # ── concurrent creation: sequence order == commit order ──────────────────────
