@@ -2,6 +2,39 @@
 
 <!-- version list -->
 
+## v1.15.0 (2026-10-21)
+
+### Chores
+
+- **ci**: Bump the actions group with 3 updates
+  ([`dfd0e76`](https://github.com/marcinpsk/nso-adapter/commit/dfd0e76488103567289686c7d01ae05591d3b46e))
+
+- **deps**: Bump the python-minor-patch group with 4 updates
+  ([`3ec760e`](https://github.com/marcinpsk/nso-adapter/commit/3ec760e0a70f4a070b71249d0835559822013de5))
+
+### Documentation
+
+- **api**: State that carrier fields are authoritative only on terminal generations
+  ([`8fe558b`](https://github.com/marcinpsk/nso-adapter/commit/8fe558ba90744bd0a41b76f23d4a6a48eddf569a))
+
+### Testing
+
+- **refusal**: Bound the wait for the first held send
+  ([`e6d4f47`](https://github.com/marcinpsk/nso-adapter/commit/e6d4f4789a103b677457c93e8351da6604b979f1))
+
+- **refusal**: Count a budget wait as held only when the send is still pending
+  ([`10e047d`](https://github.com/marcinpsk/nso-adapter/commit/10e047d8c33b8bd9b4d6d7527004d55c2ad393e9))
+
+- **refusal**: Drive the budget helper self-tests through the worker
+  ([`487957c`](https://github.com/marcinpsk/nso-adapter/commit/487957c062a66ec0916f8d202dd569c85ba96186))
+
+- **refusal**: Fail the budget tests when the held send is not reached
+  ([`c2f703f`](https://github.com/marcinpsk/nso-adapter/commit/c2f703f3c8edd7f7f251def8982eebb9352779b9))
+
+- **refusal**: Start the execution budget only after the held send
+  ([`bc748cb`](https://github.com/marcinpsk/nso-adapter/commit/bc748cbfafd1b038cc7fe077ba0ff1e44dfb50bc))
+
+
 ## v1.14.0 (2026-10-18)
 
 
