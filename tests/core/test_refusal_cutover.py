@@ -7,6 +7,7 @@ import json
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -304,6 +305,22 @@ async def run_next(device_id, *, runner=None):
     assert device == device_id
     await worker._run_one_job(1, job_id, device, kind, runner or _JOB_RUNNERS[kind], reg)
     return job_id
+
+
+def expire_budget_after_send(monkeypatch, transport, budget=0.05):
+    """Start the execution budget clock only when the held send is reached, so slow setup cannot expire it."""
+    real_wait = asyncio.wait
+
+    async def wait(tasks, *, timeout=None, **kwargs):
+        if timeout == budget:
+            sent = asyncio.create_task(transport.before_send.wait())
+            await real_wait({*tasks, sent}, return_when=asyncio.FIRST_COMPLETED)
+            sent.cancel()
+        return await real_wait(tasks, timeout=timeout, **kwargs)
+
+    transport.release_send.clear()
+    monkeypatch.setattr(worker, "JOB_EXECUTION_BUDGET", budget)
+    monkeypatch.setattr(worker, "asyncio", SimpleNamespace(**{**vars(asyncio), "wait": wait}))
 
 
 async def evidence(device_id):
@@ -711,8 +728,7 @@ async def test_removal_cancel_after_refusal_checkpoint_settles_without_resend(ad
 @pytest.mark.parametrize("operation", ["apply", "removal"])
 async def test_execution_budget_uses_attempt_disposition(adapter_client, monkeypatch, operation):
     device_id, transport = await setup(adapter_client, monkeypatch, operation=operation)
-    transport.release_send.clear()
-    monkeypatch.setattr(worker, "JOB_EXECUTION_BUDGET", 1.0)
+    expire_budget_after_send(monkeypatch, transport)
     await run_next(device_id)
     await terminal(adapter_client, device_id, refused=False)
     assert await worker._claim_next_job() is None
@@ -1019,8 +1035,7 @@ async def test_refusal_secret_canary_across_the_apply_path(adapter_client, monke
     elif mode == "escaped":
         transport.raw = b'{"message":"device-intent: refu\\u0073ed ' + CANARY.encode()
     elif mode == "transport":
-        transport.release_send.clear()
-        monkeypatch.setattr(worker, "JOB_EXECUTION_BUDGET", 1.0)
+        expire_budget_after_send(monkeypatch, transport)
     await run_next(device_id)
     job = await terminal(adapter_client, device_id, refused=mode == "valid")
     attempts, outcomes = await evidence(device_id)
