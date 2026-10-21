@@ -613,12 +613,12 @@ async def _run_connect(job_id: int, device_id: int, reg: ClaimRegistration | Non
 
 
 async def _run_apply(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
-    from nso_adapter.core.apply import run_apply
+    from nso_adapter.core.apply import WORKER_APPLY_FORCE, run_apply
 
     logger.info("job.apply.start", job_id=job_id, device_id=device_id)
     # The claim registration goes THROUGH to the runner: R1 kept it here, so no write the
     # runner makes could be claim-scoped. R2's carrier/CAS transactions need the token.
-    await run_apply(job_id, device_id, force=True, reg=reg)
+    await run_apply(job_id, device_id, force=WORKER_APPLY_FORCE, reg=reg)
 
 
 async def _run_removal(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:

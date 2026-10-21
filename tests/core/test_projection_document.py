@@ -274,7 +274,7 @@ async def test_increment_one_apply_rows_come_from_the_generation_document(
     """A successor can change the store, but the run still pushes the selected document."""
     from sqlalchemy import inspect as sa_inspect
 
-    from nso_adapter.core.apply import _Projection
+    from nso_adapter.core.apply import _Projection, select_frozen_apply
     from nso_adapter.store import models
 
     device_id = await seed_device(nso_device_name=f"document-{section}")
@@ -290,7 +290,7 @@ async def test_increment_one_apply_rows_come_from_the_generation_document(
         await db.commit()
 
     async with session() as db:
-        source = _Projection(db, device_id, True, document, frozenset({section}))
+        source = _Projection(db, device_id, select_frozen_apply(document, frozenset({section}), force=True))
         selected = await source.collect(model, section=section)
 
     assert [getattr(row, changed_field) for row in selected.push] == [original_value]
@@ -302,7 +302,7 @@ async def test_snmp_apply_rows_and_vault_refs_come_from_the_generation_document(
     """A successor ref stays pending while the selected document's ref reaches send."""
     from sqlalchemy import inspect as sa_inspect
 
-    from nso_adapter.core.apply import _Projection
+    from nso_adapter.core.apply import _Projection, select_frozen_apply
     from nso_adapter.store.models import SnmpCommunityIntent
 
     device_id = await seed_device(nso_device_name="document-snmp", netbox_device_id=9824)
@@ -322,7 +322,7 @@ async def test_snmp_apply_rows_and_vault_refs_come_from_the_generation_document(
         await db.commit()
 
     async with session() as db:
-        source = _Projection(db, device_id, True, document, frozenset({"snmp"}))
+        source = _Projection(db, device_id, select_frozen_apply(document, frozenset({"snmp"}), force=True))
         selected = await source.collect(SnmpCommunityIntent, section="snmp")
 
     assert [row.vault_ref for row in selected.push] == ["network/snmp/communities/selected#community"]
@@ -334,7 +334,7 @@ async def test_logging_apply_rows_come_from_the_generation_document(adapter_clie
     """A successor can change logging intent, but the selected document still reaches send."""
     from sqlalchemy import inspect as sa_inspect
 
-    from nso_adapter.core.apply import _Projection
+    from nso_adapter.core.apply import _Projection, select_frozen_apply
     from nso_adapter.store.models import LoggingHostIntent
 
     device_id = await seed_device(nso_device_name="document-logging", netbox_device_id=9825)
@@ -353,7 +353,7 @@ async def test_logging_apply_rows_come_from_the_generation_document(adapter_clie
         await db.commit()
 
     async with session() as db:
-        source = _Projection(db, device_id, True, document, frozenset({"logging"}))
+        source = _Projection(db, device_id, select_frozen_apply(document, frozenset({"logging"}), force=True))
         selected = await source.collect(LoggingHostIntent, section="logging")
 
     assert [row.severity for row in selected.push] == ["ERROR"]

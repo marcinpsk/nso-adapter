@@ -335,3 +335,48 @@ def test_shutdown_wait_outlasts_drain_plus_cleanup():
     which is precisely how a live child ends up behind a released claim.
     """
     assert worker_mod._SHUTDOWN_TASK_WAIT > worker_mod.JOB_CANCEL_DRAIN + worker_mod.JOB_CLEANUP_BOUND
+
+
+# ── #1825: a run the worker ends before preparation reports its membership ──
+
+
+@pytest.mark.parametrize(
+    ("lane", "code"),
+    [("claimed_budget", "cancelled"), ("claimless_budget", "cancelled"), ("runner_raised", "internal")],
+)
+async def test_1825_an_apply_the_worker_ends_reports_its_generation_not_applied(
+    adapter_client, monkeypatch, lane, code
+):
+    """L4 (a claimed cancel or budget expiry), L5 (the claimless cancel) and L6 (an escaped runner exception).
+
+    The runner never prepared an attempt, so nothing reached the device. Forbidden: a
+    terminal, sequenced apply without ``row_outcomes``, which stalls the settlement cursor.
+    """
+    from nso_adapter.core.claim import ClaimRegistration
+    from nso_adapter.store.models import Job, JobStatus, JobType
+    from tests.core.test_static_route_put import assert_not_applied, execution_rows, seed_unsent_apply
+
+    monkeypatch.setattr(worker_mod, "JOB_EXECUTION_BUDGET", 0.2)
+    device_id, job_id, generation_id, row_id = await seed_unsent_apply(f"w-1825-{lane}", 9861)
+    if lane == "claimless_budget":
+        reg = ClaimRegistration(run_attempt=1)
+    else:
+        reg = await acquire_claim(device_id, "job", job_id=job_id)
+        reg.run_attempt = 1
+
+    async def _slow(_job_id, _device_id, _reg=None):
+        await asyncio.sleep(30)
+
+    async def _boom(_job_id, _device_id, _reg=None):
+        raise RuntimeError("runner blew up before preparing an attempt")
+
+    task = await _drive(job_id, device_id, JobType.apply, _boom if lane == "runner_raised" else _slow, reg=reg)
+    await asyncio.wait_for(task, timeout=30)
+
+    async with session() as db:
+        job = await db.get(Job, job_id)
+    assert (job.status, job.error["code"]) == (JobStatus.failed, code)
+    assert job.result is not None and "row_outcomes" in job.result
+    assert_not_applied(job.result, job.error, generation_id, [row_id])
+    assert await execution_rows(job_id) == (0, 0)
+    assert await _claim(device_id) is None

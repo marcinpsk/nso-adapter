@@ -1413,3 +1413,64 @@ async def test_a2_iii_the_duplicate_retract_re_asserts_the_delivered_clear(adapt
     assert fake.sent_routes() == [wire(B)], "the duplicate re-asserts the already-cleared entry"
     assert len(fake.writes) == writes_after_first + 1
     assert (await carriers(device_id))[B] is None
+
+
+# ── #1825 L11: a superseded removal keeps its success and reports its membership ──
+
+
+@pytest.mark.parametrize("promoted", [False, True], ids=["reissue", "promoted"])
+async def test_1825_l11_a_superseded_removal_keeps_success_and_reports_its_membership(adapter_client, promoted):
+    """L11 (C4.7's lane): a fully superseded removal sends nothing and succeeds.
+
+    It is still sequenced, so it gains the not-applied evidence of its frozen membership,
+    and keeps its own keys and its null error. A reissue settles no stream, so its
+    membership is empty; a promoted removal reports the live row it carried. Forbidden: a
+    sequenced removal without ``row_outcomes``.
+    """
+    from nso_adapter.core.removal import enqueue_removal
+    from nso_adapter.store.models import GenerationStatus
+    from tests.core.test_static_route_put import assert_not_applied, execution_rows, job_generation
+
+    name = f"sr-1825-l11-{promoted}"
+    device_id = await seed_device(nso_device_name=name, netbox_device_id=7470 + promoted)
+    ids = await seed_rows(device_id, [{"triple": A, "route_id": 2}])
+    fake = SrFake(name, service=[wire(A), wire(B)])
+    client = sr_client(fake)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    if promoted:
+        async with session() as db:
+            job = await enqueue_removal(
+                db,
+                device_id,
+                "static_route",
+                marking="delete_origin",
+                defer_retract=False,
+                promotes=("static_route",),
+                static_route_tombstone_ids=(tomb,),
+            )
+            (await db.get(StaticRouteTombstone, tomb)).job_id = job.id
+            await db.commit()
+            job_id = job.id
+    else:
+        job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
+
+    job = await run_removal_job(device_id, job_id, client)
+
+    assert (job.status, job.error) == (JobStatus.succeeded, None)
+    assert fake.calls == [] and fake.reads == [], "a superseded removal issues no HTTP at all"
+    client.service_instance_state.assert_not_awaited()
+    assert {key: job.result[key] for key in ("scope", "removal_branch", "residue_check", "superseded")} == {
+        "scope": "static_route",
+        "removal_branch": "superseded",
+        "residue_check": "skipped_superseded",
+        "superseded": True,
+    }
+    assert "row_outcomes" in job.result, "a sequenced removal carries outcomes"
+    generation = await job_generation(job_id)
+    if promoted:
+        assert_not_applied(job.result, None, generation.id, [ids[A]])
+    else:
+        assert (job.result["row_outcomes"], job.result["settlement_owners"]) == ([], [])
+        assert (job.result["refusals"], job.result["commit_acknowledged"]) == ([], False)
+    assert await execution_rows(job_id) == (0, 0)
+    assert generation.status is GenerationStatus.settled

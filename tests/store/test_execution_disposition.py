@@ -1172,3 +1172,96 @@ async def test_historical_route_clear_requires_exact_field_authority(db_session,
     assert isinstance(result, AttributionFailure) is not allowed, (
         "a historical field clear needs that field's immutable authority"
     )
+
+
+# ── #1825: unprepared-run evidence is the attempt path's evidence, derived without a session ──
+
+
+async def _seed_coalesced_apply(device_name: str, netbox_device_id: int, *, repeated: bool):
+    """Seed one started apply carrying two adjacent generations through the production producers.
+
+    The first promotes ``static_route``. The second promotes ``vlan`` (disjoint streams) or
+    ``static_route`` again after one more route (a repeated stream). Returns
+    ``(device_id, job_id, first_id, second_id)``.
+    """
+    from datetime import UTC, datetime
+
+    from nso_adapter.core.generation import attach_to_job, create_generation, mark_job_generations_running, note_write
+    from nso_adapter.store.models import VlanIntent
+    from tests.conftest import seed_device, session
+    from tests.core.test_static_route_put import B, C, seed_rows
+
+    device_id = await seed_device(nso_device_name=device_name, netbox_device_id=netbox_device_id)
+    await seed_rows(device_id, [{"triple": B, "route_id": 7}])
+    async with session() as db:
+        job = Job(
+            device_id=device_id, job_type=JobType.apply, status=JobStatus.running, run_attempt=1, coalescible=True
+        )
+        db.add(job)
+        await db.flush()
+        await note_write(db, device_id, "static_route")
+        first = await create_generation(db, device_id, streams=("static_route",), mode=GenerationMode.networked)
+        assert await attach_to_job(db, first, job)
+        await db.commit()
+        job_id, first_id = job.id, first.id
+    if repeated:
+        await seed_rows(device_id, [{"triple": C, "route_id": 8}])
+    else:
+        async with session() as db:
+            db.add(VlanIntent(device_id=device_id, vlan_id=10, name="placeholder VLAN", accepted_at=datetime.now(UTC)))
+            await db.commit()
+    stream = "static_route" if repeated else "vlan"
+    async with session() as db:
+        await note_write(db, device_id, stream)
+        second = await create_generation(db, device_id, streams=(stream,), mode=GenerationMode.networked)
+        assert await attach_to_job(db, second, await db.get(Job, job_id))
+        await mark_job_generations_running(db, job_id)
+        await db.commit()
+        return device_id, job_id, first_id, second.id
+
+
+@pytest.mark.parametrize("repeated", [False, True], ids=["disjoint_streams", "repeated_stream"])
+async def test_1825_unprepared_evidence_is_the_attempt_paths_evidence_for_a_coalesced_carrier(
+    adapter_client, monkeypatch, repeated
+):
+    """DERIVE, run with no session, returns exactly what the attempt path wrote for the same generations.
+
+    The attempt path here is ``settle_unsent`` (an inconclusive retention read after
+    preparation), so the result shapes must be equal byte for byte, ``static_route_results``
+    included. A repeated stream keeps only its latest authority, as the attempt path does:
+    nothing is invented for the earlier generation (the plugin keeps that carrier blocked).
+    """
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from nso_adapter.core.execution import derive_unprepared_evidence
+    from tests.conftest import session
+    from tests.core.test_static_route_put import inconclusive, run_started_apply, sr_client
+
+    name = f"coalesced-{'repeated' if repeated else 'disjoint'}"
+    device_id, job_id, first_id, second_id = await _seed_coalesced_apply(name, 9881 + repeated, repeated=repeated)
+    job = await run_started_apply(job_id, device_id, sr_client(name, state=inconclusive())[0])
+    assert job.error["code"] == "static_route_snapshot_inconclusive"
+    assert "static_route_results" in job.result
+    async with session() as db:
+        generations = list(
+            await db.scalars(
+                sa.select(DeploymentGeneration)
+                .where(DeploymentGeneration.job_id == job_id)
+                .order_by(DeploymentGeneration.seq)
+            )
+        )
+    assert [generation.id for generation in generations] == [first_id, second_id]
+    assert all(sa_inspect(generation).detached for generation in generations)
+
+    def _no_session(*_args, **_kwargs):
+        raise AssertionError("DERIVE must not touch a session")
+
+    for method in ("execute", "scalar", "scalars", "get", "flush"):
+        monkeypatch.setattr(AsyncSession, method, _no_session)
+    derived = derive_unprepared_evidence(JobType.apply, generations, job.error, attempt_exists=False)
+
+    assert json.loads(json.dumps(derived)) == job.result
+    named = {row["generation_id"] for row in job.result["row_outcomes"]}
+    assert named == ({second_id} if repeated else {first_id, second_id})
+    assert {row["disposition"] for row in job.result["row_outcomes"]} == {"not_applied"}

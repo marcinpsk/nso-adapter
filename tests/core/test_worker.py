@@ -589,3 +589,25 @@ def test_sync_now_is_requeue_safe_and_runnable():
     # S5a B: same guarantees for the comprehensive CDB-only read (idempotent mirror job).
     assert disposition_for(JobType.sync_from_nso) is JobStatus.queued
     assert JobType.sync_from_nso in _JOB_RUNNERS
+
+
+async def test_1825_l8_an_orphaned_apply_reports_its_generation_not_applied(adapter_client):
+    """L8: the claimless recovery clock fails an interrupted apply that prepared no attempt.
+
+    No attempt means nothing reached the device. Forbidden: the ``orphaned`` terminal write
+    without ``row_outcomes``, which the settlement consumer can never pass.
+    """
+    from nso_adapter.store.models import GenerationStatus
+    from tests.core.test_static_route_put import assert_not_applied, execution_rows, job_generation, seed_unsent_apply
+
+    device_id, job_id, generation_id, row_id = await seed_unsent_apply("wrk-1825-l8", 729)
+    await _set_heartbeat(job_id, None)
+
+    await worker.requeue_orphaned_jobs()
+
+    job = await _get_job(job_id)
+    assert (job.status, job.error["code"]) == (JobStatus.failed, "orphaned")
+    assert job.result is not None and "row_outcomes" in job.result
+    assert_not_applied(job.result, job.error, generation_id, [row_id])
+    assert await execution_rows(job_id) == (0, 0)
+    assert (await job_generation(job_id)).status is GenerationStatus.outcome_unknown

@@ -6,8 +6,8 @@ The caller commits preparation before sending. It commits response checkpoints b
 settlement. The terminal writer owns outcomes, restoration, stamps, and lifecycle writes.
 """
 
-from collections.abc import Iterable
-from typing import Literal
+from collections.abc import Iterable, Sequence
+from typing import Literal, NamedTuple
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -108,24 +108,11 @@ def _generation_authorities(generations: list[DeploymentGeneration]) -> list[dic
     ]
 
 
-async def prepare_execution_attempt(
-    db: AsyncSession,
-    job_id: int,
-    run_attempt: int,
-    claim_token: str,
-    generation_id: int,
-    *,
-    origins: OriginIndex,
-    logical_rows: Iterable[LogicalRow],
-) -> ApplyExecutionAttempt:
-    """Freeze all carried authorities and the highest document without committing."""
-    job, generations = await _lock_run(db, job_id, run_attempt, claim_token, generation_id)
-    generation = generations[-1]
+def validate_logical_membership(generations: Sequence[DeploymentGeneration], logicals: Sequence[LogicalRow]) -> None:
+    """Refuse a membership that is not unique or does not match its frozen generation authority."""
     by_id = {carried.id: carried for carried in generations}
-    logicals = tuple(logical_rows)
     if len({(logical.stream, logical.row, logical.settlement_cohort) for logical in logicals}) != len(logicals):
         raise ValueError("Attempted logical membership must be unique")
-    carriers = list(dict.fromkeys(logical.carrier for logical in logicals))
     for logical in logicals:
         authority = by_id.get(logical.generation_id) if logical.generation_id is not None else None
         if (
@@ -141,6 +128,24 @@ async def prepare_execution_attempt(
             or logical.carrier.source_push_seq != logical.source_push_seq
         ):
             raise ValueError("Logical membership does not match the frozen generation")
+
+
+async def prepare_execution_attempt(
+    db: AsyncSession,
+    job_id: int,
+    run_attempt: int,
+    claim_token: str,
+    generation_id: int,
+    *,
+    origins: OriginIndex,
+    logical_rows: Iterable[LogicalRow],
+) -> ApplyExecutionAttempt:
+    """Freeze all carried authorities and the highest document without committing."""
+    job, generations = await _lock_run(db, job_id, run_attempt, claim_token, generation_id)
+    generation = generations[-1]
+    logicals = tuple(logical_rows)
+    validate_logical_membership(generations, logicals)
+    carriers = list(dict.fromkeys(logical.carrier for logical in logicals))
     tombstone_ids = (
         sorted(
             {
@@ -402,7 +407,21 @@ def _disposition_evidence(attempt: ApplyExecutionAttempt) -> tuple[str, dict, li
     return "unavailable", {}, []
 
 
-def _carrier_results(attempt: ApplyExecutionAttempt, outcomes: list[RowOutcome]) -> tuple[list, dict]:
+class UnsentOutcome(NamedTuple):
+    """One logical outcome of a run that prepared no attempt, shaped like a staged :class:`RowOutcome`."""
+
+    logical_identity: dict
+    carrier_identity: dict
+    disposition: str
+    refusals: list
+    source_identity: list
+
+
+#: Both outcome sources the shared result projection reads.
+Outcome = RowOutcome | UnsentOutcome
+
+
+def _carrier_results(attempted_carriers: list[dict], outcomes: Sequence[Outcome]) -> tuple[list, dict]:
     carriers: list[dict] = []
     counts: dict[str, dict[str, int]] = {
         f"{key}_count_by_outcome": {"in_sync": 0, "apply_failed": 0, "not_applied": 0, "unavailable": 0}
@@ -410,7 +429,7 @@ def _carrier_results(attempt: ApplyExecutionAttempt, outcomes: list[RowOutcome])
         for key in section.result_keys
     }
     priority = {"in_sync": 0, "not_applied": 1, "unavailable": 2, "refused": 3}
-    for carrier in attempt.attempted_carriers:
+    for carrier in attempted_carriers:
         public = {key: value for key, value in carrier.items() if key not in {"source_table", "content_identity"}}
         members = [outcome for outcome in outcomes if outcome.carrier_identity == public]
         if not members:
@@ -425,17 +444,54 @@ def _carrier_results(attempt: ApplyExecutionAttempt, outcomes: list[RowOutcome])
     return carriers, counts
 
 
-async def _route_outcome_evidence(
-    db: AsyncSession, attempt: ApplyExecutionAttempt, outcomes: list[RowOutcome], error: dict | None = None
+def _outcome_result(
+    attempted_carriers: list[dict], outcomes: Sequence[Outcome], *, refusals: list, commit_acknowledged: bool
+) -> dict:
+    """Project logical outcomes onto the job result every settlement path writes."""
+    carriers, counts = _carrier_results(attempted_carriers, outcomes)
+    return {
+        **counts,
+        "row_outcomes": [
+            {**outcome.logical_identity, "disposition": outcome.disposition, "refusals": outcome.refusals}
+            for outcome in outcomes
+        ],
+        "refusals": refusals,
+        "settlement_owners": carriers,
+        "commit_acknowledged": commit_acknowledged,
+    }
+
+
+def unsent_execution_result(
+    generation: DeploymentGeneration, membership: Sequence[LogicalRow], error: dict | None
+) -> dict:
+    """Return the ``not_applied`` result of *membership* for a run that reached no device."""
+    outcomes = [
+        UnsentOutcome(
+            logical.public_record(),
+            logical.carrier.public_record(),
+            "not_applied",
+            [],
+            logical_record(logical)["sources"],
+        )
+        for logical in membership
+    ]
+    carriers = [carrier.public_record() for carrier in dict.fromkeys(logical.carrier for logical in membership)]
+    result = _outcome_result(carriers, outcomes, refusals=[], commit_acknowledged=False)
+    routes = route_outcome_results(generation, outcomes, error)
+    if routes:
+        result["static_route_results"] = routes
+    return result
+
+
+def route_outcome_results(
+    generation: DeploymentGeneration, outcomes: Sequence[Outcome], error: dict | None = None
 ) -> list[dict]:
+    """Project the outcomes of the highest generation's static-route rows into per-route results."""
     from nso_adapter.core.apply import static_route_fingerprint
     from nso_adapter.core.projection import hydrate_section
     from nso_adapter.core.static_route_plan import triple_of
     from nso_adapter.store.models import StaticRouteIntent
 
-    generation = await db.get(DeploymentGeneration, attempt.generation_id)
-    if generation is None:
-        raise ValueError("Route evidence requires its frozen generation")
     rows = (
         hydrate_section(generation.document, "static_route").get(StaticRouteIntent, [])
         if "static_route" in generation.document
@@ -533,23 +589,15 @@ async def dispose_execution_attempt(
         outcomes.append(outcome)
     await _restore_attempt_bookkeeping(db, attempt)
     await stamp_refused_bookkeeping(db, attempt.device_id, attempt.prior_bookkeeping, causes)
-    carriers, counts = _carrier_results(attempt, outcomes)
-    result = {
-        **counts,
-        "row_outcomes": [
-            {**outcome.logical_identity, "disposition": outcome.disposition, "refusals": outcome.refusals}
-            for outcome in outcomes
-        ],
-        "refusals": records,
-        "settlement_owners": carriers,
-        "commit_acknowledged": attempt.commit_acknowledged,
-    }
+    result = _outcome_result(
+        attempt.attempted_carriers, outcomes, refusals=records, commit_acknowledged=attempt.commit_acknowledged
+    )
     job_error = (
         {"code": "attribution_failed", "message": "Refusal attribution failed", "detail": {}}
         if kind == "attribution_failed"
         else terminal_error or {"code": kind, "message": _EXIT_MESSAGES[exit_reason], "detail": {}}
     )
-    routes = await _route_outcome_evidence(db, attempt, outcomes, job_error)
+    routes = route_outcome_results(generations[-1], outcomes, job_error)
     if routes:
         result["static_route_results"] = routes
     from nso_adapter.core.claim import terminalize
@@ -596,15 +644,9 @@ async def complete_execution_result(
         outcomes.append(await _stage_outcome(db, attempt, logical, disposition, ()))
     await _restore_attempt_bookkeeping(db, attempt)
     await stamp_certified_bookkeeping(db, attempt.device_id, attempt.prior_bookkeeping, dispositions, now)
-    carriers, counts = _carrier_results(attempt, outcomes)
+    result = _outcome_result(
+        attempt.attempted_carriers, outcomes, refusals=[], commit_acknowledged=attempt.commit_acknowledged
+    )
     attempt.phase = "terminal"
     await db.flush()
-    return {
-        **counts,
-        "row_outcomes": [
-            {**outcome.logical_identity, "disposition": outcome.disposition, "refusals": []} for outcome in outcomes
-        ],
-        "refusals": [],
-        "settlement_owners": carriers,
-        "commit_acknowledged": attempt.commit_acknowledged,
-    }
+    return result

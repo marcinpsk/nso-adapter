@@ -832,3 +832,373 @@ def test_disposition_for_is_the_only_requeue_policy():
     for job_type in JobType:
         expected = JobStatus.failed if job_type is JobType.apply else JobStatus.queued
         assert disposition_for(job_type) is expected, job_type
+
+
+# ── #1825: recovery of a run that prepared no attempt reports its membership ──
+
+
+async def test_1825_l7_a_revoked_apply_reports_its_generation_not_applied(adapter_client):
+    """L7: the claim scan fails an apply whose heartbeat went silent before preparation.
+
+    Forbidden: the ``orphaned`` terminal write without ``row_outcomes``. Recovery did not see
+    the run, so the generation stays ``outcome_unknown``; the evidence is still exact, because
+    no attempt row means no send.
+    """
+    from nso_adapter.store.models import GenerationStatus, Job, JobStatus
+    from tests.core.test_static_route_put import assert_not_applied, execution_rows, job_generation, seed_unsent_apply
+
+    device_id, job_id, generation_id, row_id = await seed_unsent_apply("cl-1825-l7", 9961)
+    await acquire_claim(device_id, "job", job_id=job_id)
+    await _backdate_heartbeat(device_id, seconds=claim_stale_cutoff() + 60)
+
+    await revoke_stale_claims()
+
+    async with session() as db:
+        job = await db.get(Job, job_id)
+    assert (job.status, job.error["code"]) == (JobStatus.failed, "orphaned")
+    assert job.result is not None and "row_outcomes" in job.result
+    assert_not_applied(job.result, job.error, generation_id, [row_id])
+    assert await execution_rows(job_id) == (0, 0)
+    assert (await job_generation(job_id)).status is GenerationStatus.outcome_unknown
+    assert await _claim_row(device_id) is None
+
+
+async def seed_malformed_apply(device_name: str, netbox_device_id: int, kind: str) -> tuple[int, int]:
+    """Seed a started apply whose frozen generation has a valid digest but cannot be derived.
+
+    Returns ``(device_id, job_id)``. *kind* names the defect: a LAG member whose bundle the
+    document does not carry (hydration raises ``RuntimeError``), a VLAN id outside the
+    standard range (encoding raises ``ValueError``), a ``stream_revisions`` key no stream
+    has (``stream_revisions`` is outside the digest; section selection raises ``ValueError``),
+    or a stored digest the document does not reproduce.
+    """
+    from nso_adapter.core.generation import digest_document
+    from nso_adapter.store.models import DeploymentGeneration, GenerationMode, GenerationStatus, Job, JobStatus, JobType
+
+    device_id = await seed_device(nso_device_name=device_name, netbox_device_id=netbox_device_id)
+    execution = {"_execution": {"context": {"ned_id": None, "dialect": "identity"}}}
+    vlan = {"id": 5, "device_id": device_id, "name": "placeholder VLAN", "accepted_at": "2026-06-01T00:00:00+00:00"}
+    document, streams = {
+        "lag_member_without_bundle": (
+            {
+                "lag": {
+                    **execution,
+                    "lag_bundle_intent": [],
+                    "lag_member_intent": [{"id": 2, "lag_bundle_id": 999, "interface_name": "GigabitEthernet0/1"}],
+                }
+            },
+            {"lag": 1},
+        ),
+        "invalid_vlan_id": ({"vlan": {**execution, "vlan_intent": [{**vlan, "vlan_id": 5000}]}}, {"vlan": 1}),
+        "unknown_stream": (
+            {"vlan": {**execution, "vlan_intent": [{**vlan, "vlan_id": 10}]}},
+            {"vlan": 1, "placeholder_unknown_stream": 1},
+        ),
+        "tampered_digest": ({"vlan": {**execution, "vlan_intent": [{**vlan, "vlan_id": 10}]}}, {"vlan": 1}),
+    }[kind]
+    async with session() as db:
+        job = Job(
+            job_type=JobType.apply, device_id=device_id, status=JobStatus.running, coalescible=True, run_attempt=1
+        )
+        db.add(job)
+        await db.flush()
+        db.add(
+            DeploymentGeneration(
+                device_id=device_id,
+                job_id=job.id,
+                seq=1,
+                mode=GenerationMode.networked,
+                status=GenerationStatus.running,
+                document=document,
+                digest="0" * 64
+                if kind == "tampered_digest"
+                else digest_document(GenerationMode.networked, document, {}),
+                allowed_removal_keys={},
+                source_push_seq={},
+                stream_revisions=streams,
+            )
+        )
+        await db.commit()
+        return device_id, job.id
+
+
+def _unresolved(logs) -> dict[int, tuple]:
+    return {
+        record["job_id"]: (record["log_level"], record["reason"], record["exception_type"])
+        for record in logs
+        if record["event"] == "execution.unprepared_evidence_unresolved"
+    }
+
+
+@pytest.mark.parametrize(
+    ("kind", "exception_type"), [("lag_member_without_bundle", "RuntimeError"), ("invalid_vlan_id", "ValueError")]
+)
+async def test_1825_a_malformed_document_stays_unresolved_in_a_runner_lane(adapter_client, kind, exception_type):
+    """A frozen document that cannot be derived invents nothing, and never wedges the runner.
+
+    Its terminal write keeps the lane's own result (today's floor: the plugin stays blocked)
+    and names the cause by exception TYPE only, since encoder messages can carry values.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from structlog.testing import capture_logs
+
+    from nso_adapter.store.models import Job, JobStatus
+    from tests.core.execution_helpers import run_apply
+    from tests.core.test_static_route_put import execution_rows
+
+    device_id, job_id = await seed_malformed_apply(f"cl-1825-{kind}", 9962, kind)
+    with capture_logs() as logs, patch("nso_adapter.core.importer.get_nso_client", return_value=AsyncMock()):
+        await run_apply(job_id=job_id, device_id=device_id)
+
+    async with session() as db:
+        job = await db.get(Job, job_id)
+    assert (job.status, job.error["code"]) == (JobStatus.failed, "internal")
+    assert exception_type in job.error["message"]
+    assert job.result is None, "no membership is invented for a document that does not derive"
+    assert job.settle_seq is not None
+    assert _unresolved(logs) == {job_id: ("error", "derivation_failed", exception_type)}
+    assert await execution_rows(job_id) == (0, 0)
+
+
+async def test_1825_one_recovery_batch_commits_malformed_and_valid_dispositions(adapter_client):
+    """F4/F5: an underivable carrier never wedges the batch it shares with a valid one.
+
+    ``revoke_stale_claims`` re-dispositions every stale claim in ONE transaction. A DERIVE
+    failure that raised would abort all of them on every pass.
+    """
+    from structlog.testing import capture_logs
+
+    from nso_adapter.store.models import Job, JobStatus
+    from tests.core.test_static_route_put import assert_not_applied, seed_unsent_apply
+
+    valid_device, valid_job, generation_id, row_id = await seed_unsent_apply("cl-1825-batch-valid", 9963)
+    kinds = {
+        "lag_member_without_bundle": ("derivation_failed", "RuntimeError"),
+        "invalid_vlan_id": ("derivation_failed", "ValueError"),
+        "unknown_stream": ("derivation_failed", "ValueError"),
+        "tampered_digest": ("generation_tampered", None),
+    }
+    malformed = {
+        kind: await seed_malformed_apply(f"cl-1825-batch-{kind}", 9964 + index, kind)
+        for index, kind in enumerate(kinds)
+    }
+    for device_id, job_id in [(valid_device, valid_job), *malformed.values()]:
+        await acquire_claim(device_id, "job", job_id=job_id)
+        await _backdate_heartbeat(device_id, seconds=claim_stale_cutoff() + 60)
+
+    with capture_logs() as logs:
+        revoked = await revoke_stale_claims()
+
+    assert len(revoked) == 5
+    async with session() as db:
+        jobs = {job_id: await db.get(Job, job_id) for job_id in [valid_job, *(job for _d, job in malformed.values())]}
+    assert {(job.status, job.error["code"]) for job in jobs.values()} == {(JobStatus.failed, "orphaned")}
+    assert all(job.settle_seq is not None for job in jobs.values())
+    assert_not_applied(jobs[valid_job].result, jobs[valid_job].error, generation_id, [row_id])
+    assert [jobs[job_id].result for _d, job_id in malformed.values()] == [None] * len(kinds)
+    assert _unresolved(logs) == {malformed[kind][1]: ("error", *reason) for kind, reason in kinds.items()}
+    for device_id in [valid_device, *(device for device, _j in malformed.values())]:
+        assert await _claim_row(device_id) is None
+
+
+async def _untouched(device_id: int, job_id: int) -> None:
+    """Assert, from a fresh session, that no part of a terminal transaction landed."""
+    from nso_adapter.store.models import DeploymentGeneration, DeviceSettleCounter, GenerationStatus, Job, JobStatus
+
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        generation = await db.scalar(sa.select(DeploymentGeneration).where(DeploymentGeneration.job_id == job_id))
+        counter = await db.get(DeviceSettleCounter, device_id)
+    assert (job.status, job.run_attempt, job.result, job.error, job.settle_seq) == (
+        JobStatus.running,
+        1,
+        None,
+        None,
+        None,
+    )
+    assert generation.status is GenerationStatus.running
+    assert counter.last_seq == 0
+    assert await _claim_row(device_id) is not None
+
+
+async def test_1825_a_transient_load_failure_rolls_the_recovery_batch_back(adapter_client, rival_engine):
+    """A database error in LOAD propagates: the whole batch rolls back, and the next pass retries.
+
+    The second carrier's job row is held by a rival, so the hook's row lock times out. The
+    first carrier's complete write (status, generation, sequence, claim delete) shared that
+    transaction and must not survive it.
+    """
+    from nso_adapter.store.models import Job
+    from tests.core.test_static_route_put import seed_unsent_apply
+
+    first = await seed_unsent_apply("cl-1825-load-first", 9970)
+    second = await seed_unsent_apply("cl-1825-load-second", 9971)
+    for device_id, job_id, _generation, _row in (first, second):
+        await acquire_claim(device_id, "job", job_id=job_id)
+        await _backdate_heartbeat(device_id, seconds=claim_stale_cutoff() + 60)
+
+    async with async_sessionmaker(rival_engine)() as holder:
+        await holder.execute(sa.select(Job.id).where(Job.id == second[1]).with_for_update())
+        with pytest.raises(sa.exc.DBAPIError) as raised:
+            await revoke_stale_claims(lock_timeout_ms=200)
+        await holder.rollback()
+
+    assert raised.value.orig.sqlstate == "55P03"
+    for device_id, job_id, _generation, _row in (first, second):
+        await _untouched(device_id, job_id)
+
+
+async def test_1825_a_transient_load_failure_rolls_a_runner_terminal_write_back(adapter_client, rival_engine, pg_url):
+    """The runner's terminal writer reaches the attempt table first in LOAD; a lock timeout there propagates.
+
+    Forbidden: catching it and writing the terminal status without evidence. The job stays
+    ``running`` for recovery, which retries against a healthy database.
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from nso_adapter.core.jobs import _mark_job_failed
+    from tests.core.test_static_route_put import seed_unsent_apply
+
+    device_id, job_id, _generation, _row = await seed_unsent_apply("cl-1825-load-runner", 9972)
+    reg = await acquire_claim(device_id, "job", job_id=job_id)
+    reg.run_attempt = 1
+    bounded = create_async_engine(
+        pg_url, poolclass=sa.pool.NullPool, connect_args={"server_settings": {"lock_timeout": "200ms"}}
+    )
+    try:
+        async with async_sessionmaker(rival_engine)() as holder:
+            await holder.execute(sa.text("LOCK TABLE apply_execution_attempt IN ACCESS EXCLUSIVE MODE"))
+            async with async_sessionmaker(bounded, expire_on_commit=False)() as db:
+                with pytest.raises(sa.exc.DBAPIError) as raised:
+                    await _mark_job_failed(db, job_id, {"code": "removal_failed", "message": "boom", "detail": {}}, reg)
+            await holder.rollback()
+    finally:
+        await bounded.dispose()
+
+    assert raised.value.orig.sqlstate == "55P03"
+    await _untouched(device_id, job_id)
+
+
+async def _prepared_then_lost(device_name: str, netbox_device_id: int):
+    """Run the real apply up to a committed preparation; the send then loses the claim.
+
+    Returns ``(device_id, job_id, registration)`` with the job still ``running``.
+    """
+    from unittest.mock import patch
+
+    from tests.core.execution_helpers import run_apply
+    from tests.core.test_static_route_put import absent, execution_rows, seed_unsent_apply, sr_client
+
+    device_id, job_id, _generation, _row = await seed_unsent_apply(device_name, netbox_device_id)
+    reg = await acquire_claim(device_id, "job", job_id=job_id)
+    reg.run_attempt = 1
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=sr_client(device_name, state=absent())[0]),
+        patch("nso_adapter.nso.apply.apply_device_intent", side_effect=ClaimLostError("placeholder lost holder")),
+        pytest.raises(ClaimLostError),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, reg=reg)
+    assert await execution_rows(job_id) == (1, 0), "the attempt was prepared and committed"
+    return device_id, job_id, reg
+
+
+async def test_1825_l9_an_attempt_that_lost_ownership_invents_no_outcomes(adapter_client):
+    """L9 / preparation-first: an attempt exists, so a send may have happened.
+
+    Recovery cannot dispose the attempt (a second generation joined its job), so it ends the
+    run with ``attempt_ownership_lost``. Forbidden: reporting that membership ``not_applied``.
+    """
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.generation import attach_to_job, create_generation, note_write
+    from nso_adapter.store.models import GenerationMode, GenerationStatus, Job, JobStatus
+    from tests.core.test_static_route_put import execution_rows, job_generation
+
+    device_id, job_id, _reg = await _prepared_then_lost("cl-1825-l9", 9973)
+    async with session() as db:
+        await note_write(db, device_id, "vlan")
+        second = await create_generation(db, device_id, streams=("vlan",), mode=GenerationMode.networked)
+        assert await attach_to_job(db, second, await db.get(Job, job_id))
+        await db.commit()
+    await _backdate_heartbeat(device_id, seconds=claim_stale_cutoff() + 60)
+
+    with capture_logs() as logs:
+        await revoke_stale_claims()
+
+    async with session() as db:
+        job = await db.get(Job, job_id)
+    assert (job.status, job.error["code"]) == (JobStatus.failed, "attempt_ownership_lost")
+    assert job.result is None
+    assert _unresolved(logs) == {job_id: ("error", "attempt_exists", None)}
+    assert await execution_rows(job_id) == (1, 0)
+    assert (await job_generation(job_id)).status is GenerationStatus.outcome_unknown
+
+
+async def test_1825_terminalization_first_makes_a_late_preparation_lose_ownership(adapter_client):
+    """Race, the other order: the hook's terminal write commits first, then the sender prepares.
+
+    The terminal write held the job row, so the preparation finds no running job and fails
+    with ownership loss. Its evidence stays the only result, and no attempt row appears.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from nso_adapter.core import worker as worker_mod
+    from nso_adapter.store.models import Job, JobStatus
+    from tests.core.execution_helpers import run_apply
+    from tests.core.test_static_route_put import (
+        absent,
+        assert_not_applied,
+        execution_rows,
+        seed_unsent_apply,
+        sr_client,
+    )
+
+    device_id, job_id, generation_id, row_id = await seed_unsent_apply("cl-1825-race", 9974)
+    reg = await acquire_claim(device_id, "job", job_id=job_id)
+    reg.run_attempt = 1
+    await worker_mod._mark_failed(job_id, "internal", "machinery fault", reg)
+    async with session() as db:
+        terminal = await db.get(Job, job_id)
+    assert terminal.status is JobStatus.failed
+    assert_not_applied(terminal.result, terminal.error, generation_id, [row_id])
+
+    sender = AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=sr_client("cl-1825-race", state=absent())[0]),
+        patch("nso_adapter.nso.apply.apply_device_intent", new=sender),
+        pytest.raises(ClaimLostError, match="preparation ownership"),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, reg=reg)
+
+    sender.assert_not_awaited()
+    assert await execution_rows(job_id) == (0, 0)
+    async with session() as db:
+        after = await db.get(Job, job_id)
+    assert (after.status, after.result, after.error) == (terminal.status, terminal.result, terminal.error)
+
+
+async def test_1825_an_evidence_key_without_row_outcomes_is_refused_before_any_write(adapter_client):
+    """A lane result that carries an evidence key but no ``row_outcomes`` is a code bug.
+
+    Merging would silently replace one of the two values, so the writer raises before its CAS.
+    """
+    from nso_adapter.core.claim import terminalize
+    from nso_adapter.store.models import JobStatus
+    from tests.core.test_static_route_put import seed_unsent_apply
+
+    device_id, job_id, _generation, _row = await seed_unsent_apply("cl-1825-collision", 9975)
+    await acquire_claim(device_id, "job", job_id=job_id)
+    async with session() as db:
+        with pytest.raises(ValueError, match="already carries"):
+            await terminalize(
+                db,
+                job_id,
+                status=JobStatus.failed,
+                expect=JobStatus.running,
+                run_attempt=1,
+                result={"settlement_owners": []},
+            )
+        await db.rollback()
+
+    await _untouched(device_id, job_id)
