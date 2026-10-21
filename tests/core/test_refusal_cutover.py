@@ -307,20 +307,33 @@ async def run_next(device_id, *, runner=None):
     return job_id
 
 
-def expire_budget_after_send(monkeypatch, transport, budget=0.05):
+def expire_budget_after_send(monkeypatch, transport, budget=0.05, preparation=5):
     """Start the execution budget clock only when the held send is reached, so slow setup cannot expire it."""
     real_wait = asyncio.wait
 
     async def wait(tasks, *, timeout=None, **kwargs):
         if timeout == budget:
             sent = asyncio.create_task(transport.before_send.wait())
-            await real_wait({*tasks, sent}, return_when=asyncio.FIRST_COMPLETED)
-            sent.cancel()
+            try:
+                await real_wait({*tasks, sent}, timeout=preparation, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                sent.cancel()
         return await real_wait(tasks, timeout=timeout, **kwargs)
 
     transport.release_send.clear()
     monkeypatch.setattr(worker, "JOB_EXECUTION_BUDGET", budget)
     monkeypatch.setattr(worker, "asyncio", SimpleNamespace(**{**vars(asyncio), "wait": wait}))
+
+
+async def test_budget_helper_stops_waiting_for_a_send_that_never_comes(monkeypatch):
+    transport = SimpleNamespace(before_send=asyncio.Event(), release_send=asyncio.Event())
+    expire_budget_after_send(monkeypatch, transport, preparation=0.1)
+    stalled = asyncio.create_task(asyncio.Event().wait())
+    try:
+        done, pending = await asyncio.wait_for(worker.asyncio.wait({stalled}, timeout=0.05), 10)
+    finally:
+        stalled.cancel()
+    assert not done and pending == {stalled}
 
 
 async def evidence(device_id):
