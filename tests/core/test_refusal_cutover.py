@@ -308,7 +308,7 @@ async def run_next(device_id, *, runner=None):
 
 
 def expire_budget_after_send(monkeypatch, transport, budget=0.05, preparation=5):
-    """Start the execution budget clock only when the held send is reached; return whether each budget wait reached it."""
+    """Start the execution budget clock only when the held send is reached; return whether each budget wait expired on it."""
     real_wait = asyncio.wait
     held = []
 
@@ -322,9 +322,12 @@ def expire_budget_after_send(monkeypatch, transport, budget=0.05, preparation=5)
             finally:
                 sent.cancel()
                 await asyncio.gather(sent, return_exceptions=True)
-            held.append(sent in done)
             if sent not in done:
+                held.append(False)
                 return await real_wait(tasks, timeout=0, **kwargs)
+            done, pending = await real_wait(tasks, timeout=timeout, **kwargs)
+            held.append(bool(pending))
+            return done, pending
         return await real_wait(tasks, timeout=timeout, **kwargs)
 
     transport.release_send.clear()
@@ -342,6 +345,18 @@ async def test_budget_helper_stops_waiting_for_a_send_that_never_comes(monkeypat
     finally:
         stalled.cancel()
     assert not done and pending == {stalled}
+    assert held == [False]
+
+
+async def test_budget_helper_reports_a_send_that_completes_within_the_budget(monkeypatch):
+    transport = SimpleNamespace(before_send=asyncio.Event(), release_send=asyncio.Event())
+    held = expire_budget_after_send(monkeypatch, transport, budget=30)
+
+    async def send():
+        transport.before_send.set()
+
+    done, pending = await asyncio.wait_for(worker.asyncio.wait({asyncio.create_task(send())}, timeout=30), 10)
+    assert len(done) == 1 and not pending
     assert held == [False]
 
 
