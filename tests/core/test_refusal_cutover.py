@@ -307,57 +307,68 @@ async def run_next(device_id, *, runner=None):
     return job_id
 
 
-def expire_budget_after_send(monkeypatch, transport, budget=0.05, preparation=5):
-    """Start the execution budget clock only when the held send is reached; return whether each budget wait expired on it."""
+def expire_budget_at_held_send(monkeypatch, transport, preparation=5):
+    """Expire the worker's execution budget when its runner is parked in the held send; return each budget wait's outcome.
+
+    Outcomes: "held" (the budget expired on the held send), "finished" (the runner ended within the real
+    budget), "no-send" (the runner reached no send within ``preparation``; the budget expires so the worker drains it).
+    """
+    budget = 45.0
+    assert budget not in (worker.JOB_CANCEL_DRAIN, worker.JOB_CLEANUP_BOUND)
     real_wait = asyncio.wait
-    held = []
+    waits = []
 
     async def wait(tasks, *, timeout=None, **kwargs):
-        if timeout == budget:
-            sent = asyncio.create_task(transport.before_send.wait())
-            try:
-                done, _pending = await real_wait(
-                    {*tasks, sent}, timeout=preparation, return_when=asyncio.FIRST_COMPLETED
-                )
-            finally:
-                sent.cancel()
-                await asyncio.gather(sent, return_exceptions=True)
-            if sent not in done:
-                held.append(False)
-                return await real_wait(tasks, timeout=0, **kwargs)
-            done, pending = await real_wait(tasks, timeout=timeout, **kwargs)
-            held.append(bool(pending))
-            return done, pending
-        return await real_wait(tasks, timeout=timeout, **kwargs)
+        if timeout != budget:
+            return await real_wait(tasks, timeout=timeout, **kwargs)
+        sent = asyncio.create_task(transport.before_send.wait())
+        try:
+            done, _pending = await real_wait({*tasks, sent}, timeout=preparation, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            sent.cancel()
+            await asyncio.gather(sent, return_exceptions=True)
+        if not done:
+            waits.append("no-send")
+            return set(), set(tasks)
+        if not done & set(tasks) and transport.before_send.is_set() and not transport.release_send.is_set():
+            waits.append("held")
+            return set(), set(tasks)
+        done, pending = await real_wait(tasks, timeout=timeout, **kwargs)
+        waits.append("expired" if pending else "finished")
+        return done, pending
 
+    transport.before_send.clear()
     transport.release_send.clear()
     monkeypatch.setattr(worker, "JOB_EXECUTION_BUDGET", budget)
     monkeypatch.setattr(worker, "asyncio", SimpleNamespace(**{**vars(asyncio), "wait": wait}))
-    return held
+    return waits
 
 
-async def test_budget_helper_stops_waiting_for_a_send_that_never_comes(monkeypatch):
-    transport = SimpleNamespace(before_send=asyncio.Event(), release_send=asyncio.Event())
-    held = expire_budget_after_send(monkeypatch, transport, budget=30, preparation=0.1)
-    stalled = asyncio.create_task(asyncio.Event().wait())
-    try:
-        done, pending = await asyncio.wait_for(worker.asyncio.wait({stalled}, timeout=30), 10)
-    finally:
-        stalled.cancel()
-    assert not done and pending == {stalled}
-    assert held == [False]
+async def test_budget_helper_drains_a_runner_that_never_sends(adapter_client, monkeypatch):
+    device_id, transport = await setup(adapter_client, monkeypatch)
+    waits = expire_budget_at_held_send(monkeypatch, transport, preparation=0.1)
+    cancelled = asyncio.Event()
+
+    async def stalled(*_args):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    job_id = await asyncio.wait_for(run_next(device_id, runner=stalled), 10)
+    assert waits == ["no-send"]
+    assert cancelled.is_set() and not transport.documents
+    assert (await job_row(job_id)).status == JobStatus.failed
 
 
-async def test_budget_helper_reports_a_send_that_completes_within_the_budget(monkeypatch):
-    transport = SimpleNamespace(before_send=asyncio.Event(), release_send=asyncio.Event())
-    held = expire_budget_after_send(monkeypatch, transport, budget=30)
-
-    async def send():
-        transport.before_send.set()
-
-    done, pending = await asyncio.wait_for(worker.asyncio.wait({asyncio.create_task(send())}, timeout=30), 10)
-    assert len(done) == 1 and not pending
-    assert held == [False]
+async def test_budget_helper_reports_a_released_send_as_finished(adapter_client, monkeypatch):
+    device_id, transport = await setup(adapter_client, monkeypatch)
+    waits = expire_budget_at_held_send(monkeypatch, transport)
+    transport.release_send.set()
+    await asyncio.wait_for(run_next(device_id), 10)
+    assert waits == ["finished"]
+    await terminal(adapter_client, device_id)
 
 
 async def evidence(device_id):
@@ -765,9 +776,9 @@ async def test_removal_cancel_after_refusal_checkpoint_settles_without_resend(ad
 @pytest.mark.parametrize("operation", ["apply", "removal"])
 async def test_execution_budget_uses_attempt_disposition(adapter_client, monkeypatch, operation):
     device_id, transport = await setup(adapter_client, monkeypatch, operation=operation)
-    held = expire_budget_after_send(monkeypatch, transport)
+    waits = expire_budget_at_held_send(monkeypatch, transport)
     await run_next(device_id)
-    assert held == [True]
+    assert waits == ["held"]
     await terminal(adapter_client, device_id, refused=False)
     assert await worker._claim_next_job() is None
 
@@ -1073,10 +1084,10 @@ async def test_refusal_secret_canary_across_the_apply_path(adapter_client, monke
     elif mode == "escaped":
         transport.raw = b'{"message":"device-intent: refu\\u0073ed ' + CANARY.encode()
     elif mode == "transport":
-        held = expire_budget_after_send(monkeypatch, transport)
+        waits = expire_budget_at_held_send(monkeypatch, transport)
     await run_next(device_id)
     if mode == "transport":
-        assert held == [True]
+        assert waits == ["held"]
     job = await terminal(adapter_client, device_id, refused=mode == "valid")
     attempts, outcomes = await evidence(device_id)
     assert_text_free_of(
