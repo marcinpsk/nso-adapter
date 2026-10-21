@@ -935,6 +935,17 @@ class InterfaceEligibilityUnresolved(RuntimeError):
     """Interface intent whose non-intent eligibility state is missing at authorization."""
 
 
+class InterfaceProofConflict(ValueError):
+    """Interface fragments require different values for the same execution input."""
+
+    def __init__(self, section: str, key: str, field: str, previous, value):
+        self.streams: tuple[str, ...] = (section,)
+        super().__init__(
+            f"document section {section!r} interface {key} has conflicting {field!r} values "
+            f"{previous!r} and {value!r} across its fragments"
+        )
+
+
 class InterfaceExecution(NamedTuple):
     """Creation-time interface context and the explicit eligible attribute set."""
 
@@ -1139,10 +1150,7 @@ def _merge_interface_records(section: str, into: dict, record: dict, key: str) -
         if previous is None:
             merged[field] = value
         elif value is not None and value != previous:
-            raise ValueError(
-                f"document section {section!r} interface {key} has conflicting {field!r} values "
-                f"{previous!r} and {value!r} across its fragments"
-            )
+            raise InterfaceProofConflict(section, key, field, previous, value)
     into[key] = merged
 
 
@@ -1171,7 +1179,15 @@ def compose_section_execution(section: str, contributions: list[tuple[str, dict]
             if key == "interfaces":
                 merged = proof.setdefault("interfaces", {})
                 for interface_key, record in value.items():
-                    _merge_interface_records(section, merged, record, interface_key)
+                    try:
+                        _merge_interface_records(section, merged, record, interface_key)
+                    except InterfaceProofConflict as conflict:
+                        conflict.streams = tuple(
+                            name
+                            for name, contribution in contributions
+                            if interface_key in (contribution[EXECUTION_KEY].get("proof") or {}).get("interfaces", {})
+                        )
+                        raise
                 proof_source.setdefault(key, stream)
             elif isinstance(value, dict):
                 proof.setdefault(key, {}).update(deepcopy(value))
