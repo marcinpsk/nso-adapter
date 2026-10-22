@@ -37,15 +37,13 @@ pytestmark = pytest.mark.anyio
 
 
 async def test_serve_keeps_ordinary_apply_queued_and_preview_identifies_it(maintenance_client):
+    from tests.core.test_action_apply_promotion import preflight_and_apply
+
     http, recorder = maintenance_client
     device_id = await seed_device(nso_device_name="cutover-vlan", netbox_device_id=16130)
     await seed_settings(device_id, auto_apply=False)
     assert (await _put_vlans(http, device_id, [10], push_seq=7101)).status_code == 200
-    response = await http.post(
-        f"/api/v1/devices/{device_id}/actions/apply",
-        json={"apply_attempt_id": str(uuid.uuid4()), "selected": {"vlan": 7101}},
-        headers=AUTH,
-    )
+    response = await preflight_and_apply(http, device_id, {"vlan": 7101}, attempt_id=str(uuid.uuid4()))
     assert response.status_code == 202
     generation_id = response.json()["generations"][0]["generation_id"]
     preview = await http.get(f"/api/v1/devices/{device_id}/actions/apply-diff", headers=AUTH)
@@ -63,14 +61,12 @@ async def test_serve_keeps_ordinary_apply_queued_and_preview_identifies_it(maint
 
 
 async def _admit(http, name: str, sequence: int) -> tuple[int, int, int, str]:
+    from tests.core.test_action_apply_promotion import preflight_and_apply
+
     device_id = await seed_device(nso_device_name=name, netbox_device_id=sequence)
     await seed_settings(device_id, auto_apply=False)
     assert (await _put_vlans(http, device_id, [10], push_seq=sequence)).status_code == 200
-    admitted = await http.post(
-        f"/api/v1/devices/{device_id}/actions/apply",
-        json={"apply_attempt_id": str(uuid.uuid4()), "selected": {"vlan": sequence}},
-        headers=AUTH,
-    )
+    admitted = await preflight_and_apply(http, device_id, {"vlan": sequence}, attempt_id=str(uuid.uuid4()))
     assert admitted.status_code == 202
     generation = admitted.json()["generations"][0]
     return device_id, generation["generation_id"], generation["job_id"], generation["digest"]

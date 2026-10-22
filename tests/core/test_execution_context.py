@@ -666,6 +666,11 @@ async def test_scenario_5d_a_refused_composition_rolls_the_whole_transaction_bac
     assert (await _apply(adapter_client, device_id, {"vlan": 1780})).status_code == 202
     await _execute(device_id, "ec-refusal-rollback")
 
+    from tests.core.test_action_apply_promotion import preflight_and_apply
+
+    preview = await preflight_and_apply(adapter_client, device_id, {"vlan": 1780}, preflight_only=True)
+    identity = preview.json()["preflight_identity"]
+
     # An UNSELECTED stored fragment whose dialect names nothing registered: the composition
     # takes every authorized fragment, so the next Apply of another stream has to refuse.
     async with session() as db:
@@ -683,7 +688,7 @@ async def test_scenario_5d_a_refused_composition_rolls_the_whole_transaction_bac
     revisions = await _revisions(device_id)
     assert (await _put_vlans(adapter_client, device_id, [401, 402], seq=1781)).status_code == 200
     attempt_id = uuid4()
-    response = await _apply(adapter_client, device_id, {"vlan": 1781}, attempt_id=attempt_id)
+    response = await _apply(adapter_client, device_id, {"vlan": 1781}, attempt_id=attempt_id, identity=identity)
     assert response.status_code == 500, response.text
 
     async with session() as db:
@@ -708,7 +713,7 @@ def test_scenario_5d_composition_refuses_a_fragment_whose_context_is_not_a_conte
         _compose_document({"vlan": {"_execution": {**good, "operation": {}}}})
 
 
-async def test_scenario_5e_a_backfilled_binding_survives_composition_and_reaches_the_wire(adapter_client):
+async def test_automatic_ip_promotion_keeps_a_backfilled_binding(adapter_client):
     """Case E. Owner-wins is right for the context and wrong for a row.
 
     Driven by real rows, because that is where the loss happens: the ip endpoint backfills
@@ -716,7 +721,7 @@ async def test_scenario_5e_a_backfilled_binding_survives_composition_and_reaches
     while both were null. Owner-wins would restore the nulls, and SR OS would be told to
     configure the address on an interface with no port binding.
     """
-    from nso_adapter.store.models import DbInterface
+    from nso_adapter.store.models import DbInterface, DeviceSettings
 
     device_id = await seed_device(nso_device_name="ec-split-merge", netbox_device_id=17008)
     await seed_settings(device_id, auto_apply=False)
@@ -740,6 +745,11 @@ async def test_scenario_5e_a_backfilled_binding_survives_composition_and_reaches
     (recorded,) = frozen["_execution"]["proof"]["interfaces"].values()
     assert recorded["parent_binding"] is None, "setup broken: the attribute lane must freeze the bare record"
 
+    async with session() as db:
+        settings = await db.scalar(sa.select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+        settings.auto_apply = True
+        await db.commit()
+
     # The ip push backfills the binding, so the ip fragment records what the attribute
     # fragment could not have known.
     assert (
@@ -759,7 +769,6 @@ async def test_scenario_5e_a_backfilled_binding_survives_composition_and_reaches
             seq=1761,
         )
     ).status_code == 200
-    assert (await _apply(adapter_client, device_id, {"ip": 1761})).status_code == 202
 
     generation = (await _generations(device_id))[-1]
     (merged,) = generation.document["interface_config"]["_execution"]["proof"]["interfaces"].values()

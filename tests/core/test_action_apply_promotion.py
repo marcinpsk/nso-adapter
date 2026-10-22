@@ -9,7 +9,7 @@ import itertools
 import re
 import time
 from copy import deepcopy
-from types import SimpleNamespace
+from types import FunctionType
 from uuid import uuid4
 
 import httpx
@@ -107,12 +107,70 @@ async def test_freeze_returns_the_fragment_on_the_success_path(adapter_client):
     assert isinstance(fragment, dict)
 
 
-async def _apply(client, device_id: int, selected: dict[str, int], *, attempt_id=None):
-    return await client.post(
-        f"/api/v1/devices/{device_id}/actions/apply",
-        json={"apply_attempt_id": str(attempt_id or uuid4()), "selected": selected},
-        headers=AUTH,
+async def preflight_and_apply(
+    client, device_id: int, selected: dict[str, int], *, attempt_id=None, identity=None, preflight_only=False
+):
+    """Preview through HTTP and reuse that identity for admission or replay."""
+    from nso_adapter.core import importer
+    from nso_adapter.nso.client import NsoClient
+    from nso_adapter.store.models import Device
+    from tests.core.test_preflight_plan import PlanTransport
+    from tests.nso.test_apply_send import _client_with
+
+    attempt_id = attempt_id or uuid4()
+    identities = client.__dict__.setdefault("_apply_preflight_identities", {})
+    requested = dict(selected)
+    cached = identities.get(attempt_id)
+    if identity is None and cached is not None:
+        identity = cached["identity"]
+        if selected == cached["selected"]:
+            selected = cached["confirmed"]
+    async with session() as db:
+        device = await db.get(Device, device_id)
+    get_client = importer.get_nso_client
+    try:
+        previous = get_client(device.nso_instance) if device else None
+    except RuntimeError:
+        previous = None
+    temporary = device is not None and not (
+        type(previous) is NsoClient and isinstance(previous.__dict__.get("_client"), FunctionType)
     )
+    if temporary:
+        transport = PlanTransport(device.nso_device_name)
+        transport.refuse = False
+        boundary_client = _client_with(transport)
+        importer.get_nso_client = lambda instance: (
+            boundary_client if instance == device.nso_instance else get_client(instance)
+        )
+    try:
+        if identity is None:
+            preview = await client.post(
+                f"/api/v1/devices/{device_id}/actions/apply-preflight",
+                json={"selected": selected},
+                headers=AUTH,
+            )
+            if preflight_only:
+                return preview
+            assert preview.status_code == 200 and preview.json()["status"] == "ready", preview.text
+            result = preview.json()
+            identity = result["preflight_identity"]
+            selected = {
+                stream: revision
+                for stream, revision in selected.items()
+                if result["streams"][stream]["status"] != "blocked"
+            }
+        identities[attempt_id] = {"identity": identity, "selected": requested, "confirmed": dict(selected)}
+        return await client.post(
+            f"/api/v1/devices/{device_id}/actions/apply",
+            json={"apply_attempt_id": str(attempt_id), "selected": selected, "preflight_identity": identity},
+            headers=AUTH,
+        )
+    finally:
+        if temporary:
+            importer.get_nso_client = get_client
+
+
+_apply = preflight_and_apply
 
 
 def _reject_restconf_commits(client, message: str) -> None:
@@ -850,6 +908,8 @@ async def test_interface_config_generation_refuses_unresolvable_attribute_eligib
         query="?store_only=true",
     )
     assert stored.status_code == 200, stored.text
+    preview = await preflight_and_apply(adapter_client, device_id, {"interface_config": 6591}, preflight_only=True)
+    identity = preview.json()["preflight_identity"]
     async with session() as db:
         iface_id = await db.scalar(
             sa.select(DbInterface.id).where(
@@ -861,7 +921,7 @@ async def test_interface_config_generation_refuses_unresolvable_attribute_eligib
         await db.commit()
 
     with capture_logs() as logs:
-        response = await _apply(adapter_client, device_id, {"interface_config": 6591})
+        response = await _apply(adapter_client, device_id, {"interface_config": 6591}, identity=identity)
 
     assert response.status_code == 409
     assert response.json() == {
@@ -1194,7 +1254,7 @@ async def test_action_apply_rolls_back_promotion_when_generation_flush_fails(ada
 
     attempt_id = uuid4()
     async with session() as db:
-        assert await begin_apply_attempt(db, attempt_id, device_id, {"vlan": 4201}) is None
+        assert await begin_apply_attempt(db, attempt_id, device_id, {"vlan": 4201}, "0" * 64) is None
         db.add(
             DeploymentGeneration(
                 device_id=device_id,
@@ -1251,13 +1311,15 @@ async def test_action_apply_endpoint_reports_the_queued_incumbent(adapter_client
     device_id = await seed_device(nso_device_name="apply-queued-conflict", netbox_device_id=None)
     await seed_settings(device_id, auto_apply=False)
     assert (await _put_vlans(adapter_client, device_id, [10], seq=4351, query="?store_only=true")).status_code == 200
+    preview = await preflight_and_apply(adapter_client, device_id, {"vlan": 4351}, preflight_only=True)
+    identity = preview.json()["preflight_identity"]
     async with session() as db:
         incumbent = Job(device_id=device_id, job_type=JobType.apply, status=JobStatus.queued, coalescible=True)
         db.add(incumbent)
         await db.commit()
         incumbent_id = incumbent.id
 
-    response = await _apply(adapter_client, device_id, {"vlan": 4351})
+    response = await _apply(adapter_client, device_id, {"vlan": 4351}, identity=identity)
 
     assert response.status_code == 409
     assert response.json() == {
@@ -1271,30 +1333,20 @@ async def test_action_apply_endpoint_reports_the_queued_incumbent(adapter_client
 
 async def test_action_apply_wraps_a_missing_head_job_in_the_error_contract(adapter_client, monkeypatch):
     from nso_adapter.core import generation as generation_module
-    from nso_adapter.store.models import GenerationMode
 
     device_id = await seed_device(nso_device_name="apply-missing-head-job", netbox_device_id=None)
+    await seed_settings(device_id, auto_apply=False)
+    assert (await _put_vlans(adapter_client, device_id, [10], seq=4301, query="?store_only=true")).status_code == 200
+    preview = await preflight_and_apply(adapter_client, device_id, {"vlan": 4301}, preflight_only=True)
+    create = generation_module.create_action_apply
 
-    async def create_missing_head(*_args):
-        return SimpleNamespace(
-            generations=[
-                SimpleNamespace(
-                    id=81,
-                    seq=4,
-                    job_id=None,
-                    mode=GenerationMode.networked,
-                    source_push_seq={"vlan": 4301},
-                    stream_revisions={"vlan": 1},
-                    digest="a" * 64,
-                )
-            ],
-            skipped={},
-            skipped_detail={},
-        )
+    async def create_missing_head(*args):
+        result = await create(*args)
+        result.generations[0].job_id = None
+        return result
 
     monkeypatch.setattr(generation_module, "create_action_apply", create_missing_head)
-
-    response = await _apply(adapter_client, device_id, {"vlan": 4301})
+    response = await _apply(adapter_client, device_id, {"vlan": 4301}, identity=preview.json()["preflight_identity"])
 
     assert response.status_code == 500
     assert response.json() == {
@@ -1309,7 +1361,9 @@ async def test_action_apply_wraps_a_missing_head_job_in_the_error_contract(adapt
 async def test_action_apply_rejects_a_sequence_above_the_receipt_domain(adapter_client):
     device_id = await seed_device(nso_device_name="apply-sequence-bound", netbox_device_id=None)
 
-    response = await _apply(adapter_client, device_id, {"vlan": 2**63})
+    preview = await preflight_and_apply(adapter_client, device_id, {}, preflight_only=True)
+
+    response = await _apply(adapter_client, device_id, {"vlan": 2**63}, identity=preview.json()["preflight_identity"])
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "validation_error"
@@ -2062,6 +2116,8 @@ async def test_action_apply_refuses_detach_combined_with_replacement_work(adapte
     assert first.status_code == 200, first.text
     assert (await _apply(adapter_client, device_id, {"vlan": 5201})).status_code == 202
     await _settle((await _generations(device_id))[0].job_id, GenerationStatus.settled)
+    preview = await preflight_and_apply(adapter_client, device_id, {"vlan": 5201}, preflight_only=True)
+    identity = preview.json()["preflight_identity"]
     second = await adapter_client.put(
         f"/api/v1/devices/{device_id}/vlan-intent?store_only=true",
         json={"vlans": [{"vlan_id": 10, "name": ""}]},
@@ -2069,7 +2125,7 @@ async def test_action_apply_refuses_detach_combined_with_replacement_work(adapte
     )
     assert second.status_code == 200, second.text
 
-    response = await _apply(adapter_client, device_id, {"vlan": 5202})
+    response = await _apply(adapter_client, device_id, {"vlan": 5202}, identity=identity)
 
     assert response.status_code == 409
     assert response.json() == {
@@ -2374,7 +2430,7 @@ async def test_promoted_static_route_detach_fails_when_proof_is_inconclusive(ada
         )
         document = await _compose_authorized_document(db, device_id, {"static_route": desired})
         attempt_id = uuid4()
-        assert await begin_apply_attempt(db, attempt_id, device_id, {"static_route": 5602}) is None
+        assert await begin_apply_attempt(db, attempt_id, device_id, {"static_route": 5602}, "0" * 64) is None
         # The links now come back with the scope-qualified authority union beside them, so
         # every networked link of one Apply can carry the same keys.
         ((generation,), _union) = await _enqueue_action_removal_links(
@@ -2585,10 +2641,12 @@ async def test_action_apply_settlement_between_projection_and_generation_reads_i
     assert (await _apply(adapter_client, device_id, {"vlan": 6301})).status_code == 202
     (generation,) = await _generations(device_id)
 
+    preview = await preflight_and_apply(adapter_client, device_id, {"vlan": 6301}, preflight_only=True)
+    identity = preview.json()["preflight_identity"]
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
     async with session() as receipt_blocker, rival() as settler:
         await receipt_blocker.execute(sa.text("LOCK TABLE intent_push_receipt IN ACCESS EXCLUSIVE MODE"))
-        applying = asyncio.create_task(_apply(adapter_client, device_id, {"vlan": 6301}))
+        applying = asyncio.create_task(_apply(adapter_client, device_id, {"vlan": 6301}, identity=identity))
 
         # A DEADLINE, not an iteration count: how long the Apply task takes to reach its
         # blocked read is scheduling-dependent, so a fixed budget only measures how loaded
@@ -2887,10 +2945,12 @@ async def test_action_apply_refuses_a_removal_whose_interface_identity_is_gone(a
     """The removal names an interface row that no longer exists, so nothing may execute."""
     device_id = await seed_device(nso_device_name="apply-interface-gone", netbox_device_id=9985)
     await _authorized_ip_address(adapter_client, device_id, seq=6501)
+    preview = await preflight_and_apply(adapter_client, device_id, {"ip": 6501}, preflight_only=True)
+    identity = preview.json()["preflight_identity"]
     await _rebind_authorized_ip_rows(device_id, 999999)
     assert (await _put_ip(adapter_client, device_id, [], seq=6502)).status_code == 200
 
-    response = await _apply(adapter_client, device_id, {"ip": 6502})
+    response = await _apply(adapter_client, device_id, {"ip": 6502}, identity=identity)
 
     assert response.status_code == 409
     assert response.json() == {
@@ -2909,10 +2969,12 @@ async def test_action_apply_refuses_an_interface_removal_with_no_executable_inst
     """interface-reconciler is keyed per interface, so a nameless removal would send nothing."""
     device_id = await seed_device(nso_device_name="apply-interface-nameless", netbox_device_id=9986)
     await _authorized_ip_address(adapter_client, device_id, seq=6601)
+    preview = await preflight_and_apply(adapter_client, device_id, {"ip": 6601}, preflight_only=True)
+    identity = preview.json()["preflight_identity"]
     await _rebind_authorized_ip_rows(device_id, None)
     assert (await _put_ip(adapter_client, device_id, [], seq=6602)).status_code == 200
 
-    response = await _apply(adapter_client, device_id, {"ip": 6602})
+    response = await _apply(adapter_client, device_id, {"ip": 6602}, identity=identity)
 
     assert response.status_code == 409
     assert response.json() == {
@@ -3581,7 +3643,7 @@ async def test_a_failed_promotion_commits_neither_the_promotion_nor_a_generation
 
     attempt_id = uuid4()
     async with session() as db:
-        assert await begin_apply_attempt(db, attempt_id, device_id, {stream: revision}) is None
+        assert await begin_apply_attempt(db, attempt_id, device_id, {stream: revision}, "0" * 64) is None
         db.add(
             DeploymentGeneration(
                 device_id=device_id,
@@ -3622,6 +3684,8 @@ async def test_a_switching_apply_composes_the_authorized_isis_fragment_only(adap
         headers=AUTH | {"X-Push-Seq": "8801"},
     )
     assert isis.status_code == 200, isis.text
+    preview = await preflight_and_apply(adapter_client, device_id, {"isis": 8801}, preflight_only=True)
+    identity = preview.json()["preflight_identity"]
     assert (await _apply(adapter_client, device_id, {"isis": 8801})).status_code == 202
     (isis_generation,) = await _generations(device_id)
 
@@ -3634,7 +3698,7 @@ async def test_a_switching_apply_composes_the_authorized_isis_fragment_only(adap
     assert later_isis.status_code == 200, later_isis.text
     assert (await _prepare(adapter_client, device_id, "lag", {"L2": [2]}, query="?store_only=true")).status_code == 200
 
-    conflicted = await _apply(adapter_client, device_id, {"lag": lag_revision})
+    conflicted = await _apply(adapter_client, device_id, {"lag": lag_revision}, identity=identity)
     assert conflicted.status_code == 409, conflicted.text
     assert (await _stream(device_id, "lag")).prepared_revision == lag_revision
 
@@ -3747,7 +3811,7 @@ async def test_the_frozen_context_reads_the_ned_id_committed_under_the_lock(adap
     revision = (await _prepare(adapter_client, device_id, "lag", {"A": [1]})).json()["selection_revision"]
     attempt_id = uuid4()
     async with session() as db:
-        assert await begin_apply_attempt(db, attempt_id, device_id, {"lag": revision}) is None
+        assert await begin_apply_attempt(db, attempt_id, device_id, {"lag": revision}, "0" * 64) is None
         await db.commit()
 
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)

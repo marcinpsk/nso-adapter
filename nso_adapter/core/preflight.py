@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple
 from uuid import uuid4
 
+import httpx
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from nso_adapter.core.apply import _apply_error_summary, build_device_containers, encode_section
@@ -59,7 +60,10 @@ class LivePlanInputs(NamedTuple):
 
 async def read_plan_inputs(client, device) -> LivePlanInputs:
     """Read once outside the planning transaction; an inconclusive read has no digest."""
-    section = await certified_static_route_section(client, device)
+    try:
+        section = await certified_static_route_section(client, device)
+    except httpx.HTTPError:
+        return LivePlanInputs(CertifiedSection("inconclusive", None), None)
     digest = None if section.inconclusive else _digest(section._asdict())
     return LivePlanInputs(section, digest)
 
@@ -332,20 +336,49 @@ def preflight_identity(result: PreflightResult) -> str:
     if result.status != "ready" or result.plan is None or result.live_input_digest is None:
         raise ValueError("Preflight identity requires a ready plan")
     captured = json.loads(result._json)
+    return manual_apply_identity(
+        device_id=captured["device_id"],
+        nso_instance=captured["nso_instance"],
+        nso_device_name=captured["nso_device_name"],
+        selected=result.admitted_selection,
+        skips=result.skips,
+        links=[(link.mode, link.digest, link.policy) for link in result.plan.links],
+        live_input_digest=result.live_input_digest,
+    )
+
+
+def manual_apply_identity(
+    *,
+    device_id: int,
+    nso_instance: str,
+    nso_device_name: str,
+    selected: dict[str, int],
+    skips: dict[str, str],
+    links: list[tuple[GenerationMode, str, ExecutionPolicy]],
+    live_input_digest: str,
+) -> str:
+    """Hash the same executable inputs for preview and promotion."""
     return _digest(
         {
-            "device_id": captured["device_id"],
-            "nso_instance": captured["nso_instance"],
-            "nso_device_name": captured["nso_device_name"],
-            "admitted_selection": result.admitted_selection,
-            "skips": result.skips,
+            "device_id": device_id,
+            "nso_instance": nso_instance,
+            "nso_device_name": nso_device_name,
+            "admitted_selection": selected,
+            "skips": skips,
             "links": [
-                {"mode": link.mode.value, "digest": link.digest, "policy": link.policy._asdict()}
-                for link in result.plan.links
+                {"mode": mode.value, "digest": digest, "policy": policy._asdict()} for mode, digest, policy in links
             ],
-            "live_input_digest": result.live_input_digest,
+            "live_input_digest": live_input_digest,
         }
     )
+
+
+class PreflightStale(ValueError):
+    """The manual admission no longer describes the executable inputs."""
+
+    def __init__(self, reason: str):
+        super().__init__("Manual Apply needs a fresh preflight")
+        self.reason = reason
 
 
 async def _diagnose_unselected_refusal(engine, client, device, live, outcome: _DryRun) -> dict:
@@ -360,6 +393,36 @@ async def _diagnose_unselected_refusal(engine, client, device, live, outcome: _D
             "outcome": diagnosis,
         }
     return {"status": "refused", "cross_stream": sorted(_refusal_streams(outcome.refusals)), "outcome": outcome}
+
+
+def _context_blocks(planned: PlannedChain, promoted: set[str]) -> tuple[dict[str, dict], list[str]]:
+    """Block the promoted interface-section streams when an unpromoted one would change context."""
+    disturbed = _disturbed_streams(planned)
+    if not disturbed:
+        return {}, []
+    blocked = promoted & {"interface_config", "ip"}
+    return {stream: {"status": "blocked", "context_disturbed": disturbed} for stream in blocked}, disturbed
+
+
+async def _judge_dry_run(engine, client, device, live, planned, effective) -> tuple[dict[str, dict], dict | None]:
+    """Dry-run one pass: return the selected streams to drop, or the final result arguments."""
+    outcome = await _dry_run_chain(client, device, planned)
+    if outcome.status in {"unavailable", "error"}:
+        return {}, {"status": outcome.status, "outcome": outcome}
+    if outcome.status == "ready":
+        return {}, {"status": "ready", "plan": planned, "outcome": outcome}
+    blocks = _refusal_blocks(outcome.refusals, effective)
+    if blocks:
+        return blocks, None
+    return {}, await _diagnose_unselected_refusal(engine, client, device, live, outcome)
+
+
+#: A selection changed between two passes of one preflight; the caller retries.
+_INPUTS_MOVED = {"code": "inputs_changed_during_preflight"}
+
+
+def _skips_moved(earlier: dict[str, str], later: dict[str, str]) -> bool:
+    return any(later.get(stream) != reason for stream, reason in earlier.items())
 
 
 async def run_preflight(engine: AsyncEngine, client, device, selected: dict[str, int]) -> PreflightResult:
@@ -408,37 +471,32 @@ async def run_preflight(engine: AsyncEngine, client, device, selected: dict[str,
         assert blocks and blocks.keys() <= current.keys(), "Preflight can only drop selected streams"
         streams.update(blocks)
         attempts[-1]["dropped"] = sorted(blocks)
-        return {
-            stream: revision for stream, revision in current.items() if stream not in blocks and stream not in skips
-        }
+        # Skipped selections stay: Apply confirms them, and some skips still change authorized metadata.
+        return {stream: revision for stream, revision in current.items() if stream not in blocks}
 
     if live.section.inconclusive:
         return finish("unavailable")
     for _ in range(len(selected) + 1):
         assert len(attempts) <= len(selected), "Preflight exceeded its pass bound"
         attempts.append({"selection": dict(current), "dropped": []})
-        if not current:
+        if not current and streams:
             return finish("refused")
         try:
             planned = await plan_action_apply(engine, device.id, current, live.section)
         except _PlanContextConflict as conflict:
+            if _skips_moved(skips, conflict.skipped):
+                return finish("unavailable", error=_INPUTS_MOVED)
             skips.update(conflict.skipped)
             if not conflict.blocks:
                 return finish("refused", context_disturbed=conflict.disturbed)
             current = drop(conflict.blocks)
             continue
+        if _skips_moved(skips, planned.skipped):
+            return finish("unavailable", error=_INPUTS_MOVED)
         skips.update(planned.skipped)
-        disturbed = _disturbed_streams(planned)
         promoted = {stream for link in planned.links for stream in link.streams}
         effective = {stream: current[stream] for stream in promoted}
-        blocks = (
-            {
-                stream: {"status": "blocked", "context_disturbed": disturbed}
-                for stream in promoted & {"interface_config", "ip"}
-            }
-            if disturbed
-            else {}
-        )
+        blocks, disturbed = _context_blocks(planned, promoted)
         if disturbed and not blocks:
             return finish("refused", context_disturbed=disturbed)
         guard_blocks, unselected_guard = _guard_blocks(planned, effective)
@@ -448,14 +506,9 @@ async def run_preflight(engine: AsyncEngine, client, device, selected: dict[str,
             return finish("refused", error={"code": "removal_blocked_collateral", "orphans": unselected_guard})
         blocks.update(guard_blocks)
         if not blocks:
-            outcome = await _dry_run_chain(client, device, planned)
-            if outcome.status in {"unavailable", "error"}:
-                return finish(outcome.status, outcome=outcome)
-            if outcome.status == "ready":
-                return finish("ready", plan=planned, outcome=outcome)
-            blocks = _refusal_blocks(outcome.refusals, effective)
-            if not blocks:
-                return finish(**await _diagnose_unselected_refusal(engine, client, device, live, outcome))
+            blocks, final = await _judge_dry_run(engine, client, device, live, planned, effective)
+            if final is not None:
+                return finish(**final)
         current = drop(blocks)
     raise AssertionError("Preflight did not reduce its selection")
 

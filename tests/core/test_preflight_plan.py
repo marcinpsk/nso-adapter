@@ -223,7 +223,11 @@ async def test_plan_captures_composed_authorized_interface_baseline(adapter_clie
         seq=41,
     )
     assert response.status_code == 200
-    assert (await _apply(adapter_client, device.id, {"ip": 41})).status_code == 202
+    from nso_adapter.core.generation import create_automatic_apply
+
+    async with session() as db:
+        await create_automatic_apply(db, device.id, "ip", 41)
+        await db.commit()
     await _settle((await _generations(device.id))[-1].job_id, GenerationStatus.settled)
     before = await database_state()
     planned = await plan(device, selected, client)
@@ -332,7 +336,11 @@ async def test_plan_reports_collateral_guard_block(adapter_client, monkeypatch):
     planned = await plan(device, selected, client)
     assert planned.links[0].guard_orphans == {"vlan/vlan": [["999"]]}
     assert not transport.documents
-    assert (await _apply(adapter_client, device.id, selected)).status_code == 202
+    from nso_adapter.core.generation import create_automatic_apply
+
+    async with session() as db:
+        await create_automatic_apply(db, device.id, "vlan", selected["vlan"])
+        await db.commit()
     job = await job_row(await run_next(device.id))
     assert job.error["code"] == "removal_blocked_collateral"
     assert job.error["detail"]["orphans"] == planned.links[0].guard_orphans

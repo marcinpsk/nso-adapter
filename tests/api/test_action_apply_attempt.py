@@ -9,6 +9,7 @@ import uuid
 import pytest
 import sqlalchemy as sa
 
+from nso_adapter.store.apply_attempt_store import apply_response_body
 from tests.api.evidence import deployment_projections, empty_vlan_execution_result
 from tests.conftest import VALID_TOKEN, seed_device, session
 from tests.core.test_generation_protocol import seed_settings
@@ -39,11 +40,9 @@ async def _put_svis(client, device_id: int, vlan_ids: list[int], *, push_seq: in
 
 
 async def _apply(client, device_id: int, attempt_id: uuid.UUID, selected: dict[str, int]):
-    return await client.post(
-        f"/api/v1/devices/{device_id}/actions/apply",
-        json={"apply_attempt_id": str(attempt_id), "selected": selected},
-        headers=AUTH,
-    )
+    from tests.core.test_action_apply_promotion import preflight_and_apply
+
+    return await preflight_and_apply(client, device_id, selected, attempt_id=attempt_id)
 
 
 async def _settle(job_id: int) -> None:
@@ -91,7 +90,7 @@ async def test_identical_apply_attempt_replays_without_duplicate_work(adapter_cl
         assert attempt.selected == {"vlan": 7101}
         assert attempt.admission_state == "admitted"
         assert attempt.http_status == 202
-        assert attempt.response == first.json()
+        assert apply_response_body(attempt.response) == first.json()
         assert (
             await db.scalar(
                 sa.select(sa.func.count())
@@ -143,6 +142,10 @@ async def test_deterministic_rejection_is_persisted_replayed_and_served_as_evide
     admitted = await _apply(adapter_client, device_id, uuid.uuid4(), {"vlan": 7301})
     assert admitted.status_code == 202, admitted.text
     await _settle(admitted.json()["job_id"])
+    from tests.core.test_action_apply_promotion import preflight_and_apply
+
+    prior_preview = await preflight_and_apply(adapter_client, device_id, {"vlan": 7301}, preflight_only=True)
+    identity = prior_preview.json()["preflight_identity"]
     changed = await adapter_client.put(
         f"/api/v1/devices/{device_id}/vlan-intent?store_only=true",
         json={"vlans": [{"vlan_id": 10, "name": ""}]},
@@ -151,7 +154,9 @@ async def test_deterministic_rejection_is_persisted_replayed_and_served_as_evide
     assert changed.status_code == 200, changed.text
     attempt_id = uuid.uuid4()
 
-    rejected = await _apply(adapter_client, device_id, attempt_id, {"vlan": 7302})
+    rejected = await preflight_and_apply(
+        adapter_client, device_id, {"vlan": 7302}, attempt_id=attempt_id, identity=identity
+    )
     replay = await _apply(adapter_client, device_id, attempt_id, {"vlan": 7302})
 
     assert rejected.status_code == replay.status_code == 409
@@ -168,7 +173,7 @@ async def test_deterministic_rejection_is_persisted_replayed_and_served_as_evide
         assert attempt is not None
         assert attempt.admission_state == "rejected"
         assert attempt.http_status == 409
-        assert attempt.response == rejected.json()
+        assert apply_response_body(attempt.response) == rejected.json()
 
     evidence = await adapter_client.post(
         f"/api/v1/devices/{device_id}/deployment-evidence",
@@ -222,7 +227,7 @@ async def test_complete_no_op_replays_and_serves_its_stored_response_as_evidence
     async with session() as db:
         attempt = await db.get(DeploymentApplyAttempt, attempt_id)
         assert attempt is not None
-        assert attempt.response == expected
+        assert apply_response_body(attempt.response) == expected
 
     evidence = await adapter_client.post(
         f"/api/v1/devices/{device_id}/deployment-evidence",
@@ -266,7 +271,7 @@ async def test_same_uuid_with_a_different_selection_is_a_non_mutating_conflict(a
         attempt = await db.get(DeploymentApplyAttempt, attempt_id)
         assert attempt is not None
         assert attempt.selected == {}
-        assert attempt.response == admitted.json()
+        assert apply_response_body(attempt.response) == admitted.json()
         assert (
             await db.scalar(
                 sa.select(sa.func.count())
@@ -289,18 +294,18 @@ async def test_begin_apply_attempt_loser_reads_the_committed_winner(adapter_clie
     device_id = await seed_device(nso_device_name="apply-attempt-loser", netbox_device_id=16238)
     attempt_id = uuid.uuid4()
     async with session() as db:
-        assert await begin_apply_attempt(db, attempt_id, device_id, {}) is None
+        assert await begin_apply_attempt(db, attempt_id, device_id, {}, "0" * 64) is None
         await complete_apply_attempt(
             db, attempt_id, admission_state="admitted", http_status=200, response={"outcome": "no_op"}
         )
         await db.commit()
 
     async with session() as db:
-        stored = await begin_apply_attempt(db, attempt_id, device_id, {})
+        stored = await begin_apply_attempt(db, attempt_id, device_id, {}, "0" * 64)
         assert stored is not None
         assert (stored.http_status, stored.response) == (200, {"outcome": "no_op"})
         with pytest.raises(ApplyAttemptIdentityMismatch) as excinfo:
-            await begin_apply_attempt(db, attempt_id, device_id, {"vlan": 9001})
+            await begin_apply_attempt(db, attempt_id, device_id, {"vlan": 9001}, "0" * 64)
         assert excinfo.value.mismatch == "selected"
 
 
@@ -370,7 +375,7 @@ async def test_skipped_stream_detail_is_stored_and_replayed_with_promoted_work(a
         attempt = await db.get(DeploymentApplyAttempt, attempt_id)
         assert attempt is not None
         assert attempt.selected == {"svi": 7602, "vlan": 7601}
-        assert attempt.response["skipped_detail"] == first.json()["skipped_detail"]
+        assert apply_response_body(attempt.response)["skipped_detail"] == first.json()["skipped_detail"]
 
 
 async def test_store_failure_after_admission_rolls_back_attempt_generation_and_projection(

@@ -245,6 +245,7 @@ async def test_preflight_cross_stream_refusal_admits_nothing(adapter_client, mon
     device, _, client, transport = await setup(adapter_client, monkeypatch)
     selected = await interface_selection(adapter_client, device)
     await authorize(adapter_client, device, {"ip": selected["ip"]})
+    transport.dry_requests.clear()
     transport.judge = lambda body, _request: (
         (IP_REFUSAL,) if any(row.get("description") for row in body.get("interface", {}).get("interface", [])) else None
     )
@@ -259,6 +260,7 @@ async def test_preflight_baseline_refusal_after_withdrawal(adapter_client, monke
     device, vlan, client, transport = await setup(adapter_client, monkeypatch)
     selected = await interface_selection(adapter_client, device)
     await authorize(adapter_client, device, {"ip": selected["ip"]})
+    transport.dry_requests.clear()
     response = await _put_ip(
         adapter_client, device.id, [{"interface": INTERFACE, "address": "192.0.2.2/24", "family": "ipv4"}], seq=42
     )
@@ -288,6 +290,7 @@ async def test_baseline_diagnosis_replays_cli_refusal(adapter_client, monkeypatc
     device, vlan, client, transport = await setup(adapter_client, monkeypatch)
     selected = await interface_selection(adapter_client, device)
     await authorize(adapter_client, device, {"ip": selected["ip"]})
+    transport.dry_requests.clear()
     transport.judge = lambda body, request: (
         (IP_REFUSAL,) if has_ip(body) and request.url.params["dry-run"] == "cli" else None
     )
@@ -310,6 +313,7 @@ async def test_preflight_ip_backfill_disturbing_blocked_stream(adapter_client, m
     device, _, client, transport = await setup(adapter_client, monkeypatch)
     selected = await interface_selection(adapter_client, device)
     await authorize(adapter_client, device, {"ip": selected["ip"]})
+    transport.dry_requests.clear()
     response = await _put_ip(
         adapter_client,
         device.id,
@@ -327,7 +331,7 @@ async def test_preflight_ip_backfill_disturbing_blocked_stream(adapter_client, m
 
 @pytest.mark.parametrize("select_skipped_ip", [False, True])
 async def test_preflight_conflicting_interface_context_blocks_promotion(adapter_client, monkeypatch, select_skipped_ip):
-    device, vlan, client, _ = await setup(adapter_client, monkeypatch)
+    device, vlan, client, transport = await setup(adapter_client, monkeypatch)
     response = await _put_ip(
         adapter_client,
         device.id,
@@ -336,6 +340,7 @@ async def test_preflight_conflicting_interface_context_blocks_promotion(adapter_
     )
     assert response.status_code == 200
     await authorize(adapter_client, device, {"ip": 41})
+    transport.dry_requests.clear()
     async with session() as db:
         interface = await db.scalar(select(DbInterface).where(DbInterface.device_id == device.id))
         interface.parent_binding = "lag-2"
@@ -357,6 +362,7 @@ async def test_preflight_skipped_refused_baseline_stays_not_evaluated(adapter_cl
     device, vlan, client, transport = await setup(adapter_client, monkeypatch)
     await interface_selection(adapter_client, device)
     await authorize(adapter_client, device, {"ip": 41})
+    transport.dry_requests.clear()
     transport.judge = lambda _body, _request: (IP_REFUSAL,)
     result = await preflight.run_preflight(get_engine(), client, device, vlan | {"ip": 41})
     assert result.status == "refused" and result.baseline_refused == ["ip"]
@@ -365,7 +371,7 @@ async def test_preflight_skipped_refused_baseline_stays_not_evaluated(adapter_cl
     assert len(result.attempts) == 1
 
 
-async def test_preflight_skipped_stream_does_not_enter_a_later_pass(adapter_client, monkeypatch):
+async def test_preflight_skip_that_moves_between_passes_is_unavailable(adapter_client, monkeypatch):
     device, vlan, client, transport = await setup(adapter_client, monkeypatch)
     response = await _put_interface_attrs(adapter_client, device.id, "pending", seq=41, query="?store_only=true")
     assert response.status_code == 200
@@ -382,10 +388,10 @@ async def test_preflight_skipped_stream_does_not_enter_a_later_pass(adapter_clie
         (attribute_refusal(),) if body.get("interface", {}).get("interface") else None
     )
     result = await preflight.run_preflight(get_engine(), client, device, vlan | {"interface_config": 41, "ip": 41})
-    assert result.status == "ready", result.error
-    assert result.admitted_selection == vlan and result.skips["ip"] == "no_receipt"
-    assert result.streams["ip"]["status"] == "not_evaluated"
-    assert result.plan.links[0].streams == ("vlan",)
+    # The skipped ip became selectable between passes, so the preflight stops instead of admitting it.
+    assert result.status == "unavailable"
+    assert result.error == {"code": "inputs_changed_during_preflight"}
+    assert not result.admitted_selection and result.plan is None
 
 
 async def test_preflight_unrelated_selection_over_merged_split_interface_baseline(adapter_client, monkeypatch):
@@ -399,7 +405,12 @@ async def test_preflight_unrelated_selection_over_merged_split_interface_baselin
         seq=42,
     )
     assert response.status_code == 200
-    await authorize(adapter_client, device, {"ip": 42})
+    from nso_adapter.core.generation import create_automatic_apply
+
+    async with session() as db:
+        await create_automatic_apply(db, device.id, "ip", 42)
+        await db.commit()
+    await _settle((await _generations(device.id))[-1].job_id, GenerationStatus.settled)
     result = await preflight.run_preflight(get_engine(), client, device, selected)
     assert result.status == "ready", result.error
     assert result.admitted_selection == selected and not result.context_disturbed
@@ -456,6 +467,7 @@ async def test_guard_block_drops_only_stream_owning_orphan(adapter_client, monke
     )
     assert response.status_code == 200, response.text
     await authorize(adapter_client, device, {"ip": 41})
+    transport.dry_requests.clear()
     async with session() as db:
         interface = await db.scalar(select(DbInterface).where(DbInterface.device_id == device.id))
         interface.name = "GigabitEthernet0/2"

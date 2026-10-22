@@ -98,7 +98,7 @@ async def test_preparation_waits_for_committed_apply_authorization(adapter_clien
     source_revision = (await _stream(device_id, stream)).prepared_source_revision
     attempt_id = uuid4()
     async with session() as db:
-        assert await begin_apply_attempt(db, attempt_id, device_id, {stream: revision}) is None
+        assert await begin_apply_attempt(db, attempt_id, device_id, {stream: revision}, "0" * 64) is None
         await db.commit()
 
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)

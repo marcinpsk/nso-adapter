@@ -52,6 +52,7 @@
   - Phase 2: `not_implemented` (apply endpoint pre-M4),
     `nso_commit_failed` (M5+, reconcile-commit refused or partially
     failed; `error.detail.attributes` lists the failed ones), and
+    `preflight_stale` (409, manual Apply needs a fresh preflight),
     `apply_unexecutable` (409, a selected stream cannot be delivered faithfully by its
     existing apply or removal runner; `error.detail.streams` maps each stream to its reason).
   - AS content: `asn_rule_violation` (409, stored or device-read AS content violates
@@ -999,9 +1000,10 @@ queued job from starting.
 |---|---|
 | `actions/sync`, `actions/sync-from-nso`, `actions/detect-drift`, `actions/connect`, and `sync-notify` | Return `409 conflict` only when a queued job of the same requested job type already exists. `error.detail.job_id` identifies that queued job. A running job of that type permits a queued successor. Jobs of other types do not cause this conflict. |
 | `actions/force-removal` | Every valid request creates a new removal generation and a new dedicated removal job. The endpoint does not inspect active jobs and does not deduplicate repeated requests, including requests for the same scope. |
-| `actions/apply` | Require `apply_attempt_id`. Replay a completed request when its UUID, device, and complete canonical `selected` match. Return `409 conflict` when the UUID identifies a different request. For a new UUID, evaluate the selection first. If no selected stream is promotable, return the documented `200` no-op without checking active jobs. If at least one stream is promotable, inspect queued and running jobs once. Return `409 conflict` with the first observed job by `(created_at, id)` in `error.detail.job_id` when any exists. Otherwise, promote and enqueue the generation chain. This is a point-in-time check in the device-locked transaction. A later action can enqueue after Apply commits. |
+| `actions/apply` | Require `apply_attempt_id` and `preflight_identity`. Revalidate the executable inputs inside a savepoint before admission. A stale identity or an inconclusive live input returns `409 preflight_stale` without promotion. The live input is read once before the projection lock. Replay a completed request when its UUID, device, complete canonical `selected`, and `preflight_identity` match. Return `409 conflict` when the UUID identifies a different request. For a new UUID, evaluate the selection first. If no selected stream is promotable, return the documented `200` no-op without checking active jobs. If at least one stream is promotable, inspect queued and running jobs once. Return `409 conflict` with the first observed job by `(created_at, id)` in `error.detail.job_id` when any exists. Otherwise, promote and enqueue the generation chain. This is a point-in-time check in the device-locked transaction. A later action can enqueue after Apply commits. |
 | `actions/retry-generation` | Return `409 conflict` only when there is no blocked executable head or another barrier action already acted on it. Otherwise, create a fresh dedicated job for the blocked head and return `202`. Existing jobs and successor bindings remain unchanged. Unrelated queued or running jobs do not cause a conflict. The request names the generation to act on; when it is not the current head, the 409 carries `error.detail.head_generation_id` naming the head. |
 | `actions/abandon-generation` | Return `409 conflict` only when there is no blocked executable head or another barrier action already acted on it. Otherwise, abandon the head, ensure the next executable generation has a live carrier, and return `202`. Unrelated queued or running jobs do not cause a conflict. The request names the generation to act on; when it is not the current head, the 409 carries `error.detail.head_generation_id` naming the head. |
+| `actions/apply-preflight` | Plan in a rollback-only transaction and dry-run the selection. Create no persistent job, receipt or promotion. Use the same live-job conflict as Apply. |
 | `actions/apply-diff` | Create no job and apply no queue-admission rule. |
 
 ### `POST /api/v1/devices/{id}/actions/sync`
@@ -1072,6 +1074,63 @@ blocked head returns `409 conflict`; `error.detail.head_generation_id` and
 `error.detail.head_status` identify that head. Queued or running jobs of any type
 do not otherwise refuse these barrier actions.
 
+### `POST /api/v1/devices/{id}/actions/apply-preflight` → `200 | 404 | 409 | 422`
+
+Requires bearer authentication. The body is `{"selected": {"vlan": 4711}}`. Selection
+validation is identical to Apply: known stream names and strict integers in `1..2^63-1`.
+The route reads one certified live service snapshot. It plans the exact Apply chain in an
+owned rollback-only transaction, then dry-runs every NSO-writing link outside that
+transaction, including detach with its own no-networking policy. It persists no promotion,
+job, receipt or attempt and sends no NSO commit.
+
+The response contains:
+
+- `status`: `ready`, `refused`, `unavailable`, or `error`.
+- `streams`: a map of selected stream names to `status`: `admitted`, `blocked`, or
+  `not_evaluated`. A blocked verdict can include `refusals` (the attributed catalog records
+  used by apply-diff), `guard` (collateral keys), or `context_disturbed` (stream names).
+- `baseline_refused`, `cross_stream`, and `context_disturbed`: lists of affected streams.
+  Baseline refusal requires repair of that selected stream or Release. A cross-stream
+  refusal means the selection caused a refusal that does not occur in the pure baseline.
+- `admitted_selection`: the accepted stream selections. `skips` maps skipped stream names
+  to Apply's skip reasons. Skipped streams remain `not_evaluated`.
+- `preflight_identity`: a lowercase sha256 hex string, present only when `status` is `ready`.
+- `diffs`: `native` and `cli` strings from the final admitted plan. Multiple networked links
+  are joined in order with newlines. Detach links have no diff-panel output.
+- `attempts`: the ordered passes, each with `selection` and `dropped` stream names.
+- `refusals`: attributed catalog records for terminal baseline or cross-stream diagnosis.
+  Provisional generation and cohort identities are never published.
+- `error`: a structured diagnostic for an error or collateral block, otherwise `null`.
+
+The loop drops refused selected streams and replans, at most one pass per dropped stream
+plus one. Blocked streams keep their authorized fragments and remain pending. A baseline
+refusal, cross-stream refusal, or disturbed unpromoted interface context admits nothing.
+Inconclusive live reads or dry-runs return `unavailable`. A skip reason that changes between
+two passes of one preflight returns `unavailable` with `error.code = "inputs_changed_during_preflight"`. Attribution failures and ordinary
+NSO rejections return `error`. These NSO outcomes use HTTP 200 and omit the identity.
+A live job returns the same `409 conflict` envelope as Apply, including `detail.job_id`.
+
+For confirm, remove blocked streams from the original selection and keep skipped entries
+with their original selection values. Submit that selection and the returned identity to
+Apply. The identity binds the admitted selection, skip reasons, ordered generation modes,
+digests and execution policies, device id, NSO instance and device name, and the certified
+live snapshot digest. Any changed input requires another preflight.
+
+This admission gate covers manual Apply only. Device `auto_apply` and immediate removals
+from normal-mode shrink pushes authorize the current desired stream, including every
+pending accepted acquisition. They retain commit-time refusal settlement and have no
+selective-delivery guarantee. A refusal commits nothing and fails the generation, but its
+fragment is already authorized. Retry reuses it. Abandon releases the ordering barrier and
+does not repair it. An unrelated manual Apply can then report `baseline_refused`.
+Repair requires a fresh push of that stream selected in the next manual Apply, or Release.
+Force-removal and cutover reissues redeploy authorized fragments, promote nothing, and
+carry no pending desired acquisition. Intend will refuse devices with `auto_apply` enabled.
+Warn-and-skip planner sites still require the refusal conversion tracked separately.
+
+The capability-matrix `POST /api/v1/devices/{id}/apply/preflight` was deleted. It had no
+plugin caller and did not preflight configuration. `/route-policy/preflight` remains.
+`GET actions/apply-diff` also remains for a stored executable generation.
+
 ### `POST /api/v1/devices/{id}/actions/apply` (A3)
 
 Atomically promote the exact intent selected by the caller and enqueue its immutable
@@ -1081,27 +1140,39 @@ name to the `X-Push-Seq` that the plugin drained:
 ```json
 {
   "apply_attempt_id": "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8",
-  "selected": { "vlan": 4711 }
+  "selected": { "vlan": 4711 },
+  "preflight_identity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 }
 ```
 
 `apply_attempt_id` is required and is the durable identity of this manual Apply.
-No revision field is accepted. A missing UUID returns the house `422 validation_error`
-envelope.
+`preflight_identity` is required and must be a lowercase sha256 hex string from preflight.
+No revision field is accepted. A missing UUID or identity returns the house
+`422 validation_error` envelope.
 
 The adapter stores one `DeploymentApplyAttempt` for every admitted request. This includes
 a complete no-op and a deterministic rejection such as `409 apply_unexecutable`. The row
 contains the complete canonical selection, admission state, HTTP status, and exact response
-body. Generations created by the request carry its `apply_attempt_id`, including the
+body. The response JSON column also stores the preflight request identity; replay and
+deployment evidence omit that internal field. Generations created by the request carry its `apply_attempt_id`, including the
 Apply-composed removal generations it enqueues. Only generations reissued outside an
 admitted request leave it `null`: force-removal, retry-generation, and chain-advancement
 reissues.
 
-A repeat with the same UUID, same device and complete canonical `selected` returns the
+A repeat with the same UUID, same device and complete canonical `selected`, and the same
+`preflight_identity`, returns the
 stored HTTP status and response body byte for byte. It performs no admission check and
-creates no generation or job. Reusing the UUID with a different device or selection returns
-`409 conflict`; `error.detail.mismatch` is `device_id` or `selected`. The conflict changes
+creates no generation or job. Reusing the UUID with a different device, selection or preflight identity returns
+`409 conflict`; `error.detail.mismatch` is `device_id`, `selected` or `preflight_identity`. The conflict changes
 nothing.
+
+Before taking the projection lock, a new Apply reads the live inputs once. An inconclusive
+read returns `409 preflight_stale` with `error.detail.reason = "live_input_inconclusive"`.
+Inside its savepoint, Apply creates the planned generations and recomputes the same identity.
+A mismatch, an interface proof conflict, or an ASN rule violation caused by a changed input
+returns `409 preflight_stale` with `reason = "inputs_changed"`. The savepoint
+rolls back all promotion and job creation, and the attempt is stored as rejected. Replay of
+that UUID serves the stored rejection. Use a new UUID after a fresh preflight.
 
 The receipt lanes use push sequences because the plugin owns these values in its drain
 bookkeeping. The out-of-protocol `lag` and `switchport` streams use the `selection_revision`
@@ -1189,7 +1260,7 @@ top-level `job_id` is the first job in that chain.
 The attempt row, promotion, document storage, cohort allocation, generation stamps, job
 enqueue, and replay body commit in one transaction under the device projection lock. An
 internal or transport failure rolls back all of them and leaves the UUID unknown. The caller
-must re-POST the identical request with the same UUID and selection. There is no received or
+must re-POST the identical request with the same UUID, selection and preflight identity. There is no received or
 in-progress attempt state. Removal work uses the ordinary
 `enqueue_removal` path and its existing scope runner. Networked removal generations precede
 the apply generation; detach removal generations follow it, so the top-level `job_id` names
