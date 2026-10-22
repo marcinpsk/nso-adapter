@@ -10,6 +10,7 @@ import httpx
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import async_sessionmaker
+from structlog.testing import capture_logs
 
 from nso_adapter.core.apply import encode_device_document, overlay_retained_routes
 from nso_adapter.core.projection import _row_dict
@@ -1321,8 +1322,11 @@ async def test_1825_unprepared_evidence_skips_a_section_the_attempt_path_cannot_
 
     for method in ("execute", "scalar", "scalars", "get", "flush"):
         monkeypatch.setattr(AsyncSession, method, _no_session)
-    derived = derive_unprepared_evidence(JobType.apply, generations, job.error, attempt_exists=False)
+    with capture_logs() as logs:
+        derived = derive_unprepared_evidence(JobType.apply, generations, job.error, attempt_exists=False)
 
     assert json.loads(json.dumps(derived)) == job.result
+    skipped = [log for log in logs if log["event"] == "apply.document_section_skipped"]
+    assert [(log["section"], log["code"]) for log in skipped] == [("interface_config", "origin_construction")]
     assert job.result["row_outcomes"]
     assert {row["disposition"] for row in job.result["row_outcomes"]} == {"not_applied"}

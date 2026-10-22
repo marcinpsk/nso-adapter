@@ -665,7 +665,8 @@ def encode_device_document(
                     proof=(proof_by_section or {}).get(section),
                     origin_context=origin_context,
                 )
-            except NsoApplyError:
+            except NsoApplyError as exc:
+                logger.info("apply.document_section_skipped", section=section, code=exc.code)
                 continue
             containers[entry.container] = encoded.body
             origins.merge(encoded.origins)
