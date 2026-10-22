@@ -1431,7 +1431,11 @@ def section_rows_by_table(document: dict, section: str) -> dict[str, list]:
     an encoder indexes its tables directly and a renamed table raises instead of silently
     encoding an empty list.
     """
-    hydrated = hydrate_section(document, section)
+    return rows_by_table(section, hydrate_section(document, section))
+
+
+def rows_by_table(section: str, hydrated: Mapping[type, list]) -> dict[str, list]:
+    """Key one :func:`hydrate_section` result of *section* by table name, every declared table present."""
     return {spec.model.__tablename__: hydrated.get(spec.model, []) for spec in section_registry()[section].tables}
 
 

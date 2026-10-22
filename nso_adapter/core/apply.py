@@ -1008,7 +1008,7 @@ class FrozenApplySelection(NamedTuple):
 
 def select_frozen_apply(document: dict, streams: frozenset[str], *, force: bool) -> FrozenApplySelection:
     """Select what an apply of *document* encodes and attempts, with no live row and no device."""
-    from nso_adapter.core.projection import section_rows_by_table
+    from nso_adapter.core.projection import rows_by_table
     from nso_adapter.store.models import StaticRouteTombstone
 
     sections = frozenset(stream_section(stream) for stream in streams)
@@ -1019,7 +1019,8 @@ def select_frozen_apply(document: dict, streams: frozenset[str], *, force: bool)
     for section in section_registry():
         if section not in document:
             continue
-        rows[section] = section_rows_by_table(document, section)
+        loaded = hydrate_section(document, section)
+        rows[section] = rows_by_table(section, loaded)
         if section == "static_route" and static_route is not None:
             # The frozen plan owns which rows and which carriers this document executes.
             rows[section] = {
@@ -1028,7 +1029,7 @@ def select_frozen_apply(document: dict, streams: frozenset[str], *, force: bool)
                 StaticRouteTombstone.__tablename__: list(static_route.tombstones),
             }
         if section in sections or section == "interface_config":
-            hydrated[section] = hydrate_section(document, section)
+            hydrated[section] = loaded
     selection = FrozenApplySelection(document, sections, executed, force, rows, hydrated, None, (), static_route)
     if "interface_config" not in document:
         return selection

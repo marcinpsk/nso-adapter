@@ -1035,3 +1035,31 @@ def test_document_executed_sections_is_the_section_registry():
     from nso_adapter.core.projection import DOCUMENT_EXECUTED_SECTIONS, projection_sections
 
     assert DOCUMENT_EXECUTED_SECTIONS == projection_sections()
+
+
+async def test_frozen_apply_selection_hydrates_each_section_once(adapter_client, monkeypatch):
+    """The encoded rows and the attempted rows of an executed section are one hydration."""
+    from nso_adapter.core import apply, projection
+    from nso_adapter.core.apply import select_frozen_apply
+    from nso_adapter.store.models import VlanIntent
+
+    device_id = await seed_device(nso_device_name="projection-hydrate-once", netbox_device_id=9829)
+    async with session() as db:
+        db.add(VlanIntent(device_id=device_id, vlan_id=10, name="MGMT", accepted_at=datetime(2026, 8, 1, tzinfo=UTC)))
+        await db.commit()
+    async with session() as db:
+        document = {"vlan": await freeze_snapshot(db, device_id, "vlan")}
+
+    calls: list[str] = []
+    real = projection.hydrate_section
+
+    def counted(document, section):
+        calls.append(section)
+        return real(document, section)
+
+    monkeypatch.setattr(projection, "hydrate_section", counted)
+    monkeypatch.setattr(apply, "hydrate_section", counted)
+    selection = select_frozen_apply(document, frozenset({"vlan"}), force=True)
+
+    assert calls == ["vlan"]
+    assert selection.rows["vlan"][VlanIntent.__tablename__] is selection.hydrated["vlan"][VlanIntent]
