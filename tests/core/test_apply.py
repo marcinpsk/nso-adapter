@@ -915,6 +915,44 @@ async def test_run_apply_does_not_reselect_recorded_interface_eligibility(adapte
         assert job.result["attribute_count_by_outcome"]["in_sync"] == 1
 
 
+async def test_run_apply_leaves_unexecuted_interface_attributes_to_their_own_stream(adapter_client):
+    """A job that does not execute ``interface_config`` neither counts nor stamps its eligible attributes."""
+    from nso_adapter.core.generation import attach_to_job, create_generation, note_write
+    from nso_adapter.store.models import GenerationMode, InterfaceAttrState
+
+    device_id = await _seed_device("rtr-a18", 118)
+    _iface_id, attr_id = await _seed_interface_with_intent(
+        device_id=device_id,
+        iface_name="GigabitEthernet0/4",
+        attribute="description",
+        intent_value="pending-iface",
+        sync_state=SyncState.accepted,
+        netbox_id=204,
+    )
+    job_id = await _seed_apply_job(device_id)
+    async with session() as db:
+        for stream in ("interface_config", "vlan"):
+            await note_write(db, device_id, stream)
+        await create_generation(db, device_id, streams=("interface_config",), mode=GenerationMode.networked)
+        generation = await create_generation(db, device_id, streams=("vlan",), mode=GenerationMode.networked)
+        assert "interface_config" in generation.document, "setup broken: the VLAN document must carry the attribute"
+        assert await attach_to_job(db, generation, await db.get(Job, job_id))
+        await db.commit()
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, new_callable=AsyncMock) as sender,
+    ):
+        await _run_apply_worker(job_id=job_id, device_id=device_id)
+
+    sender.assert_not_awaited()
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded, job.error
+        assert job.result["row_outcomes"] == []
+        assert (await db.get(InterfaceAttrState, attr_id)).sync_state == SyncState.accepted
+
+
 async def test_run_apply_outer_exception(adapter_client):
     """run_apply marks job failed on an outer unexpected exception."""
     device_id = await _seed_device("rtr-a17", 117)

@@ -961,7 +961,7 @@ class FrozenApplySelection(NamedTuple):
     hydrated: dict[str, dict[type, list]]
     #: The frozen interface writer context, or ``None`` when the document has no interface section.
     interface: Any
-    #: The interface attribute rows the frozen context marks eligible, executed or not.
+    #: The interface attribute rows the frozen context marks eligible, when ``interface_config`` is executed.
     attributes: tuple
     #: Hydrated whenever the document CARRIES the section, executed or not.
     static_route: SrPlan | None
@@ -1024,7 +1024,9 @@ def select_frozen_apply(document: dict, sections: frozenset[str], *, force: bool
         if row.interface_id not in interface.interfaces:
             raise ValueError(f"interface_config document has no context for interface id {row.interface_id}")
     attributes = tuple(
-        row for row in attribute_rows if (row.interface_id, row.attribute) in interface.eligible_attributes
+        row
+        for row in attribute_rows
+        if "interface_config" in sections and (row.interface_id, row.attribute) in interface.eligible_attributes
     )
     return selection._replace(interface=interface, attributes=attributes)
 
