@@ -983,7 +983,7 @@ class FrozenApplySelection(NamedTuple):
     def sent(self, section: str) -> list:
         """Return the rows *section*'s body carries for this run to record."""
         if section == "static_route" and self.static_route is not None:
-            return list(self.static_route.rows)
+            return list(self.static_route.rows) if self.executes(section, StaticRouteIntent) else []
         if section == "interface_config":
             return []
         return [

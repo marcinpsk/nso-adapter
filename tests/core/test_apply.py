@@ -1057,6 +1057,51 @@ async def test_run_apply_flex_algo_job_leaves_authorized_isis_rows_to_the_isis_s
         assert process.last_apply_at is None
 
 
+async def test_run_apply_vlan_job_leaves_a_carried_static_route_plan_to_its_own_stream(adapter_client):
+    """A ``vlan``-only job carries an earlier static-route plan in its body but neither checks nor counts it."""
+    from nso_adapter.store.models import StaticRouteIntent
+
+    device_id = await _seed_device("rtr-a22", 122)
+    async with session() as db:
+        db.add(VlanIntent(device_id=device_id, vlan_id=22, accepted_at=datetime.now(UTC)))
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id,
+                vrf="",
+                prefix="198.18.22.0/24",
+                next_hop="10.0.0.1",
+                accepted_at=datetime.now(UTC),
+            )
+        )
+        await db.commit()
+    job_id = await _seed_apply_job(device_id)
+    await _attach_lane_generations(device_id, job_id, authorized="static_route", executed="vlan")
+
+    mock_client = _nso_client()
+    mock_client.run_device_state_read.return_value = {
+        **_rc_action("rtr-a22", "static_route", {"status": "ok", "route": []}),  # never landed; not this job's
+        "vlan-database": {"status": "ok", "vlan": [{"vlan-id": 22}]},
+    }
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch(_SENDER, new_callable=AsyncMock) as sender,
+    ):
+        await _run_apply_worker(job_id=job_id, device_id=device_id)
+
+    assert [route["prefix"] for route in sent_list(sender, "static-route", "route")] == ["198.18.22.0/24"]
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded, job.error
+        assert "static_route" not in job.result["reader_compare"]
+        assert {outcome["stream"] for outcome in job.result["row_outcomes"]} == {"vlan"}
+        route = (
+            (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        assert route.last_apply_at is None
+
+
 async def test_run_apply_outer_exception(adapter_client):
     """run_apply marks job failed on an outer unexpected exception."""
     device_id = await _seed_device("rtr-a17", 117)
