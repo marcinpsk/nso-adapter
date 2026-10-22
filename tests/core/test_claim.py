@@ -863,6 +863,34 @@ async def test_1825_l7_a_revoked_apply_reports_its_generation_not_applied(adapte
     assert await _claim_row(device_id) is None
 
 
+async def test_1825_recovery_derives_the_evidence_off_the_event_loop(adapter_client):
+    """The CPU-bound document derivation runs in a worker thread while the job row lock is held."""
+    import threading
+    from unittest.mock import patch
+
+    from nso_adapter.core import execution
+    from nso_adapter.store.models import Job
+    from tests.core.test_static_route_put import assert_not_applied, seed_unsent_apply
+
+    device_id, job_id, generation_id, row_id = await seed_unsent_apply("cl-1825-thread", 9969)
+    await acquire_claim(device_id, "job", job_id=job_id)
+    await _backdate_heartbeat(device_id, seconds=claim_stale_cutoff() + 60)
+    derive = execution.derive_unprepared_evidence
+    threads: list[int] = []
+
+    def recording_derive(*args, **kwargs):
+        threads.append(threading.get_ident())
+        return derive(*args, **kwargs)
+
+    with patch.object(execution, "derive_unprepared_evidence", recording_derive):
+        await revoke_stale_claims()
+
+    assert threads and threading.get_ident() not in threads
+    async with session() as db:
+        job = await db.get(Job, job_id)
+    assert_not_applied(job.result, job.error, generation_id, [row_id])
+
+
 async def seed_malformed_apply(device_name: str, netbox_device_id: int, kind: str) -> tuple[int, int]:
     """Seed a started apply whose frozen generation has a valid digest but cannot be derived.
 

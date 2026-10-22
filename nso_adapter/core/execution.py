@@ -3,8 +3,10 @@
 """Runtime transactions over the shared execution-attempt store."""
 
 from collections.abc import Iterable, Sequence
+from functools import partial
 from typing import Literal, NamedTuple
 
+import anyio.to_thread
 import httpx
 import structlog
 from sqlalchemy import select
@@ -106,7 +108,10 @@ async def unprepared_evidence(
             select(DeploymentGeneration).where(DeploymentGeneration.job_id == job_id).order_by(DeploymentGeneration.seq)
         )
     )
-    derived = derive_unprepared_evidence(job_type, generations, error, attempt_exists=attempt_id is not None)
+    # CPU-bound encoding: keep the event loop free while the caller holds the job row lock.
+    derived = await anyio.to_thread.run_sync(
+        partial(derive_unprepared_evidence, job_type, generations, error, attempt_exists=attempt_id is not None)
+    )
     if isinstance(derived, Unresolved):
         logger.error(
             "execution.unprepared_evidence_unresolved",
