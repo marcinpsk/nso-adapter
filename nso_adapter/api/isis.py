@@ -474,6 +474,7 @@ async def _sync_isis_redistribution(
             existing_map[key] = existing_row
     await db.flush()
 
+    accepted = {proc.process_tag: proc.accepted_at or now for proc in processes}
     cleared = False
     for dest_ref, entry in _iter_isis_redistribution(processes):
         key = (dest_ref, entry.source_protocol, redistribution_source_identity(entry.source_protocol, entry.source_ref))
@@ -485,7 +486,7 @@ async def _sync_isis_redistribution(
                 dest_ref=dest_ref,
                 source_protocol=entry.source_protocol,
                 source_ref=entry.source_ref,
-                accepted_at=now,
+                accepted_at=accepted[dest_ref],
             )
             db.add(row)
         else:

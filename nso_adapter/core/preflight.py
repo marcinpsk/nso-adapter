@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple
 from uuid import uuid4
 
 import httpx
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from nso_adapter.core.apply import _apply_error_summary, build_device_containers, encode_section
@@ -29,6 +31,7 @@ from nso_adapter.core.generation import (
 from nso_adapter.core.projection import (
     InterfaceProofConflict,
     fragment_tables,
+    projection_streams,
     rows_by_intent_identity,
     section_proof,
     section_registry,
@@ -42,7 +45,7 @@ from nso_adapter.nso.origins import AttributionFailure, OriginContext, OriginInd
 from nso_adapter.nso.refusals import DefiniteRefusal, OrdinaryRejection, ProtocolFault, Unavailable
 from nso_adapter.store.execution_evidence import attributed_catalog_records, origin_records, origins_from_records
 from nso_adapter.store.execution_history import bind_historical_origins
-from nso_adapter.store.models import Base, DbInterface, Device, GenerationMode
+from nso_adapter.store.models import Base, DbInterface, Device, DeviceProjectionStream, GenerationMode
 
 
 def _canonical(value: Any) -> str:
@@ -128,6 +131,15 @@ class PlannedLink:
 class PlannedChain:
     links: tuple[PlannedLink, ...]
     _json: str
+    _candidate_json: str | None = None
+
+    @property
+    def candidate_identity(self) -> str | None:
+        return json.loads(self._candidate_json)["identity"] if self._candidate_json is not None else None
+
+    @property
+    def candidate_selection(self) -> dict[str, int] | None:
+        return json.loads(self._candidate_json)["selection"] if self._candidate_json is not None else None
 
     @property
     def skipped(self) -> dict[str, str]:
@@ -425,7 +437,114 @@ def _skips_moved(earlier: dict[str, str], later: dict[str, str]) -> bool:
     return any(later.get(stream) != reason for stream, reason in earlier.items())
 
 
-async def run_preflight(engine: AsyncEngine, client, device, selected: dict[str, int]) -> PreflightResult:
+CandidateIngest = Callable[[AsyncSession], Awaitable[tuple[dict[str, int], dict[str, dict]]]]
+
+
+def _preflight_result(
+    device,
+    live,
+    streams,
+    current,
+    skips,
+    attempts,
+    status,
+    *,
+    plan=None,
+    outcome=None,
+    baseline_refused=(),
+    cross_stream=(),
+    context_disturbed=(),
+    error=None,
+) -> PreflightResult:
+    admitted = (
+        {stream: revision for stream, revision in current.items() if stream not in skips} if status == "ready" else {}
+    )
+    verdicts = {stream: dict(verdict) for stream, verdict in streams.items()}
+    for stream in admitted:
+        verdicts[stream] = {"status": "admitted"}
+    return PreflightResult(
+        status,
+        plan if status == "ready" else None,
+        _canonical(
+            {
+                "device_id": device.id,
+                "nso_instance": device.nso_instance,
+                "nso_device_name": device.nso_device_name,
+                "streams": verdicts,
+                "admitted_selection": admitted,
+                "skips": skips,
+                "attempts": attempts,
+                "deltas": outcome.deltas if status == "ready" and outcome else [],
+                "live_input_digest": live.digest,
+                "baseline_refused": baseline_refused,
+                "cross_stream": cross_stream,
+                "context_disturbed": context_disturbed,
+                "error": error or (outcome.error if outcome else None),
+                "refusals": outcome.refusals if outcome else [],
+            }
+        ),
+    )
+
+
+async def run_preflight(
+    engine: AsyncEngine, client, device, selected: dict[str, int], *, ingest: CandidateIngest | None = None
+) -> PreflightResult:
+    """Evaluate a stored selection or an exact candidate through the shared planner."""
+    if ingest is not None:
+        return await _run_candidate_preflight(engine, client, device, selected, ingest)
+    return await _run_selected_preflight(engine, client, device, selected)
+
+
+async def _run_candidate_preflight(engine, client, device, selected, ingest) -> PreflightResult:
+    live = await read_plan_inputs(client, device)
+    streams: dict[str, dict] = {stream: {"status": "not_evaluated"} for stream in selected}
+    attempts: list[dict] = []
+    current = dict(selected)
+    skips: dict[str, str] = {}
+
+    def finish(status, **kwargs):
+        return _preflight_result(device, live, streams, current, skips, attempts, status, **kwargs)
+
+    if live.section.inconclusive:
+        return finish("unavailable")
+    attempts.append({"selection": current, "dropped": []})
+    try:
+        planned = await plan_action_apply(
+            engine,
+            device.id,
+            current,
+            live.section,
+            ingest=ingest,
+            expected_context=(device.nso_instance, device.nso_device_name, device.ned_id),
+        )
+    except PreflightStale:
+        return finish("unavailable", error=_INPUTS_MOVED)
+    except _PlanContextConflict as conflict:
+        streams.update(conflict.blocks)
+        return finish("refused", context_disturbed=conflict.disturbed)
+    assert planned.candidate_selection is not None
+    current = planned.candidate_selection
+    skips = planned.skipped
+    attempts[-1]["selection"] = current
+    promoted = {stream for link in planned.links for stream in link.streams}
+    effective = {stream: current[stream] for stream in promoted}
+    blocks, disturbed = _context_blocks(planned, promoted)
+    guard_blocks, unselected_guard = _guard_blocks(planned, effective)
+    blocks.update(guard_blocks)
+    streams.update(blocks)
+    if unselected_guard:
+        return finish("refused", error={"code": "removal_blocked_collateral", "orphans": unselected_guard})
+    if disturbed or blocks:
+        return finish("refused", context_disturbed=disturbed)
+    blocks, final = await _judge_dry_run(engine, client, device, live, planned, effective)
+    if final is not None:
+        return finish(**final)
+    streams.update(blocks)
+    records = {_canonical(record): record for block in blocks.values() for record in block.get("refusals", [])}
+    return finish("refused", outcome=_DryRun("refused", [], list(records.values())))
+
+
+async def _run_selected_preflight(engine: AsyncEngine, client, device, selected: dict[str, int]) -> PreflightResult:
     """Admit a manual selection without storing a promotion or committing to NSO."""
     current = dict(selected)
     streams: dict[str, dict] = {stream: {"status": "not_evaluated"} for stream in selected}
@@ -436,35 +555,20 @@ async def run_preflight(engine: AsyncEngine, client, device, selected: dict[str,
     def finish(
         status, *, plan=None, outcome=None, baseline_refused=(), cross_stream=(), context_disturbed=(), error=None
     ):
-        admitted = (
-            {stream: revision for stream, revision in current.items() if stream not in skips}
-            if status == "ready"
-            else {}
-        )
-        verdicts = {stream: dict(verdict) for stream, verdict in streams.items()}
-        for stream in admitted:
-            verdicts[stream] = {"status": "admitted"}
-        return PreflightResult(
+        return _preflight_result(
+            device,
+            live,
+            streams,
+            current,
+            skips,
+            attempts,
             status,
-            plan if status == "ready" else None,
-            _canonical(
-                {
-                    "device_id": device.id,
-                    "nso_instance": device.nso_instance,
-                    "nso_device_name": device.nso_device_name,
-                    "streams": verdicts,
-                    "admitted_selection": admitted,
-                    "skips": skips,
-                    "attempts": attempts,
-                    "deltas": outcome.deltas if status == "ready" and outcome else [],
-                    "live_input_digest": live.digest,
-                    "baseline_refused": baseline_refused,
-                    "cross_stream": cross_stream,
-                    "context_disturbed": context_disturbed,
-                    "error": error or (outcome.error if outcome else None),
-                    "refusals": outcome.refusals if outcome else [],
-                }
-            ),
+            plan=plan,
+            outcome=outcome,
+            baseline_refused=baseline_refused,
+            cross_stream=cross_stream,
+            context_disturbed=context_disturbed,
+            error=error,
         )
 
     def drop(blocks):
@@ -601,6 +705,8 @@ async def plan_action_apply(
     snapshot: CertifiedSection,
     *,
     baseline_only: bool = False,
+    ingest: CandidateIngest | None = None,
+    expected_context: tuple[str, str, str | None] | None = None,
 ) -> PlannedChain:
     """Plan the real Apply chain without persistence, even if a planner commits its session.
 
@@ -618,45 +724,94 @@ async def plan_action_apply(
                 bind=connection, join_transaction_mode="create_savepoint", expire_on_commit=False
             ) as db:
                 await lock_projection(db, device_id)
-                authorized = await _authorized_fragments(db, device_id)
-                baseline = _baseline_proofs(authorized)
-                skipped: dict[str, str]
-                if baseline_only:
-                    if selected:
-                        raise ValueError("Baseline planning cannot promote streams")
-                    generations = [await create_reissue_generation(db, device_id, mode=GenerationMode.networked)]
-                    skipped, skipped_detail = {}, {}
-                else:
-                    planning_error = None
-                    try:
-                        result = await create_action_apply(db, device_id, selected, uuid4())
-                    except InterfaceProofConflict as conflict:
-                        promoted, skipped, _ = await _selected_promotions(db, device_id, selected)
-                        planning_error = _PlanContextConflict(conflict.streams, set(promoted), skipped)
-                    if planning_error is not None:
-                        raise planning_error
-                    generations = result.generations
-                    skipped, skipped_detail = result.skipped, result.skipped_detail
-                device = await db.get(Device, device_id)
-                links = tuple(
-                    [
-                        await _capture_link(db, device, generation, order, snapshot, authorized)
-                        for order, generation in enumerate(generations)
-                    ]
-                )
-                return PlannedChain(
-                    links,
-                    _canonical(
-                        {
-                            "skipped": skipped,
-                            "skipped_detail": _without_execution_ids(skipped_detail),
-                            "baseline_interface_proofs": baseline,
-                        }
-                    ),
-                )
+                candidate = None
+                if ingest is not None:
+                    selected, candidate = await _ingest_candidate_plan(
+                        db, device_id, ingest, snapshot, expected_context
+                    )
+                return await _plan_in_session(db, device_id, selected, snapshot, baseline_only, candidate)
         finally:
             LAST_ENQUEUED_GENERATION_ID.reset(token)
             await outer.rollback()
+
+
+async def _ingest_candidate_plan(db, device_id, ingest, snapshot, expected_context):
+    device = await db.get(Device, device_id)
+    assert device is not None
+    if (
+        expected_context is not None
+        and (device.nso_instance, device.nso_device_name, device.ned_id) != expected_context
+    ):
+        raise PreflightStale("inputs_changed")
+    selected, bodies = await ingest(db)
+    revisions = {
+        stream: revision
+        for stream, revision in (
+            await db.execute(
+                select(DeviceProjectionStream.stream, DeviceProjectionStream.authorized_revision).where(
+                    DeviceProjectionStream.device_id == device_id
+                )
+            )
+        ).all()
+    }
+    candidate = _canonical(
+        {
+            "selection": selected,
+            "identity": _digest(
+                {
+                    "bodies": bodies,
+                    "authorized_revisions": {
+                        stream: revisions.get(stream, 0) for stream in sorted(projection_streams())
+                    },
+                    "nso_instance": device.nso_instance,
+                    "nso_device_name": device.nso_device_name,
+                    "ned_id": device.ned_id,
+                    "live_input_digest": _digest(snapshot._asdict()),
+                }
+            ),
+        }
+    )
+    return selected, candidate
+
+
+async def _plan_in_session(db, device_id, selected, snapshot, baseline_only, candidate) -> PlannedChain:
+    authorized = await _authorized_fragments(db, device_id)
+    baseline = _baseline_proofs(authorized)
+    skipped: dict[str, str]
+    if baseline_only:
+        if selected:
+            raise ValueError("Baseline planning cannot promote streams")
+        generations = [await create_reissue_generation(db, device_id, mode=GenerationMode.networked)]
+        skipped, skipped_detail = {}, {}
+    else:
+        planning_error = None
+        try:
+            result = await create_action_apply(db, device_id, selected, uuid4())
+        except InterfaceProofConflict as conflict:
+            promoted, skipped, _ = await _selected_promotions(db, device_id, selected)
+            planning_error = _PlanContextConflict(conflict.streams, set(promoted), skipped)
+        if planning_error is not None:
+            raise planning_error
+        generations = result.generations
+        skipped, skipped_detail = result.skipped, result.skipped_detail
+    device = await db.get(Device, device_id)
+    links = tuple(
+        [
+            await _capture_link(db, device, generation, order, snapshot, authorized)
+            for order, generation in enumerate(generations)
+        ]
+    )
+    return PlannedChain(
+        links,
+        _canonical(
+            {
+                "skipped": skipped,
+                "skipped_detail": _without_execution_ids(skipped_detail),
+                "baseline_interface_proofs": baseline,
+            }
+        ),
+        candidate,
+    )
 
 
 def normalized_plan_digest(planned: PlannedChain) -> str:

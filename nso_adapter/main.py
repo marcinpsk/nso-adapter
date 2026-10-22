@@ -157,7 +157,9 @@ def _preserve_exact_openapi_integer_bounds(app: FastAPI) -> None:
         schema = generated_openapi()
         components = schema["components"]["schemas"]
         for name in ("ActionApplyIn", "ApplyPreflightIn"):
-            sequence = components[name]["properties"]["selected"]["additionalProperties"]
+            selected = components[name]["properties"]["selected"]
+            selection = next(item for item in selected.get("anyOf", [selected]) if item.get("type") == "object")
+            sequence = selection["additionalProperties"]
             sequence["minimum"] = MIN_PUSH_SEQ
             sequence["maximum"] = MAX_PUSH_SEQ
         for model, field in _WIDE_INTEGER_FIELDS:

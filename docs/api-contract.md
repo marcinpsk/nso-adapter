@@ -1003,7 +1003,7 @@ queued job from starting.
 | `actions/apply` | Require `apply_attempt_id` and `preflight_identity`. Revalidate the executable inputs inside a savepoint before admission. A stale identity or an inconclusive live input returns `409 preflight_stale` without promotion. The live input is read once before the projection lock. Replay a completed request when its UUID, device, complete canonical `selected`, and `preflight_identity` match. Return `409 conflict` when the UUID identifies a different request. For a new UUID, evaluate the selection first. If no selected stream is promotable, return the documented `200` no-op without checking active jobs. If at least one stream is promotable, inspect queued and running jobs once. Return `409 conflict` with the first observed job by `(created_at, id)` in `error.detail.job_id` when any exists. Otherwise, promote and enqueue the generation chain. This is a point-in-time check in the device-locked transaction. A later action can enqueue after Apply commits. |
 | `actions/retry-generation` | Return `409 conflict` only when there is no blocked executable head or another barrier action already acted on it. Otherwise, create a fresh dedicated job for the blocked head and return `202`. Existing jobs and successor bindings remain unchanged. Unrelated queued or running jobs do not cause a conflict. The request names the generation to act on; when it is not the current head, the 409 carries `error.detail.head_generation_id` naming the head. |
 | `actions/abandon-generation` | Return `409 conflict` only when there is no blocked executable head or another barrier action already acted on it. Otherwise, abandon the head, ensure the next executable generation has a live carrier, and return `202`. Unrelated queued or running jobs do not cause a conflict. The request names the generation to act on; when it is not the current head, the 409 carries `error.detail.head_generation_id` naming the head. |
-| `actions/apply-preflight` | Plan in a rollback-only transaction and dry-run the selection. Create no persistent job, receipt or promotion. Use the same live-job conflict as Apply. |
+| `actions/apply-preflight` | Plan in a rollback-only transaction and dry-run a stored selection or candidate bodies. Create no persistent job, receipt or promotion. Use the same live-job conflict as Apply. |
 | `actions/apply-diff` | Create no job and apply no queue-admission rule. |
 
 ### `POST /api/v1/devices/{id}/actions/sync`
@@ -1076,8 +1076,46 @@ do not otherwise refuse these barrier actions.
 
 ### `POST /api/v1/devices/{id}/actions/apply-preflight` → `200 | 404 | 409 | 422`
 
-Requires bearer authentication. The body is `{"selected": {"vlan": 4711}}`. Selection
-validation is identical to Apply: known stream names and strict integers in `1..2^63-1`.
+Requires bearer authentication. The body contains exactly one of `selected` or `candidates`.
+An omitted mode, both modes, an explicit `null`, or an unknown stream returns 422.
+
+Stored selection mode takes `{"selected": {"vlan": 4711}}`. Selection validation is
+identical to Apply: known stream names and strict integers in `1..2^63-1`.
+
+Candidate mode takes a nonempty map from stream names to their complete ingestion bodies:
+
+```json
+{
+  "candidates": {
+    "ip": {
+      "addresses": [
+        {
+          "interface": "GigabitEthernet0/1",
+          "address": "198.18.0.1/24",
+          "family": "ipv4",
+          "accepted_at": "2026-10-20T12:00:00Z"
+        }
+      ]
+    }
+  }
+}
+```
+
+Each receipt stream uses its normal PUT body. `lag` and `switchport` use their normal
+apply-POST body, including `source_revision` and `deleted_roots`. Each timestamp must be
+explicit and valid. A missing or null `accepted_at` on an ingestion row returns 422.
+LAG and switchport take `accepted_at` at the top level of the apply-POST body. OSPF
+instances and interfaces take it per entry. Route-policy objects take it per object and
+keep their normal `accepted` flag. Redistribution rows inherit their BGP router, OSPF
+instance, or IS-IS process acceptance time. These normal ingestion routes also accept the
+explicit timestamps. An omitted timestamp retains their normal default behavior.
+
+Candidate validation uses the models and handlers derived from the live route table.
+Receipt streams run store-only ingestion with the next receipt sequence. Switching
+streams run normal preparation and select the newly prepared slot. The shared Apply
+planner then selects exactly those streams at those revisions. All ingestion, receipt,
+prepared-slot and planning changes roll back. PostgreSQL sequences can advance.
+
 The route reads one certified live service snapshot. It plans the exact Apply chain in an
 owned rollback-only transaction, then dry-runs every NSO-writing link outside that
 transaction, including detach with its own no-networking policy. It persists no promotion,
@@ -1094,15 +1132,17 @@ The response contains:
   refusal means the selection caused a refusal that does not occur in the pure baseline.
 - `admitted_selection`: the accepted stream selections. `skips` maps skipped stream names
   to Apply's skip reasons. Skipped streams remain `not_evaluated`.
-- `preflight_identity`: a lowercase sha256 hex string, present only when `status` is `ready`.
+- `preflight_identity`: a lowercase sha256 hex string, present only for a `ready` stored selection.
+- `candidate_identity` and `plan_digest`: lowercase sha256 hex strings, present only for a
+  `ready` candidate result. Candidate results omit `preflight_identity`.
 - `diffs`: `native` and `cli` strings from the final admitted plan. Multiple networked links
   are joined in order with newlines. Detach links have no diff-panel output.
 - `attempts`: the ordered passes, each with `selection` and `dropped` stream names.
-- `refusals`: attributed catalog records for terminal baseline or cross-stream diagnosis.
+- `refusals`: attributed catalog records for candidate refusal or terminal baseline or cross-stream diagnosis.
   Provisional generation and cohort identities are never published.
 - `error`: a structured diagnostic for an error or collateral block, otherwise `null`.
 
-The loop drops refused selected streams and replans, at most one pass per dropped stream
+In stored selection mode, the loop drops refused selected streams and replans, at most one pass per dropped stream
 plus one. Blocked streams keep their authorized fragments and remain pending. A baseline
 refusal, cross-stream refusal, or disturbed unpromoted interface context admits nothing.
 Inconclusive live reads or dry-runs return `unavailable`. A skip reason that changes between
@@ -1110,7 +1150,25 @@ two passes of one preflight returns `unavailable` with `error.code = "inputs_cha
 NSO rejections return `error`. These NSO outcomes use HTTP 200 and omit the identity.
 A live job returns the same `409 conflict` envelope as Apply, including `detail.job_id`.
 
-For confirm, remove blocked streams from the original selection and keep skipped entries
+Candidate mode never drops a candidate stream. Any candidate refusal, collateral guard
+block, or disturbed authorized context returns `refused` and admits nothing. Refusals
+include the candidate row identities and acceptance times. Refusals naming only streams
+outside the candidate map use the same baseline and cross-stream diagnosis as stored
+selection mode. No identity or plan digest is returned for a non-ready result.
+
+`candidate_identity` hashes canonical JSON of the normalized candidate bodies, all streams'
+authorized revisions, NSO instance id, NSO device name, device `ned_id`, and the single
+certified live-input digest. Equivalent timestamp offsets normalize to UTC. `plan_digest`
+hashes the complete normalized chain, including every link's wire containers, execution
+policy, frozen context and proofs, and removal authority. Database row, generation, cohort
+and sequence identities are normalized out. The two hashes serve different purposes.
+
+Intend preview runs candidate preflight before row acquisition. Intend confirm must rerun
+it with the same rendered candidates and require both `candidate_identity` and `plan_digest`
+to match. A mismatch requires a new preview. These hashes do not authorize Apply; a later
+Apply uses stored selection preflight and its own `preflight_identity`.
+
+For stored selection confirm, remove blocked streams from the original selection and keep skipped entries
 with their original selection values. Submit that selection and the returned identity to
 Apply. The identity binds the admitted selection, skip reasons, ordered generation modes,
 digests and execution policies, device id, NSO instance and device name, and the certified

@@ -23,7 +23,7 @@ from nso_adapter.api.errors import (
 )
 from nso_adapter.api.observation import LagConfigObservationOut
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
-from nso_adapter.api.timestamps import iso_z, latest_refreshed
+from nso_adapter.api.timestamps import UtcInstant, iso_z, latest_refreshed
 from nso_adapter.core.generation import DeviceProjectionGone
 from nso_adapter.core.switching_intent import (
     LagBundleSnapshot,
@@ -83,6 +83,7 @@ class LagBundleApply(_StrictRequestModel):
 
 
 class LagConfigApplyRequest(_StrictRequestModel):
+    accepted_at: UtcInstant | None = None
     bundles: list[LagBundleApply]
     source_revision: int = Field(strict=True, ge=0, le=9223372036854775807)
     #: The bundle roots this preparation authorizes RETRACTING from the device. Required,
@@ -250,6 +251,7 @@ async def apply_lag_config(
             bundles,
             deleted_roots=payload.deleted_roots,
             source_revision=payload.source_revision,
+            accepted_at=payload.accepted_at,
         )
     except DeviceProjectionGone:
         # Built in the handler, raised after it: a raise inside attaches the caught exception.

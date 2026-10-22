@@ -287,7 +287,9 @@ def unhandled_exception_response(request: Request, exc: BaseException) -> JSONRe
 #: caller's own string whatever the value type is, so every ``dict[str, ...]`` field of a
 #: request body belongs here; ``test_caller_keyed_maps_are_registered_for_loc_redaction``
 #: derives the set from the app's own routes and fails when one is added without it.
-DYNAMIC_KEY_LOCATIONS: frozenset[tuple[str, ...]] = frozenset({("body", "selected"), ("body", "values")})
+DYNAMIC_KEY_LOCATIONS: frozenset[tuple[str, ...]] = frozenset(
+    {("body", "selected"), ("body", "candidates"), ("body", "values")}
+)
 
 #: What replaces a caller-chosen key in a reported location.
 REDACTED_LOC = "[redacted]"

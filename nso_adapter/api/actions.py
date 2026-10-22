@@ -13,8 +13,8 @@ import json
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Response
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from fastapi import APIRouter, Depends, Request, Response
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
@@ -65,7 +65,7 @@ class ApplyDiffOut(BaseModel):
     refusals: list[AttributedRefusalOut]
 
 
-class ApplyPreflightIn(BaseModel):
+class ApplySelectionIn(BaseModel):
     """The exact stored selection to evaluate without promotion."""
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
@@ -83,7 +83,27 @@ class ApplyPreflightIn(BaseModel):
         return canonical_selected(selected)
 
 
-class ActionApplyIn(ApplyPreflightIn):
+class ApplyPreflightIn(BaseModel):
+    """Evaluate exactly one stored selection or candidate body map."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    selected: dict[str, SelectedPushSequence] | None = None
+    candidates: dict[str, dict] | None = None
+
+    @field_validator("selected")
+    @classmethod
+    def _validate_selected(cls, selected):
+        return ApplySelectionIn(selected=selected).selected
+
+    @model_validator(mode="after")
+    def _one_mode(self):
+        modes = self.model_fields_set & {"selected", "candidates"}
+        if len(modes) != 1 or getattr(self, next(iter(modes))) is None:
+            raise ValueError("Exactly one of selected or candidates is required")
+        return self
+
+
+class ActionApplyIn(ApplySelectionIn):
     """The exact per-stream selections this manual Apply is allowed to promote.
 
     A selection value carries one of two identities. For an in-protocol stream it is a
@@ -113,6 +133,8 @@ class ApplyPreflightOut(BaseModel):
     admitted_selection: dict[str, int]
     skips: dict[str, str]
     preflight_identity: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    candidate_identity: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    plan_digest: str | None = Field(default=None, exclude_if=lambda value: value is None)
     diffs: dict[str, str]
     attempts: list[dict]
     refusals: list[AttributedRefusalOut]
@@ -363,13 +385,16 @@ async def sync_notify(
     response_model=ApplyPreflightOut,
     responses={**_ACTION_ERRORS, **RESP_409_PREFLIGHT},
 )
-async def action_apply_preflight(device_id: int, body: ApplyPreflightIn, db: AsyncSession = Depends(get_db)):
-    """Dry-run a manual selection and return the admitted selection and its identity.
+async def action_apply_preflight(
+    device_id: int, body: ApplyPreflightIn, request: Request, db: AsyncSession = Depends(get_db)
+):
+    """Dry-run a stored selection or candidate bodies without persistence.
 
     No promotion or NSO commit persists. NSO failures return unavailable or error.
     """
+    from nso_adapter.api.candidate_ingestion import validate_candidates
     from nso_adapter.core.generation import ApplyJobConflict
-    from nso_adapter.core.preflight import preflight_identity, run_preflight
+    from nso_adapter.core.preflight import normalized_plan_digest, preflight_identity, run_preflight
     from nso_adapter.core.request_flags import STORE_ONLY
     from nso_adapter.store.db import get_engine
 
@@ -378,13 +403,17 @@ async def action_apply_preflight(device_id: int, body: ApplyPreflightIn, db: Asy
     device = await db.get(Device, device_id)
     if device is None:
         raise api_error(404, "not_found", "Device not found")
+    ingest = (
+        validate_candidates(request.app.routes, device_id, body.candidates) if body.candidates is not None else None
+    )
+    selected = body.selected if body.selected is not None else dict.fromkeys(body.candidates or {}, 1)
     db.expunge(device)
     await db.rollback()
     client = _preflight_client(device.nso_instance)
     if client is None:
         return {
             "status": "unavailable",
-            "streams": {stream: {"status": "not_evaluated"} for stream in body.selected},
+            "streams": {stream: {"status": "not_evaluated"} for stream in selected},
             "baseline_refused": [],
             "cross_stream": [],
             "context_disturbed": [],
@@ -397,7 +426,7 @@ async def action_apply_preflight(device_id: int, body: ApplyPreflightIn, db: Asy
         }
     conflict = None
     try:
-        result = await run_preflight(get_engine(), client, device, body.selected)
+        result = await run_preflight(get_engine(), client, device, selected, ingest=ingest)
     except ApplyJobConflict as exc:
         conflict = api_error(
             409, "conflict", "A job is already queued or running for this device", {"job_id": exc.job_id}
@@ -418,7 +447,12 @@ async def action_apply_preflight(device_id: int, body: ApplyPreflightIn, db: Asy
         "error": result.error,
     }
     if result.status == "ready":
-        payload["preflight_identity"] = preflight_identity(result)
+        if ingest is not None:
+            assert result.plan is not None
+            payload["candidate_identity"] = result.plan.candidate_identity
+            payload["plan_digest"] = normalized_plan_digest(result.plan)
+        else:
+            payload["preflight_identity"] = preflight_identity(result)
     return payload
 
 

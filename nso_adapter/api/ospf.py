@@ -19,7 +19,7 @@ from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.observation import OspfObservationOut
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.redistribution import RedistributionSourceModel, validate_unique_redistribution_sources
-from nso_adapter.api.timestamps import iso_z, latest_refreshed
+from nso_adapter.api.timestamps import UtcInstant, iso_z, latest_refreshed
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.domain.asn import checked_intent_source_ref, redistribution_source_identity
 from nso_adapter.store import outcome_store
@@ -173,6 +173,7 @@ class RedistributionEntry(RedistributionSourceModel):
 
 
 class OspfInstanceEntry(BaseModel):
+    accepted_at: UtcInstant | None = None
     # process_id is a STRING (matches the OspfInstanceIntent.process_id String column and
     # the plugin's CharField; IOS-XR/Junos allow named processes). Declaring it int made
     # asyncpg reject the coerced value on insert — only surfaced once OSPF intent was first
@@ -186,6 +187,7 @@ class OspfInstanceEntry(BaseModel):
 
 
 class OspfInterfaceEntry(BaseModel):
+    accepted_at: UtcInstant | None = None
     interface_name: str
     process_id: str | None = None
     area_id: str | None = None
@@ -237,8 +239,10 @@ async def _sync_keyed_intent(
         row = existing.get(getattr(entry, key_attr))
         before = {f: getattr(row, f) for f in state_fields} if row is not None else None
         if row is None:
-            row = make_row(entry, now)
+            row = make_row(entry, entry.accepted_at or now)
             db.add(row)
+        if entry.accepted_at is not None:
+            row.accepted_at = entry.accepted_at
         apply_fields(row, entry)
         if before is not None and any(is_cleared(before[f], getattr(row, f)) for f in state_fields):
             cleared = True
@@ -310,6 +314,7 @@ async def _sync_ospf_redistribution(
             existing_map[key] = existing_row
     await db.flush()
 
+    accepted = {str(inst.process_id): inst.accepted_at or now for inst in instances}
     cleared = False
     for dest_ref, entry in _iter_ospf_redistribution(instances):
         key = (dest_ref, entry.source_protocol, redistribution_source_identity(entry.source_protocol, entry.source_ref))
@@ -321,7 +326,7 @@ async def _sync_ospf_redistribution(
                 dest_ref=dest_ref,
                 source_protocol=entry.source_protocol,
                 source_ref=entry.source_ref,
-                accepted_at=now,
+                accepted_at=accepted[dest_ref],
             )
             db.add(row)
         else:

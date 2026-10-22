@@ -276,21 +276,40 @@
       },
       "ApplyPreflightIn": {
         "additionalProperties": false,
-        "description": "The exact stored selection to evaluate without promotion.",
+        "description": "Evaluate exactly one stored selection or candidate body map.",
         "properties": {
+          "candidates": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidates"
+          },
           "selected": {
-            "additionalProperties": {
-              "maximum": 9223372036854775807,
-              "minimum": 1,
-              "type": "integer"
-            },
-            "title": "Selected",
-            "type": "object"
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "maximum": 9223372036854775807,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selected"
           }
         },
-        "required": [
-          "selected"
-        ],
         "title": "ApplyPreflightIn",
         "type": "object"
       },
@@ -317,6 +336,17 @@
             },
             "title": "Baseline Refused",
             "type": "array"
+          },
+          "candidate_identity": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Identity"
           },
           "context_disturbed": {
             "items": {
@@ -350,6 +380,17 @@
               }
             ],
             "title": "Error"
+          },
+          "plan_digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan Digest"
           },
           "preflight_identity": {
             "anyOf": [
@@ -9355,6 +9396,18 @@
       "LagConfigApplyRequest": {
         "additionalProperties": false,
         "properties": {
+          "accepted_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted At"
+          },
           "bundles": {
             "items": {
               "$ref": "#/components/schemas/LagBundleApply"
@@ -10984,6 +11037,18 @@
       },
       "OspfInstanceEntry-Input": {
         "properties": {
+          "accepted_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted At"
+          },
           "areas": {
             "default": [],
             "items": {
@@ -11193,6 +11258,18 @@
       },
       "OspfInterfaceEntry-Input": {
         "properties": {
+          "accepted_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted At"
+          },
           "area_id": {
             "anyOf": [
               {
@@ -16145,6 +16222,18 @@
       "SwitchportApplyRequest": {
         "additionalProperties": false,
         "properties": {
+          "accepted_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted At"
+          },
           "deleted_roots": {
             "items": {
               "maxLength": 128,
@@ -17620,7 +17709,7 @@
     },
     "/api/v1/devices/{device_id}/actions/apply-preflight": {
       "post": {
-        "description": "Dry-run a manual selection and return the admitted selection and its identity.\n\nNo promotion or NSO commit persists. NSO failures return unavailable or error.",
+        "description": "Dry-run a stored selection or candidate bodies without persistence.\n\nNo promotion or NSO commit persists. NSO failures return unavailable or error.",
         "operationId": "action_apply_preflight_api_v1_devices__device_id__actions_apply_preflight_post",
         "parameters": [
           {
@@ -20873,6 +20962,11 @@
                           "default": false,
                           "description": "When true, stamps accepted_at on the object.",
                           "type": "boolean"
+                        },
+                        "accepted_at": {
+                          "description": "Explicit acceptance time; defaults to now.",
+                          "format": "date-time",
+                          "type": "string"
                         },
                         "entries": {
                           "description": "Per-family entry list (prefix-list lines, community members, as-path patterns, or route-map terms). The shape is family-specific and stored verbatim.",

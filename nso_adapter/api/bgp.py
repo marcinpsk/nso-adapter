@@ -587,6 +587,12 @@ async def _sync_redistribution(
             existing_map[key] = existing_row
     await db.flush()
 
+    accepted = {
+        f"{router.asn}:{scope.vrf}:{af.af}": router.accepted_at or now
+        for router in routers
+        for scope in router.scopes
+        for af in scope.address_families
+    }
     cleared = False
     for dest_ref, entry in _iter_redistribution(routers):
         key = _bgp_redistribution_key(dest_ref, entry.source_protocol, entry.source_ref)
@@ -598,7 +604,7 @@ async def _sync_redistribution(
                 dest_ref=dest_ref,
                 source_protocol=entry.source_protocol,
                 source_ref=entry.source_ref,
-                accepted_at=now,
+                accepted_at=accepted[dest_ref],
             )
             db.add(row)
         else:
