@@ -60,8 +60,8 @@ async def _run(runner, job_id, device_id, reg, **kwargs):
             await release_claim(claim)
 
 
-async def run_apply(job_id, device_id, force=True, reg=None):
-    await _run(apply_runner, job_id, device_id, reg, force=force)
+async def run_apply(job_id, device_id, reg=None):
+    await _run(apply_runner, job_id, device_id, reg)
 
 
 async def run_removal(job_id, device_id, reg=None):

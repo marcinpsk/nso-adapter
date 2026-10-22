@@ -115,13 +115,13 @@ async def _seed_apply_job(device_id: int, status: JobStatus = JobStatus.running)
         return j.id
 
 
-async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -> None:
+async def run_apply(job_id: int, device_id: int, reg=None) -> None:
     """Attach the immutable fixture document, then invoke the real Apply worker."""
     async with session() as db:
         job = await db.get(Job, job_id)
     if job is not None:
         await attach_apply_generation(job_id, job.device_id)
-    await _run_apply_worker(job_id=job_id, device_id=device_id, force=force, reg=reg)
+    await _run_apply_worker(job_id=job_id, device_id=device_id, reg=reg)
 
 
 #: The ONE sender every deployment goes through: a PUT of the device's whole document.
@@ -229,7 +229,7 @@ async def test_the_transmitted_interface_entry_carries_the_nokia_routed_context(
         patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
         patch(_SENDER, sender),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     (entry,) = sent_list(sender, "interface", "interface")
     # RED against the aggregate encoder: the routed context is emitted only for an interface
@@ -257,7 +257,7 @@ async def test_the_transmitted_interface_entry_carries_lag_kind_for_a_nokia_lag(
         patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
         patch(_SENDER, sender),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     (entry,) = sent_list(sender, "interface", "interface")
     # RED for the same reason as the vprn case above (reported).
@@ -279,7 +279,7 @@ async def test_the_transmitted_interface_entry_omits_the_routed_context_off_noki
         patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
         patch(_SENDER, sender),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     (entry,) = sent_list(sender, "interface", "interface")
     assert entry["enabled"] is True
@@ -398,7 +398,7 @@ async def test_run_apply_nothing_eligible(adapter_client):
         patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
         patch(_SENDER, sender),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     sender.assert_not_awaited()
     async with session() as db:
@@ -437,7 +437,7 @@ async def test_run_apply_syncs_from_device_by_default(adapter_client):
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         capture_logs() as logs,
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     mock_client.sync_from.assert_awaited_once_with("rtr-sync-on")
     record = next(record for record in logs if record["event"] == "apply.sync_from.done")
@@ -454,7 +454,7 @@ async def test_run_apply_skips_sync_from_when_disabled(adapter_client):
 
     mock_client = _nso_client()
     with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     mock_client.sync_from.assert_not_called()
 
@@ -474,7 +474,7 @@ async def test_run_apply_survives_sync_from_failure(adapter_client):
         patch(_SENDER, AsyncMock(return_value=None)),
         capture_logs() as logs,
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -722,7 +722,7 @@ async def test_run_apply_all_succeed(adapter_client):
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -769,7 +769,7 @@ async def test_run_apply_refreshes_mirror_and_notifies_plugin(adapter_client):
             patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
             patch(_SENDER, new_callable=AsyncMock),
         ):
-            await run_apply(job_id=job_id, device_id=device_id, force=True)
+            await run_apply(job_id=job_id, device_id=device_id)
     finally:
         imp._netbox_client = None
 
@@ -824,7 +824,7 @@ async def test_run_apply_post_refresh_failure_does_not_fail_job(adapter_client):
             side_effect=RuntimeError("NSO unreachable"),
         ),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)  # must not raise
+        await run_apply(job_id=job_id, device_id=device_id)  # must not raise
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -852,7 +852,7 @@ async def test_run_apply_partial_failure(adapter_client):
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock, side_effect=nso_err),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -879,7 +879,7 @@ async def test_run_apply_unexpected_exception_on_attribute(adapter_client):
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock, side_effect=RuntimeError("unexpected internal error")),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -905,13 +905,201 @@ async def test_run_apply_does_not_reselect_recorded_interface_eligibility(adapte
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
+        patch("nso_adapter.core.apply.WORKER_APPLY_FORCE", False),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=False)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result["attribute_count_by_outcome"]["in_sync"] == 1
+
+
+async def test_run_apply_leaves_unexecuted_interface_attributes_to_their_own_stream(adapter_client):
+    """A job that does not execute ``interface_config`` neither counts nor stamps its eligible attributes."""
+    from nso_adapter.core.generation import attach_to_job, create_generation, note_write
+    from nso_adapter.store.models import GenerationMode, InterfaceAttrState
+
+    device_id = await _seed_device("rtr-a18", 118)
+    _iface_id, attr_id = await _seed_interface_with_intent(
+        device_id=device_id,
+        iface_name="GigabitEthernet0/4",
+        attribute="description",
+        intent_value="pending-iface",
+        sync_state=SyncState.accepted,
+        netbox_id=204,
+    )
+    job_id = await _seed_apply_job(device_id)
+    async with session() as db:
+        for stream in ("interface_config", "vlan"):
+            await note_write(db, device_id, stream)
+        await create_generation(db, device_id, streams=("interface_config",), mode=GenerationMode.networked)
+        generation = await create_generation(db, device_id, streams=("vlan",), mode=GenerationMode.networked)
+        assert "interface_config" in generation.document, "setup broken: the VLAN document must carry the attribute"
+        assert await attach_to_job(db, generation, await db.get(Job, job_id))
+        await db.commit()
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, new_callable=AsyncMock) as sender,
+    ):
+        await _run_apply_worker(job_id=job_id, device_id=device_id)
+
+    sender.assert_not_awaited()
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded, job.error
+        assert job.result["row_outcomes"] == []
+        assert (await db.get(InterfaceAttrState, attr_id)).sync_state == SyncState.accepted
+
+
+async def _attach_lane_generations(device_id: int, job_id: int, authorized: str, executed: str) -> None:
+    """Authorize *authorized* in an earlier generation, then attach an *executed*-only generation to the job."""
+    from nso_adapter.core.generation import attach_to_job, create_generation, note_write
+    from nso_adapter.store.models import GenerationMode
+
+    async with session() as db:
+        for stream in (authorized, executed):
+            await note_write(db, device_id, stream)
+        await create_generation(db, device_id, streams=(authorized,), mode=GenerationMode.networked)
+        generation = await create_generation(db, device_id, streams=(executed,), mode=GenerationMode.networked)
+        assert generation.stream_revisions == {executed: 1}
+        assert await attach_to_job(db, generation, await db.get(Job, job_id))
+        await db.commit()
+
+
+async def test_run_apply_ip_job_leaves_authorized_interface_attributes_to_their_own_stream(adapter_client):
+    """An ``ip``-only job shares the interface section but neither counts nor stamps its attributes."""
+    from nso_adapter.store.models import InterfaceAttrState
+
+    device_id = await _seed_device("rtr-a19", 119)
+    _iface_id, attr_id = await _seed_interface_with_intent(
+        device_id=device_id,
+        iface_name="GigabitEthernet0/5",
+        attribute="description",
+        intent_value="pending-iface",
+        sync_state=SyncState.accepted,
+        netbox_id=205,
+    )
+    job_id = await _seed_apply_job(device_id)
+    await _attach_lane_generations(device_id, job_id, authorized="interface_config", executed="ip")
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, new_callable=AsyncMock) as sender,
+    ):
+        await _run_apply_worker(job_id=job_id, device_id=device_id)
+
+    sender.assert_not_awaited()
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded, job.error
+        assert job.result["row_outcomes"] == []
+        assert (await db.get(InterfaceAttrState, attr_id)).sync_state == SyncState.accepted
+
+
+async def test_run_apply_interface_job_leaves_authorized_addresses_to_the_ip_stream(adapter_client):
+    """An ``interface_config``-only job with no attribute is a no-op, although the section carries an address."""
+    from nso_adapter.store.models import InterfaceIpIntent
+
+    device_id = await _seed_device("rtr-a20", 120)
+    iface_id = await _seed_iface(device_id, "GigabitEthernet0/6")
+    await _seed_ip_intent(iface_id, address="10.0.20.1/24")
+    job_id = await _seed_apply_job(device_id)
+    await _attach_lane_generations(device_id, job_id, authorized="ip", executed="interface_config")
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, new_callable=AsyncMock) as sender,
+    ):
+        await _run_apply_worker(job_id=job_id, device_id=device_id)
+
+    sender.assert_not_awaited()
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded, job.error
+        assert job.result["row_outcomes"] == []
+        ip_row = (
+            (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface_id)))
+            .scalars()
+            .one()
+        )
+        assert ip_row.last_apply_at is None
+
+
+async def test_run_apply_flex_algo_job_leaves_authorized_isis_rows_to_the_isis_stream(adapter_client):
+    """An ``isis_flex_algo``-only job with no flex-algo row is a no-op, although the section carries a process."""
+    from nso_adapter.store.models import IsisProcessIntent
+
+    device_id = await _seed_device("rtr-a21", 121)
+    async with session() as db:
+        db.add(IsisProcessIntent(device_id=device_id, accepted_at=datetime.now(UTC)))
+        await db.commit()
+    job_id = await _seed_apply_job(device_id)
+    await _attach_lane_generations(device_id, job_id, authorized="isis", executed="isis_flex_algo")
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, new_callable=AsyncMock) as sender,
+    ):
+        await _run_apply_worker(job_id=job_id, device_id=device_id)
+
+    sender.assert_not_awaited()
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded, job.error
+        assert job.result["row_outcomes"] == []
+        process = (
+            (await db.execute(select(IsisProcessIntent).where(IsisProcessIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        assert process.last_apply_at is None
+
+
+async def test_run_apply_vlan_job_leaves_a_carried_static_route_plan_to_its_own_stream(adapter_client):
+    """A ``vlan``-only job carries an earlier static-route plan in its body but neither checks nor counts it."""
+    from nso_adapter.store.models import StaticRouteIntent
+
+    device_id = await _seed_device("rtr-a22", 122)
+    async with session() as db:
+        db.add(VlanIntent(device_id=device_id, vlan_id=22, accepted_at=datetime.now(UTC)))
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id,
+                vrf="",
+                prefix="198.18.22.0/24",
+                next_hop="10.0.0.1",
+                accepted_at=datetime.now(UTC),
+            )
+        )
+        await db.commit()
+    job_id = await _seed_apply_job(device_id)
+    await _attach_lane_generations(device_id, job_id, authorized="static_route", executed="vlan")
+
+    mock_client = _nso_client()
+    mock_client.run_device_state_read.return_value = {
+        **_rc_action("rtr-a22", "static_route", {"status": "ok", "route": []}),  # never landed; not this job's
+        "vlan-database": {"status": "ok", "vlan": [{"vlan-id": 22}]},
+    }
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch(_SENDER, new_callable=AsyncMock) as sender,
+    ):
+        await _run_apply_worker(job_id=job_id, device_id=device_id)
+
+    assert [route["prefix"] for route in sent_list(sender, "static-route", "route")] == ["198.18.22.0/24"]
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded, job.error
+        assert "static_route" not in job.result["reader_compare"]
+        assert {outcome["stream"] for outcome in job.result["row_outcomes"]} == {"vlan"}
+        route = (
+            (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        assert route.last_apply_at is None
 
 
 async def test_run_apply_outer_exception(adapter_client):
@@ -920,7 +1108,7 @@ async def test_run_apply_outer_exception(adapter_client):
     job_id = await _seed_apply_job(device_id)
 
     with patch("nso_adapter.core.importer.get_nso_client", side_effect=RuntimeError("DB boom")):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -988,7 +1176,7 @@ async def test_run_apply_ip_intent_success(adapter_client):
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_nso),
         patch(_SENDER, new_callable=AsyncMock) as sender,
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -1031,7 +1219,7 @@ async def test_run_apply_ip_intent_failure_marks_error(adapter_client):
             side_effect=NsoApplyError("nso_patch_failed", "NSO returned 500"),
         ),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -1059,14 +1247,14 @@ async def test_run_apply_ip_intent_not_accepted_skipped(adapter_client):
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_nso),
         patch(_SENDER, new_callable=AsyncMock) as sender,
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     sender.assert_not_awaited()
 
 
 @pytest.mark.anyio
 async def test_run_apply_ip_already_applied_skipped_without_force(adapter_client):
-    """IP rows with last_apply_at set and no error are skipped when force=False."""
+    """IP rows with last_apply_at set and no error are skipped when the worker does not force."""
     from datetime import UTC, datetime
 
     from sqlalchemy import select
@@ -1094,8 +1282,9 @@ async def test_run_apply_ip_already_applied_skipped_without_force(adapter_client
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_nso),
         patch(_SENDER, new_callable=AsyncMock) as sender,
+        patch("nso_adapter.core.apply.WORKER_APPLY_FORCE", False),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=False)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     sender.assert_not_awaited()
 
@@ -1123,7 +1312,7 @@ async def test_run_apply_bgp_intent_does_not_crash_on_commit(adapter_client):
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)  # must not raise
+        await run_apply(job_id=job_id, device_id=device_id)  # must not raise
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -1214,7 +1403,7 @@ async def test_run_apply_family_is_transmitted_and_stamped(
         patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
         patch(_SENDER, sender),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     sender.assert_awaited_once()
     assert len(sent_list(sender, container, label)) == 1, sent_document(sender)
@@ -1250,7 +1439,7 @@ async def test_run_apply_logging_transmits_and_stamps_the_levels_singleton(adapt
         patch(_SENDER, sender),
         patch("nso_adapter.nso.apply.local_levels_write_enabled", return_value=True),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     logging_body = sent_document(sender)["logging"]
     assert logging_body["host"][0]["address"] == "10.9.0.98"
@@ -1288,7 +1477,7 @@ async def test_run_apply_logging_levels_only_is_eligible(adapter_client):
         patch(_SENDER, sender),
         patch("nso_adapter.nso.apply.local_levels_write_enabled", return_value=True),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     sender.assert_awaited_once()
     async with session() as db:
@@ -1324,7 +1513,7 @@ async def test_gated_local_levels_refuse_the_whole_send(adapter_client):
         patch(_SENDER, sender),
         patch("nso_adapter.nso.apply.local_levels_write_enabled", return_value=False),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     sender.assert_not_awaited()
     async with session() as db:
@@ -1373,7 +1562,7 @@ async def test_ordinary_rejection_restores_all_attempted_families(adapter_client
         patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
         patch(_SENDER, AsyncMock(side_effect=nso_err)),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -1419,7 +1608,7 @@ async def test_run_apply_unexpected_send_exception_is_recorded_as_internal(adapt
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock, side_effect=RuntimeError("kaboom")),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -1465,7 +1654,7 @@ async def test_run_apply_isis_subscope_failure_fails_the_job(adapter_client, mod
         patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
         patch(_SENDER, new_callable=AsyncMock, side_effect=nso_err),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -1497,7 +1686,7 @@ async def test_run_apply_isis_subscope_success_is_counted(adapter_client, model_
         patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
         patch(_SENDER, new_callable=AsyncMock) as mock_apply,
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     mock_apply.assert_awaited_once()
     async with session() as db:
@@ -1545,7 +1734,7 @@ async def test_run_apply_isis_applies_process_redist_and_flexalgo(adapter_client
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock) as sender,
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     sender.assert_awaited_once()
     isis = sent_document(sender)["isis"]
@@ -1601,7 +1790,7 @@ async def test_run_apply_ospf_applies_instance_interface_and_redist(adapter_clie
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock) as sender,
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     sender.assert_awaited_once()
     ospf = sent_document(sender)["ospf"]
@@ -1658,7 +1847,7 @@ async def test_run_apply_snmp_applies_all_row_types(adapter_client):
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock) as sender,
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     sender.assert_awaited_once()
     snmp = sent_document(sender)["snmp"]
@@ -1722,7 +1911,7 @@ async def test_run_apply_route_policy_failure_records_capability(adapter_client)
         ),
         patch("nso_adapter.core.capability.record_capability_rejection", new=rec),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     rec.assert_awaited_once()
     async with session() as db:
@@ -1767,7 +1956,7 @@ async def test_run_apply_route_policy_capability_recording_is_best_effort(adapte
             side_effect=RuntimeError("capability backend down"),
         ) as rec,
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)  # must not raise
+        await run_apply(job_id=job_id, device_id=device_id)  # must not raise
 
     rec.assert_awaited_once()
     async with session() as db:
@@ -1806,7 +1995,7 @@ async def test_run_apply_route_policy_capability_skips_record_when_unparseable(a
         patch("nso_adapter.core.capability.parse_rejected_construct", return_value=(None, None)),
         patch("nso_adapter.core.capability.record_capability_rejection", new=rec),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     rec.assert_not_awaited()
     async with session() as db:
@@ -1832,7 +2021,7 @@ async def test_run_apply_ip_unexpected_exception(adapter_client):
             side_effect=RuntimeError("transport exploded"),
         ),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -1931,7 +2120,7 @@ async def test_the_document_carries_the_subif_and_its_address_in_one_commit(adap
         patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
         patch(_SENDER, sender),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     sender.assert_awaited_once()
     (iface_entry,) = sent_list(sender, "interface", "interface")
@@ -1964,7 +2153,7 @@ async def test_the_document_carries_every_family_the_device_authorized(adapter_c
         patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
         patch(_SENDER, sender),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     sender.assert_awaited_once()
     containers = sent_document(sender)
@@ -2007,7 +2196,7 @@ async def test_attributes_and_addresses_merge_into_one_interface_entry(adapter_c
         patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
         patch(_SENDER, sender),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     gi = [e for e in sent_list(sender, "interface", "interface") if e["interface-name"] == "Gi0/1"]
     assert len(gi) == 1  # ONE merged entry, not two
@@ -2074,7 +2263,7 @@ async def test_a_rejected_interface_family_is_attributed_to_the_offending_half(a
         patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
         patch(_SENDER, _sender),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         caps = (
@@ -2133,7 +2322,7 @@ async def test_a_clean_commit_clears_the_stale_reactive_unsupported(adapter_clie
         patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
         patch(_SENDER, AsyncMock(return_value=None)),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         by_key = {
@@ -2201,7 +2390,7 @@ async def test_run_apply_misconfig_device_rejection_records_no_capability(adapte
     with ExitStack() as stack:
         stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
         stack.enter_context(patch(_SENDER, _sender))
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         assert (await db.execute(select(DeviceCapability))).scalars().all() == []  # NOT a capability gap
@@ -2238,7 +2427,7 @@ async def test_run_apply_transient_failure_records_no_capability(adapter_client)
     with ExitStack() as stack:
         stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
         stack.enter_context(patch(_SENDER, _sender))
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         assert (await db.execute(select(DeviceCapability))).scalars().all() == []  # nothing recorded
@@ -2253,7 +2442,7 @@ async def test_run_apply_marks_failed_even_when_session_poisoned(adapter_client,
     job_id = await _seed_apply_job(device_id)
     poison_reached = False
 
-    async def _poison(db, job, job_id, device_id, force, *, reg):
+    async def _poison(db, job, job_id, device_id, *, reg):
         nonlocal poison_reached
         poison_reached = True
         # A real DB error (duplicate PK) puts the AsyncSession into a needs-rollback state,
@@ -2270,7 +2459,7 @@ async def test_run_apply_marks_failed_even_when_session_poisoned(adapter_client,
         await db.flush()  # IntegrityError → session poisoned; propagates to run_apply's handler
 
     with patch("nso_adapter.core.apply._execute_apply", _poison):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     assert poison_reached, "the test double must reach the real database error"
     async with session() as db:
@@ -2294,7 +2483,7 @@ async def test_a_body_build_failure_reverts_deploying(adapter_client):
 
     mock_client = _nso_client()
     with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         assert (await db.get(Job, job_id)).status == JobStatus.failed
@@ -2343,7 +2532,7 @@ async def test_an_apply_is_blocked_when_the_document_would_flush_a_live_orphan(a
         patch(_SENDER, sender),
         capture_logs() as logs,
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     committed = [call for call in sender.await_args_list if not call.kwargs.get("dry_run")]
     assert committed == [], "a blocked document must not be committed"
@@ -2422,7 +2611,7 @@ async def test_run_apply_reader_compare_flags_silent_drop(adapter_client):
         patch(_SENDER, new_callable=AsyncMock),
         capture_logs() as logs,
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -2475,7 +2664,7 @@ async def test_run_apply_reader_compare_ok_when_key_lands(adapter_client):
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -2542,7 +2731,7 @@ async def test_run_apply_reader_compare_does_not_fail_a_landed_community(adapter
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -2589,7 +2778,7 @@ async def test_run_apply_reader_compare_still_catches_a_dropped_snmp_host(adapte
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -2635,7 +2824,7 @@ async def test_run_apply_reader_compare_absent_reader_surface_is_not_a_drop(adap
         patch(_SENDER, new_callable=AsyncMock),
         capture_logs() as logs,
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -2686,7 +2875,7 @@ async def test_run_apply_reader_compare_empty_list_payload_is_still_a_drop(adapt
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -2750,7 +2939,7 @@ async def test_run_apply_reader_compare_skips_a_fully_unrepresentable_community_
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -2799,7 +2988,7 @@ async def test_run_apply_reader_compare_still_fails_a_representable_community_li
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -2833,7 +3022,7 @@ async def test_run_apply_reader_compare_reader_error_is_nonfatal(adapter_client)
         patch(_SENDER, new_callable=AsyncMock),
         capture_logs() as logs,
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -2874,7 +3063,7 @@ async def test_run_apply_reader_compare_prepare_error_uses_device_id(adapter_cli
         patch(_SENDER, new_callable=AsyncMock),
         capture_logs() as logs,
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -2914,7 +3103,7 @@ async def test_run_apply_reader_compare_bgp_checks_router_and_peers(adapter_clie
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -2962,7 +3151,7 @@ async def test_run_apply_reader_compare_isis_flags_only_missing_model(adapter_cl
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -3030,7 +3219,7 @@ async def _apply_snmp(device_id: int, job_id: int, snmp_view: dict) -> Job:
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
     async with session() as db:
         return await db.get(Job, job_id)
 
@@ -3231,7 +3420,7 @@ async def test_all_unverifiable_scope_runs_NO_action_and_is_unknown(adapter_clie
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     mock_client.run_device_state_read.assert_not_awaited()  # never ran the action
     async with session() as db:
@@ -3285,7 +3474,7 @@ async def test_reader_compare_batches_ONE_action_for_every_family(adapter_client
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, AsyncMock(return_value=None)),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     assert len(calls) == 1, f"expected exactly one batched action, got {calls}"
     assert set(calls[0]) == {"static-route", "snmp-config"}
@@ -3322,7 +3511,7 @@ async def test_reader_compare_non_terminal_section_is_error(adapter_client):
         patch(_SENDER, new_callable=AsyncMock),
         capture_logs() as logs,
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -3363,7 +3552,7 @@ async def test_reader_compare_malformed_ok_section_is_error_not_job_crash(adapte
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -3405,7 +3594,7 @@ async def test_reader_compare_malformed_batched_section_is_error_not_job_crash(a
         patch(_SENDER, AsyncMock(return_value=None)),
         capture_logs() as logs,
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -3447,7 +3636,7 @@ async def test_action_failure_preserves_unverifiable_labels(adapter_client, vaul
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -3606,7 +3795,7 @@ async def test_an_origin_construction_failure_fails_its_family_not_the_job_build
         patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
         patch(_SENDER, sender),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
 
     assert [call for call in sender.await_args_list if not call.kwargs.get("dry_run")] == []
     async with session() as db:

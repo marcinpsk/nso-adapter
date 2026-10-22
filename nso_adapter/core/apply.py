@@ -24,7 +24,7 @@ from nso_adapter.core.community_dialect import community_dialect_for
 from nso_adapter.core.generation import (
     executing_generation,
     generation_execution_context,
-    generation_execution_sections,
+    generation_execution_streams,
 )
 from nso_adapter.core.projection import (
     NoComparison,
@@ -35,6 +35,8 @@ from nso_adapter.core.projection import (
     section_context,
     section_models,
     section_registry,
+    stream_section,
+    stream_tables,
 )
 from nso_adapter.core.static_route_plan import (
     SrPlan,
@@ -47,6 +49,7 @@ from nso_adapter.nso.apply import NsoApplyError
 from nso_adapter.nso.client import failure_detail
 from nso_adapter.nso.origins import (
     EncodedSection,
+    LogicalRow,
     OriginConstructionError,
     OriginContext,
     OriginIndex,
@@ -73,6 +76,9 @@ logger = structlog.get_logger(__name__)
 #: The apply preview's one key. One document is one transaction, so it renders one delta;
 #: the key names the write, not a family.
 PREVIEW_KEY = "device_intent"
+
+#: Every apply run selects with this value, and unprepared-run evidence selects with the same one.
+WORKER_APPLY_FORCE = True
 
 
 class ApplyPreview(NamedTuple):
@@ -634,13 +640,33 @@ def overlay_retained_routes(encoded: EncodedSection, retained: list[dict]) -> se
     return keys
 
 
-def encode_device_document(document: dict, *, origin_context: OriginContext | None = None) -> EncodedSection:
-    """Encode the carried containers and combine their exact origins."""
+def encode_device_document(
+    document: dict,
+    *,
+    rows_by_section: Mapping[str, Mapping[str, list]] | None = None,
+    proof_by_section: Mapping[str, Any] | None = None,
+    origin_context: OriginContext | None = None,
+) -> EncodedSection:
+    """Encode the carried containers and combine their exact origins.
+
+    *rows_by_section* and *proof_by_section* are the same document-derived inputs
+    :func:`build_device_containers` receives, so both encode one membership. A section that
+    cannot be encoded contributes nothing, as in :func:`build_device_containers`.
+    """
     containers = {}
     origins = OriginIndex()
     for section, entry in section_registry().items():
         if section in document:
-            encoded = encode_section(document, section, origin_context=origin_context)
+            try:
+                encoded = encode_section(
+                    document,
+                    section,
+                    rows=(rows_by_section or {}).get(section),
+                    proof=(proof_by_section or {}).get(section),
+                    origin_context=origin_context,
+                )
+            except NsoApplyError:
+                continue
             containers[entry.container] = encoded.body
             origins.merge(encoded.origins)
     return EncodedSection(containers, origins)
@@ -924,6 +950,119 @@ async def _collect_eligible(db: AsyncSession, model, device_id: int, force: bool
     return [r for r in rows if _is_eligible(r, force)]
 
 
+class FrozenApplySelection(NamedTuple):
+    """What one apply of a frozen document encodes and attempts, chosen from that document alone.
+
+    The send path and the unprepared-run evidence both read it, so the rows a run attempts
+    and the rows it reports as not applied cannot drift apart (#1825).
+    """
+
+    document: dict
+    #: The sections the carried streams execute.
+    sections: frozenset[str]
+    #: The ``(section, table)`` pairs the carried streams own: a split section executes only its carried lane.
+    executed: frozenset[tuple[str, str]]
+    force: bool
+    #: The encoder's rows per section, table name -> rows.
+    rows: dict[str, dict[str, list]]
+    #: The hydrated rows of every executed section and of the interface section.
+    hydrated: dict[str, dict[type, list]]
+    #: The frozen interface writer context, or ``None`` when the document has no interface section.
+    interface: Any
+    #: The interface attribute rows the frozen context marks eligible, when ``interface_config`` is executed.
+    attributes: tuple
+    #: Hydrated whenever the document CARRIES the section, executed or not.
+    static_route: SrPlan | None
+
+    def executes(self, section: str, model) -> bool:
+        """Report whether a carried stream owns *model* in *section*."""
+        return (section, model.__tablename__) in self.executed
+
+    def push(self, section: str, model) -> list:
+        """Return the eligible document rows of *model* when a carried stream owns it."""
+        if not self.executes(section, model):
+            return []
+        return [row for row in self.hydrated[section].get(model, []) if _is_eligible(row, self.force)]
+
+    def sent(self, section: str) -> list:
+        """Return the rows *section*'s body carries for this run to record."""
+        if section == "static_route" and self.static_route is not None:
+            return list(self.static_route.rows) if self.executes(section, StaticRouteIntent) else []
+        if section == "interface_config":
+            return []
+        return [
+            row
+            for spec in section_registry()[section].tables
+            if _stampable(spec)
+            for row in self.push(section, spec.model)
+        ]
+
+    def identities(self) -> set[tuple[str, int]]:
+        """Return every attempted frozen row as its live stamp join."""
+        rows = [row for section in self.rows for row in self.sent(section)]
+        rows.extend(self.attributes)
+        if "interface_config" in self.rows:
+            rows.extend(self.push("interface_config", InterfaceIpIntent))
+        return {(row.__tablename__, row.id) for row in rows}
+
+
+def select_frozen_apply(document: dict, streams: frozenset[str], *, force: bool) -> FrozenApplySelection:
+    """Select what an apply of *document* encodes and attempts, with no live row and no device."""
+    from nso_adapter.core.projection import rows_by_table
+    from nso_adapter.store.models import StaticRouteTombstone
+
+    sections = frozenset(stream_section(stream) for stream in streams)
+    executed = frozenset((stream_section(stream), table) for stream in streams for table in stream_tables(stream))
+    static_route = hydrate_static_route_apply_plan(document) if "static_route" in document else None
+    rows: dict[str, dict[str, list]] = {}
+    hydrated: dict[str, dict[type, list]] = {}
+    for section in section_registry():
+        if section not in document:
+            continue
+        loaded = hydrate_section(document, section)
+        rows[section] = rows_by_table(section, loaded)
+        if section == "static_route" and static_route is not None:
+            # The frozen plan owns which rows and which carriers this document executes.
+            rows[section] = {
+                **rows[section],
+                StaticRouteIntent.__tablename__: list(static_route.rows),
+                StaticRouteTombstone.__tablename__: list(static_route.tombstones),
+            }
+        if section in sections or section == "interface_config":
+            hydrated[section] = loaded
+    selection = FrozenApplySelection(document, sections, executed, force, rows, hydrated, None, (), static_route)
+    if "interface_config" not in document:
+        return selection
+    interface = hydrate_interface_execution(document)
+    attribute_rows = hydrated["interface_config"].get(InterfaceIntent, [])
+    for row in [*attribute_rows, *hydrated["interface_config"].get(InterfaceIpIntent, [])]:
+        if row.interface_id not in interface.interfaces:
+            raise ValueError(f"interface_config document has no context for interface id {row.interface_id}")
+    attributes = tuple(
+        row
+        for row in attribute_rows
+        if selection.executes("interface_config", InterfaceIntent)
+        and (row.interface_id, row.attribute) in interface.eligible_attributes
+    )
+    return selection._replace(interface=interface, attributes=attributes)
+
+
+def eligible_membership(membership: tuple[LogicalRow, ...], selection: FrozenApplySelection) -> tuple[LogicalRow, ...]:
+    """Keep the logical rows whose carrier an attempted frozen row owns."""
+    eligible = selection.identities()
+    carriers = {
+        logical.carrier
+        for logical in membership
+        if any(
+            source.live_stamp_join in eligible
+            and source.source_table == logical.carrier.source_table
+            and source.content_identity == logical.carrier.content_identity
+            for source in logical.source_refs
+        )
+    }
+    return tuple(logical for logical in membership if logical.carrier in carriers)
+
+
 class _Rows(NamedTuple):
     """One model's contribution to an apply pass, split by what each half is FOR.
 
@@ -965,46 +1104,27 @@ class _Projection:
     this read cannot be deployed under the wrong generation's identity.
 
     The worker refuses an Apply without a generation before constructing this source. Every
-    selected section is therefore hydrated from one immutable document.
+    selected section is therefore hydrated from one immutable document, by
+    :func:`select_frozen_apply`; this class adds only the live rows a run stamps.
     """
 
-    def __init__(
-        self,
-        db: AsyncSession,
-        device_id: int,
-        force: bool,
-        document: dict,
-        sections: frozenset[str],
-    ):
+    def __init__(self, db: AsyncSession, device_id: int, selection: FrozenApplySelection):
         self._db = db
         self._device_id = device_id
-        self._force = force
-        self._document = document
-        self._sections = sections
-        self._hydrated: dict[str, dict[type, list]] = {}
-        self._live: dict[tuple[type, bool], list] = {}
+        self.selection = selection
+        self._live: dict[type, list] = {}
 
-    def _document_rows(self, section: str) -> dict[type, list]:
-        if self._document is None:
-            raise RuntimeError("document rows requested without a deployment document")
-        if section not in self._hydrated:
-            self._hydrated[section] = hydrate_section(self._document, section)
-        return self._hydrated[section]
-
-    async def collect(self, model, *, section: str, force: bool | None = None) -> _Rows:
+    async def collect(self, model, *, section: str) -> _Rows:
         if model not in section_models({section}):
             raise ValueError(f"{model.__name__} does not belong to projection section {section!r}")
-        if section not in self._sections:
+        if not self.selection.executes(section, model):
             return _Rows(push=[], stamp=[])
-        effective_force = self._force if force is None else force
-        live_key = (model, effective_force)
-        if live_key not in self._live:
-            self._live[live_key] = await _collect_eligible(self._db, model, self._device_id, effective_force)
-        live = self._live[live_key]
+        if model not in self._live:
+            self._live[model] = await _collect_eligible(self._db, model, self._device_id, self.selection.force)
+        live = self._live[model]
         if model is RedistributionIntent:
             live = [row for row in live if row.dest_protocol == section]
-        document_rows = self._document_rows(section).get(model, [])
-        push = [row for row in document_rows if _is_eligible(row, effective_force)]
+        push = self.selection.push(section, model)
         # Matched on CONTENT, not on the id alone. A successor push rewrites a row in place,
         # so the id it kept says nothing about whether this document carried what the row now
         # holds; stamping on the id would report the successor's intent as applied by a
@@ -1067,10 +1187,10 @@ class _InterfaceApply(NamedTuple):
 _NO_INTERFACE = _InterfaceApply(None, [], {}, None, [], [])
 
 
-async def _collect_document_interface(db: AsyncSession, source: _Projection, document: dict) -> _InterfaceApply:
-    """Hydrate interface rows and consume their creation-time execution context."""
-    execution = hydrate_interface_execution(document)
-    document_attr_rows = source._document_rows("interface_config").get(InterfaceIntent, [])
+async def _collect_document_interface(db: AsyncSession, source: _Projection) -> _InterfaceApply:
+    """Join the selected interface rows to the live rows and states this run may stamp."""
+    execution = source.selection.interface
+    document_attr_rows = source.selection.hydrated["interface_config"].get(InterfaceIntent, [])
     interface_ids = list(execution.interfaces)
     live_attr_rows = (
         (await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id.in_(interface_ids))))
@@ -1089,34 +1209,28 @@ async def _collect_document_interface(db: AsyncSession, source: _Projection, doc
         else []
     )
     state_by_key = {(state.interface_id, state.attribute): state for state in states}
+    intent_snapshot = [
+        {
+            "interface": execution.interfaces[row.interface_id].name,
+            "attribute": row.attribute,
+            "intent_value": row.intent_value,
+            "accepted_at": row.accepted_at.isoformat() if row.accepted_at else None,
+            "status_at_snapshot": "eligible"
+            if (row.interface_id, row.attribute) in execution.eligible_attributes
+            else "ineligible",
+        }
+        for row in document_attr_rows
+    ]
     eligible: list[_AttributeApply] = []
-    intent_snapshot: list[dict] = []
-    for row in document_attr_rows:
-        key = (row.interface_id, row.attribute)
-        iface = execution.interfaces.get(row.interface_id)
-        if iface is None:
-            raise ValueError(f"interface_config document has no context for interface id {row.interface_id}")
-        is_eligible = key in execution.eligible_attributes
-        intent_snapshot.append(
-            {
-                "interface": iface.name,
-                "attribute": row.attribute,
-                "intent_value": row.intent_value,
-                "accepted_at": row.accepted_at.isoformat() if row.accepted_at else None,
-                "status_at_snapshot": "eligible" if is_eligible else "ineligible",
-            }
-        )
-        if not is_eligible:
-            continue
+    for row in source.selection.attributes:
         stamp = attr_stamp_of.get(_stamp_key(row))
-        eligible.append(_AttributeApply(state_by_key.get(key) if stamp is not None else None, row, iface, stamp))
+        state = state_by_key.get((row.interface_id, row.attribute)) if stamp is not None else None
+        eligible.append(_AttributeApply(state, row, execution.interfaces[row.interface_id], stamp))
 
     ip_by_iface: dict[int, list] = {}
     ip_snapshot: list[dict] = []
     for row in ip_rows.push:
-        iface = execution.interfaces.get(row.interface_id)
-        if iface is None:
-            raise ValueError(f"interface_config document has no context for interface id {row.interface_id}")
+        iface = execution.interfaces[row.interface_id]
         ip_by_iface.setdefault(row.interface_id, []).append(row)
         ip_snapshot.append(
             {
@@ -1356,6 +1470,7 @@ class _ApplyPlan(NamedTuple):
     #: The keys this deployment may drop, per section and guarded list — the guard's authority.
     allowed: dict
     any_eligible: bool
+    selection: FrozenApplySelection
 
 
 @cache
@@ -1373,50 +1488,29 @@ def _stampable(spec) -> bool:
     return spec.parent is None and not spec.lifecycle
 
 
-async def _collect_sections(
-    db: AsyncSession,
-    source: _Projection,
-    document: dict,
-    *,
-    static_route_plan: SrPlan | None,
-) -> dict[str, _SectionApply]:
+async def _collect_sections(source: _Projection) -> dict[str, _SectionApply]:
     """Collect every section the document carries: the body's rows and their live stamps.
 
     The registry is the walk. A section the job does not execute contributes its rows and no
-    bookkeeping; ``_Projection`` decides that, so the two halves cannot drift apart.
+    bookkeeping; the selection decides that, so the two halves cannot drift apart. For the
+    static-route section, *sent* is the plan's own rows: the SAME objects the body carried and
+    the settlement reads, because a send error stamped on another hydration is invisible there.
     """
-    from nso_adapter.core.projection import section_rows_by_table
-    from nso_adapter.store.models import StaticRouteTombstone
-
+    selection = source.selection
     sections: dict[str, _SectionApply] = {}
-    for section, entry in section_registry().items():
-        if section not in document:
-            continue
-        rows = section_rows_by_table(document, section)
-        if section == "static_route" and static_route_plan is not None:
-            # The frozen plan owns which rows and which carriers this document executes.
-            rows = {
-                **rows,
-                StaticRouteIntent.__tablename__: list(static_route_plan.rows),
-                StaticRouteTombstone.__tablename__: list(static_route_plan.tombstones),
-            }
-        sent: list = []
+    for section, rows in selection.rows.items():
         stamp: list = []
         stamp_of: dict = {}
         if section != "interface_config":  # the interface halves keep their own bookkeeping
-            for spec in entry.tables:
+            for spec in section_registry()[section].tables:
                 if not _stampable(spec):
                     continue
                 collected = await source.collect(spec.model, section=section)
-                sent.extend(collected.push)
                 stamp.extend(collected.stamp)
                 stamp_of.update(collected.stamp_of or {})
-        if section == "static_route" and static_route_plan is not None:
-            # The SAME objects the body carried and the settlement reads. Two hydrations of
-            # one document produce equal rows that are not the same objects, so a send error
-            # stamped on one is invisible to the per-route record built from the other.
-            sent = list(static_route_plan.rows)
-        sections[section] = _SectionApply(rows, sent, stamp, stamp_of, section_context(document, section)["ned_id"])
+        sections[section] = _SectionApply(
+            rows, selection.sent(section), stamp, stamp_of, section_context(selection.document, section)["ned_id"]
+        )
     return sections
 
 
@@ -1440,21 +1534,7 @@ async def _run_document_apply(db, device, client, device_name, job, job_id, now,
         static_route_plan=plan.static_route,
         origin_context=context,
     )
-    membership = current_membership(body.origins, context)
-    eligible = {(row.__tablename__, row.id) for section in plan.sections.values() for row in section.sent}
-    eligible.update((item.push.__tablename__, item.push.id) for item in plan.interface.attributes)
-    eligible.update((row.__tablename__, row.id) for row in plan.interface.ip_rows)
-    carriers = {
-        logical.carrier
-        for logical in membership
-        if any(
-            source.live_stamp_join in eligible
-            and source.source_table == logical.carrier.source_table
-            and source.content_identity == logical.carrier.content_identity
-            for source in logical.source_refs
-        )
-    }
-    membership = tuple(logical for logical in membership if logical.carrier in carriers)
+    membership = eligible_membership(current_membership(body.origins, context), plan.selection)
     if body.errors:
         from nso_adapter.core.execution import settle_unsent
 
@@ -1975,13 +2055,13 @@ async def _required_apply_generation(db: AsyncSession, job_id: int):
             "apply_generation_missing",
             f"Apply job {job_id} carries no generation to deploy.",
         )
-    execution_sections = await generation_execution_sections(db, job_id)
-    if execution_sections is None:  # pragma: no cover - the generation above came from this job
-        raise RuntimeError(f"apply job {job_id} lost its generation while selecting execution sections")
-    return generation, execution_sections
+    execution_streams = await generation_execution_streams(db, job_id)
+    if execution_streams is None:  # pragma: no cover - the generation above came from this job
+        raise RuntimeError(f"apply job {job_id} lost its generation while selecting execution streams")
+    return generation, execution_streams
 
 
-async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int, force: bool, *, reg=None) -> None:
+async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int, *, reg=None) -> None:
     """Run the apply body: sync-from, collect the document, PUT it once, finalize the job.
 
     Raises on a missing device / NSO-client error so ``run_apply``'s outer handler can mark
@@ -2000,30 +2080,27 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     # it stands now (#1522 §G1). Between the worker committing `running` and this point a
     # successor push can commit; without the stored document it would be deployed here, under
     # this generation's identity and settled as this generation's revision.
-    generation, execution_sections = await _required_apply_generation(db, job_id)
+    generation, execution_streams = await _required_apply_generation(db, job_id)
     _refuse_unverifiable_recorded_put(generation)
 
     client = get_nso_client(device.nso_instance)
     device_name = device.nso_device_name
 
     document = generation.document
-    source = _Projection(db, device_id, force, document, execution_sections)
-
     # ── Step 1: the document's own rows, plus the live rows this run may stamp ──
-    interface = (
-        await _collect_document_interface(db, source, document) if "interface_config" in document else _NO_INTERFACE
-    )
-    # Hydrated whenever the document CARRIES the section, executed or not: the body asserts
-    # every family of the device, so a section this job does not settle still rides it.
-    sr_plan = hydrate_static_route_apply_plan(document) if "static_route" in document else None
-    sections = await _collect_sections(db, source, document, static_route_plan=sr_plan)
+    selection = select_frozen_apply(document, execution_streams, force=WORKER_APPLY_FORCE)
+    source = _Projection(db, device_id, selection)
+    interface = await _collect_document_interface(db, source) if selection.interface is not None else _NO_INTERFACE
+    # The body asserts every family of the device, so a section this job does not settle still rides it.
+    sr_plan = selection.static_route
+    sections = await _collect_sections(source)
 
     from nso_adapter.core.claim import lock_claim
 
     with db.no_autoflush:
         await lock_claim(db, reg)
     job.context = {
-        "force": force,
+        "force": WORKER_APPLY_FORCE,
         "intent_snapshot": interface.intent_snapshot,
         "ip_snapshot": interface.ip_snapshot,
     }
@@ -2035,7 +2112,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     any_eligible = bool(
         interface.attributes
         or interface.ip_by_iface
-        or any(rows.sent for section, rows in sections.items() if section in execution_sections)
+        or any(rows.sent for section, rows in sections.items() if section in selection.sections)
     )
 
     plan = _ApplyPlan(
@@ -2043,9 +2120,10 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         document=document,
         sections=sections,
         interface=interface,
-        static_route=sr_plan if "static_route" in execution_sections else None,
+        static_route=sr_plan if "static_route" in selection.sections else None,
         allowed=guard_allowed(generation, route_keys=sr_plan.allowed if sr_plan is not None else None),
         any_eligible=any_eligible,
+        selection=selection,
     )
     if not any_eligible:
         await _finalize_empty_job(db, job_id, device_id, reg)
@@ -2100,7 +2178,7 @@ async def _post_apply_refresh_and_notify(db: AsyncSession, device_id: int) -> No
         logger.warning("apply.post_refresh_failed", device_id=device_id, error=failure_detail(exc))
 
 
-async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -> None:
+async def run_apply(job_id: int, device_id: int, reg=None) -> None:
     """Background task: execute the apply for *device_id* (see module docstring §7a).
 
     *reg* is the worker's live ``ClaimRegistration``. R1 stopped it at the job runner, so
@@ -2116,7 +2194,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -
             return
 
         try:
-            await _execute_apply(db, job, job_id, device_id, force, reg=reg)
+            await _execute_apply(db, job, job_id, device_id, reg=reg)
         except ClaimLostError:
             # Revocation is not a runner error: recovery already owns the disposition.
             raise

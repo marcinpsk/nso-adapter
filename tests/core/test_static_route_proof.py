@@ -163,7 +163,7 @@ def proof_client(device_name: str, *, state, section: dict, dry_run_status: int 
     return client, rec
 
 
-async def run_the_apply(device_id: int, client, *, force: bool = True, reg=None) -> Job:
+async def run_the_apply(device_id: int, client, *, reg=None) -> Job:
     from tests.core.execution_helpers import run_apply
 
     job_id = await seed_apply_job(device_id)
@@ -171,7 +171,7 @@ async def run_the_apply(device_id: int, client, *, force: bool = True, reg=None)
         patch("nso_adapter.core.importer.get_nso_client", return_value=client),
         patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=AsyncMock()),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=force, reg=reg)
+        await run_apply(job_id=job_id, device_id=device_id, reg=reg)
     return await read_job(job_id)
 
 
@@ -898,7 +898,7 @@ async def test_a_revoked_claim_stops_the_bookkeeping_transaction(adapter_client)
         patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=AsyncMock()),
         pytest.raises(ClaimLostError),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=True, reg=reg)
+        await run_apply(job_id=job_id, device_id=device_id, reg=reg)
 
     assert await deployed_keys(device_id) == {B: list(A)}
     assert (await read_job(job_id)).status == JobStatus.running, "the runner must not write its own terminal status"

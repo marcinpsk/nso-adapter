@@ -2500,3 +2500,58 @@ async def test_the_vault_read_never_runs_on_the_EVENT_LOOP_thread(adapter_client
     assert provider.reads == 1
     assert provider.read_threads == [provider.read_threads[0]]
     assert provider.read_threads[0] != threading.get_ident(), "the Vault read ran ON the event loop"
+
+
+# ── #1825 L3: a removal that ends before preparation reports its membership not applied ──
+
+
+async def test_1825_l3_a_removal_failing_before_preparation_reports_its_generation_not_applied(adapter_client):
+    """L3: the retry fails before any attempt is prepared, so nothing reaches the device.
+
+    The first run takes the attempt path for the SAME generation (an inconclusive retention
+    read settles the prepared membership unsent). Removal reports the full membership, with
+    no eligibility filter. Forbidden: a terminal, sequenced removal without ``row_outcomes``.
+    """
+    from nso_adapter.store.models import GenerationStatus
+    from tests.core.execution_helpers import run_removal
+    from tests.core.removal_helpers import authorize_static_route
+    from tests.core.test_static_route_put import (
+        B,
+        assert_not_applied,
+        execution_rows,
+        inconclusive,
+        job_generation,
+        retry_job,
+        seed_rows,
+        sr_client,
+        without_route_errors,
+    )
+
+    device_id = await _seed_device(nso_device_name="sw-1825-l3", netbox_device_id=8501)
+    async with session() as db:
+        db.add(VlanIntent(device_id=device_id, vlan_id=10, name="placeholder VLAN", accepted_at=datetime.now(UTC)))
+        await db.commit()
+    await seed_rows(device_id, [{"triple": B, "route_id": 7}])
+    await authorize_static_route(device_id)
+    job_id = await _seed_removal_job(device_id, "vlan", {"removed": {"vlan": [[100]]}})
+    with patch(
+        "nso_adapter.core.importer.get_nso_client", return_value=sr_client("sw-1825-l3", state=inconclusive())[0]
+    ):
+        await run_removal(job_id=job_id, device_id=device_id)
+    attempted = await _job_after(job_id)
+    assert attempted.error["code"] == "static_route_snapshot_inconclusive"
+    assert (await execution_rows(job_id))[0] == 1, "the first run took the attempt path"
+    generation = await job_generation(job_id)
+
+    retry_id = await retry_job(generation.id)
+    with patch("nso_adapter.core.importer.get_nso_client", side_effect=KeyError("placeholder-instance")):
+        await run_removal(job_id=retry_id, device_id=device_id)
+    job = await _job_after(retry_id)
+
+    assert (job.status, job.error["code"]) == (JobStatus.failed, "removal_failed")
+    assert job.result is not None and "row_outcomes" in job.result
+    assert_not_applied(job.result, job.error, generation.id, [])
+    assert {row["stream"] for row in job.result["row_outcomes"]} == {"vlan"}
+    assert without_route_errors(job.result) == without_route_errors(attempted.result)
+    assert await execution_rows(retry_id) == (0, 0)
+    assert (await job_generation(retry_id)).status is GenerationStatus.failed

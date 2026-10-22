@@ -2,8 +2,11 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Runtime transactions over the shared execution-attempt store."""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from functools import partial
+from typing import Literal, NamedTuple
 
+import anyio.to_thread
 import httpx
 import structlog
 from sqlalchemy import select
@@ -21,10 +24,103 @@ from nso_adapter.store.execution_attempt_store import (
     dispose_execution_attempt,
     prepare_execution_attempt,
     record_classified_response,
+    unsent_execution_result,
+    validate_logical_membership,
 )
-from nso_adapter.store.models import ApplyExecutionAttempt, DeploymentGeneration, Job
+from nso_adapter.store.models import ApplyExecutionAttempt, DeploymentGeneration, Job, JobType
 
 logger = structlog.get_logger(__name__)
+
+
+class Unresolved(NamedTuple):
+    """Why a run that prepared no attempt gets no not-applied evidence (#1825)."""
+
+    reason: Literal["attempt_exists", "no_generation", "generation_tampered", "derivation_failed"]
+    exception_type: str | None = None
+
+
+def _unprepared_membership(job_type: JobType, generations: Sequence[DeploymentGeneration]) -> tuple[LogicalRow, ...]:
+    from nso_adapter.core.apply import (
+        WORKER_APPLY_FORCE,
+        eligible_membership,
+        encode_device_document,
+        select_frozen_apply,
+    )
+    from nso_adapter.core.generation import execution_context, execution_streams, validate_generation_execution
+    from nso_adapter.nso.origins import current_membership
+
+    streams = execution_streams(generations)
+    context = execution_context(generations)
+    generation = generations[-1]
+    validate_generation_execution(generation)
+    if job_type is JobType.removal:
+        return current_membership(encode_device_document(generation.document, origin_context=context).origins, context)
+    selection = select_frozen_apply(generation.document, streams, force=WORKER_APPLY_FORCE)
+    encoded = encode_device_document(
+        generation.document,
+        rows_by_section=selection.rows,
+        proof_by_section={"interface_config": selection.interface},
+        origin_context=context,
+    )
+    return eligible_membership(current_membership(encoded.origins, context), selection)
+
+
+def derive_unprepared_evidence(
+    job_type: JobType, generations: Sequence[DeploymentGeneration], error: dict | None, *, attempt_exists: bool
+) -> dict | Unresolved:
+    """Derive the not-applied result of a run that reached no device, from loaded rows alone.
+
+    No session and no I/O: every exception here is a property of the frozen document or of
+    the code, so a retry cannot change it, and the caller keeps its own result instead.
+    """
+    from nso_adapter.core.generation import GenerationTampered, verify_generation_digest
+
+    if attempt_exists:
+        return Unresolved("attempt_exists")
+    if not generations:
+        return Unresolved("no_generation")
+    try:
+        verify_generation_digest(generations[-1])
+        membership = _unprepared_membership(job_type, generations)
+        validate_logical_membership(generations, membership)
+        return unsent_execution_result(generations[-1], membership, error)
+    except GenerationTampered:
+        return Unresolved("generation_tampered")
+    except Exception as exc:  # noqa: BLE001 - fail closed to the lane's own result; the type is logged
+        return Unresolved("derivation_failed", type(exc).__name__)
+
+
+async def unprepared_evidence(
+    db: AsyncSession, job_id: int, job_type: JobType, run_attempt: int, error: dict | None
+) -> dict | None:
+    """Load the locked run's frozen rows and return its not-applied evidence, or ``None``.
+
+    The caller holds the job row lock, so a missing attempt proves that nothing was sent:
+    preparation commits before delivery and needs that lock. Database errors propagate.
+    """
+    attempt_id = await db.scalar(
+        select(ApplyExecutionAttempt.id)
+        .where(ApplyExecutionAttempt.job_correlation_id == job_id, ApplyExecutionAttempt.run_attempt == run_attempt)
+        .limit(1)
+    )
+    generations = list(
+        await db.scalars(
+            select(DeploymentGeneration).where(DeploymentGeneration.job_id == job_id).order_by(DeploymentGeneration.seq)
+        )
+    )
+    # CPU-bound encoding: keep the event loop free while the caller holds the job row lock.
+    derived = await anyio.to_thread.run_sync(
+        partial(derive_unprepared_evidence, job_type, generations, error, attempt_exists=attempt_id is not None)
+    )
+    if isinstance(derived, Unresolved):
+        logger.error(
+            "execution.unprepared_evidence_unresolved",
+            job_id=job_id,
+            reason=derived.reason,
+            exception_type=derived.exception_type,
+        )
+        return None
+    return derived
 
 
 async def prepare_send(

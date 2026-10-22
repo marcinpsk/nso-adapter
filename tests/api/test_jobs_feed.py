@@ -321,3 +321,29 @@ async def test_the_store_incarnation_header_is_present_on_an_empty_page(adapter_
     assert default.headers["X-Store-Incarnation"] == live
     body = default.json()
     assert isinstance(body, list) and body, "the default page is a bare list of rows"
+
+
+# ── #1825: a sequenced apply that failed before preparation carries its outcomes ──
+
+
+async def test_an_apply_failed_before_preparation_reaches_the_feed_with_its_outcomes(adapter_client):
+    """L2: the NSO client cannot be built, so no attempt is prepared and nothing is sent.
+
+    The consumer cannot pass a sequenced apply without ``row_outcomes``: before #1825 this
+    entry stalled the device's settlement cursor behind it for good.
+    """
+    from unittest.mock import patch
+
+    from tests.core.execution_helpers import run_apply
+    from tests.core.test_static_route_put import assert_not_applied, execution_rows, seed_unsent_apply
+
+    device_id, job_id, generation_id, row_id = await seed_unsent_apply("feed-unsent", 8305)
+    with patch("nso_adapter.core.importer.get_nso_client", side_effect=KeyError("placeholder-instance")):
+        await run_apply(job_id=job_id, device_id=device_id)
+
+    (entry,) = await _walk(adapter_client, device_id)
+    assert (entry["id"], entry["status"], entry["settle_seq"]) == (job_id, "failed", 1)
+    assert entry["error"]["code"] == "internal"
+    assert entry["result"] is not None and "row_outcomes" in entry["result"]
+    assert_not_applied(entry["result"], entry["error"], generation_id, [row_id])
+    assert await execution_rows(job_id) == (0, 0)

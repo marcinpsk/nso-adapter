@@ -237,7 +237,7 @@ async def _t11_apply_nothing_eligible() -> tuple[int, int]:
             patch("nso_adapter.core.importer.get_nso_client", return_value=AsyncMock()),
             patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=AsyncMock()),
         ):
-            await run_apply(job_id=job_id, device_id=device_id, force=True, reg=reg)
+            await run_apply(job_id=job_id, device_id=device_id, reg=reg)
     finally:
         await release_claim(reg)
     job = await _job_row(job_id)
@@ -292,7 +292,7 @@ async def _t12_apply_all_ok() -> tuple[int, int]:
             patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=AsyncMock()),
             patch("nso_adapter.nso.apply.apply_device_intent", new_callable=AsyncMock),
         ):
-            await run_apply(job_id=job_id, device_id=device_id, force=True, reg=reg)
+            await run_apply(job_id=job_id, device_id=device_id, reg=reg)
     finally:
         await release_claim(reg)
     job = await _job_row(job_id)
@@ -322,7 +322,7 @@ async def _t13_apply_any_failed() -> tuple[int, int]:
             patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=AsyncMock()),
             patch("nso_adapter.nso.apply.apply_device_intent", new_callable=AsyncMock, side_effect=err),
         ):
-            await run_apply(job_id=job_id, device_id=device_id, force=True, reg=reg)
+            await run_apply(job_id=job_id, device_id=device_id, reg=reg)
     finally:
         await release_claim(reg)
     job = await _job_row(job_id)
@@ -346,7 +346,7 @@ async def _t14_run_apply_fallback() -> tuple[int, int]:
     try:
         # The device the apply is pointed at does not exist, so _execute_apply raises out.
         with patch("nso_adapter.core.importer.get_nso_client", side_effect=KeyError("nso-dev")):
-            await run_apply(job_id=job_id, device_id=99998, force=True, reg=reg)
+            await run_apply(job_id=job_id, device_id=99998, reg=reg)
     finally:
         await release_claim(reg)
     job = await _job_row(job_id)
@@ -583,3 +583,49 @@ async def test_device_null_provision_failure_is_exempt(adapter_client):
     assert failed_provision.status is JobStatus.failed
     assert failed_provision.device_id is None
     assert failed_provision.settle_seq is None
+
+
+# ── #1825: every sequenced apply/removal site carries outcomes, or names why not ──
+
+#: What each device-bound apply/removal site writes: complete ``row_outcomes``, or the closed
+#: reason it stays without them. T15's carrier has no generation, so no membership exists.
+_EVIDENCE = {
+    "T7": "row_outcomes",
+    "T8": "row_outcomes",
+    "T9": "row_outcomes",
+    "T10": "row_outcomes",
+    "T11": "row_outcomes",
+    "T12": "row_outcomes",
+    "T13": "row_outcomes",
+    "T14": "row_outcomes",
+    "T15": "no_generation",
+}
+
+
+def test_the_evidence_inventory_covers_every_apply_and_removal_site():
+    """A new apply or removal site must state its evidence here, not drift in silently."""
+    apply_or_removal = {"T7", "T8", "T9", "T10", "T11", "T12", "T13", "T14", "T15"}
+    assert set(_EVIDENCE) == apply_or_removal <= set(_INVENTORY)
+
+
+@pytest.mark.parametrize("site_id", list(_EVIDENCE))
+async def test_every_sequenced_apply_or_removal_site_carries_outcomes_or_a_closed_reason(adapter_client, site_id):
+    """#1825: the settlement consumer cannot pass a sequenced apply/removal without ``row_outcomes``.
+
+    Forbidden: such a job written silently. Where no membership can be derived, the terminal
+    writer logs its closed reason and keeps the lane's result; it never invents a row set.
+    """
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        _device_id, job_id = await _INVENTORY[site_id].driver()
+
+    job = await _job_row(job_id)
+    assert job.job_type in (JobType.apply, JobType.removal) and job.settle_seq is not None
+    unresolved = [record["reason"] for record in logs if record["event"] == "execution.unprepared_evidence_unresolved"]
+    if _EVIDENCE[site_id] == "row_outcomes":
+        assert job.result is not None and "row_outcomes" in job.result, f"{site_id}: no row outcomes"
+        assert unresolved == []
+    else:
+        assert job.result is None or "row_outcomes" not in job.result
+        assert unresolved == [_EVIDENCE[site_id]]
