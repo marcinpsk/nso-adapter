@@ -650,19 +650,23 @@ def encode_device_document(
     """Encode the carried containers and combine their exact origins.
 
     *rows_by_section* and *proof_by_section* are the same document-derived inputs
-    :func:`build_device_containers` receives, so both encode one membership.
+    :func:`build_device_containers` receives, so both encode one membership. A section that
+    cannot be encoded contributes nothing, as in :func:`build_device_containers`.
     """
     containers = {}
     origins = OriginIndex()
     for section, entry in section_registry().items():
         if section in document:
-            encoded = encode_section(
-                document,
-                section,
-                rows=(rows_by_section or {}).get(section),
-                proof=(proof_by_section or {}).get(section),
-                origin_context=origin_context,
-            )
+            try:
+                encoded = encode_section(
+                    document,
+                    section,
+                    rows=(rows_by_section or {}).get(section),
+                    proof=(proof_by_section or {}).get(section),
+                    origin_context=origin_context,
+                )
+            except NsoApplyError:
+                continue
             containers[entry.container] = encoded.body
             origins.merge(encoded.origins)
     return EncodedSection(containers, origins)

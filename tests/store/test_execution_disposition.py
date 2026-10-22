@@ -1265,3 +1265,64 @@ async def test_1825_unprepared_evidence_is_the_attempt_paths_evidence_for_a_coal
     named = {row["generation_id"] for row in job.result["row_outcomes"]}
     assert named == ({second_id} if repeated else {first_id, second_id})
     assert {row["disposition"] for row in job.result["row_outcomes"]} == {"not_applied"}
+
+
+async def test_1825_unprepared_evidence_skips_a_section_the_attempt_path_cannot_encode(adapter_client, monkeypatch):
+    """A section whose encode fails contributes nothing on BOTH paths; its siblings still report.
+
+    Two IP rows on one interface in different VRFs make the interface section unencodable
+    (competing field producers). The attempt path settles the VLAN row ``not_applied``; DERIVE
+    must return the same result instead of failing the whole derivation.
+    """
+    from datetime import UTC, datetime
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from nso_adapter.core.execution import derive_unprepared_evidence
+    from nso_adapter.core.generation import attach_to_job, create_generation, mark_job_generations_running, note_write
+    from nso_adapter.store.models import DbInterface, InterfaceIpIntent, VlanIntent
+    from tests.conftest import seed_device, session
+    from tests.core.test_static_route_put import absent, run_started_apply, sr_client
+
+    name = "mixed-vrf-ip"
+    device_id = await seed_device(nso_device_name=name, netbox_device_id=9884)
+    now = datetime.now(UTC)
+    async with session() as db:
+        interface = DbInterface(device_id=device_id, name="Ethernet1")
+        db.add(interface)
+        await db.flush()
+        for address, vrf in (("192.0.2.1/24", "VRF-A"), ("198.51.100.1/24", "VRF-B")):
+            db.add(
+                InterfaceIpIntent(interface_id=interface.id, address=address, vrf=vrf, family="ipv4", accepted_at=now)
+            )
+        db.add(VlanIntent(device_id=device_id, vlan_id=10, name="placeholder VLAN", accepted_at=now))
+        job = Job(
+            device_id=device_id, job_type=JobType.apply, status=JobStatus.running, run_attempt=1, coalescible=True
+        )
+        db.add(job)
+        await db.flush()
+        for stream in ("ip", "vlan"):
+            await note_write(db, device_id, stream)
+        generation = await create_generation(db, device_id, streams=("ip", "vlan"), mode=GenerationMode.networked)
+        assert await attach_to_job(db, generation, job)
+        await mark_job_generations_running(db, job.id)
+        await db.commit()
+        job_id = job.id
+
+    job = await run_started_apply(job_id, device_id, sr_client(name, state=absent())[0])
+    assert job.error["code"] == "origin_construction"
+    async with session() as db:
+        generations = list(
+            await db.scalars(sa.select(DeploymentGeneration).where(DeploymentGeneration.job_id == job_id))
+        )
+
+    def _no_session(*_args, **_kwargs):
+        raise AssertionError("DERIVE must not touch a session")
+
+    for method in ("execute", "scalar", "scalars", "get", "flush"):
+        monkeypatch.setattr(AsyncSession, method, _no_session)
+    derived = derive_unprepared_evidence(JobType.apply, generations, job.error, attempt_exists=False)
+
+    assert json.loads(json.dumps(derived)) == job.result
+    assert job.result["row_outcomes"]
+    assert {row["disposition"] for row in job.result["row_outcomes"]} == {"not_applied"}
