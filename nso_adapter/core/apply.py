@@ -24,7 +24,7 @@ from nso_adapter.core.community_dialect import community_dialect_for
 from nso_adapter.core.generation import (
     executing_generation,
     generation_execution_context,
-    generation_execution_sections,
+    generation_execution_streams,
 )
 from nso_adapter.core.projection import (
     NoComparison,
@@ -35,6 +35,8 @@ from nso_adapter.core.projection import (
     section_context,
     section_models,
     section_registry,
+    stream_section,
+    stream_tables,
 )
 from nso_adapter.core.static_route_plan import (
     SrPlan,
@@ -954,6 +956,8 @@ class FrozenApplySelection(NamedTuple):
     document: dict
     #: The sections the carried streams execute.
     sections: frozenset[str]
+    #: The ``(section, table)`` pairs the carried streams own: a split section executes only its carried lane.
+    executed: frozenset[tuple[str, str]]
     force: bool
     #: The encoder's rows per section, table name -> rows.
     rows: dict[str, dict[str, list]]
@@ -966,9 +970,13 @@ class FrozenApplySelection(NamedTuple):
     #: Hydrated whenever the document CARRIES the section, executed or not.
     static_route: SrPlan | None
 
+    def executes(self, section: str, model) -> bool:
+        """Report whether a carried stream owns *model* in *section*."""
+        return (section, model.__tablename__) in self.executed
+
     def push(self, section: str, model) -> list:
-        """Return the eligible document rows of *model* when *section* is executed."""
-        if section not in self.sections:
+        """Return the eligible document rows of *model* when a carried stream owns it."""
+        if not self.executes(section, model):
             return []
         return [row for row in self.hydrated[section].get(model, []) if _is_eligible(row, self.force)]
 
@@ -994,11 +1002,13 @@ class FrozenApplySelection(NamedTuple):
         return {(row.__tablename__, row.id) for row in rows}
 
 
-def select_frozen_apply(document: dict, sections: frozenset[str], *, force: bool) -> FrozenApplySelection:
+def select_frozen_apply(document: dict, streams: frozenset[str], *, force: bool) -> FrozenApplySelection:
     """Select what an apply of *document* encodes and attempts, with no live row and no device."""
     from nso_adapter.core.projection import section_rows_by_table
     from nso_adapter.store.models import StaticRouteTombstone
 
+    sections = frozenset(stream_section(stream) for stream in streams)
+    executed = frozenset((stream_section(stream), table) for stream in streams for table in stream_tables(stream))
     static_route = hydrate_static_route_apply_plan(document) if "static_route" in document else None
     rows: dict[str, dict[str, list]] = {}
     hydrated: dict[str, dict[type, list]] = {}
@@ -1015,18 +1025,19 @@ def select_frozen_apply(document: dict, sections: frozenset[str], *, force: bool
             }
         if section in sections or section == "interface_config":
             hydrated[section] = hydrate_section(document, section)
-    selection = FrozenApplySelection(document, sections, force, rows, hydrated, None, (), static_route)
+    selection = FrozenApplySelection(document, sections, executed, force, rows, hydrated, None, (), static_route)
     if "interface_config" not in document:
         return selection
     interface = hydrate_interface_execution(document)
     attribute_rows = hydrated["interface_config"].get(InterfaceIntent, [])
-    for row in [*attribute_rows, *selection.push("interface_config", InterfaceIpIntent)]:
+    for row in [*attribute_rows, *hydrated["interface_config"].get(InterfaceIpIntent, [])]:
         if row.interface_id not in interface.interfaces:
             raise ValueError(f"interface_config document has no context for interface id {row.interface_id}")
     attributes = tuple(
         row
         for row in attribute_rows
-        if "interface_config" in sections and (row.interface_id, row.attribute) in interface.eligible_attributes
+        if selection.executes("interface_config", InterfaceIntent)
+        and (row.interface_id, row.attribute) in interface.eligible_attributes
     )
     return selection._replace(interface=interface, attributes=attributes)
 
@@ -1101,7 +1112,7 @@ class _Projection:
     async def collect(self, model, *, section: str) -> _Rows:
         if model not in section_models({section}):
             raise ValueError(f"{model.__name__} does not belong to projection section {section!r}")
-        if section not in self.selection.sections:
+        if not self.selection.executes(section, model):
             return _Rows(push=[], stamp=[])
         if model not in self._live:
             self._live[model] = await _collect_eligible(self._db, model, self._device_id, self.selection.force)
@@ -2039,10 +2050,10 @@ async def _required_apply_generation(db: AsyncSession, job_id: int):
             "apply_generation_missing",
             f"Apply job {job_id} carries no generation to deploy.",
         )
-    execution_sections = await generation_execution_sections(db, job_id)
-    if execution_sections is None:  # pragma: no cover - the generation above came from this job
-        raise RuntimeError(f"apply job {job_id} lost its generation while selecting execution sections")
-    return generation, execution_sections
+    execution_streams = await generation_execution_streams(db, job_id)
+    if execution_streams is None:  # pragma: no cover - the generation above came from this job
+        raise RuntimeError(f"apply job {job_id} lost its generation while selecting execution streams")
+    return generation, execution_streams
 
 
 async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int, *, reg=None) -> None:
@@ -2064,7 +2075,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     # it stands now (#1522 §G1). Between the worker committing `running` and this point a
     # successor push can commit; without the stored document it would be deployed here, under
     # this generation's identity and settled as this generation's revision.
-    generation, execution_sections = await _required_apply_generation(db, job_id)
+    generation, execution_streams = await _required_apply_generation(db, job_id)
     _refuse_unverifiable_recorded_put(generation)
 
     client = get_nso_client(device.nso_instance)
@@ -2072,7 +2083,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
 
     document = generation.document
     # ── Step 1: the document's own rows, plus the live rows this run may stamp ──
-    selection = select_frozen_apply(document, execution_sections, force=WORKER_APPLY_FORCE)
+    selection = select_frozen_apply(document, execution_streams, force=WORKER_APPLY_FORCE)
     source = _Projection(db, device_id, selection)
     interface = await _collect_document_interface(db, source) if selection.interface is not None else _NO_INTERFACE
     # The body asserts every family of the device, so a section this job does not settle still rides it.
@@ -2096,7 +2107,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     any_eligible = bool(
         interface.attributes
         or interface.ip_by_iface
-        or any(rows.sent for section, rows in sections.items() if section in execution_sections)
+        or any(rows.sent for section, rows in sections.items() if section in selection.sections)
     )
 
     plan = _ApplyPlan(
@@ -2104,7 +2115,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         document=document,
         sections=sections,
         interface=interface,
-        static_route=sr_plan if "static_route" in execution_sections else None,
+        static_route=sr_plan if "static_route" in selection.sections else None,
         allowed=guard_allowed(generation, route_keys=sr_plan.allowed if sr_plan is not None else None),
         any_eligible=any_eligible,
         selection=selection,

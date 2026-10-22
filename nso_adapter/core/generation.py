@@ -1548,20 +1548,19 @@ async def _job_generations(db: AsyncSession, job_id: int) -> list[DeploymentGene
     )
 
 
-def execution_sections(generations: Sequence[DeploymentGeneration]) -> frozenset[str]:
-    """Return the sections the carried generations execute.
+def execution_streams(generations: Sequence[DeploymentGeneration]) -> frozenset[str]:
+    """Return the streams the carried generations execute.
 
     Adjacent generations can share one apply job. Their streams form the execution boundary,
-    and every selected section uses the highest generation's complete document.
+    and every executed stream uses the highest generation's complete document.
     """
-    streams = {stream for generation in generations for stream in (generation.stream_revisions or {})}
-    return frozenset(stream_section(stream) for stream in streams)
+    return frozenset(stream for generation in generations for stream in (generation.stream_revisions or {}))
 
 
-async def generation_execution_sections(db: AsyncSession, job_id: int) -> frozenset[str] | None:
-    """Return the sections carried by this job, or ``None`` for an invalid carrier."""
+async def generation_execution_streams(db: AsyncSession, job_id: int) -> frozenset[str] | None:
+    """Return the streams carried by this job, or ``None`` for an invalid carrier."""
     generations = await _job_generations(db, job_id)
-    return execution_sections(generations) if generations else None
+    return execution_streams(generations) if generations else None
 
 
 async def generation_execution_context(db: AsyncSession, job_id: int):
@@ -2330,7 +2329,7 @@ __all__ = [
     "create_action_apply",
     "create_reissue_generation",
     "digest_document",
-    "generation_execution_sections",
+    "generation_execution_streams",
     "executable_head",
     "executing_generation",
     "job_admissible",

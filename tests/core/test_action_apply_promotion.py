@@ -915,7 +915,7 @@ async def test_unrelated_promotion_preserves_recorded_interface_eligibility(adap
 
 async def test_coalesced_vlan_successor_preserves_interface_execution(adapter_client):
     """The highest document keeps the immutable plan for every section the shared job executes."""
-    from nso_adapter.core.generation import generation_execution_sections
+    from nso_adapter.core.generation import generation_execution_streams
     from nso_adapter.store.models import JobStatus
     from tests.core.test_generation_protocol import job_row, recorded_client, run_head
 
@@ -939,9 +939,7 @@ async def test_coalesced_vlan_successor_preserves_interface_execution(adapter_cl
     assert vlan_generation.document["interface_config"]["_execution"] == interface_execution
 
     async with session() as db:
-        assert await generation_execution_sections(db, vlan_generation.job_id) == frozenset(
-            {"interface_config", "vlan"}
-        )
+        assert await generation_execution_streams(db, vlan_generation.job_id) == frozenset({"interface_config", "vlan"})
 
     client, _recorder = recorded_client("coalesced-interface-plan")
     assert await run_head(device_id, client) == vlan_generation.job_id

@@ -5,7 +5,7 @@
 import httpx
 import pytest
 
-from nso_adapter.core.generation import generation_execution_sections
+from nso_adapter.core.generation import generation_execution_streams
 from nso_adapter.store.models import GenerationMode, JobStatus
 from tests.api.test_static_route_identity import entry as route_entry
 from tests.conftest import seed_device, session
@@ -80,7 +80,7 @@ async def test_carried_replacement_refuses_unverified_mixed_stream_commit(adapte
     assert route["deployed_key"] == list(_A)
     assert intermediate.document["static_route"]["_execution"]["proof"]["apply"]["mode"] == "PUT"
     async with session() as db:
-        assert "static_route" not in await generation_execution_sections(db, intermediate.job_id)
+        assert "static_route" not in await generation_execution_streams(db, intermediate.job_id)
 
     monkeypatch.setattr("nso_adapter.nso.apply.VERIFY_AFTER_APPLY", False)
     fake.calls.clear()

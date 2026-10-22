@@ -44,16 +44,16 @@ def _unprepared_membership(job_type: JobType, generations: Sequence[DeploymentGe
         encode_device_document,
         select_frozen_apply,
     )
-    from nso_adapter.core.generation import execution_context, execution_sections, validate_generation_execution
+    from nso_adapter.core.generation import execution_context, execution_streams, validate_generation_execution
     from nso_adapter.nso.origins import current_membership
 
-    sections = execution_sections(generations)
+    streams = execution_streams(generations)
     context = execution_context(generations)
     generation = generations[-1]
     validate_generation_execution(generation)
     if job_type is JobType.removal:
         return current_membership(encode_device_document(generation.document, origin_context=context).origins, context)
-    selection = select_frozen_apply(generation.document, sections, force=WORKER_APPLY_FORCE)
+    selection = select_frozen_apply(generation.document, streams, force=WORKER_APPLY_FORCE)
     encoded = encode_device_document(
         generation.document,
         rows_by_section=selection.rows,

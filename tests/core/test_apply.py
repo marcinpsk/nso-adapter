@@ -953,6 +953,110 @@ async def test_run_apply_leaves_unexecuted_interface_attributes_to_their_own_str
         assert (await db.get(InterfaceAttrState, attr_id)).sync_state == SyncState.accepted
 
 
+async def _attach_lane_generations(device_id: int, job_id: int, authorized: str, executed: str) -> None:
+    """Authorize *authorized* in an earlier generation, then attach an *executed*-only generation to the job."""
+    from nso_adapter.core.generation import attach_to_job, create_generation, note_write
+    from nso_adapter.store.models import GenerationMode
+
+    async with session() as db:
+        for stream in (authorized, executed):
+            await note_write(db, device_id, stream)
+        await create_generation(db, device_id, streams=(authorized,), mode=GenerationMode.networked)
+        generation = await create_generation(db, device_id, streams=(executed,), mode=GenerationMode.networked)
+        assert generation.stream_revisions == {executed: 1}
+        assert await attach_to_job(db, generation, await db.get(Job, job_id))
+        await db.commit()
+
+
+async def test_run_apply_ip_job_leaves_authorized_interface_attributes_to_their_own_stream(adapter_client):
+    """An ``ip``-only job shares the interface section but neither counts nor stamps its attributes."""
+    from nso_adapter.store.models import InterfaceAttrState
+
+    device_id = await _seed_device("rtr-a19", 119)
+    _iface_id, attr_id = await _seed_interface_with_intent(
+        device_id=device_id,
+        iface_name="GigabitEthernet0/5",
+        attribute="description",
+        intent_value="pending-iface",
+        sync_state=SyncState.accepted,
+        netbox_id=205,
+    )
+    job_id = await _seed_apply_job(device_id)
+    await _attach_lane_generations(device_id, job_id, authorized="interface_config", executed="ip")
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, new_callable=AsyncMock) as sender,
+    ):
+        await _run_apply_worker(job_id=job_id, device_id=device_id)
+
+    sender.assert_not_awaited()
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded, job.error
+        assert job.result["row_outcomes"] == []
+        assert (await db.get(InterfaceAttrState, attr_id)).sync_state == SyncState.accepted
+
+
+async def test_run_apply_interface_job_leaves_authorized_addresses_to_the_ip_stream(adapter_client):
+    """An ``interface_config``-only job with no attribute is a no-op, although the section carries an address."""
+    from nso_adapter.store.models import InterfaceIpIntent
+
+    device_id = await _seed_device("rtr-a20", 120)
+    iface_id = await _seed_iface(device_id, "GigabitEthernet0/6")
+    await _seed_ip_intent(iface_id, address="10.0.20.1/24")
+    job_id = await _seed_apply_job(device_id)
+    await _attach_lane_generations(device_id, job_id, authorized="ip", executed="interface_config")
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, new_callable=AsyncMock) as sender,
+    ):
+        await _run_apply_worker(job_id=job_id, device_id=device_id)
+
+    sender.assert_not_awaited()
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded, job.error
+        assert job.result["row_outcomes"] == []
+        ip_row = (
+            (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface_id)))
+            .scalars()
+            .one()
+        )
+        assert ip_row.last_apply_at is None
+
+
+async def test_run_apply_flex_algo_job_leaves_authorized_isis_rows_to_the_isis_stream(adapter_client):
+    """An ``isis_flex_algo``-only job with no flex-algo row is a no-op, although the section carries a process."""
+    from nso_adapter.store.models import IsisProcessIntent
+
+    device_id = await _seed_device("rtr-a21", 121)
+    async with session() as db:
+        db.add(IsisProcessIntent(device_id=device_id, accepted_at=datetime.now(UTC)))
+        await db.commit()
+    job_id = await _seed_apply_job(device_id)
+    await _attach_lane_generations(device_id, job_id, authorized="isis", executed="isis_flex_algo")
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(_SENDER, new_callable=AsyncMock) as sender,
+    ):
+        await _run_apply_worker(job_id=job_id, device_id=device_id)
+
+    sender.assert_not_awaited()
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded, job.error
+        assert job.result["row_outcomes"] == []
+        process = (
+            (await db.execute(select(IsisProcessIntent).where(IsisProcessIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        assert process.last_apply_at is None
+
+
 async def test_run_apply_outer_exception(adapter_client):
     """run_apply marks job failed on an outer unexpected exception."""
     device_id = await _seed_device("rtr-a17", 117)
