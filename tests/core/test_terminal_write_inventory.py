@@ -237,7 +237,7 @@ async def _t11_apply_nothing_eligible() -> tuple[int, int]:
             patch("nso_adapter.core.importer.get_nso_client", return_value=AsyncMock()),
             patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=AsyncMock()),
         ):
-            await run_apply(job_id=job_id, device_id=device_id, force=True, reg=reg)
+            await run_apply(job_id=job_id, device_id=device_id, reg=reg)
     finally:
         await release_claim(reg)
     job = await _job_row(job_id)
@@ -292,7 +292,7 @@ async def _t12_apply_all_ok() -> tuple[int, int]:
             patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=AsyncMock()),
             patch("nso_adapter.nso.apply.apply_device_intent", new_callable=AsyncMock),
         ):
-            await run_apply(job_id=job_id, device_id=device_id, force=True, reg=reg)
+            await run_apply(job_id=job_id, device_id=device_id, reg=reg)
     finally:
         await release_claim(reg)
     job = await _job_row(job_id)
@@ -322,7 +322,7 @@ async def _t13_apply_any_failed() -> tuple[int, int]:
             patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=AsyncMock()),
             patch("nso_adapter.nso.apply.apply_device_intent", new_callable=AsyncMock, side_effect=err),
         ):
-            await run_apply(job_id=job_id, device_id=device_id, force=True, reg=reg)
+            await run_apply(job_id=job_id, device_id=device_id, reg=reg)
     finally:
         await release_claim(reg)
     job = await _job_row(job_id)
@@ -346,7 +346,7 @@ async def _t14_run_apply_fallback() -> tuple[int, int]:
     try:
         # The device the apply is pointed at does not exist, so _execute_apply raises out.
         with patch("nso_adapter.core.importer.get_nso_client", side_effect=KeyError("nso-dev")):
-            await run_apply(job_id=job_id, device_id=99998, force=True, reg=reg)
+            await run_apply(job_id=job_id, device_id=99998, reg=reg)
     finally:
         await release_claim(reg)
     job = await _job_row(job_id)

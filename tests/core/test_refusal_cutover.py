@@ -1874,7 +1874,9 @@ async def test_removal_unsent_failure_retains_attempt_evidence(adapter_client, m
         assert row.last_apply_at is not None and row.last_apply_error is None
 
 
-async def test_apply_build_failure_excludes_ineligible_carried_rows(adapter_client, monkeypatch):
+@pytest.mark.parametrize("prepared", [True, False])
+async def test_apply_build_failure_excludes_ineligible_carried_rows(adapter_client, monkeypatch, prepared):
+    """A run and its unprepared evidence select rows with the same ``WORKER_APPLY_FORCE``."""
     from nso_adapter.core.apply import run_apply
 
     device_id, transport = await setup(adapter_client, monkeypatch, admit=False)
@@ -1892,17 +1894,22 @@ async def test_apply_build_failure_excludes_ineligible_carried_rows(adapter_clie
     response = await _apply(adapter_client, device_id, {"vlan": 41, "interface_config": 41, "logging": 41})
     assert response.status_code == 202
     monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "0")
+    monkeypatch.setattr("nso_adapter.core.apply.WORKER_APPLY_FORCE", False)
+    if not prepared:
+
+        def unreachable(_instance):
+            raise httpx.ConnectError("placeholder unreachable")
+
+        monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", unreachable)
 
     async def run_pending(job_id, device_id, reg):
-        await run_apply(job_id, device_id, force=False, reg=reg)
+        await run_apply(job_id, device_id, reg=reg)
 
     job_id = await run_next(device_id, runner=run_pending)
     job = await job_row(job_id)
     assert job.status == JobStatus.failed
-    assert job.error["code"] == "local_levels_gated"
+    assert job.error["code"] == ("local_levels_gated" if prepared else "internal")
     assert transport.documents == []
-    attempts, outcomes = await evidence(device_id)
-    attempt = attempts[-1]
     excluded = row_ref("vlan", "vlan.vlan", (("vlan", (101,)),))
     expected = {
         row_ref("vlan", "vlan.vlan", (("vlan", (102,)),)),
@@ -1913,6 +1920,12 @@ async def test_apply_build_failure_excludes_ineligible_carried_rows(adapter_clie
         ),
     }
     assert {RowRef(row["row"]["subject"], row["row"]["key"]) for row in job.result["row_outcomes"]} == expected
+    assert {row["disposition"] for row in job.result["row_outcomes"]} == {"not_applied"}
+    attempts, outcomes = await evidence(device_id)
+    if not prepared:
+        assert attempts == [], "the unreachable client stops the run before preparation"
+        return
+    attempt = attempts[-1]
     assert {RowRef(row["row"]["subject"], row["row"]["key"]) for row in attempt.logical_membership} == expected
     assert attempt.phase == "terminal" and not attempt.commit_acknowledged
     own = [row for row in outcomes if row.execution_attempt_id == attempt.id]

@@ -75,7 +75,7 @@ logger = structlog.get_logger(__name__)
 #: the key names the write, not a family.
 PREVIEW_KEY = "device_intent"
 
-#: The worker runs every apply with force, and unprepared-run evidence selects with the same value.
+#: Every apply run selects with this value, and unprepared-run evidence selects with the same one.
 WORKER_APPLY_FORCE = True
 
 
@@ -2043,7 +2043,7 @@ async def _required_apply_generation(db: AsyncSession, job_id: int):
     return generation, execution_sections
 
 
-async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int, force: bool, *, reg=None) -> None:
+async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int, *, reg=None) -> None:
     """Run the apply body: sync-from, collect the document, PUT it once, finalize the job.
 
     Raises on a missing device / NSO-client error so ``run_apply``'s outer handler can mark
@@ -2070,7 +2070,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
 
     document = generation.document
     # ── Step 1: the document's own rows, plus the live rows this run may stamp ──
-    selection = select_frozen_apply(document, execution_sections, force=force)
+    selection = select_frozen_apply(document, execution_sections, force=WORKER_APPLY_FORCE)
     source = _Projection(db, device_id, selection)
     interface = await _collect_document_interface(db, source) if selection.interface is not None else _NO_INTERFACE
     # The body asserts every family of the device, so a section this job does not settle still rides it.
@@ -2082,7 +2082,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     with db.no_autoflush:
         await lock_claim(db, reg)
     job.context = {
-        "force": force,
+        "force": WORKER_APPLY_FORCE,
         "intent_snapshot": interface.intent_snapshot,
         "ip_snapshot": interface.ip_snapshot,
     }
@@ -2160,7 +2160,7 @@ async def _post_apply_refresh_and_notify(db: AsyncSession, device_id: int) -> No
         logger.warning("apply.post_refresh_failed", device_id=device_id, error=failure_detail(exc))
 
 
-async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -> None:
+async def run_apply(job_id: int, device_id: int, reg=None) -> None:
     """Background task: execute the apply for *device_id* (see module docstring §7a).
 
     *reg* is the worker's live ``ClaimRegistration``. R1 stopped it at the job runner, so
@@ -2176,7 +2176,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -
             return
 
         try:
-            await _execute_apply(db, job, job_id, device_id, force, reg=reg)
+            await _execute_apply(db, job, job_id, device_id, reg=reg)
         except ClaimLostError:
             # Revocation is not a runner error: recovery already owns the disposition.
             raise

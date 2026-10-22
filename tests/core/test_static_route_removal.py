@@ -238,7 +238,7 @@ async def run_apply_job(device_id: int, client, *, reg=None) -> Job:
             patch("nso_adapter.core.importer.get_nso_client", return_value=client),
             patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=AsyncMock()),
         ):
-            await run_apply(job_id=job_id, device_id=device_id, force=True, reg=reg)
+            await run_apply(job_id=job_id, device_id=device_id, reg=reg)
     finally:
         if own_claim:
             await release_claim(reg)

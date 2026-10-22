@@ -275,7 +275,7 @@ def inconclusive():
     return ServiceInstanceState("inconclusive", None)
 
 
-async def run_the_apply(device_id: int, client, *, force: bool = True) -> Job:
+async def run_the_apply(device_id: int, client) -> Job:
     from tests.core.execution_helpers import run_apply
 
     job_id = await seed_apply_job(device_id)
@@ -283,7 +283,7 @@ async def run_the_apply(device_id: int, client, *, force: bool = True) -> Job:
         patch("nso_adapter.core.importer.get_nso_client", return_value=client),
         patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=AsyncMock()),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=force)
+        await run_apply(job_id=job_id, device_id=device_id)
     return await read_job(job_id)
 
 
@@ -469,7 +469,7 @@ async def test_c2_6_the_preview_payload_is_byte_identical_to_the_applied_one(ada
     ):
         from tests.core.execution_helpers import run_apply
 
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
     job = await read_job(job_id)
     assert job.status == JobStatus.succeeded, job.error
 
@@ -510,7 +510,7 @@ async def test_c2_7_the_replacement_is_refused_when_verification_is_disabled(ada
 # ── C2.8 — the PUT body is every accepted row, force-independent ─────────────
 
 
-async def test_c2_8_a_force_false_apply_still_carries_every_accepted_route(adapter_client):
+async def test_c2_8_a_force_false_apply_still_carries_every_accepted_route(adapter_client, monkeypatch):
     """C2.8 + C1.4's second half — the eligible list is the wrong basis for a replace.
 
     An identity-edited row keeps its ``last_apply_at``, so under ``force=False`` the very
@@ -527,8 +527,9 @@ async def test_c2_8_a_force_false_apply_still_carries_every_accepted_route(adapt
         ],
     )
     client, rec = sr_client("sr-put", state=present(wire(A), wire(C), device_name="sr-put"))
+    monkeypatch.setattr("nso_adapter.core.apply.WORKER_APPLY_FORCE", False)
 
-    job = await run_the_apply(device_id, client, force=False)
+    job = await run_the_apply(device_id, client)
 
     assert job.status == JobStatus.succeeded, job.error
     assert rec.routes(rec.sr_commits("put")[0]) == [wire(B), wire(C)]

@@ -341,14 +341,14 @@ async def test_c5_5b_an_inconclusive_follow_on_verify_closes_nothing_and_still_s
 # ── C2's hand-off: a force=False pass with nothing eligible ─────────────────
 
 
-async def test_a_replacement_is_delivered_even_when_the_eligible_list_is_empty(adapter_client):
+async def test_a_replacement_is_delivered_even_when_the_eligible_list_is_empty(adapter_client, monkeypatch):
     """C1.4's rule at the sender: ``any_eligible`` comes from the PLAN, not the eligible list.
 
     ``force=False`` on a replacement-open row with a clean ``last_apply_at`` leaves the
     eligible list empty while the body still has every accepted row to send and a
     predecessor to retract. Deriving "anything to do" from the eligible list would take the
     all-zero early success and leave the predecessor on the device for ever. Unreachable in
-    production only because the worker passes ``force=True``; the structure must not depend
+    production only because ``WORKER_APPLY_FORCE`` is true; the structure must not depend
     on that.
     """
     device_id = await seed_device(nso_device_name="sr-atomic", netbox_device_id=7507)
@@ -357,7 +357,8 @@ async def test_a_replacement_is_delivered_even_when_the_eligible_list_is_empty(a
         "sr-atomic", state=present(wire(A), device_name="sr-atomic"), section=dev_state(wire(B))
     )
 
-    job = await run_the_apply(device_id, client, force=False)
+    monkeypatch.setattr("nso_adapter.core.apply.WORKER_APPLY_FORCE", False)
+    job = await run_the_apply(device_id, client)
 
     assert job.status == JobStatus.succeeded, job.error
     assert rec.documents[0][_SR_CONTAINER]["route"] == [wire(B)], "the replacement was delivered"
