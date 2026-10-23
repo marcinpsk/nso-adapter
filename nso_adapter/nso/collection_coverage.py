@@ -13,9 +13,10 @@ is the one decoder every export consumer reads through:
 
 * covered and omitted: restored as ``[]`` (complete, nothing configured);
 * covered and present: kept, entries decoded recursively;
-* not covered and omitted: left absent (unavailable);
-* not covered and present, an unknown or duplicate marker name, a marker on a parent that
-  bears no collection, or a malformed value: :class:`CollectionCoverageError`.
+* not covered, omitted or present: removed (unavailable). The exporter serves a collection
+  without a statement when its reader skipped configuration it does not export;
+* an unknown or duplicate marker name, a marker on a parent that bears no collection, or a
+  malformed covered value: :class:`CollectionCoverageError`.
 
 The marker is transport metadata and never leaves this module. :func:`admit_coverage` is
 the consumer side: a consumer names the collections it needs, and a ``Present`` read that
@@ -147,8 +148,7 @@ def _decode_parent(node: dict, collections: dict[str, dict], where: str) -> dict
             _refuse_marker(value, f"{where}/{key}")
     for name, body in collections.items():
         if name not in covered:
-            if name in node:
-                raise CollectionCoverageError(f"{where}/{name}: a collection without a coverage statement")
+            out.pop(name, None)  # served without a statement: unavailable, never empty
             continue
         value = node.get(name, [])
         if not isinstance(value, list):

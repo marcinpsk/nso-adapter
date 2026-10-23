@@ -58,6 +58,19 @@ def test_an_uncovered_omitted_collection_stays_absent():
     assert decoded["router"][0]["scope"][0] == {"vrf": "", "peer": []}
 
 
+def test_a_collection_served_without_a_statement_is_unavailable():
+    peer = {"peer-address": "198.18.0.2", MARKER: [], "peer-address-family": [{"afi": "ipv4"}]}
+    section = _bgp(_scope(**{MARKER: ["peer"], "peer": [peer], "peer-group": [{"name": "G1"}]}))
+    decoded = decode_section("bgp-config", section)
+    assert decoded["router"][0]["scope"][0] == {"vrf": "", "peer": [{"peer-address": "198.18.0.2"}]}
+    assert uncovered_paths(
+        "bgp-config", decoded, ["router/scope/peer-group", "router/scope/peer/peer-address-family"]
+    ) == [
+        "router/scope/peer-group",
+        "router/scope/peer/peer-address-family",
+    ]
+
+
 def test_a_parent_without_a_marker_covers_nothing():
     decoded = decode_section("bgp-config", _bgp(_scope()))
     assert decoded["router"][0]["scope"][0] == {"vrf": ""}
@@ -110,7 +123,6 @@ def test_a_covered_leaf_list_decodes_as_empty_and_keeps_scalars():
         (_bgp(_scope(**{MARKER: ["peer", "peer"]})), "repeats a name"),
         (_bgp(_scope(**{MARKER: "peer"})), "must be an array of names"),
         (_bgp(_scope(**{MARKER: [7]})), "must be an array of names"),
-        (_bgp(_scope(peer=[])), "a collection without a coverage statement"),
         (_bgp(_scope(**{MARKER: ["peer"], "peer": {"peer-address": "198.18.0.2"}})), "must be an array"),
         (_bgp(_scope(**{MARKER: ["peer"], "peer": [None]})), "a list entry must be an object"),
         (_bgp(_scope(**{MARKER: ["peer"], "peer": None})), "must be an array"),
@@ -137,7 +149,6 @@ def test_a_covered_leaf_list_decodes_as_empty_and_keeps_scalars():
         "duplicate",
         "scalar-marker",
         "non-string",
-        "uncovered-array",
         "bare-object",
         "null-entry",
         "null",

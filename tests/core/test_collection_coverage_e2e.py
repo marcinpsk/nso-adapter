@@ -168,14 +168,43 @@ async def test_a_marker_that_breaks_the_contract_keeps_rows(adapter_client, scop
     assert second["read_state"]["payload_revision"] == first["read_state"]["payload_revision"]
 
 
-async def test_a_collection_without_a_coverage_statement_is_refused(adapter_client):
+async def test_a_collection_served_without_a_statement_is_unavailable_not_an_error(adapter_client):
     device_id = await seed_device(nso_device_name=DEVICE)
-    section = _bgp_wire(_groupless_scope(""))
-    section["router"][0]["scope"][0]["peer"][0][MARKER] = []
-    nso = CoverageNso({"bgp-config": section})
-    assert await _refresh(device_id, refresh_bgp_config_for_device, nso) is False
-    body = await _family(adapter_client, device_id, "bgp-config")
-    assert (body["read_state"]["reason"], body["observation"]) == ("read_error", None)
+    nso = CoverageNso({"bgp-config": _bgp_wire(_groupless_scope(""))})
+    assert await _refresh(device_id, refresh_bgp_config_for_device, nso) is True
+    first = await _family(adapter_client, device_id, "bgp-config")
+    unmarked = _bgp_wire(_groupless_scope(""))
+    unmarked["router"][0]["scope"][0]["peer"][0][MARKER] = []  # the exporter skipped part of it
+    nso.sections["bgp-config"] = unmarked
+    assert await _refresh(device_id, refresh_bgp_config_for_device, nso) is True
+    second = await _family(adapter_client, device_id, "bgp-config")
+    assert (second["read_state"]["outcome"], second["read_state"]["reason"]) == ("unavailable", "not_covered")
+    assert second["read_state"]["payload_revision"] == first["read_state"]["payload_revision"]
+
+
+async def test_an_unmarked_collection_in_one_family_leaves_the_other_families_of_the_document(
+    adapter_client, monkeypatch
+):
+    device_id = await seed_device(nso_device_name=DEVICE, attributes=["description", "enabled"])
+    unmarked = _bgp_wire(_groupless_scope(""))
+    unmarked["router"][0]["scope"][0]["peer"][0][MARKER] = []
+    nso = CoverageNso(
+        {
+            "bgp-config": unmarked,
+            "interface-attributes": exported(
+                "interface-attributes", {"status": "ok", "interface": [{"interface-name": "port0", "enabled": True}]}
+            ),
+        }
+    )
+    monkeypatch.setitem(importer._nso_clients, "nso-dev", nso)
+    monkeypatch.setattr(importer, "_netbox_client", None)
+    async with session() as db:
+        await importer.sync_device(device_id, db)
+    bgp = await _family(adapter_client, device_id, "bgp-config")
+    assert (bgp["read_state"]["outcome"], bgp["read_state"]["reason"]) == ("unavailable", "not_covered")
+    attributes = await _family(adapter_client, device_id, "interfaces-doc")
+    assert attributes["read_state"]["result"] == "replaced"
+    assert attributes["observation"]["document"]["interfaces"][0]["name"] == "port0"
 
 
 async def test_a_marker_inside_a_container_keeps_rows_and_revision(adapter_client):
