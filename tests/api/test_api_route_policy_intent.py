@@ -304,7 +304,7 @@ async def test_put_route_policy_intent_auto_apply_creates_generation(adapter_cli
         patch("nso_adapter.core.importer.get_nso_client", return_value=nso_client),
         patch("nso_adapter.nso.apply.apply_device_intent", new_callable=AsyncMock) as send,
     ):
-        await run_apply(job_id=job.id, device_id=device_id, force=True)
+        await run_apply(job_id=job.id, device_id=device_id)
 
     send.assert_awaited_once()
     assert "route-policy" in send.await_args.args[2], "the document must carry the family it authorized"

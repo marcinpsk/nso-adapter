@@ -784,7 +784,7 @@ async def test_run_apply_calls_run_apply(adapter_client):
 
     with patch("nso_adapter.core.apply.run_apply", new_callable=AsyncMock) as mock_run:
         await _run_apply(job_id, device_id)
-        mock_run.assert_called_once_with(job_id, device_id, force=True, reg=None)
+        mock_run.assert_called_once_with(job_id, device_id, reg=None)
 
 
 # ── _run_provision ──────────────────────────────────────────────────────────────

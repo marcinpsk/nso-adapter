@@ -24,7 +24,7 @@ from sqlalchemy import select
 
 from nso_adapter.store.models import Job, JobStatus, JobType
 from tests._secret_discipline import assert_text_free_of
-from tests.conftest import VALID_TOKEN, attach_apply_generation, push_seq, seed_device, session
+from tests.conftest import VALID_TOKEN, attach_apply_generation, push_seq, seed_device, session, start_job
 
 pytestmark = pytest.mark.anyio
 
@@ -275,7 +275,7 @@ def inconclusive():
     return ServiceInstanceState("inconclusive", None)
 
 
-async def run_the_apply(device_id: int, client, *, force: bool = True) -> Job:
+async def run_the_apply(device_id: int, client) -> Job:
     from tests.core.execution_helpers import run_apply
 
     job_id = await seed_apply_job(device_id)
@@ -283,7 +283,7 @@ async def run_the_apply(device_id: int, client, *, force: bool = True) -> Job:
         patch("nso_adapter.core.importer.get_nso_client", return_value=client),
         patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=AsyncMock()),
     ):
-        await run_apply(job_id=job_id, device_id=device_id, force=force)
+        await run_apply(job_id=job_id, device_id=device_id)
     return await read_job(job_id)
 
 
@@ -469,7 +469,7 @@ async def test_c2_6_the_preview_payload_is_byte_identical_to_the_applied_one(ada
     ):
         from tests.core.execution_helpers import run_apply
 
-        await run_apply(job_id=job_id, device_id=device_id, force=True)
+        await run_apply(job_id=job_id, device_id=device_id)
     job = await read_job(job_id)
     assert job.status == JobStatus.succeeded, job.error
 
@@ -510,7 +510,7 @@ async def test_c2_7_the_replacement_is_refused_when_verification_is_disabled(ada
 # ── C2.8 — the PUT body is every accepted row, force-independent ─────────────
 
 
-async def test_c2_8_a_force_false_apply_still_carries_every_accepted_route(adapter_client):
+async def test_c2_8_a_force_false_apply_still_carries_every_accepted_route(adapter_client, monkeypatch):
     """C2.8 + C1.4's second half — the eligible list is the wrong basis for a replace.
 
     An identity-edited row keeps its ``last_apply_at``, so under ``force=False`` the very
@@ -527,8 +527,9 @@ async def test_c2_8_a_force_false_apply_still_carries_every_accepted_route(adapt
         ],
     )
     client, rec = sr_client("sr-put", state=present(wire(A), wire(C), device_name="sr-put"))
+    monkeypatch.setattr("nso_adapter.core.apply.WORKER_APPLY_FORCE", False)
 
-    job = await run_the_apply(device_id, client, force=False)
+    job = await run_the_apply(device_id, client)
 
     assert job.status == JobStatus.succeeded, job.error
     assert rec.routes(rec.sr_commits("put")[0]) == [wire(B), wire(C)]
@@ -716,3 +717,148 @@ async def test_a_blocked_replace_reports_the_orphan_it_refused_over(adapter_clie
     assert row_error is None
     assert job.error["detail"]["orphans"] == {"static_route/route": [list(C)]}
     assert_text_free_of(json.dumps(job.error), [delta])
+
+
+# ── #1825 — a run that ends before preparation reports its membership not applied ──
+
+
+async def execution_rows(job_id: int) -> tuple[int, int]:
+    """Count the prepared attempts and the staged row outcomes this job owns."""
+    from sqlalchemy import func
+
+    from nso_adapter.store.models import ApplyExecutionAttempt, RowOutcome
+
+    async with session() as db:
+        attempts = await db.scalar(
+            select(func.count())
+            .select_from(ApplyExecutionAttempt)
+            .where(ApplyExecutionAttempt.job_correlation_id == job_id)
+        )
+        outcomes = await db.scalar(
+            select(func.count())
+            .select_from(RowOutcome)
+            .join(ApplyExecutionAttempt, RowOutcome.execution_attempt_id == ApplyExecutionAttempt.id)
+            .where(ApplyExecutionAttempt.job_correlation_id == job_id)
+        )
+    return attempts, outcomes
+
+
+async def job_generation(job_id: int):
+    from nso_adapter.store.models import DeploymentGeneration
+
+    async with session() as db:
+        return await db.scalar(select(DeploymentGeneration).where(DeploymentGeneration.job_id == job_id))
+
+
+def without_route_errors(result: dict) -> dict:
+    """Drop each route's copy of the job error: two runs of one generation fail differently."""
+    routes = [{**route, "error": None} for route in result.get("static_route_results", [])]
+    return {**result, "static_route_results": routes}
+
+
+async def retry_job(generation_id: int) -> int:
+    """Re-admit the failed generation as a new started job, as the operator retry does."""
+    from nso_adapter.core.generation import retry_generation
+
+    async with session() as db:
+        job = await retry_generation(db, generation_id)
+        await db.commit()
+        job_id = job.id
+    await start_job(job_id)
+    return job_id
+
+
+async def run_started_apply(job_id: int, device_id: int, client) -> Job:
+    from tests.core.execution_helpers import run_apply
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=client),
+        patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=AsyncMock()),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id)
+    return await read_job(job_id)
+
+
+def assert_not_applied(result: dict, error: dict | None, generation_id: int, route_row_ids: list[int]) -> None:
+    """The settle_unsent shape: every frozen row ``not_applied``, nothing acknowledged."""
+    outcomes = result["row_outcomes"]
+    assert outcomes, "a frozen membership must be reported"
+    assert {(row["generation_id"], row["disposition"], json.dumps(row["refusals"])) for row in outcomes} == {
+        (generation_id, "not_applied", "[]")
+    }
+    assert result["settlement_owners"] == [
+        {**carrier, "disposition": "not_applied"}
+        for carrier in {json.dumps(row["carrier"], sort_keys=True): row["carrier"] for row in outcomes}.values()
+    ]
+    assert (result["refusals"], result["commit_acknowledged"]) == ([], False)
+    counts = [value for key, value in result.items() if key.endswith("_count_by_outcome")]
+    assert counts and all(count["in_sync"] == count["apply_failed"] == count["unavailable"] == 0 for count in counts)
+    assert sum(count["not_applied"] for count in counts) == len(result["settlement_owners"])
+    routes = result.get("static_route_results", [])
+    assert [(route["row_id"], route["outcome"], route["error"]) for route in routes] == [
+        (row_id, "apply_failed", error) for row_id in route_row_ids
+    ]
+
+
+async def test_1825_l2_an_unreachable_retention_read_reports_the_generation_not_applied(adapter_client):
+    """L2: NSO is unreachable during the certified read, before any attempt is prepared.
+
+    The first run takes the attempt path (an inconclusive read settles its prepared membership
+    unsent). Its retry carries the SAME generation and fails one step earlier, so nothing is
+    prepared. Forbidden: a terminal, sequenced job without ``row_outcomes`` (the plugin's
+    settlement cursor stalls behind it), and any evidence other than what the attempt path
+    reported for that generation.
+    """
+    from nso_adapter.store.models import GenerationStatus
+
+    device_id = await seed_device(nso_device_name="sr-put", netbox_device_id=7230)
+    ids = await seed_rows(device_id, [{"triple": B, "route_id": 7}])
+    attempted = await run_the_apply(device_id, sr_client("sr-put", state=inconclusive())[0])
+    assert attempted.error["code"] == "static_route_snapshot_inconclusive"
+    assert (await execution_rows(attempted.id))[0] == 1, "the first run took the attempt path"
+    generation = await job_generation(attempted.id)
+
+    retry_id = await retry_job(generation.id)
+    client, rec = sr_client("sr-put", state=absent())
+    client.service_instance_state = AsyncMock(side_effect=httpx.ConnectError("placeholder unreachable"))
+    job = await run_started_apply(retry_id, device_id, client)
+
+    assert job.status == JobStatus.failed
+    assert job.error == {
+        "code": "internal",
+        "message": "internal error (ConnectError); see the server log",
+        "detail": {},
+    }
+    assert rec.calls == [], "nothing reached NSO"
+    assert job.settle_seq is not None
+    assert job.result is not None and "row_outcomes" in job.result, "a sequenced failed apply carries outcomes"
+    assert_not_applied(job.result, job.error, generation.id, [ids[B]])
+    assert without_route_errors(job.result) == without_route_errors(attempted.result)
+    assert await execution_rows(job.id) == (0, 0), "no attempt and no row outcome is invented"
+    assert (await job_generation(job.id)).status is GenerationStatus.failed
+
+
+async def seed_unsent_apply(device_name: str, netbox_device_id: int, **row) -> tuple[int, int, int, int]:
+    """Seed one accepted route and a started apply carrying its generation.
+
+    Returns ``(device_id, job_id, generation_id, route_row_id)``.
+    """
+    device_id = await seed_device(nso_device_name=device_name, netbox_device_id=netbox_device_id)
+    ids = await seed_rows(device_id, [{"triple": B, "route_id": 7, **row}])
+    job_id = await seed_apply_job(device_id)
+    return device_id, job_id, (await job_generation(job_id)).id, ids[B]
+
+
+async def test_1825_l1_a_refused_unverifiable_replace_reports_the_generation_not_applied(adapter_client):
+    """L1: ``static_route_put_verify_disabled`` refuses the job before preparation (C2.7's lane)."""
+    device_id, job_id, generation_id, row_id = await seed_unsent_apply("sr-put", 7231, deployed_key=list(A))
+    client, rec = sr_client("sr-put", state=present(wire(A), device_name="sr-put"))
+
+    with patch("nso_adapter.nso.apply.VERIFY_AFTER_APPLY", False):
+        job = await run_started_apply(job_id, device_id, client)
+
+    assert (job.status, job.error["code"]) == (JobStatus.failed, "static_route_put_verify_disabled")
+    assert rec.sr_commits() == []
+    assert job.result is not None and "row_outcomes" in job.result
+    assert_not_applied(job.result, job.error, generation_id, [row_id])
+    assert await execution_rows(job_id) == (0, 0)

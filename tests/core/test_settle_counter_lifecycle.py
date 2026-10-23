@@ -366,7 +366,7 @@ async def test_a_failed_allocation_never_takes_a_second_terminal_write(adapter_c
             patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=refresh),
         ):
             with pytest.raises(BookkeepingOutcomeUnknown):
-                await run_apply(job_id=job_id, device_id=device_id, force=True, reg=reg)
+                await run_apply(job_id=job_id, device_id=device_id, reg=reg)
     finally:
         await release_claim(reg)
 

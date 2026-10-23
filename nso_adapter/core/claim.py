@@ -624,6 +624,14 @@ class TerminalWrite:
     settle_seq: int | None = None
 
 
+def _ownership(job_id: int, expect: JobStatus, run_attempt: int | None) -> list:
+    """Return the terminal write's ownership predicate: the observed status and, when named, the attempt."""
+    where = [Job.id == job_id, Job.status == expect]
+    if run_attempt is not None:
+        where.append(Job.run_attempt == run_attempt)
+    return where
+
+
 async def _cas_job_status(
     db: AsyncSession,
     job_id: int,
@@ -640,17 +648,48 @@ async def _cas_job_status(
     only for the queued-sourced writers (offboard, the claimless-corruption failure),
     which have no execution.
     """
-    where = [Job.id == job_id, Job.status == expect]
-    if run_attempt is not None:
-        where.append(Job.run_attempt == run_attempt)
     stmt = (
         sa_update(Job)
-        .where(*where)
+        .where(*_ownership(job_id, expect, run_attempt))
         .values(status=status, **(values or {}))
         .returning(Job.device_id)
         .execution_options(synchronize_session=False)
     )
     return (await db.execute(stmt)).one_or_none()
+
+
+def _refused(job_id: int, status: JobStatus, expect: JobStatus, run_attempt: int | None) -> None:
+    logger.error(
+        "job.terminal_write_refused",
+        job_id=job_id,
+        requested=status.value,
+        expected_status=expect.value,
+        expected_attempt=run_attempt,
+    )
+
+
+async def _with_unprepared_evidence(
+    db: AsyncSession, job_id: int, locked, result: dict | None, error: dict | None
+) -> dict | None:
+    """Add the not-applied evidence a device-writing run owes when it prepared no attempt (#1825).
+
+    The settlement feed cannot pass a sequenced apply or removal without ``row_outcomes``.
+    An unresolved case keeps the caller's result: the plugin then stays blocked, which is
+    the fail-closed floor, never invented evidence.
+    """
+    from nso_adapter.core.generation import DEVICE_WRITING_JOB_TYPES
+
+    if locked.job_type not in DEVICE_WRITING_JOB_TYPES or locked.device_id is None:
+        return result
+    from nso_adapter.core.execution import unprepared_evidence
+
+    evidence = await unprepared_evidence(db, job_id, locked.job_type, locked.run_attempt, error)
+    if evidence is None:
+        return result
+    collision = sorted(evidence.keys() & (result or {}).keys())
+    if collision:
+        raise ValueError(f"job {job_id}: a result without row outcomes already carries {collision}")
+    return {**(result or {}), **evidence}
 
 
 def internal_error(exc: BaseException, *, code: str = "internal", detail: dict | None = None) -> dict:
@@ -726,9 +765,27 @@ async def terminalize(
     let the next one cross a barrier that never opened. *generation_outcome* overrides the
     status-derived verdict for the one caller that knows better — recovery, which never
     observed the run and so can only report ``outcome_unknown``.
+
+    A device-bound apply or removal written without ``row_outcomes`` gains them here, before
+    the CAS (#1825): with the job row locked and no execution attempt for the run, nothing
+    reached the device, so the frozen membership is reported ``not_applied``. Every terminal
+    lane passes through this one writer, so no lane can omit the evidence.
     """
     if status not in _TERMINAL_STATUSES:
         raise ValueError(f"terminalize is for terminal statuses only, not {status.value}")
+    if result is None or "row_outcomes" not in result:
+        # Locked FIRST: a missing execution attempt proves no send only while preparation is excluded.
+        locked = (
+            await db.execute(
+                select(Job.job_type, Job.device_id, Job.run_attempt)
+                .where(*_ownership(job_id, expect, run_attempt))
+                .with_for_update()
+            )
+        ).one_or_none()
+        if locked is None:
+            _refused(job_id, status, expect, run_attempt)
+            return None
+        result = await _with_unprepared_evidence(db, job_id, locked, result, error)
     values: dict = {}
     if result is not None:
         values["result"] = result
@@ -738,13 +795,7 @@ async def terminalize(
         values["device_id"] = set_device_id
     row = await _cas_job_status(db, job_id, status=status, expect=expect, run_attempt=run_attempt, values=values)
     if row is None:
-        logger.error(
-            "job.terminal_write_refused",
-            job_id=job_id,
-            requested=status.value,
-            expected_status=expect.value,
-            expected_attempt=run_attempt,
-        )
+        _refused(job_id, status, expect, run_attempt)
         return None
     from nso_adapter.core.generation import settle_job_generations
 

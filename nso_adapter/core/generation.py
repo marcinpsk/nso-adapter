@@ -1548,24 +1548,30 @@ async def _job_generations(db: AsyncSession, job_id: int) -> list[DeploymentGene
     )
 
 
-async def generation_execution_sections(db: AsyncSession, job_id: int) -> frozenset[str] | None:
-    """Return the sections carried by this job, or ``None`` for an invalid carrier.
+def execution_streams(generations: Sequence[DeploymentGeneration]) -> frozenset[str]:
+    """Return the streams the carried generations execute.
 
     Adjacent generations can share one apply job. Their streams form the execution boundary,
-    and every selected section uses the highest generation's complete document.
+    and every executed stream uses the highest generation's complete document.
     """
+    return frozenset(stream for generation in generations for stream in (generation.stream_revisions or {}))
+
+
+async def generation_execution_streams(db: AsyncSession, job_id: int) -> frozenset[str] | None:
+    """Return the streams carried by this job, or ``None`` for an invalid carrier."""
     generations = await _job_generations(db, job_id)
-    if not generations:
-        return None
-    streams = {stream for generation in generations for stream in (generation.stream_revisions or {})}
-    return frozenset(stream_section(stream) for stream in streams)
+    return execution_streams(generations) if generations else None
 
 
 async def generation_execution_context(db: AsyncSession, job_id: int):
     """Keep each carried stream's authority while encoding the highest document."""
+    return execution_context(await _job_generations(db, job_id))
+
+
+def execution_context(generations: Sequence[DeploymentGeneration]):
+    """Return the origin context of the carried generations: each stream keeps its own authority."""
     from nso_adapter.nso.origins import OriginContext
 
-    generations = await _job_generations(db, job_id)
     if not generations:
         raise ValueError("Execution requires a carried generation")
     contexts = {
@@ -1623,20 +1629,29 @@ async def executing_generation(db: AsyncSession, job_id: int) -> DeploymentGener
     if not carried:
         return None
     generation = carried[-1]
-    from nso_adapter.core.static_route_plan import validate_removal_authority
+    verify_generation_digest(generation)
+    validate_generation_execution(generation)
+    return generation
 
-    validate_removal_authority(generation.allowed_removal_keys)
+
+def verify_generation_digest(generation: DeploymentGeneration) -> None:
+    """Raise :class:`GenerationTampered` when *generation*'s digest does not reproduce."""
     expected = digest_document(generation.mode, generation.document, generation.allowed_removal_keys or {})
     if expected != generation.digest:
         raise GenerationTampered(
             f"generation {generation.id} (device {generation.device_id} seq {generation.seq}) digest "
             f"{generation.digest[:12]} does not match its document"
         )
-    from nso_adapter.core.projection import section_context
 
+
+def validate_generation_execution(generation: DeploymentGeneration) -> None:
+    """Refuse a document whose removal authority or section contexts are malformed."""
+    from nso_adapter.core.projection import section_context
+    from nso_adapter.core.static_route_plan import validate_removal_authority
+
+    validate_removal_authority(generation.allowed_removal_keys)
     for section in generation.document:
         section_context(generation.document, section)
-    return generation
 
 
 async def _blocking_predecessor(db: AsyncSession, device_id: int, seq: int) -> DeploymentGeneration | None:
@@ -2314,7 +2329,7 @@ __all__ = [
     "create_action_apply",
     "create_reissue_generation",
     "digest_document",
-    "generation_execution_sections",
+    "generation_execution_streams",
     "executable_head",
     "executing_generation",
     "job_admissible",

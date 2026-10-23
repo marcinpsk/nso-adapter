@@ -149,7 +149,7 @@ async def _seed_coalesced(db):
         attach_to_job,
         digest_document,
         executing_generation,
-        generation_execution_sections,
+        generation_execution_streams,
     )
     from nso_adapter.store.models import BgpRouterIntent
 
@@ -187,7 +187,7 @@ async def _seed_coalesced(db):
     await db.flush()
     assert await attach_to_job(db, second, job)
     assert (await executing_generation(db, job.id)).id == second.id
-    assert await generation_execution_sections(db, job.id) == frozenset({"vlan", "bgp"})
+    assert await generation_execution_streams(db, job.id) == frozenset({"vlan", "bgp"})
     recorder = OriginRecorder("bgp", OriginContext.from_generation(second))
     path = (("router", ("64512",)),)
     bgp_logical = recorder.logical("bgp.router", path, recorder.source(router, router.__tablename__, "bgp"), "bgp")
