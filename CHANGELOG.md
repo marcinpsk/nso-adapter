@@ -2,6 +2,17 @@
 
 <!-- version list -->
 
+## v1.16.0 (2026-10-23)
+
+### Features
+
+- **refusal**: Add the warn-and-skip conversion catalog ids
+  ([`68a5709`](https://github.com/marcinpsk/nso-adapter/commit/68a570982f4bda4cab45c35af57987f3216d94d9))
+
+- **refusal**: Declare the community field on the community-list entry subject
+  ([`a8377c3`](https://github.com/marcinpsk/nso-adapter/commit/a8377c3c792b3b304fb0af56e099c015a8dc0781))
+
+
 ## v1.15.1 (2026-10-23)
 
 ### Bug Fixes
