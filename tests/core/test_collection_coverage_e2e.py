@@ -22,6 +22,7 @@ from nso_adapter.core.bgp import refresh_bgp_config_for_device
 from nso_adapter.core.interface_ip import refresh_interface_ips_for_device
 from nso_adapter.core.isis import refresh_isis_interfaces_for_device
 from nso_adapter.core.l2_service import refresh_l2_services_for_device
+from nso_adapter.core.logging_config import refresh_logging_config_for_device
 from nso_adapter.core.redistribution import refresh_redistribution_for_device
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.collection_coverage import FAMILIES, MARKER
@@ -29,6 +30,7 @@ from nso_adapter.store.models import (
     Device,
     DeviceBgpPeerGroup,
     DeviceIsisProcess,
+    DeviceLoggingHost,
     DeviceRedistribution,
     InterfaceIpAddress,
     MappingStatus,
@@ -174,6 +176,21 @@ async def test_a_collection_without_a_coverage_statement_is_refused(adapter_clie
     assert await _refresh(device_id, refresh_bgp_config_for_device, nso) is False
     body = await _family(adapter_client, device_id, "bgp-config")
     assert (body["read_state"]["reason"], body["observation"]) == ("read_error", None)
+
+
+async def test_a_marker_inside_a_container_keeps_rows_and_revision(adapter_client):
+    device_id = await seed_device(nso_device_name=DEVICE)
+    section = {"status": "ok", MARKER: ["host"], "host": [{"address": "198.18.0.10"}]}
+    nso = CoverageNso({"logging-config": section})
+    assert await _refresh(device_id, refresh_logging_config_for_device, nso) is True
+    first = await _family(adapter_client, device_id, "logging-config")
+    nso.sections["logging-config"] = {"status": "ok", MARKER: ["host"], "local-levels": {MARKER: []}}
+    assert await _refresh(device_id, refresh_logging_config_for_device, nso) is False
+    second = await _family(adapter_client, device_id, "logging-config")
+    assert (second["read_state"]["outcome"], second["read_state"]["reason"]) == ("unavailable", "read_error")
+    assert second["read_state"]["payload_revision"] == first["read_state"]["payload_revision"]
+    async with session() as db:
+        assert (await db.execute(select(DeviceLoggingHost.address))).scalars().all() == ["198.18.0.10"]
 
 
 @pytest.mark.parametrize("atomic", [False, True], ids=["document", "action"])

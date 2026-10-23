@@ -142,6 +142,9 @@ def decode_sections(families: Iterable[str], served: Mapping) -> dict:
 def _decode_parent(node: dict, collections: dict[str, dict], where: str) -> dict:
     covered = _covered(node, collections, where)
     out = {key: value for key, value in node.items() if key != MARKER}
+    for key, value in out.items():
+        if key not in collections:
+            _refuse_marker(value, f"{where}/{key}")
     for name, body in collections.items():
         if name not in covered:
             if name in node:
@@ -157,6 +160,18 @@ def _decode_parent(node: dict, collections: dict[str, dict], where: str) -> dict
             continue
         out[name] = [_decode_entry(entry, body, f"{where}/{name}") for entry in value]
     return out
+
+
+def _refuse_marker(value: object, where: str) -> None:
+    """Refuse the marker below a value that is not a collection: only parents of collections carry it."""
+    if isinstance(value, dict):
+        if MARKER in value:
+            raise CollectionCoverageError(f"{where}: the {MARKER} marker sits on a parent with no collection")
+        for key, item in value.items():
+            _refuse_marker(item, f"{where}/{key}")
+    elif isinstance(value, list):
+        for item in value:
+            _refuse_marker(item, where)
 
 
 def _decode_entry(entry: object, body: dict, where: str) -> dict:

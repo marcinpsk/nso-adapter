@@ -149,6 +149,19 @@ def test_a_section_that_breaks_the_contract_is_refused(section, message):
         decode_section("bgp-config", section)
 
 
+@pytest.mark.parametrize(
+    "section",
+    [
+        {"status": "ok", MARKER: ["host"], "local-levels": {"console-severity": "warning", MARKER: []}},
+        {"status": "ok", MARKER: ["host"], "local-levels": {"nested": [{MARKER: ["host"]}]}},
+    ],
+    ids=["container", "nested-list"],
+)
+def test_a_marker_below_a_value_that_is_not_a_collection_is_refused(section):
+    with pytest.raises(CollectionCoverageError, match="sits on a parent with no collection"):
+        decode_section("logging-config", section)
+
+
 def test_a_leaf_list_value_must_be_a_scalar():
     entry = {"sequence": 10, MARKER: ["match-as-paths"], "match-as-paths": [{"name": "AP"}]}
     section = {
