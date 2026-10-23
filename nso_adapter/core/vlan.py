@@ -85,6 +85,7 @@ VLAN_DATABASE_SPEC = FamilySpec(
     extract=lambda data: data,
     materialize=_upsert_vlans,
     wire_name="vlan-database",  # READSEM S3: fetch from the device-state envelope
+    requires=("vlan",),
 )
 
 
@@ -179,6 +180,7 @@ SWITCHPORT_SPEC = FamilySpec(
     extract=lambda data: data,
     materialize=_upsert_switchports,
     wire_name="switchport",  # READSEM S3: fetch from the device-state envelope
+    requires=("interface",),
 )
 
 

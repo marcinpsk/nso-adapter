@@ -46,6 +46,7 @@ from nso_adapter.store.models import (
     VlanIntent,
 )
 from tests._secret_discipline import assert_records_free_of, assert_text_free_of
+from tests.collection_coverage_helpers import exported_sections
 from tests.conftest import push_seq, seed_device, session
 from tests.core.test_action_apply_promotion import _apply, _put_routes
 from tests.core.test_generation_protocol import AUTH, generations, job_row, put_vlans, seed_settings
@@ -90,9 +91,9 @@ class RuntimeTransport(httpx.AsyncBaseTransport):
         if request.method == "POST":
             if "device-state-read" in url and self.device_sections is not None:
                 request_body = json.loads(request.content)["network-state-export:input"]
-                sections = {
-                    wire: self.device_sections.get(wire, {"status": "unsupported"}) for wire in request_body["family"]
-                }
+                sections = exported_sections(
+                    {wire: self.device_sections.get(wire, {"status": "unsupported"}) for wire in request_body["family"]}
+                )
                 return httpx.Response(
                     200,
                     json={

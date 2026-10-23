@@ -6,13 +6,13 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
 
 from nso_adapter.core.svi import refresh_svi_for_device
 from nso_adapter.store.models import Device, DeviceSvi
+from tests.collection_coverage_helpers import section_client
 from tests.conftest import seed_device, session
 from tests.fixtures.switching_read_payloads import SWITCHING_READ_PAYLOADS
 
@@ -35,7 +35,7 @@ async def _svis(db, device_id):
 async def test_refresh_inserts_svis(adapter_client):
     device_id = await seed_device(nso_device_name="svi-sw01", netbox_device_id=980)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "device-name": "svi-sw01",
@@ -51,7 +51,7 @@ async def test_refresh_inserts_svis(adapter_client):
 async def test_refresh_full_replace(adapter_client):
     device_id = await seed_device(nso_device_name="svi-sw02", netbox_device_id=981)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "interface": [{"interface-name": "Vlan10", "vlan-id": 10, "type": "svi"}],
@@ -78,7 +78,7 @@ async def test_refresh_full_replace(adapter_client):
 async def test_invalid_vlan_id_refuses_family_read_and_keeps_previous_rows(adapter_client, invalid_row):
     device_id = await seed_device(nso_device_name="svi-missing-vid", netbox_device_id=983)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "interface": [{"interface-name": "irb.0", "vlan-id": 1}],
@@ -106,7 +106,7 @@ async def test_refresh_authoritative_empty_clears(adapter_client):
     """An authoritatively-empty read (status=ok, no list keys) clears the rows. (Device-absence, section None, now KEEPS — READSEM S5.)"""
     device_id = await seed_device(nso_device_name="svi-sw03", netbox_device_id=982)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "interface": [{"interface-name": "Vlan10", "vlan-id": 10, "type": "svi"}],
@@ -122,7 +122,7 @@ async def test_a_duplicate_svi_is_reported_as_a_duplicate(adapter_client):
     device_id = await seed_device(nso_device_name="svi-duplicate", netbox_device_id=989)
     row = {"interface-name": "Vlan10", "vlan-id": 10, "type": "svi"}
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {"status": "ok", "interface": [row, dict(row)]}
         with pytest.raises(ValueError, match="^svi item has a duplicate interface-name$"):
             await refresh_svi_for_device(db, device, nso_client, refresh_source="test")

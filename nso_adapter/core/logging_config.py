@@ -21,8 +21,8 @@ logger = structlog.get_logger(__name__)
 async def _upsert_logging_config(db: AsyncSession, device: Device, entry: dict, refresh_source: str) -> None:
     """Full-replace the device's logging hosts + local-levels singleton (the materializer).
 
-    ``entry`` is the whole logging-config payload; ``extract({})`` feeds ``{}`` so the
-    authoritative clear runs the same path: no hosts, no local-levels → both wiped.
+    ``entry`` is the whole decoded logging-config section; the authoritative clear feeds the
+    covered empty section through the same path: no hosts, no local-levels → both wiped.
     """
     document = project_logging(entry)
     log_skipped_entries("logging", device.id, document.unprojectable)
@@ -63,11 +63,11 @@ async def _upsert_logging_config(db: AsyncSession, device: Device, entry: dict, 
 
 LOGGING_CONFIG_SPEC = FamilySpec(
     name="logging",
-    # Whole-entry payload: the materializer destructures host + local-levels itself
-    # (extract({}) == {} is the authoritative-clear "nothing" payload).
+    # Whole-entry payload: the materializer destructures host + local-levels itself.
     extract=lambda data: data,
     materialize=_upsert_logging_config,
     wire_name="logging-config",  # READSEM S3: fetch from the device-state envelope
+    requires=("host",),
 )
 
 

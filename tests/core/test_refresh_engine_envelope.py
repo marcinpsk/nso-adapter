@@ -27,6 +27,7 @@ from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
 from nso_adapter.nso.read_outcome import AbsentAuthoritative, Unavailable, UnavailableReason
 from nso_adapter.store.models import Device, DeviceStaticRoute, RefreshOutcome
 from tests._secret_discipline import assert_records_free_of
+from tests.collection_coverage_helpers import covered_sections, exported
 from tests.conftest import seed_device, session
 
 ENV_SPEC = dataclasses.replace(STATIC_ROUTE_SPEC, wire_name="static-route")
@@ -73,10 +74,11 @@ async def _latest_outcome(db, device_id: int) -> RefreshOutcome:
 
 
 def _client(section=None, action_output=None) -> AsyncMock:
+    """A client stand-in that returns sections decoded the way the real client does."""
     client = AsyncMock(spec=NsoClient)
-    client.get_device_state_section.return_value = section
+    client.get_device_state_section.return_value = covered_sections({"static-route": section})["static-route"]
     if action_output is not None:
-        client.run_device_state_read.return_value = action_output
+        client.run_device_state_read.return_value = covered_sections(action_output)
     return client
 
 
@@ -103,7 +105,7 @@ async def test_ok_section_replaces_rows_and_records_fresh(adapter_client):
 
 @pytest.mark.anyio
 async def test_ok_without_list_keys_is_the_authoritative_clear(adapter_client):
-    """RESTCONF omits empty lists — ok + absent keys must CLEAR, not keep."""
+    """RESTCONF omits empty lists: ok + a covered list with no entries must CLEAR, not keep."""
     device_id = await seed_device(nso_device_name="eng-env-okempty", netbox_device_id=9702)
     await _seed_one_route(device_id)
     async with _device_session(device_id) as (db, device):
@@ -492,7 +494,9 @@ async def test_real_client_envelope_refresh_end_to_end(adapter_client):
     await _seed_one_route(device_id)
     async with _device_session(device_id) as (db, device):
         real_client = _make_client()
-        transport = EnvelopeTransport(device_body={"network-state-export:static-route": OK_SECTION})
+        transport = EnvelopeTransport(
+            device_body={"network-state-export:static-route": exported("static-route", OK_SECTION)}
+        )
         real_client._client = lambda timeout=None: httpx.AsyncClient(transport=transport, base_url="http://nso:8080")
 
         ok = await run_family_refresh(db, device, real_client, ENV_SPEC)

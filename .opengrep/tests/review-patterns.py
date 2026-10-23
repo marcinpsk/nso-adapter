@@ -837,3 +837,40 @@ async def recovery_fails_lost_attempt(db, rows, logger, dispose_execution_attemp
             logger.error("worker.orphan_ownership_lost", job_id=job_id)
             await fail_lost_attempt(db, job_id, run_attempt)
             continue
+
+
+async def classify_envelope_family_read(client, name, wire):
+    # ok: nso-export-read-outside-the-census
+    return await client.get_device_state_section(name, wire)
+
+
+async def _fetch_projection(client, name, wires):
+    # ok: nso-export-read-outside-the-census
+    doc = await client.get_device_state_doc(name)
+    # ok: nso-export-read-outside-the-census
+    return doc, await client.run_device_state_read(name, wires)
+
+
+async def _residue_after_removal(client, name, wire):
+    # ok: nso-export-read-outside-the-census
+    return await _live_family_sections(client, name, [wire])
+
+
+async def sync_device(projection, wire):
+    # ok: nso-export-read-outside-the-census
+    return projection.outcome_for(wire)
+
+
+async def new_consumer(client, projection, name, wire):
+    # ruleid: nso-export-read-outside-the-census
+    await client.get_device_state_section(name, wire)
+    # ruleid: nso-export-read-outside-the-census
+    await client.get_device_state_doc(name)
+    # ruleid: nso-export-read-outside-the-census
+    await client.run_device_state_read(name, [wire])
+    # ruleid: nso-export-read-outside-the-census
+    await classify_envelope_family_read(client, name, wire)
+    # ruleid: nso-export-read-outside-the-census
+    await _live_family_sections(client, name, [wire])
+    # ruleid: nso-export-read-outside-the-census
+    return projection.outcome_for(wire)

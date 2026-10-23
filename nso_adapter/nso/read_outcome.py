@@ -13,11 +13,11 @@ The classification input is a per-family **envelope section** carrying an explic
 leaf (``ok|stale|unsupported|not-ready|error``) — the ground truth the legacy 200/404 wire could
 not carry. Classification is therefore a direct mapping, no inference:
 
-* **Present(data)** — ``status=ok`` (or ``stale`` — degraded-success). RESTCONF omits empty
-  lists, so ``ok`` with the family's list keys absent IS an authoritative "this device has none",
-  which materializes as a clear (replace with nothing).
+* **Present(data)** — ``status=ok`` (or ``stale`` — degraded-success). The data is decoded
+  (:mod:`nso_adapter.nso.collection_coverage`): a covered collection is present (``[]`` when
+  empty) and an uncovered one is absent, so absence is never an authoritative empty.
 * **AbsentAuthoritative** — the device genuinely has none of this family and clearing the mirror
-  is correct. In the envelope world this is expressed via ``Present`` with an empty payload; the
+  is correct. In the envelope world this is expressed via ``Present`` with covered empty collections; the
   type remains a first-class outcome the executor + outcome store still handle.
 * **Unavailable(reason)** — no authoritative answer: the export is down
   (``NsoExportUnavailableError``), the read errored (``error`` / 5xx / transport / parse), the NED
@@ -48,6 +48,7 @@ class UnavailableReason(str, enum.Enum):
     # Envelope-declared (READSEM S3) — the wire finally distinguishes what not_authoritative merges:
     unsupported = "unsupported"  # this NED has no reader for the family — keep rows, not degraded
     not_ready = "not_ready"  # no record yet (post-reload / NED remount) — the engine escalates to the action
+    not_covered = "not_covered"  # the section is ok but does not cover a collection this consumer needs (#1833)
 
 
 @dataclass(frozen=True)
@@ -274,8 +275,8 @@ def classify_envelope_section(section: dict | None, *, device: str, family: str)
     The envelope carries the ground truth the legacy wire could not: a per-family
     ``status`` leaf. Classification is a direct mapping — no probes, no empty-policy inference:
 
-    * ``ok`` → :class:`Present` (fresh). RESTCONF omits empty lists, so ok with absent
-      list keys IS the authoritative empty — the full-replace materialize path clears.
+    * ``ok`` → :class:`Present` (fresh). The section is already decoded: an absent collection
+      is one the reader did not cover, and each consumer admits it (``admit_coverage``).
     * ``stale`` → :class:`Present` with ``Freshness.stale`` — **degraded-success**
       (operator decision): the rows are the export's best-known and replace, but the
       recorded outcome carries the degradation.

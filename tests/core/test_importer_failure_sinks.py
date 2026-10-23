@@ -21,6 +21,7 @@ import httpx
 import pytest
 import yaml
 
+from nso_adapter.nso.collection_coverage import MARKER
 from nso_adapter.store.models import Device
 from tests._ast_scanner_support import (
     argument_names,
@@ -1673,7 +1674,7 @@ async def test_a_missing_action_section_is_named_missing_not_malformed(adapter_c
 
     device_id = await seed_device(nso_device_name="split-missing-section")
     client = _make_client()
-    served = _atomic_output("split-missing-section", {"static-route": {"status": "ok", "route": []}})
+    served = _atomic_output("split-missing-section", {"static-route": {"status": "ok", MARKER: ["route"]}})
     transport = MockTransport(200, served)
     client._client = lambda timeout=None: httpx.AsyncClient(transport=transport, base_url="http://nso:8080")
 
@@ -1706,7 +1707,7 @@ async def test_an_explicitly_null_action_section_is_named_malformed_not_missing(
     client = _make_client()
     served = _atomic_output(
         "split-null-section",
-        {"static-route": {"status": "ok", "route": []}, "interface-ip": None},
+        {"static-route": {"status": "ok", MARKER: ["route"]}, "interface-ip": None},
     )
     transport = MockTransport(200, served)
     client._client = lambda timeout=None: httpx.AsyncClient(transport=transport, base_url="http://nso:8080")

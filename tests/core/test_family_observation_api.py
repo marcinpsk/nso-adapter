@@ -13,6 +13,7 @@ from nso_adapter.core.refresh_engine import run_family_refresh_from_outcome
 from nso_adapter.core.vlan import VLAN_DATABASE_SPEC
 from nso_adapter.nso.read_outcome import Freshness, Present, Unavailable, UnavailableReason
 from nso_adapter.store.models import Device
+from tests.collection_coverage_helpers import REDIST_WIRES, covered, exported
 from tests.conftest import AUTH, push_seq, seed_device, session
 from tests.core.test_read_observation import DeviceReadNso, assert_publication
 
@@ -21,6 +22,12 @@ BGP_PAYLOAD = {
 }
 VLAN_PAYLOAD = {"vlan": [{"vlan-id": 10, "name": "device"}]}
 OSPF_PAYLOAD = {"instance": [{"process-id": "1", "redistribute": [{"source-protocol": "connected", "metric": 0}]}]}
+
+
+def _covered(spec_or_protocol, payload: dict) -> Present:
+    """A fresh read of a reader that covered every collection (the old meaning of an omitted list)."""
+    wire = REDIST_WIRES.get(spec_or_protocol) if isinstance(spec_or_protocol, str) else spec_or_protocol.wire_name
+    return Present(covered(wire, payload), Freshness.fresh)
 
 
 def _family_payload(family: str) -> dict:
@@ -32,6 +39,10 @@ def _family_payload(family: str) -> dict:
 
 def _family_spec(family: str):
     return importer.projectable_spec("lag_topology" if family == "lag" else family)
+
+
+def _wire(wire: str, section: dict) -> dict:
+    return exported(wire, section) if section.get("status") == "ok" else section
 
 
 class FamilyReadNso(DeviceReadNso):
@@ -54,10 +65,9 @@ class FamilyReadNso(DeviceReadNso):
         if "device-state" in request.url.path:
             wire = request.url.path.rsplit("/", 1)[-1]
             if wire.startswith("device="):
-                return httpx.Response(
-                    200, json={"device": [{"device-name": wire.removeprefix("device="), **self.sections}]}
-                )
-            return httpx.Response(200, json={wire: self.sections.get(wire, {"status": "unsupported"})})
+                sections = {name: _wire(name, section) for name, section in self.sections.items()}
+                return httpx.Response(200, json={"device": [{"device-name": wire.removeprefix("device="), **sections}]})
+            return httpx.Response(200, json={wire: _wire(wire, self.sections.get(wire, {"status": "unsupported"}))})
         return super().respond(request)
 
 
@@ -72,15 +82,15 @@ async def test_new_family_observations_are_stored_and_served(adapter_client, mon
             device = await db.get(Device, device_id)
             for family, _path in SEAM_ENDPOINTS:
                 await run_family_refresh_from_outcome(
-                    db, device, _family_spec(family), Present(_family_payload(family), Freshness.fresh)
+                    db, device, _family_spec(family), _covered(_family_spec(family), _family_payload(family))
                 )
-            await run_family_refresh_from_outcome(db, device, BGP_SPEC, Present(BGP_PAYLOAD, Freshness.fresh))
+            await run_family_refresh_from_outcome(db, device, BGP_SPEC, _covered(BGP_SPEC, BGP_PAYLOAD))
             await refresh_redistribution_from_outcomes(
                 db,
                 device,
                 {
-                    "ospf": Present(OSPF_PAYLOAD, Freshness.fresh),
-                    "bgp": Present(BGP_PAYLOAD, Freshness.fresh),
+                    "ospf": _covered("ospf", OSPF_PAYLOAD),
+                    "bgp": _covered("bgp", BGP_PAYLOAD),
                     "isis": Unavailable(UnavailableReason.unsupported),
                 },
             )
@@ -109,7 +119,9 @@ async def test_vlan_intent_cannot_change_the_device_observation(adapter_client):
     device_id = await seed_device(nso_device_name="observation-device")
     async with session() as db:
         device = await db.get(Device, device_id)
-        await run_family_refresh_from_outcome(db, device, VLAN_DATABASE_SPEC, Present(VLAN_PAYLOAD, Freshness.fresh))
+        await run_family_refresh_from_outcome(
+            db, device, VLAN_DATABASE_SPEC, _covered(VLAN_DATABASE_SPEC, VLAN_PAYLOAD)
+        )
     path = f"/api/v1/devices/{device_id}/vlan-database"
     old = (await adapter_client.get(path, headers=AUTH)).json()["observation"]
     response = await adapter_client.put(
@@ -155,7 +167,7 @@ async def test_family_api_distinguishes_no_read_empty_and_failed_read(adapter_cl
     spec = importer.projectable_spec("lag_topology" if family == "lag" else family)
     async with session() as db:
         device = await db.get(Device, device_id)
-        await run_family_refresh_from_outcome(db, device, spec, Present({}, Freshness.fresh))
+        await run_family_refresh_from_outcome(db, device, spec, _covered(spec, {}))
     published = await adapter_client.get(endpoint, headers=AUTH)
     assert published.status_code == 200, published.text
     old = assert_publication(published.json(), family)
@@ -173,9 +185,9 @@ async def test_family_api_distinguishes_no_read_empty_and_failed_read(adapter_cl
 async def test_partial_redistribution_never_claims_retained_component_as_observed(adapter_client):
     device_id = await seed_device(nso_device_name="observation-device")
     initial = {
-        "ospf": Present(OSPF_PAYLOAD, Freshness.fresh),
-        "isis": Present({}, Freshness.fresh),
-        "bgp": Present({}, Freshness.fresh),
+        "ospf": _covered("ospf", OSPF_PAYLOAD),
+        "isis": _covered("isis", {}),
+        "bgp": _covered("bgp", {}),
     }
     async with session() as db:
         device = await db.get(Device, device_id)
@@ -189,8 +201,8 @@ async def test_partial_redistribution_never_claims_retained_component_as_observe
             device,
             {
                 "ospf": Unavailable(UnavailableReason.read_error),
-                "isis": Present({}, Freshness.fresh),
-                "bgp": Present({}, Freshness.fresh),
+                "isis": _covered("isis", {}),
+                "bgp": _covered("bgp", {}),
             },
         )
     response = await adapter_client.get(endpoint, headers=AUTH)
@@ -219,15 +231,15 @@ async def test_redistribution_rejects_malformed_asn_on_duplicate_destination(
 
     device_id = await seed_device(nso_device_name="observation-device")
     destination = {identity: value, "redistribute": [{"source-protocol": "connected"}]}
-    initial = {name: Present({}, Freshness.fresh) for name in ["ospf", "isis", "bgp"]}
-    initial[protocol] = Present({key: [destination]}, Freshness.fresh)
+    initial = {name: _covered(name, {}) for name in ["ospf", "isis", "bgp"]}
+    initial[protocol] = _covered(protocol, {key: [destination]})
     async with session() as db:
         device = await db.get(Device, device_id)
         await refresh_redistribution_from_outcomes(db, device, initial)
     endpoint = f"/api/v1/devices/{device_id}/redistribution"
     old = (await adapter_client.get(endpoint, headers=AUTH)).json()["observation"]
     invalid = {identity: value, "redistribute": [{"source-protocol": "bgp", "source-ref": "064512"}]}
-    initial[protocol] = Present({key: [destination, invalid]}, Freshness.fresh)
+    initial[protocol] = _covered(protocol, {key: [destination, invalid]})
     async with session() as db:
         device = await db.get(Device, device_id)
         with pytest.raises(AsnRuleViolation):
@@ -339,11 +351,11 @@ async def test_observation_json_never_contains_credentials(adapter_client, famil
         device = await db.get(Device, device_id)
         if family == "redistribution":
             await refresh_redistribution_from_outcomes(
-                db, device, {protocol: Present(component, Freshness.fresh) for protocol, component in payload.items()}
+                db, device, {protocol: _covered(protocol, component) for protocol, component in payload.items()}
             )
         else:
             spec = importer.projectable_spec("lag_topology" if family == "lag" else family)
-            await run_family_refresh_from_outcome(db, device, spec, Present(payload, Freshness.fresh))
+            await run_family_refresh_from_outcome(db, device, spec, _covered(spec, payload))
     response = await adapter_client.get(f"/api/v1/devices/{device_id}/{path}", headers=AUTH)
     assert response.status_code == 200
     assert_text_free_of(json.dumps(response.json()["observation"]), [placeholder])
@@ -389,9 +401,9 @@ async def test_ospf_redistribution_keeps_same_process_in_two_vrfs(adapter_client
             db,
             device,
             {
-                "ospf": Present(payload, Freshness.fresh),
-                "bgp": Present({}, Freshness.fresh),
-                "isis": Present({}, Freshness.fresh),
+                "ospf": _covered("ospf", payload),
+                "bgp": _covered("bgp", {}),
+                "isis": _covered("isis", {}),
             },
         )
     response = await adapter_client.get(f"/api/v1/devices/{device_id}/redistribution", headers=AUTH)
@@ -421,13 +433,13 @@ async def test_isis_wire_uint64_keeps_process_in_mirror_and_observation(adapter_
             db,
             device,
             spec,
-            Present({"process": [{"process-tag": "CORE", "reference-bandwidth": 100}]}, Freshness.fresh),
+            _covered(spec, {"process": [{"process-tag": "CORE", "reference-bandwidth": 100}]}),
         )
         await run_family_refresh_from_outcome(
             db,
             device,
             spec,
-            Present({"process": [{"process-tag": "CORE", "reference-bandwidth": bandwidth}]}, Freshness.fresh),
+            _covered(spec, {"process": [{"process-tag": "CORE", "reference-bandwidth": bandwidth}]}),
         )
         rows = (await db.scalars(select(DeviceIsisProcess).where(DeviceIsisProcess.device_id == device_id))).all()
         assert [(row.process_tag, row.reference_bandwidth) for row in rows] == [("CORE", int(bandwidth))]
@@ -472,17 +484,17 @@ async def test_refresh_logs_each_entry_the_projection_drops(adapter_client, fami
     payload = _family_payload(family)
     async with session() as db:
         device = await db.get(Device, device_id)
-        await run_family_refresh_from_outcome(db, device, spec, Present(deepcopy(payload), Freshness.fresh))
+        await run_family_refresh_from_outcome(db, device, spec, _covered(spec, deepcopy(payload)))
     clean = await adapter_client.get(f"/api/v1/devices/{device_id}/{path}", headers=AUTH)
-    payload[collection] = [*payload[collection], "not-an-object"]
+    payload[collection] = [*payload[collection], {}]
     async with session() as db:
         device = await db.get(Device, device_id)
         with capture_logs() as logs:
-            await run_family_refresh_from_outcome(db, device, spec, Present(payload, Freshness.fresh))
+            await run_family_refresh_from_outcome(db, device, spec, _covered(spec, payload))
     dirty = await adapter_client.get(f"/api/v1/devices/{device_id}/{path}", headers=AUTH)
     event = "lag_topology.entry_skipped" if family == "lag" else f"{spec.name}.entry_skipped"
     skipped = [record for record in logs if record["event"] == event]
-    assert [(record["device_id"], record["reason"].endswith("expected object")) for record in skipped] == [
+    assert [(record["device_id"], record["reason"].startswith(f"{collection}[")) for record in skipped] == [
         (device_id, True)
     ], logs
     assert (clean.status_code, dirty.status_code) == (200, 200)
@@ -507,7 +519,7 @@ async def test_routing_refresh_logs_each_entry_the_projection_drops(adapter_clie
         device = await db.get(Device, device_id)
         with capture_logs() as logs:
             await run_family_refresh_from_outcome(
-                db, device, spec, Present(deepcopy(ROUTING_DROPPED_ENTRY_PAYLOADS[family]), Freshness.fresh)
+                db, device, spec, _covered(spec, deepcopy(ROUTING_DROPPED_ENTRY_PAYLOADS[family]))
             )
     skipped = [record for record in logs if record["event"] == f"{family}.entry_skipped"]
     assert [(record["device_id"], bool(record["reason"])) for record in skipped] == [(device_id, True)], logs
@@ -527,9 +539,9 @@ async def test_redistribution_refresh_logs_each_source_the_projection_drops(adap
                 db,
                 device,
                 {
-                    "ospf": Present(payload, Freshness.fresh),
-                    "bgp": Present({}, Freshness.fresh),
-                    "isis": Present({}, Freshness.fresh),
+                    "ospf": _covered("ospf", payload),
+                    "bgp": _covered("bgp", {}),
+                    "isis": _covered("isis", {}),
                 },
             )
     skipped = [record for record in logs if record["event"] == "redistribution.entry_skipped"]

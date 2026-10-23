@@ -30,6 +30,7 @@ from nso_adapter.store.models import (
     VlanIntent,
 )
 from tests._secret_discipline import assert_records_free_of, assert_text_free_of
+from tests.collection_coverage_helpers import covered_sections
 from tests.conftest import attach_apply_generation, note_projection_write, session
 from tests.core.execution_helpers import run_apply as _run_apply_worker
 
@@ -756,11 +757,13 @@ async def test_run_apply_refreshes_mirror_and_notifies_plugin(adapter_client):
     mock_client = _nso_client()
     # READSEM grain b: post-apply consumes the projected doc. Serve BOTH families' sections
     # with a row each so their materializers demonstrably run.
-    mock_client.get_device_state_doc.return_value = {
-        "device-name": "rtr-settle",
-        "route-policy": {"status": "ok", "prefix-list": [{"name": "PL-SETTLE", "entry": []}]},
-        "svi": {"status": "ok", "interface": [{"interface-name": "Vlan77", "vlan-id": 77}]},
-    }
+    mock_client.get_device_state_doc.return_value = covered_sections(
+        {
+            "device-name": "rtr-settle",
+            "route-policy": {"status": "ok", "prefix-list": [{"name": "PL-SETTLE", "entry": []}]},
+            "svi": {"status": "ok", "interface": [{"interface-name": "Vlan77", "vlan-id": 77}]},
+        }
+    )
     nb = AsyncMock(spec=NetboxClient)
     nb.notify_sync_complete = AsyncMock()
     imp._netbox_client = nb

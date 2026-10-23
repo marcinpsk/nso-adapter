@@ -22,6 +22,7 @@ from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.read_outcome import Freshness, Present
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device, RefreshOutcome
+from tests.collection_coverage_helpers import covered, exported
 from tests.conftest import AUTH, push_seq, seed_device, session
 
 SEAMS = ["sync", "drift", "ip"]
@@ -47,11 +48,15 @@ class DeviceReadNso(NsoClient):
         if "device-state" in request.url.path:
             wire = request.url.path.rsplit("/", 1)[-1]
             if wire in {"interface-attributes", "interface-ip"}:
-                return httpx.Response(200, json={wire: self.section})
+                return httpx.Response(200, json={wire: exported(wire, self.section)})
             name = wire.removeprefix("device=")
             return httpx.Response(
                 200,
-                json={"device": [{"device-name": name, "interface-attributes": self.section}]},
+                json={
+                    "device": [
+                        {"device-name": name, "interface-attributes": exported("interface-attributes", self.section)}
+                    ]
+                },
             )
         return httpx.Response(200, json={"tailf-ncs:device": {"device-type": {"cli": {"ned-id": "test-ned"}}}})
 
@@ -73,6 +78,11 @@ async def read_family(client, device_id: int, seam: str) -> dict:
     response = await client.get(f"/api/v1/devices/{device_id}/{endpoint}", headers=AUTH)
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def _mirror_view(document: dict) -> list[dict]:
+    """The observation's interfaces without collection presence, which the address mirror cannot hold."""
+    return [{key: value for key, value in item.items() if key != "present"} for item in document["interfaces"]]
 
 
 def assert_publication(body: dict, family: str):
@@ -98,6 +108,7 @@ async def test_successful_read_publishes_device_observation(adapter_client, monk
             "addresses": [
                 {"address": "198.18.0.1/24", "prefix_length": 24, "family": "ipv4", "secondary": False, "vrf": ""}
             ],
+            "present": ["addresses"],
         }
     else:
         entries = [{"interface-name": "port0", "description": "", "enabled": False, "kind": "", "vrf": ""}]
@@ -115,7 +126,7 @@ async def test_successful_read_publishes_device_observation(adapter_client, monk
     body = await read_family(adapter_client, device_id, seam)
     family = "interface_ip" if seam == "ip" else "interface_attributes"
     observation = assert_publication(body, family)
-    assert observation["document"] == {"interfaces": [expected], "unprojectable": []}
+    assert observation["document"] == {"interfaces": [expected], "present": ["interfaces"], "unprojectable": []}
     assert observation["coverage"] == {
         "attributes": ["address", "prefix_length", "secondary", "vrf"] if seam == "ip" else ["description", "enabled"]
     }
@@ -169,7 +180,7 @@ async def test_empty_read_publishes_empty_observation(adapter_client, monkeypatc
     await publish(device_id, seam, DeviceReadNso([]), monkeypatch)
     body = await read_family(adapter_client, device_id, seam)
     observation = assert_publication(body, "interface_ip" if seam == "ip" else "interface_attributes")
-    assert observation["document"] == {"interfaces": [], "unprojectable": []}
+    assert observation["document"] == {"interfaces": [], "present": ["interfaces"], "unprojectable": []}
     assert observation["revision"] > old["revision"]
     assert len(await stored_observations(device_id)) == 1
 
@@ -194,7 +205,6 @@ async def test_malformed_entry_is_reported_in_observation(adapter_client, monkey
     entries = [
         {"interface-name": "port2", "description": None, "address": [{"address": "198.18.0.2/24"}]},
         {"description": "missing name"},
-        "not a mapping",
         {"interface-name": "port1", "description": "", "address": [{"address": "198.18.0.1/24"}]},
     ]
     await publish(device_id, seam, DeviceReadNso(entries), monkeypatch)
@@ -202,12 +212,9 @@ async def test_malformed_entry_is_reported_in_observation(adapter_client, monkey
     document = body["observation"]["document"]
     key = "interface" if seam == "ip" else "name"
     assert [entry[key] for entry in document["interfaces"]] == ["port1", "port2"]
-    assert document["unprojectable"] == [
-        {"index": 1, "reason": "missing or invalid interface-name"},
-        {"index": 2, "reason": "missing or invalid interface-name"},
-    ]
+    assert document["unprojectable"] == [{"index": 1, "reason": "missing or invalid interface-name"}]
     if seam == "ip":
-        assert body["interfaces"] == document["interfaces"]
+        assert body["interfaces"] == _mirror_view(document)
 
 
 async def test_ip_observation_uses_the_mirror_projection(adapter_client, monkeypatch):
@@ -236,6 +243,7 @@ async def test_ip_observation_uses_the_mirror_projection(adapter_client, monkeyp
             {"address": "198.18.0.3/24", "prefix_length": 24, "family": "ipv4", "secondary": False, "vrf": ""},
             {"address": "2001:db8::1/64", "prefix_length": 64, "family": "ipv6", "secondary": False, "vrf": "BLUE"},
         ],
+        "present": ["addresses"],
     }
 
 
@@ -269,12 +277,16 @@ async def publish_unlocked(db, device_id: int, seam: str, nso: DeviceReadNso):
     device = await db.get(Device, device_id)
     if seam == "sync":
         return await importer._consume_interface_attributes(
-            db, device, Present(nso.section, Freshness.fresh), None, refresh_source="sync"
+            db,
+            device,
+            Present(covered("interface-attributes", nso.section), Freshness.fresh),
+            None,
+            refresh_source="sync",
         )
     if seam == "drift":
         return await importer._detect_drift_attributes(device_id, db, device, nso)
     return await run_family_refresh_from_outcome(
-        db, device, INTERFACE_IP_SPEC, Present(nso.section, Freshness.fresh), own_lock=False
+        db, device, INTERFACE_IP_SPEC, Present(covered("interface-ip", nso.section), Freshness.fresh), own_lock=False
     )
 
 
@@ -559,20 +571,17 @@ async def test_authoritative_absence_publishes_empty_ip_observation(adapter_clie
     body = await read_family(adapter_client, device_id, "ip")
     observation = assert_publication(body, "interface_ip")
     assert body["read_state"]["result"] == "cleared"
-    assert observation["document"] == {"interfaces": [], "unprojectable": []}
+    assert observation["document"] == {"interfaces": [], "present": ["interfaces"], "unprojectable": []}
 
 
 async def test_invalid_address_remains_visible_in_observation(adapter_client, monkeypatch):
     device_id = await seed_device(nso_device_name="observation-device")
-    entries = [{"interface-name": "port0", "address": ["bad", {}, {"address": "198.18.0.1/24"}]}]
+    entries = [{"interface-name": "port0", "address": [{}, {"address": "198.18.0.1/24"}]}]
     await publish(device_id, "ip", DeviceReadNso(entries), monkeypatch)
     body = await read_family(adapter_client, device_id, "ip")
     document = body["observation"]["document"]
-    assert document["interfaces"] == body["interfaces"]
-    assert document["unprojectable"] == [
-        {"index": 0, "reason": "address[0]: missing or invalid address"},
-        {"index": 0, "reason": "address[1]: missing or invalid address"},
-    ]
+    assert _mirror_view(document) == body["interfaces"]
+    assert document["unprojectable"] == [{"index": 0, "reason": "address[0]: missing or invalid address"}]
 
 
 async def test_non_boolean_secondary_is_unprojectable(adapter_client, monkeypatch):
@@ -590,7 +599,7 @@ async def test_non_boolean_secondary_is_unprojectable(adapter_client, monkeypatc
     await publish(device_id, "ip", DeviceReadNso(entries), monkeypatch)
     body = await read_family(adapter_client, device_id, "ip")
     document = body["observation"]["document"]
-    assert document["interfaces"] == body["interfaces"]
+    assert _mirror_view(document) == body["interfaces"]
     assert [(item["address"], item["secondary"]) for item in document["interfaces"][0]["addresses"]] == [
         ("198.18.0.2/24", False),
         ("198.18.0.3/24", False),
@@ -616,7 +625,7 @@ async def test_non_string_ip_fields_are_unprojectable(adapter_client, monkeypatc
     await publish(device_id, "ip", DeviceReadNso(entries), monkeypatch)
     body = await read_family(adapter_client, device_id, "ip")
     document = body["observation"]["document"]
-    assert document["interfaces"] == body["interfaces"]
+    assert _mirror_view(document) == body["interfaces"]
     assert [(item["interface"], item["bound_port"]) for item in document["interfaces"]] == [
         ("port0", None),
         ("port2", None),

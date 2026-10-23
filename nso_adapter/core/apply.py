@@ -206,10 +206,12 @@ async def _static_route_device_state(client, device) -> tuple[str, dict]:
 
     One read serves both post-write consumers: the residue check over the consumed
     predecessor keys, and §4.11's per-field evidence for the clear carrier. ``status`` is
-    ``ok`` / ``unsupported`` (the NED exports no such section — absence proves nothing) /
-    ``error``; only ``ok`` yields entries, and only entries can consume anything.
+    ``ok`` / ``unsupported`` (the NED exports no such section, or the section does not cover
+    ``route`` — absence proves nothing) / ``error``; only ``ok`` yields entries, and only entries
+    can consume anything.
     """
     from nso_adapter.core.removal import _VERIFY_BATCH_TIMEOUT, _live_family_sections, _verifier_section_status
+    from nso_adapter.nso.collection_coverage import uncovered_paths
 
     try:
         sections = await _live_family_sections(
@@ -219,6 +221,9 @@ async def _static_route_device_state(client, device) -> tuple[str, dict]:
         status = _verifier_section_status(section)
         if status != "ok":
             return ("unsupported" if status == "unknown" else "error"), {}
+        if uncovered_paths("static-route", section, ["route"]):
+            logger.info("static_route.device_state_not_covered", device_id=device.id)
+            return "unsupported", {}
         entries: dict[tuple[str, str, str], dict] = {}
         for entry in section.get("route") or []:
             if isinstance(entry, dict):
@@ -1855,7 +1860,7 @@ def _reader_compare_walk(
 ) -> tuple[Any, Any, Any, Any, Any]:
     """Walk an ``ok`` device-state *section* for the presence of every translated key.
 
-    Present-all → ``ok``, unless some grain was ``unverifiable`` (never checked) → ``partial``
+    Present-all → ``ok``, unless some grain was ``unverifiable`` or not covered (never checked) → ``partial``
     (the r3-M2 fix for the mixed community+host false-green — ``partial`` beats ``ok`` but
     ``missing`` still beats ``partial``). A missing key stamps its rows ``reader_compare_missing``
     and fails the scope. Returns ``(ok, failed, fails, status, evidence)``.
@@ -1870,15 +1875,19 @@ def _reader_compare_walk(
     alongside the unchanged aggregate. The aggregate collapses a two-row walk with one
     missing key into ``missing`` for BOTH, so a consumer that reads it CASes neither row —
     while the rule that a proven sibling must still CAS demands the opposite. A row absent
-    from the map was never checked and its consumer must treat it as unverifiable.
+    from the map was never checked and its consumer must treat it as unverifiable. A row with a
+    key absent from a collection the section does not cover is ``unproven`` (#1833), never
+    ``missing`` and never ``present``.
     """
-    from nso_adapter.core.removal import _norm_key, _reader_keys
+    from nso_adapter.core.removal import _norm_key, _reader_covered, _reader_keys
 
     present = {gl.label: _reader_keys(scope, section, gl) for gl in lists}
+    covered = {gl.label: _reader_covered(scope, section, gl) for gl in lists}
     guards = {gl.label: gl for gl in lists}
     row_by_id: dict[int, Any] = {}
     missing: dict[int, list[str]] = {}
     evidence: dict[tuple[str, int], str] = {}
+    unproven: set[str] = set()
     for row, label, key in translated:
         pk = getattr(row, "id", None)
         if _norm_key(key, scope, guards[label]) in present.get(label, set()):
@@ -1888,12 +1897,22 @@ def _reader_compare_walk(
             if pk is not None:
                 evidence.setdefault((row.__tablename__, pk), "present")
             continue
+        if not covered[label]:
+            # Absent from an uncovered collection: unproven, so the row gets no evidence (#1833 R2-1).
+            unproven.add(label)
+            if pk is not None and evidence.get((row.__tablename__, pk)) != "missing":
+                evidence[(row.__tablename__, pk)] = "unproven"
+            continue
         if pk is not None:
             evidence[(row.__tablename__, pk)] = "missing"
         row_by_id[id(row)] = row
         missing.setdefault(id(row), []).append(f"{label} {list(key)}")
+    if unproven:
+        logger.info(
+            "apply.reader_compare_not_covered", job_id=job_id, **device_fields(device_id=device_id), scope=scope
+        )
     if not missing:
-        return ok, 0, [], ("partial" if unverifiable else "ok"), evidence
+        return ok, 0, [], ("partial" if unverifiable or unproven else "ok"), evidence
     fails = []
     for rid, keys in missing.items():
         msg = (

@@ -21,6 +21,7 @@ from nso_adapter.store.models import (
     ManagedScope,
     MappingStatus,
 )
+from tests.collection_coverage_helpers import covered_sections
 
 _ALL_PROJECTED_WIRES = (
     "static-route",
@@ -60,10 +61,14 @@ def _make_nso_client(iface_entry=None, sections=None):
     client._sections = routed
 
     async def _get_section(device_name, wire_family):
-        return routed.get(wire_family, {"status": "error", "error-reason": "not stubbed in this test"})
+        served = {wire_family: routed.get(wire_family, {"status": "error", "error-reason": "not stubbed in this test"})}
+        return covered_sections(served)[wire_family]
+
+    async def _get_doc(device_name):
+        return covered_sections(routed)
 
     client.get_device_state_section = AsyncMock(side_effect=_get_section)
-    client.get_device_state_doc = AsyncMock(return_value=routed)
+    client.get_device_state_doc = AsyncMock(side_effect=_get_doc)
     return client
 
 
@@ -814,31 +819,39 @@ async def test_sync_device_default_stays_lean(db_session: AsyncSession):
     assert doc_outcomes == []
 
 
-async def test_refresh_routing_surfaces_isolates_failures(db_session: AsyncSession):
+async def test_refresh_routing_surfaces_isolates_failures(db_session: AsyncSession, monkeypatch):
     """READSEM grain b: ONE projected doc feeds the fan-out; a surface whose
     materialization raises must not abort the others."""
     from sqlalchemy import select as _select
 
+    from nso_adapter.core import isis
     from nso_adapter.core.importer import refresh_routing_surfaces_for_device
     from nso_adapter.store.models import DeviceStaticRoute
+
+    async def _crash(*_args, **_kwargs):
+        raise RuntimeError("deterministic materializer crash")
+
+    monkeypatch.setattr(isis, "_upsert_isis_data", _crash)
 
     device = Device(nso_instance="nso-dev", nso_device_name="sw01", ned_id="x", netbox_device_id=1)
     db_session.add(device)
     await db_session.commit()
 
     nso_client = AsyncMock(spec=NsoClient)
-    nso_client.get_device_state_doc.return_value = {
-        "device-name": "sw01",
-        "static-route": {"status": "ok", "route": [{"vrf": "", "prefix": "10.5.0.0/16", "next-hop": "1.1.1.1"}]},
-        "isis-interface": {"status": "ok", "process": 42},  # deterministic materializer crash
-        "bgp-config": {"status": "error", "error-reason": "extract boom"},  # signalled failure
-        "ospf-config": {"status": "ok"},
-        "route-policy": {"status": "ok"},
-        "snmp-config": {"status": "ok"},
-        "logging-config": {"status": "ok"},
-        "bfd-config": {"status": "ok"},
-        "interface-ip": {"status": "ok"},
-    }
+    nso_client.get_device_state_doc.return_value = covered_sections(
+        {
+            "device-name": "sw01",
+            "static-route": {"status": "ok", "route": [{"vrf": "", "prefix": "10.5.0.0/16", "next-hop": "1.1.1.1"}]},
+            "isis-interface": {"status": "ok", "process": [{"process-tag": "CORE"}]},  # the materializer crashes
+            "bgp-config": {"status": "error", "error-reason": "extract boom"},  # signalled failure
+            "ospf-config": {"status": "ok"},
+            "route-policy": {"status": "ok"},
+            "snmp-config": {"status": "ok"},
+            "logging-config": {"status": "ok"},
+            "bfd-config": {"status": "ok"},
+            "interface-ip": {"status": "ok"},
+        }
+    )
 
     failed = await refresh_routing_surfaces_for_device(db_session, device, nso_client, refresh_source="sync")
 
@@ -892,28 +905,36 @@ async def test_surface_refresher_returns_true_on_success(db_session: AsyncSessio
     assert ok is True
 
 
-async def test_refresh_routing_surfaces_returns_failed_surfaces(db_session: AsyncSession):
+async def test_refresh_routing_surfaces_returns_failed_surfaces(db_session: AsyncSession, monkeypatch):
     """The fan-out returns the names of surfaces that failed — whether they RAISED (isis:
     materializer crash) or signalled a read failure (bgp: error-status section)."""
+    from nso_adapter.core import isis
     from nso_adapter.core.importer import refresh_routing_surfaces_for_device
+
+    async def _crash(*_args, **_kwargs):
+        raise RuntimeError("deterministic materializer crash")
+
+    monkeypatch.setattr(isis, "_upsert_isis_data", _crash)
 
     device = Device(nso_instance="nso-dev", nso_device_name="sw01", ned_id="x", netbox_device_id=1)
     db_session.add(device)
     await db_session.commit()
 
     nso_client = AsyncMock(spec=NsoClient)
-    nso_client.get_device_state_doc.return_value = {
-        "device-name": "sw01",
-        "static-route": {"status": "ok", "route": [{"vrf": "", "prefix": "10.5.0.0/16", "next-hop": "1.1.1.1"}]},
-        "isis-interface": {"status": "ok", "process": 42},  # deterministic materializer crash
-        "bgp-config": {"status": "error", "error-reason": "extract boom"},  # signalled failure
-        "ospf-config": {"status": "ok"},
-        "route-policy": {"status": "ok"},
-        "snmp-config": {"status": "ok"},
-        "logging-config": {"status": "ok"},
-        "bfd-config": {"status": "ok"},
-        "interface-ip": {"status": "ok"},
-    }
+    nso_client.get_device_state_doc.return_value = covered_sections(
+        {
+            "device-name": "sw01",
+            "static-route": {"status": "ok", "route": [{"vrf": "", "prefix": "10.5.0.0/16", "next-hop": "1.1.1.1"}]},
+            "isis-interface": {"status": "ok", "process": [{"process-tag": "CORE"}]},  # the materializer crashes
+            "bgp-config": {"status": "error", "error-reason": "extract boom"},  # signalled failure
+            "ospf-config": {"status": "ok"},
+            "route-policy": {"status": "ok"},
+            "snmp-config": {"status": "ok"},
+            "logging-config": {"status": "ok"},
+            "bfd-config": {"status": "ok"},
+            "interface-ip": {"status": "ok"},
+        }
+    )
 
     failed = await refresh_routing_surfaces_for_device(db_session, device, nso_client, refresh_source="sync")
 
@@ -2349,13 +2370,15 @@ async def test_projected_asn_refusal_preserves_a_later_surface_refresh(adapter_c
 
     class DeviceRead:
         async def get_device_state_doc(self, device_name):
-            return {
-                "bgp-config": {"status": "ok", "router": [{"asn": "064512"}]},
-                "static-route": {
-                    "status": "ok",
-                    "route": [{"vrf": "", "prefix": "198.18.0.0/24", "next-hop": "198.18.1.1"}],
-                },
-            }
+            return covered_sections(
+                {
+                    "bgp-config": {"status": "ok", "router": [{"asn": "064512"}]},
+                    "static-route": {
+                        "status": "ok",
+                        "route": [{"vrf": "", "prefix": "198.18.0.0/24", "next-hop": "198.18.1.1"}],
+                    },
+                }
+            )
 
     device_id = await seed_device(nso_device_name="placeholder-device")
     async with session() as db:

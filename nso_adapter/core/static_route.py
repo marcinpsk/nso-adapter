@@ -55,9 +55,10 @@ async def _upsert_static_routes(
 
 STATIC_ROUTE_SPEC = FamilySpec(
     name="static_route",
-    extract=lambda data: data.get("route", []),
+    extract=lambda data: data["route"],
     materialize=_upsert_static_routes,
     wire_name="static-route",  # READSEM S3: fetch from the device-state envelope
+    requires=("route",),
 )
 
 
