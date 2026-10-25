@@ -13,7 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.core.refresh_engine import FamilySpec, log_skipped_entries, run_family_refresh
 from nso_adapter.domain.switching_observation import project_lag_config
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, LagBundleConfig, LagMemberConfig
 
 logger = structlog.get_logger(__name__)
@@ -64,10 +63,10 @@ async def _upsert_lag_configs(
 
 LAG_CONFIG_SPEC = FamilySpec(
     name="lag_config",
-    # as_list guards the singleton-rendered-as-bare-dict case; extract({}) → [] → clear.
-    extract=lambda data: as_list(data.get("lag")),
+    extract=lambda data: data["lag"],
     materialize=_upsert_lag_configs,
     wire_name="lag-config",  # READSEM S3: fetch from the device-state envelope
+    requires=("lag", "lag/member"),
 )
 
 

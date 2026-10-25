@@ -19,7 +19,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.core.refresh_engine import FamilySpec, log_skipped_entries, run_family_refresh
 from nso_adapter.domain.switching_observation import project_lag_topology
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, LagInterface, LagMember
 
 _DEVICE_RE = re.compile(r"devices/device\[name='([^']+)'\]")
@@ -81,10 +80,10 @@ async def _upsert_lags(
 
 LAG_TOPOLOGY_SPEC = FamilySpec(
     name="lag",
-    # as_list guards the singleton-rendered-as-bare-dict case; extract({}) → [] → clear.
-    extract=lambda data: as_list(data.get("lag")),
+    extract=lambda data: data["lag"],
     materialize=_upsert_lags,
     wire_name="lag-topology",  # READSEM S3: fetch from the device-state envelope
+    requires=("lag", "lag/member"),
 )
 
 

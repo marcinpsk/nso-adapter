@@ -22,6 +22,7 @@ import pytest
 import sqlalchemy as sa
 
 from nso_adapter.nso.client import DEVICE_INTENT_ROOT
+from tests.collection_coverage_helpers import covered_sections
 from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 from tests.core.removal_helpers import authorize_stream
 
@@ -132,13 +133,15 @@ def recorded_client(
     if device_state is None:
 
         async def _default_state(_device_name, wires, **_kwargs):
-            return {wire: rec.fake.section() if wire == "static-route" else {"status": "unsupported"} for wire in wires}
+            return covered_sections(
+                {wire: rec.fake.section() if wire == "static-route" else {"status": "unsupported"} for wire in wires}
+            )
 
         client.run_device_state_read = AsyncMock(side_effect=_default_state)
     else:
 
         async def _state(_device_name, wires, **_kwargs):
-            return {wire: device_state.get(wire, {"status": "unsupported"}) for wire in wires}
+            return covered_sections({wire: device_state.get(wire, {"status": "unsupported"}) for wire in wires})
 
         client.run_device_state_read = AsyncMock(side_effect=_state)
 

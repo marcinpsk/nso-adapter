@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
@@ -16,6 +15,7 @@ from nso_adapter.core.static_route import (
     refresh_static_routes_for_device,
 )
 from nso_adapter.store.models import Device, DeviceStaticRoute
+from tests.collection_coverage_helpers import section_client
 from tests.conftest import seed_device, session
 from tests.fixtures.family_read_payloads import STATIC_ROUTES_READ_PAYLOAD
 
@@ -34,7 +34,7 @@ async def test_refresh_inserts_routes(adapter_client):
     """NSO returns routes → DeviceStaticRoute rows inserted."""
     device_id = await seed_device(nso_device_name="sr-insert-sw01", netbox_device_id=980)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "name": "sr-insert-sw01",
@@ -59,7 +59,7 @@ async def test_refresh_replaces_existing_rows(adapter_client):
     """Second refresh fully replaces previous rows (full-replace pattern)."""
     device_id = await seed_device(nso_device_name="sr-replace-sw01", netbox_device_id=981)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "route": [{"vrf": "", "prefix": "10.0.0.0/8", "next-hop": "192.168.1.1"}],
@@ -98,7 +98,7 @@ async def test_refresh_authoritative_empty_clears_rows(adapter_client):
         await db.commit()
 
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {"status": "ok"}
         await refresh_static_routes_for_device(db, device, nso_client)
 
@@ -124,7 +124,7 @@ async def test_refresh_nso_error_skips_update(adapter_client):
         await db.commit()
 
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.side_effect = RuntimeError("NSO unreachable")
         await refresh_static_routes_for_device(db, device, nso_client)
 
@@ -140,7 +140,7 @@ async def test_refresh_skips_device_without_nso_name(adapter_client):
     device_id = await seed_device(nso_device_name="sr-noname-placeholder", netbox_device_id=984)
     async with _device_session(device_id) as (db, device):
         device.nso_device_name = None  # simulate unmapped device
-        nso_client = AsyncMock()
+        nso_client = section_client()
         await refresh_static_routes_for_device(db, device, nso_client)
         nso_client.get_device_state_section.assert_not_awaited()
 
@@ -162,7 +162,7 @@ async def test_unsupported_keeps_rows_and_reports_success(adapter_client):
         db.add(DeviceStaticRoute(device_id=device_id, vrf="", prefix="10.9.0.0/16", next_hop="1.1.1.1"))
         await db.commit()
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {"status": "unsupported"}
 
         ok = await refresh_static_routes_for_device(db, device, nso_client)

@@ -7,7 +7,6 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -15,6 +14,7 @@ from sqlalchemy import select
 
 from nso_adapter.core.lag_config import refresh_lag_config_for_device
 from nso_adapter.store.models import Device, LagBundleConfig, LagMemberConfig
+from tests.collection_coverage_helpers import section_client
 from tests.conftest import seed_device, session
 from tests.fixtures.switching_read_payloads import SWITCHING_READ_PAYLOADS
 
@@ -32,7 +32,7 @@ async def _device_session(device_id: int):
 async def test_refresh_lag_config_happy(adapter_client):
     device_id = await seed_device(nso_device_name="sw03", netbox_device_id=910)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "device-name": "sw03",
@@ -63,7 +63,7 @@ async def test_refresh_lag_config_carries_vpc_sensitive(adapter_client):
     refused zero-write by the lag-reconciler and must never be offered for accept."""
     device_id = await seed_device(nso_device_name="nx-tor", netbox_device_id=913)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "device-name": "nx-tor",
@@ -89,7 +89,7 @@ async def test_refresh_lag_config_skips_malformed_bundles_and_members(adapter_cl
     whole LAG mirror for the device (s2-6)."""
     device_id = await seed_device(nso_device_name="sw-malformed", netbox_device_id=912)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "device-name": "sw-malformed",
@@ -134,7 +134,7 @@ async def test_refresh_lag_config_clears_on_authoritative_empty(adapter_client):
         )
         await db.commit()
 
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {"status": "ok"}
 
         await refresh_lag_config_for_device(db, device, nso_client, refresh_source="poll")
@@ -158,7 +158,7 @@ async def test_refresh_lag_config_transport_error_no_change(adapter_client):
         )
         await db.commit()
 
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.side_effect = httpx.ConnectError("timeout")
 
         await refresh_lag_config_for_device(db, device, nso_client, refresh_source="poll")
@@ -173,7 +173,7 @@ async def test_refresh_lag_config_skips_without_nso_name(adapter_client):
     device_id = await seed_device(nso_device_name="sw03", netbox_device_id=913)
     async with _device_session(device_id) as (db, device):
         device.nso_device_name = None
-        nso_client = AsyncMock()
+        nso_client = section_client()
 
         await refresh_lag_config_for_device(db, device, nso_client, refresh_source="poll")
 

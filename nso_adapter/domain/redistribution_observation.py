@@ -40,6 +40,11 @@ class RedistributionEntry(RedistributionSourceEntry):
     dest_vrf: str | None = None
 
 
+#: ``covered``: the destination protocol's read replaced its rows. ``unavailable``: its rows
+#: were kept and authorize no change (#1833 R2-2).
+ComponentStatus = Literal["covered", "unavailable"]
+
+
 class RedistributionSourceCoverage(BaseModel):
     model_config = ConfigDict(strict=True)
 
@@ -118,6 +123,7 @@ class OspfRedistributionComponent(BaseModel):
     model_config = ConfigDict(strict=True)
 
     protocol: Literal["ospf"] = "ospf"
+    status: ComponentStatus
     inventory: list[OspfDestination] | None
     present: list[str]
 
@@ -126,6 +132,7 @@ class IsisRedistributionComponent(BaseModel):
     model_config = ConfigDict(strict=True)
 
     protocol: Literal["isis"] = "isis"
+    status: ComponentStatus
     inventory: list[IsisDestination] | None
     present: list[str]
 
@@ -134,6 +141,7 @@ class BgpRedistributionComponent(BaseModel):
     model_config = ConfigDict(strict=True)
 
     protocol: Literal["bgp"] = "bgp"
+    status: ComponentStatus
     inventory: list[BgpDestination] | None
     present: list[str]
 
@@ -149,6 +157,17 @@ class RedistributionDocument(BaseModel):
     unprojectable: list[UnprojectableEntry]
 
 
+def unavailable_redistribution_component(protocol: str) -> RedistributionComponent:
+    """Return the component of a destination protocol whose rows were kept."""
+    if protocol == "ospf":
+        return OspfRedistributionComponent(status="unavailable", inventory=None, present=[])
+    if protocol == "isis":
+        return IsisRedistributionComponent(status="unavailable", inventory=None, present=[])
+    if protocol != "bgp":
+        raise ValueError("unknown redistribution protocol")
+    return BgpRedistributionComponent(status="unavailable", inventory=None, present=[])
+
+
 def project_redistribution_component(
     protocol: str, data: dict
 ) -> tuple[RedistributionComponent, list[UnprojectableEntry]]:
@@ -159,7 +178,7 @@ def project_redistribution_component(
         if key in data:
             present.append("inventory")
         return OspfRedistributionComponent(
-            inventory=None if key in data and data[key] is None else inventory, present=present
+            status="covered", inventory=None if key in data and data[key] is None else inventory, present=present
         ), invalid
     if protocol == "isis":
         key = "process"
@@ -167,7 +186,7 @@ def project_redistribution_component(
         if key in data:
             present.append("inventory")
         return IsisRedistributionComponent(
-            inventory=None if key in data and data[key] is None else inventory_isis, present=present
+            status="covered", inventory=None if key in data and data[key] is None else inventory_isis, present=present
         ), invalid
     if protocol != "bgp":
         raise ValueError("unknown redistribution protocol")
@@ -176,7 +195,7 @@ def project_redistribution_component(
     if key in data:
         present.append("inventory")
     return BgpRedistributionComponent(
-        inventory=None if key in data and data[key] is None else inventory_bgp, present=present
+        status="covered", inventory=None if key in data and data[key] is None else inventory_bgp, present=present
     ), invalid
 
 
@@ -209,6 +228,7 @@ def _projected_destinations(
 
 
 def project_redistribution(data: dict | None) -> tuple[RedistributionDocument, RedistributionCoverage]:
+    """Project the covered destination protocols in *data*; every other protocol is an unavailable component."""
     data = data or {}
     entries: list[RedistributionEntry] = []
     invalid: list[UnprojectableEntry] = []
@@ -218,6 +238,7 @@ def project_redistribution(data: dict | None) -> tuple[RedistributionDocument, R
     protocols: tuple[Literal["bgp", "isis", "ospf"], ...] = ("bgp", "isis", "ospf")
     for protocol in protocols:
         if protocol not in data:
+            document_components.append(unavailable_redistribution_component(protocol))
             continue
         component, bad_destinations = project_redistribution_component(protocol, data[protocol])
         document_components.append(component)

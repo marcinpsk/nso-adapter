@@ -259,10 +259,18 @@ async def _upsert_bgp_data(
 
 BGP_SPEC = FamilySpec(
     name="bgp",
-    # as_list guards the singleton-rendered-as-bare-dict case; extract({}) → [] → clear.
-    extract=lambda data: as_list(data.get("router")),
+    extract=lambda data: data["router"],
     materialize=_upsert_bgp_data,
     wire_name="bgp-config",  # READSEM S3: fetch from the device-state envelope
+    requires=(
+        "router",
+        "router/scope",
+        "router/scope/address-family",
+        "router/scope/peer",
+        "router/scope/peer/peer-address-family",
+        "router/scope/peer-group",
+        "router/scope/peer-group/peer-group-address-family",
+    ),
 )
 
 

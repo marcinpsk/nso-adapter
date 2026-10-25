@@ -6,13 +6,13 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
 
 from nso_adapter.core.isis import refresh_isis_interfaces_for_device
 from nso_adapter.store.models import Device, DeviceIsisInterface, DeviceIsisProcess
+from tests.collection_coverage_helpers import section_client
 from tests.conftest import seed_device, session
 from tests.fixtures.routing_read_payloads import ISIS_LEVEL_READ
 
@@ -32,7 +32,7 @@ async def test_refresh_normalizes_level_2_alias(adapter_client):
     canonical YANG 'level-2-only', matching the writer so it can't drive phantom drift."""
     device_id = await seed_device(nso_device_name="isis-lvl2", netbox_device_id=968)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = deepcopy(ISIS_LEVEL_READ)
 
         await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
@@ -57,7 +57,7 @@ async def test_refresh_persists_bound_port_for_nokia(adapter_client):
     Loopback/unbound interfaces (no bound-port) store None."""
     device_id = await seed_device(nso_device_name="isis-nokia01", netbox_device_id=960)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "process": [],
@@ -80,7 +80,7 @@ async def test_refresh_empty_bound_port_string_stored_as_none(adapter_client):
     """An empty-string bound-port (defensive) is normalized to None, not ''."""
     device_id = await seed_device(nso_device_name="isis-nokia02", netbox_device_id=961)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "process": [],
@@ -99,7 +99,7 @@ async def test_refresh_cisco_interface_has_no_bound_port(adapter_client):
     """Cisco/Junos interfaces never emit bound-port → stored None."""
     device_id = await seed_device(nso_device_name="isis-cisco01", netbox_device_id=962)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "process": [],
@@ -118,7 +118,7 @@ async def test_refresh_persists_hello_auth(adapter_client):
     """Per-interface IS-IS hello auth (type + present) is mirrored secret-safe."""
     device_id = await seed_device(nso_device_name="isis-hauth01", netbox_device_id=961)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "process": [],
@@ -142,7 +142,7 @@ async def test_refresh_persists_isis_bfd_enabled(adapter_client):
     """Per-interface IS-IS bfd-enabled is mirrored."""
     device_id = await seed_device(nso_device_name="isis-bfd01", netbox_device_id=963)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "process": [],
@@ -167,7 +167,7 @@ async def test_refresh_persists_p1_scalars_and_settings(adapter_client):
     """cross-vendor instance/interface scalars + EAV settings are mirrored."""
     device_id = await seed_device(nso_device_name="isis-p1-01", netbox_device_id=965)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "process": [
@@ -223,7 +223,7 @@ async def test_refresh_persists_p2_levels_and_sr(adapter_client):
     """per-level child lists + segment-routing object are mirrored."""
     device_id = await seed_device(nso_device_name="isis-p2-01", netbox_device_id=967)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "process": [
@@ -288,7 +288,7 @@ async def test_refresh_persists_p2_levels_and_sr(adapter_client):
 async def test_refresh_preserves_segment_routing_absence_provenance(adapter_client):
     device_id = await seed_device(nso_device_name="isis-sr-empty", netbox_device_id=975)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "process": [
@@ -316,7 +316,7 @@ async def test_refresh_persists_srv6_locators(adapter_client):
     """The per-process srv6-locator list is mirrored to the srv6_locators column."""
     device_id = await seed_device(nso_device_name="isis-srv6-01", netbox_device_id=971)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "process": [
@@ -344,7 +344,7 @@ async def test_refresh_persists_attached_bit(adapter_client):
     """Per-process suppress/ignore-attached-bit boolean leaves are mirrored to columns."""
     device_id = await seed_device(nso_device_name="isis-att-01", netbox_device_id=972)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "process": [
@@ -374,7 +374,7 @@ async def test_refresh_persists_frr(adapter_client):
     device-side disable/exclude arrives as frr-enabled=False and must persist as False."""
     device_id = await seed_device(nso_device_name="isis-frr-01", netbox_device_id=973)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "process": [
@@ -419,7 +419,7 @@ async def test_refresh_dedups_duplicate_interface(adapter_client):
     whole full-replace — deduped (first occurrence wins)."""
     device_id = await seed_device(nso_device_name="isis-dup01", netbox_device_id=969)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "process": [],

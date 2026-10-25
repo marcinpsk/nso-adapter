@@ -7,6 +7,7 @@ from sqlalchemy import select
 
 from nso_adapter.domain.asn import AsnRuleViolation, asn_row_identity, validate_source_as_numbers
 from nso_adapter.store.models import Device
+from tests.collection_coverage_helpers import covered
 from tests.conftest import AUTH, seed_device, session
 
 _UNQUALIFIED = {"source-protocol": "bgp", "source-ref": ""}
@@ -27,7 +28,7 @@ async def test_protocol_refresh_stores_bgp_source_without_as(adapter_client, pro
 
     class JunosShapedRead:
         async def get_device_state_section(self, device_name, section):
-            return {"status": "ok", list_key: [process]}
+            return covered(section, {"status": "ok", list_key: [process]})
 
     device_id = await seed_device(nso_device_name="placeholder-device")
     async with session() as db:

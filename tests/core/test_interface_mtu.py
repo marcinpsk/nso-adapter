@@ -6,13 +6,13 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
 
 from nso_adapter.core.interface_mtu import refresh_interface_mtu_for_device
 from nso_adapter.store.models import Device, DeviceInterfaceMtu
+from tests.collection_coverage_helpers import section_client
 from tests.conftest import seed_device, session
 from tests.fixtures.switching_read_payloads import SWITCHING_READ_PAYLOADS
 
@@ -37,7 +37,7 @@ async def _rows(db, device_id):
 async def test_refresh_inserts_mtu(adapter_client):
     device_id = await seed_device(nso_device_name="mtu-rtr01", netbox_device_id=980)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "device-name": "mtu-rtr01",
@@ -57,7 +57,7 @@ async def test_refresh_inserts_mtu(adapter_client):
 async def test_refresh_full_replace(adapter_client):
     device_id = await seed_device(nso_device_name="mtu-rtr02", netbox_device_id=981)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "interface": [{"interface-name": "ae10", "mtu": 9192}],
@@ -76,7 +76,7 @@ async def test_refresh_authoritative_empty_clears(adapter_client):
     """An authoritatively-empty read (status=ok, no list keys) clears the rows. (Device-absence, section None, now KEEPS — READSEM S5.)"""
     device_id = await seed_device(nso_device_name="mtu-rtr03", netbox_device_id=982)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "interface": [{"interface-name": "ae10", "mtu": 9192}],
@@ -92,7 +92,7 @@ async def test_a_BOOLEAN_mtu_is_dropped_and_never_stored_as_1(adapter_client):
     """``int(True)`` stored an MTU of 1 byte; the refused value is stored as absent instead."""
     device_id = await seed_device(nso_device_name="mtu-bool", netbox_device_id=984)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "device-name": "mtu-bool",
@@ -111,7 +111,7 @@ async def test_an_invalid_mtu_leaf_is_materialized_without_a_skip_warning(adapte
 
     device_id = await seed_device(nso_device_name="mtu-invalid-leaf", netbox_device_id=985)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "device-name": "mtu-invalid-leaf",

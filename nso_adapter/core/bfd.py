@@ -13,7 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.core.refresh_engine import FamilySpec, log_skipped_entries, run_family_refresh
 from nso_adapter.domain.service_observation import project_bfd
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceBfdInterface
 
 logger = structlog.get_logger(__name__)
@@ -49,10 +48,10 @@ async def _upsert_bfd_data(
 
 BFD_SPEC = FamilySpec(
     name="bfd",
-    # as_list guards the singleton-rendered-as-bare-dict case (was a raw .get → crash).
-    extract=lambda data: as_list(data.get("interface")),
+    extract=lambda data: data["interface"],
     materialize=_upsert_bfd_data,
     wire_name="bfd-config",  # READSEM S3: fetch from the device-state envelope
+    requires=("interface",),
 )
 
 

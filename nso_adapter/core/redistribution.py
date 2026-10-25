@@ -12,8 +12,9 @@ Entry points:
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
+from typing import NamedTuple
 
 import structlog
 from sqlalchemy import delete
@@ -21,13 +22,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.bgp import validate_bgp_as_numbers
 from nso_adapter.core.cancelsafe import await_uncancellable
-from nso_adapter.core.refresh_engine import classify_envelope_family_read, log_skipped_entries
+from nso_adapter.core.refresh_engine import NONFAILING_KEEP_REASONS, classify_envelope_family_read, log_skipped_entries
 from nso_adapter.domain.asn import validate_asn_rows, validate_source_as_numbers
 from nso_adapter.domain.observation import observe_redistribution
 from nso_adapter.domain.redistribution_observation import (
     project_redistribution,
 )
 from nso_adapter.nso.client import NsoClient, failure_detail
+from nso_adapter.nso.collection_coverage import admit_coverage, empty_section, validate_paths
 from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
     Freshness,
@@ -86,13 +88,33 @@ def _bgp_redistribution_rows(device_id: int, entry: dict, now: datetime, refresh
     return _component_rows(device_id, "bgp", entry, now, refresh_source)
 
 
-# Each source protocol: its envelope section (READSEM S3 B5) + the row builder that
-# partitions on this dest_protocol. The redistribute lists ride inside the protocol
-# families' own sections — redistribution reads the same wire the family specs read.
-_REDIST_COMPONENTS = (
-    ("ospf", "ospf-config", _ospf_redistribution_rows),
-    ("isis", "isis-interface", _isis_redistribution_rows),
-    ("bgp", "bgp-config", _bgp_redistribution_rows),
+class RedistComponent(NamedTuple):
+    """One destination protocol: its section, row builder and the collections it replaces."""
+
+    protocol: str
+    wire_name: str
+    builder: Callable[[int, dict, datetime, str], list]
+    requires: tuple[str, ...]
+
+    def admit(self, outcome: ReadOutcome) -> ReadOutcome:
+        return admit_coverage(outcome, self.wire_name, self.requires, consumer=f"redistribution.{self.protocol}")
+
+
+# Each destination protocol: its envelope section (READSEM S3 B5), the row builder that
+# partitions on this dest_protocol and the collections a replacement needs covered. The
+# redistribute lists ride inside the protocol families' own sections.
+_REDIST_COMPONENTS = tuple(
+    RedistComponent(protocol, wire, builder, validate_paths(wire, requires))
+    for protocol, wire, builder, requires in (
+        ("ospf", "ospf-config", _ospf_redistribution_rows, ("instance", "instance/redistribute")),
+        ("isis", "isis-interface", _isis_redistribution_rows, ("process", "process/redistribute")),
+        (
+            "bgp",
+            "bgp-config",
+            _bgp_redistribution_rows,
+            ("router", "router/scope", "router/scope/address-family", "router/scope/address-family/redistribute"),
+        ),
+    )
 )
 
 
@@ -129,12 +151,12 @@ async def refresh_redistribution_for_device(
 
     async with _engine._family_lock(device.id, "redistribution"):
         outcomes: dict[str, ReadOutcome] = {}
-        for proto, wire_name, _builder in _REDIST_COMPONENTS:
-            outcomes[proto] = await classify_envelope_family_read(
+        for component in _REDIST_COMPONENTS:
+            outcomes[component.protocol] = await classify_envelope_family_read(
                 device,
                 nso_client,
-                wire_name=wire_name,
-                family_name=f"redistribution.{proto}",
+                wire_name=component.wire_name,
+                family_name=f"redistribution.{component.protocol}",
             )
         return await refresh_redistribution_from_outcomes(
             db, device, outcomes, refresh_source=refresh_source, own_lock=False
@@ -172,6 +194,8 @@ async def refresh_redistribution_from_outcomes(
     device_id = device.id
     source_epoch = device.source_epoch
     now = datetime.now(UTC)
+    # A component whose read does not cover its collections keeps its partition (#1833 R2-2).
+    outcomes = {component.protocol: component.admit(outcomes[component.protocol]) for component in _REDIST_COMPONENTS}
 
     # Tier 1 — any confirmed export outage aborts the whole refresh, rows untouched.
     outage = _first_with_reason(outcomes.values(), UnavailableReason.export_down)
@@ -192,14 +216,13 @@ async def refresh_redistribution_from_outcomes(
     # Merged phase-1 outcome, recorded BEFORE any mutation — the COMPLETE terminal
     # contract (READSEM S4 D7). Buckets: replaced = authoritative (Present rebuilds /
     # AbsentAuthoritative clears its partition), errors = retained by a real failure,
-    # kept_nonfailing = declared no-reader (unsupported — the ArcOS asymmetry) OR device-level
-    # absence (not_authoritative — READSEM S5 keep-rows): deliberately non-failing, exactly as
-    # every FamilySpec family treats them (_apply_outcome), so a device-absent read is a KEPT
-    # success here too, never a false degrade.
-    _NONFAILING_KEEP = (UnavailableReason.unsupported, UnavailableReason.not_authoritative)
+    # kept_nonfailing = declared no-reader (unsupported — the ArcOS asymmetry), a reader that
+    # does not cover the collections (not_covered) OR device-level absence (not_authoritative —
+    # READSEM S5 keep-rows): deliberately non-failing, exactly as every FamilySpec family treats
+    # them (_apply_outcome), so a device-absent read is a KEPT success here too, never a false degrade.
     assert _REDIST_COMPONENTS, "empty _REDIST_COMPONENTS is a programming error"
     replaced = [p for p, o in outcomes.items() if not isinstance(o, Unavailable)]
-    errors = [p for p, o in outcomes.items() if isinstance(o, Unavailable) and o.reason not in _NONFAILING_KEEP]
+    errors = [p for p, o in outcomes.items() if isinstance(o, Unavailable) and o.reason not in NONFAILING_KEEP_REASONS]
     # Worst freshness among the REPLACED authoritative components: fresh < stale
     # (READSEM S5 retired the `aged` approximation — the envelope carries `stale` directly).
     _FRESHNESS_RANK = {Freshness.fresh: 0, Freshness.stale: 1}
@@ -216,7 +239,7 @@ async def refresh_redistribution_from_outcomes(
         merged: ReadOutcome = Present.composite(
             {},
             Freshness.stale if errors else worst_freshness,
-            (outcomes[proto] for proto, _wire_name, _builder in _REDIST_COMPONENTS),
+            (outcomes[component.protocol] for component in _REDIST_COMPONENTS),
         )
         terminal_result, terminal_succeeded = "replaced", True
         composite_ok = not errors
@@ -364,9 +387,9 @@ async def _commit_partitions(
                 publish_payload=terminal_result == "replaced",
                 observation=observe_redistribution(
                     {
-                        protocol: outcome.data if isinstance(outcome, Present) else {}
-                        for protocol, outcome in outcomes.items()
-                        if isinstance(outcome, (Present, AbsentAuthoritative))
+                        component.protocol: _component_data(component, outcomes[component.protocol])
+                        for component in _REDIST_COMPONENTS
+                        if isinstance(outcomes[component.protocol], (Present, AbsentAuthoritative))
                     }
                 )
                 if terminal_result == "replaced"
@@ -408,6 +431,11 @@ async def _commit_partitions(
     return rebuilt, bool(outcome_row is not None and outcome_row.result == "superseded")
 
 
+def _component_data(component: RedistComponent, outcome: ReadOutcome) -> dict:
+    """Return the decoded section a covered component replaces from; a clear is the covered empty section."""
+    return outcome.data if isinstance(outcome, Present) else empty_section(component.wire_name)
+
+
 # Reason severity for the no-authoritative-component merge (D7): a real failure always
 # outranks a declared capability gap.
 _REASON_SEVERITY = (
@@ -415,6 +443,7 @@ _REASON_SEVERITY = (
     UnavailableReason.read_error,
     UnavailableReason.not_ready,
     UnavailableReason.not_authoritative,
+    UnavailableReason.not_covered,
     UnavailableReason.unsupported,
 )
 
@@ -481,10 +510,10 @@ async def _rebuild_partitions(
 ) -> list[DeviceRedistribution]:
     """Apply the per-component aggregation (R1-F7): replace / keep-unsupported / keep-failed."""
     rebuilt: list[DeviceRedistribution] = []
-    for proto, _wire_name, builder in _REDIST_COMPONENTS:
-        outcome = outcomes[proto]
+    for component in _REDIST_COMPONENTS:
+        proto, builder, outcome = component.protocol, component.builder, outcomes[component.protocol]
         if isinstance(outcome, (Present, AbsentAuthoritative)):
-            entry = outcome.data if isinstance(outcome, Present) else {}
+            entry = _component_data(component, outcome)
             await db.execute(
                 delete(DeviceRedistribution).where(
                     DeviceRedistribution.device_id == device_id,
@@ -492,9 +521,12 @@ async def _rebuild_partitions(
                 )
             )
             rebuilt.extend(builder(device_id, entry, now, refresh_source))
-        elif isinstance(outcome, Unavailable) and outcome.reason is UnavailableReason.unsupported:
+        elif isinstance(outcome, Unavailable) and outcome.reason in (
+            UnavailableReason.unsupported,
+            UnavailableReason.not_covered,
+        ):
             logger.info(
-                "redistribution.refresh.component_unsupported",
+                f"redistribution.refresh.component_{outcome.reason.value}",
                 device_id=device_id,
                 protocol=proto,
             )

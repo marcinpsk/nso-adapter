@@ -177,21 +177,31 @@ async def _upsert_route_policy_data(
 
     now = datetime.now(UTC)
 
-    # as_list guards the RESTCONF singleton-rendered-as-bare-dict case for each top-level list;
-    # an empty ``data`` dict (the AbsentAuthoritative clear) yields four empty lists → clear.
-    await _upsert_prefix_lists(db, device, as_list(data.get("prefix-list")), now, refresh_source)
-    await _upsert_community_lists(db, device, as_list(data.get("community-list")), now, refresh_source)
-    await _upsert_as_paths(db, device, as_list(data.get("as-path")), now, refresh_source)
-    await _upsert_route_maps(db, device, as_list(data.get("route-map")), now, refresh_source)
+    await _upsert_prefix_lists(db, device, data["prefix-list"], now, refresh_source)
+    await _upsert_community_lists(db, device, data["community-list"], now, refresh_source)
+    await _upsert_as_paths(db, device, data["as-path"], now, refresh_source)
+    await _upsert_route_maps(db, device, data["route-map"], now, refresh_source)
 
 
 ROUTE_POLICY_SPEC = FamilySpec(
     name="route_policy",
-    # The materializer takes the whole entry dict; extract({}) → the four-family clear. The engine
-    # logs the clear (route_policy.refresh.cleared) — fixing the old silent clear-on-None path.
+    # The materializer takes the whole decoded entry; the engine admits its four lists first.
     extract=lambda data: data,
     materialize=_upsert_route_policy_data,
     wire_name="route-policy",  # READSEM S3: fetch from the device-state envelope
+    requires=(
+        "prefix-list",
+        "prefix-list/entry",
+        "community-list",
+        "community-list/entry",
+        "as-path",
+        "as-path/entry",
+        "route-map",
+        "route-map/entry",
+        "route-map/entry/match-prefix-lists",
+        "route-map/entry/match-community-lists",
+        "route-map/entry/match-as-paths",
+    ),
 )
 
 

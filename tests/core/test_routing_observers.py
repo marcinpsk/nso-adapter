@@ -7,6 +7,7 @@ import pytest
 from nso_adapter.core.families import ALL_FAMILY_KEYS
 from nso_adapter.domain.observation import OBSERVERS, observe_family
 from tests._secret_discipline import assert_text_free_of
+from tests.collection_coverage_helpers import covered
 from tests.fixtures.routing_read_payloads import (
     BGP_ROUTERS_READ,
     ISIS_LEVEL_READ,
@@ -407,7 +408,9 @@ async def test_bgp_mirror_keeps_device_group_precedence_while_observation_sorts(
     device_id = await seed_device(nso_device_name="observation-device")
     async with session() as db:
         device = await db.get(Device, device_id)
-        await run_family_refresh_from_outcome(db, device, BGP_SPEC, Present(payload, Freshness.fresh))
+        await run_family_refresh_from_outcome(
+            db, device, BGP_SPEC, Present(covered("bgp-config", payload), Freshness.fresh)
+        )
     response = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
     assert response.status_code == 200, response.text
     body = response.json()

@@ -19,6 +19,7 @@ import pytest
 from nso_adapter.config import NsoInstanceConfig
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError, NsoReadContractError
 from tests._secret_discipline import assert_chain_free_of, assert_text_contains, assert_text_free_of
+from tests.collection_coverage_helpers import exported
 
 
 def _make_client() -> NsoClient:
@@ -100,11 +101,14 @@ def patch_client():
 async def test_section_get_returns_the_namespaced_section(patch_client):
     client = _make_client()
     body = {
-        "network-state-export:ospf-config": {
-            "status": "ok",
-            "last-updated": "2026-07-20T12:00:00+00:00",
-            "instance": [{"process-id": "1", "vrf": "", "area": [{"area-id": "0.0.0.0"}]}],
-        }
+        "network-state-export:ospf-config": exported(
+            "ospf-config",
+            {
+                "status": "ok",
+                "last-updated": "2026-07-20T12:00:00+00:00",
+                "instance": [{"process-id": "1", "vrf": "", "area": [{"area-id": "0.0.0.0"}]}],
+            },
+        )
     }
     with patch_client(client, EnvelopeTransport(device_body=body)):
         section = await client.get_device_state_section("sw01", "ospf-config")
@@ -188,7 +192,7 @@ async def test_action_posts_module_qualified_input_and_returns_output(patch_clie
             "atomic": True,
             "device-name": "sw01",
             "last-updated": "2026-07-20T12:00:00+00:00",
-            "ospf-config": {"status": "ok", "instance": []},
+            "ospf-config": exported("ospf-config", {"status": "ok", "instance": []}),
             "logging-config": {"status": "unsupported"},
         }
     }
@@ -343,7 +347,7 @@ async def test_action_certified_terminal_sections_pass(patch_client):
         {
             "atomic": True,
             "device-name": "sw01",
-            "ospf-config": {"status": "ok", "instance": []},
+            "ospf-config": exported("ospf-config", {"status": "ok", "instance": []}),
             "logging-config": {"status": "unsupported"},
             "bgp-config": {"status": "error", "error-reason": "boom"},
         }

@@ -166,19 +166,8 @@ async def _upsert_isis_data(
 
 
 async def _materialize_isis(db: AsyncSession, device: Device, entry: dict, refresh_source: str) -> None:
-    """Engine materializer: destructure the IS-IS entry into its two lists and full-replace.
-
-    ``as_list`` guards the RESTCONF singleton-as-bare-object case for both the ``process`` and
-    ``interface`` YANG lists (a raw ``entry.get(...)`` would iterate a singleton dict's keys and
-    crash). An empty entry ``{}`` (the AbsentAuthoritative clear) yields two empty lists → clear.
-    """
-    await _upsert_isis_data(
-        db,
-        device,
-        as_list(entry.get("process")),
-        as_list(entry.get("interface")),
-        refresh_source,
-    )
+    """Engine materializer: destructure the IS-IS entry into its two covered lists and full-replace."""
+    await _upsert_isis_data(db, device, entry["process"], entry["interface"], refresh_source)
 
 
 ISIS_SPEC = FamilySpec(
@@ -186,6 +175,17 @@ ISIS_SPEC = FamilySpec(
     extract=lambda data: data,
     materialize=_materialize_isis,
     wire_name="isis-interface",  # READSEM S3: fetch from the device-state envelope
+    requires=(
+        "process",
+        "process/setting",
+        "process/level",
+        "process/srv6-locator",
+        "process/flex-algo",
+        "interface",
+        "interface/setting",
+        "interface/level",
+        "interface/prefix-sid",
+    ),
 )
 
 

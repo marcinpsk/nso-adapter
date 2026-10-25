@@ -5,7 +5,6 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -16,6 +15,7 @@ from nso_adapter.core.lag_topology import (
     refresh_lag_topology_for_device,
 )
 from nso_adapter.store.models import Device, LagInterface, LagMember
+from tests.collection_coverage_helpers import section_client
 from tests.conftest import seed_device, session
 from tests.fixtures.switching_read_payloads import SWITCHING_READ_PAYLOADS
 
@@ -67,7 +67,7 @@ def test_parse_changed_devices_unknown():
 async def test_refresh_lag_topology_happy(adapter_client):
     device_id = await seed_device(nso_device_name="sw03", netbox_device_id=900)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "device-name": "sw03",
@@ -101,7 +101,7 @@ async def test_refresh_lag_topology_clears_on_authoritative_empty(adapter_client
         )
         await db.commit()
 
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {"status": "ok"}
 
         await refresh_lag_topology_for_device(db, device, nso_client, refresh_source="poll")
@@ -114,7 +114,7 @@ async def test_refresh_lag_topology_clears_on_authoritative_empty(adapter_client
 async def test_refresh_lag_topology_transport_error(adapter_client):
     device_id = await seed_device(nso_device_name="sw03", netbox_device_id=902)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.side_effect = httpx.ConnectError("timeout")
 
         await refresh_lag_topology_for_device(db, device, nso_client, refresh_source="poll")
@@ -135,7 +135,7 @@ async def test_lag_without_lag_id_is_skipped_not_fatal(adapter_client):
 
         from tests._secret_discipline import assert_keys_absent, assert_records_free_of
 
-        client = AsyncMock()
+        client = section_client()
         client.get_device_state_section.return_value = {
             "status": "ok",
             "lag": [
@@ -165,7 +165,7 @@ async def test_lag_with_malformed_id_does_not_block_valid_topology(adapter_clien
 
     device_id = await seed_device(nso_device_name="sw-malformed-lag", netbox_device_id=9821)
     async with _device_session(device_id) as (db, device):
-        client = AsyncMock()
+        client = section_client()
         client.get_device_state_section.return_value = {
             "status": "ok",
             "lag": [
@@ -190,7 +190,7 @@ async def test_lag_coverage_gap_is_materialized_without_a_skip_warning(adapter_c
 
     device_id = await seed_device(nso_device_name="sw-lag-coverage-gap", netbox_device_id=9822)
     async with _device_session(device_id) as (db, device):
-        client = AsyncMock()
+        client = section_client()
         client.get_device_state_section.return_value = {
             "status": "ok",
             "lag": [
@@ -212,7 +212,7 @@ async def test_a_BOOLEAN_lag_id_is_refused(adapter_client):
     """``int(True)`` stored LAG 1, a bundle id the device never reported."""
     device_id = await seed_device(nso_device_name="sw-bool-lag", netbox_device_id=1408)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "device-name": "sw-bool-lag",

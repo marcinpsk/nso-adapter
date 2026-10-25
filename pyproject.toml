@@ -56,6 +56,10 @@ dev = [
 where = ["."]
 include = ["nso_adapter*"]
 
+[tool.setuptools.package-data]
+# The collection decoder reads its manifest at import, so wheels must carry it.
+"nso_adapter.nso" = ["*.json"]
+
 [tool.semantic_release]
 allow_zero_version = true
 commit_message = "chore(release): {version} [skip ci]"

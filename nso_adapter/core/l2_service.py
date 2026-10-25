@@ -20,7 +20,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.core.refresh_engine import FamilySpec, log_skipped_entries, run_family_refresh
 from nso_adapter.domain.service_observation import project_l2_services
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceL2Sap
 
 logger = structlog.get_logger(__name__)
@@ -58,9 +57,10 @@ async def _upsert_l2_saps(
 
 L2_SERVICE_SPEC = FamilySpec(
     name="l2_service",
-    extract=lambda data: as_list(data.get("service")),
+    extract=lambda data: data["service"],
     materialize=_upsert_l2_saps,
     wire_name="l2-service",  # READSEM S3: fetch from the device-state envelope
+    requires=("service", "service/sap"),
 )
 
 

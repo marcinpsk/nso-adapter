@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy import select
 
 from nso_adapter.domain.asn import AsnRuleViolation
+from tests.collection_coverage_helpers import covered
 from tests.conftest import seed_device, session
 from tests.fixtures.routing_read_payloads import BGP_ROUTERS_READ
 
@@ -286,7 +287,7 @@ class _FakeNso:
             raise self._exc
         if self._entry is None:
             return None
-        return {"status": "ok", **self._entry}
+        return covered(wire_family, {"status": "ok", **self._entry})
 
 
 async def test_router_without_asn_is_rejected(adapter_client):
