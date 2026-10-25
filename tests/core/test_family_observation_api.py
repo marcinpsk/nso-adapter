@@ -450,16 +450,16 @@ async def test_isis_wire_uint64_keeps_process_in_mirror_and_observation(adapter_
     assert observed["document"]["unprojectable"] == []
 
 
-DROPPED_ENTRY_COLLECTIONS = {
-    "lag": "lag",
-    "bfd": "interface",
-    "l2_service": "service",
-    "logging": "host",
-    "snmp": "host",
-    "static_route": "route",
-    "interface_mtu": "interface",
-    "lag_config": "lag",
-}
+DROPPED_ENTRY_CASES = [
+    ("lag", "lag", "lag[2]: invalid lag_id, name"),
+    ("bfd", "interface", "interface[2]: invalid interface_name"),
+    ("l2_service", "service", "service[2]: invalid service_name"),
+    ("logging", "host", "host[1]: invalid address"),
+    ("snmp", "host", "host[2]: invalid address"),
+    ("static_route", "route", "route[2]: invalid prefix"),
+    ("interface_mtu", "interface", "interface[3]: invalid interface_name"),
+    ("lag_config", "lag", "lag[2]: invalid lag_id, name"),
+]
 
 
 def _mirror_rows(body: object) -> object:
@@ -474,8 +474,8 @@ def _mirror_rows(body: object) -> object:
     return body
 
 
-@pytest.mark.parametrize(("family", "collection"), DROPPED_ENTRY_COLLECTIONS.items())
-async def test_refresh_logs_each_entry_the_projection_drops(adapter_client, family, collection):
+@pytest.mark.parametrize(("family", "collection", "expected_reason"), DROPPED_ENTRY_CASES)
+async def test_refresh_logs_each_entry_the_projection_drops(adapter_client, family, collection, expected_reason):
     from structlog.testing import capture_logs
 
     device_id = await seed_device(nso_device_name="observation-device")
@@ -494,9 +494,7 @@ async def test_refresh_logs_each_entry_the_projection_drops(adapter_client, fami
     dirty = await adapter_client.get(f"/api/v1/devices/{device_id}/{path}", headers=AUTH)
     event = "lag_topology.entry_skipped" if family == "lag" else f"{spec.name}.entry_skipped"
     skipped = [record for record in logs if record["event"] == event]
-    assert [(record["device_id"], record["reason"].startswith(f"{collection}[")) for record in skipped] == [
-        (device_id, True)
-    ], logs
+    assert [(record["device_id"], record["reason"]) for record in skipped] == [(device_id, expected_reason)], logs
     assert (clean.status_code, dirty.status_code) == (200, 200)
     assert _mirror_rows(dirty.json()) == _mirror_rows(clean.json())
 

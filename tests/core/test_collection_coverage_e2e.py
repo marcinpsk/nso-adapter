@@ -51,6 +51,7 @@ class CoverageNso(NsoClient):
             "placeholder-password",
         )
         self.sections = sections
+        self.paths: list[str] = []
 
     def _client(self, timeout=None):
         return httpx.AsyncClient(transport=httpx.MockTransport(self.respond))
@@ -60,6 +61,7 @@ class CoverageNso(NsoClient):
 
     def respond(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        self.paths.append(path)
         if path.endswith(":device-state-read/run"):
             asked = json.loads(request.content)["network-state-export:input"]
             output = {"device-name": asked["device"], "atomic": True}
@@ -239,6 +241,8 @@ async def test_sync_decodes_the_document_and_the_action(adapter_client, monkeypa
         await importer.sync_device(device_id, db, atomic=atomic)
     scope = _scope_by_vrf(await _family(adapter_client, device_id, "bgp-config"))[""]
     assert scope["peer_group"] == [] and "peer_group" in scope["present"]
+    assert any(path.endswith(":device-state-read/run") for path in nso.paths) is atomic
+    assert any(path.endswith(f":device-state/device={DEVICE}") for path in nso.paths) is (not atomic)
 
 
 async def test_a_service_without_saps_reports_a_covered_empty_sap_list(adapter_client):
