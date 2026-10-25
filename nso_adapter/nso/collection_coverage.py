@@ -131,12 +131,17 @@ def decode_section(family: str, section: object) -> dict:
 def decode_sections(families: Iterable[str], served: Mapping) -> dict:
     """Return a copy of *served* with each object section named in *families* decoded.
 
-    A non-object section stays as served, so the caller's classifier names it malformed.
+    A non-object section stays as served, and a section that breaks the coverage contract
+    becomes None, so the caller's classifier names only that family malformed.
     """
     out = dict(served)
     for family in families:
         if isinstance(out.get(family), dict):
-            out[family] = decode_section(family, out[family])
+            try:
+                out[family] = decode_section(family, out[family])
+            except CollectionCoverageError:
+                logger.warning("collection_coverage.section_rejected", family=family)
+                out[family] = None
     return out
 
 

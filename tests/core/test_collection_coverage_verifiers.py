@@ -7,8 +7,16 @@ The device-state-read action is answered at the RESTCONF boundary and decoded by
 
 from __future__ import annotations
 
+import pytest
+
 from nso_adapter.core.apply import _reader_compare_walk, _static_route_device_state
-from nso_adapter.core.removal import _interface_config_residue, _residue_after_removal, section_guard_lists
+from nso_adapter.core.removal import (
+    _interface_config_residue,
+    _live_family_sections,
+    _residue_after_removal,
+    section_guard_lists,
+)
+from nso_adapter.nso.client import NsoReadContractError
 from nso_adapter.nso.collection_coverage import MARKER
 from nso_adapter.store.models import BgpRouterIntent, Device
 from tests.core.test_collection_coverage_e2e import CoverageNso
@@ -36,6 +44,15 @@ async def test_removal_residue_is_unproven_when_the_removed_list_is_not_covered(
     assert await _residue_after_removal(unread, DEVICE, "bgp", context) == (None, ["peer"])
     read = CoverageNso({"bgp-config": _bgp(["address-family", "peer", "peer-group"])})
     assert await _residue_after_removal(read, DEVICE, "bgp", context) == ({}, [])
+
+
+async def test_verifier_refuses_a_section_that_breaks_the_coverage_contract():
+    broken = CoverageNso({"bgp-config": _bgp(["peer", "peer"])})
+    with pytest.raises(NsoReadContractError, match="coverage contract"):
+        await _live_family_sections(broken, DEVICE.nso_device_name, ["bgp-config"], timeout=1.0)
+    context = {"removed": {"peer": [["198.18.0.2"]]}}
+    with pytest.raises(NsoReadContractError):
+        await _residue_after_removal(broken, DEVICE, "bgp", context)
 
 
 async def test_interface_config_residue_is_unproven_when_addresses_are_not_covered():

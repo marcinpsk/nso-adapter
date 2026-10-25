@@ -26,6 +26,7 @@ from nso_adapter.core.logging_config import refresh_logging_config_for_device
 from nso_adapter.core.redistribution import refresh_redistribution_for_device
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.collection_coverage import FAMILIES, MARKER
+from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
     Device,
     DeviceBgpPeerGroup,
@@ -204,6 +205,33 @@ async def test_an_unmarked_collection_in_one_family_leaves_the_other_families_of
         await importer.sync_device(device_id, db)
     bgp = await _family(adapter_client, device_id, "bgp-config")
     assert (bgp["read_state"]["outcome"], bgp["read_state"]["reason"]) == ("unavailable", "not_covered")
+    attributes = await _family(adapter_client, device_id, "interfaces-doc")
+    assert attributes["read_state"]["result"] == "replaced"
+    assert attributes["observation"]["document"]["interfaces"][0]["name"] == "port0"
+
+
+@pytest.mark.parametrize("atomic", [False, True], ids=["document", "action"])
+async def test_a_marker_that_breaks_the_contract_in_one_family_leaves_the_other_families(
+    adapter_client, monkeypatch, atomic
+):
+    device_id = await seed_device(nso_device_name=DEVICE, attributes=["description", "enabled"])
+    broken = _groupless_scope("")
+    broken[MARKER] = ["peer", "peer"]
+    nso = CoverageNso(
+        {
+            "bgp-config": _bgp_wire(broken),
+            "interface-attributes": exported(
+                "interface-attributes", {"status": "ok", "interface": [{"interface-name": "port0", "enabled": True}]}
+            ),
+        }
+    )
+    monkeypatch.setitem(importer._nso_clients, "nso-dev", nso)
+    monkeypatch.setattr(importer, "_netbox_client", None)
+    async with session() as db:
+        await importer.sync_device(device_id, db, atomic=atomic)
+        row = await outcome_store.get_current_outcome(db, device_id, "bgp")
+    assert (row.read_outcome, row.read_reason, row.result) == ("unavailable", "read_error", "kept")
+    assert [failure["failure_code"] for failure in row.read_failures] == ["section_malformed"]
     attributes = await _family(adapter_client, device_id, "interfaces-doc")
     assert attributes["read_state"]["result"] == "replaced"
     assert attributes["observation"]["document"]["interfaces"][0]["name"] == "port0"

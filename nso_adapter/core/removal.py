@@ -43,7 +43,7 @@ from nso_adapter.core.request_flags import (
 )
 from nso_adapter.domain.asn import AsnRuleViolation, checked_asn, validate_asn_rows, validate_source_as_numbers
 from nso_adapter.domain.diagnostics import device_fields
-from nso_adapter.nso.client import failure_detail
+from nso_adapter.nso.client import NsoReadContractError, failure_detail
 from nso_adapter.nso.collection_coverage import uncovered_paths
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device
@@ -82,7 +82,11 @@ async def _live_family_sections(client, device_name: str, wire_names: list[str],
 
     async with _action_semaphore():
         output = await client.run_device_state_read(device_name, list(wire_names), timeout=timeout)
-    return {wire: output[wire] for wire in wire_names}
+    sections = {wire: output[wire] for wire in wire_names}
+    for section in sections.values():
+        if not isinstance(section, dict):  # decode_sections nulls a section that broke the coverage contract
+            raise NsoReadContractError("a device-state-read section broke the collection coverage contract")
+    return sections
 
 
 def _verifier_section_status(section: dict) -> str:
