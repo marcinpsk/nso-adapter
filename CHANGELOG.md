@@ -2,6 +2,92 @@
 
 <!-- version list -->
 
+## v1.16.0 (2026-10-23)
+
+### Features
+
+- **refusal**: Add the warn-and-skip conversion catalog ids
+  ([`68a5709`](https://github.com/marcinpsk/nso-adapter/commit/68a570982f4bda4cab45c35af57987f3216d94d9))
+
+- **refusal**: Declare the community field on the community-list entry subject
+  ([`a8377c3`](https://github.com/marcinpsk/nso-adapter/commit/a8377c3c792b3b304fb0af56e099c015a8dc0781))
+
+
+## v1.15.1 (2026-10-23)
+
+### Bug Fixes
+
+- **apply**: Count a carried static-route plan only when its stream executes
+  ([`4a5570a`](https://github.com/marcinpsk/nso-adapter/commit/4a5570a68ddd2ee21931321e56ebf60ca3d3d0cb))
+
+- **apply**: Count interface attributes only when interface_config executes
+  ([`5a80e41`](https://github.com/marcinpsk/nso-adapter/commit/5a80e418d33689f3eeb6e8d2319f81373f10b1ba))
+
+- **apply**: Log a document section that encode_device_document skips
+  ([`dacd828`](https://github.com/marcinpsk/nso-adapter/commit/dacd8289eda8e05f44a3e27f49a9c405db7779d5))
+
+- **apply**: Select every apply run with WORKER_APPLY_FORCE
+  ([`5a18bc2`](https://github.com/marcinpsk/nso-adapter/commit/5a18bc2c1c33f5c320fb087433efd99486a4d82e))
+
+- **apply**: Select execution rows by carried stream, not by section
+  ([`23b574f`](https://github.com/marcinpsk/nso-adapter/commit/23b574f23a1b1c1d5e9b4d2aa13194bd9824b9d5))
+
+- **execution**: Report not-applied outcomes for runs that prepared no attempt
+  ([`ef0721d`](https://github.com/marcinpsk/nso-adapter/commit/ef0721d4762267b0982829e344bd30af3f247885))
+
+- **execution**: Skip an unencodable section when deriving unprepared evidence
+  ([`46a6995`](https://github.com/marcinpsk/nso-adapter/commit/46a69953c5605508ac363a89d92deffa55c66460))
+
+### Chores
+
+- **deps**: Bump certifi from 2026.5.20 to 2026.10.19
+  ([`815f887`](https://github.com/marcinpsk/nso-adapter/commit/815f8872f1a518f6152bfbca3cce733ace61f222))
+
+- **deps**: Bump virtualenv from 21.7.13 to 21.14.9
+  ([`e4b37e1`](https://github.com/marcinpsk/nso-adapter/commit/e4b37e17f995e7e20317d2e908ed28bb02acb372))
+
+### Performance Improvements
+
+- **apply**: Hydrate each section once when selecting a frozen apply
+  ([`0cb4575`](https://github.com/marcinpsk/nso-adapter/commit/0cb457515fb7818e6d403310361e902cab661f16))
+
+- **execution**: Derive not-applied evidence off the event loop
+  ([`06fa26d`](https://github.com/marcinpsk/nso-adapter/commit/06fa26d72b27b281cb48360528d2c7469ab8ea55))
+
+
+## v1.15.0 (2026-10-21)
+
+### Chores
+
+- **ci**: Bump the actions group with 3 updates
+  ([`dfd0e76`](https://github.com/marcinpsk/nso-adapter/commit/dfd0e76488103567289686c7d01ae05591d3b46e))
+
+- **deps**: Bump the python-minor-patch group with 4 updates
+  ([`3ec760e`](https://github.com/marcinpsk/nso-adapter/commit/3ec760e0a70f4a070b71249d0835559822013de5))
+
+### Documentation
+
+- **api**: State that carrier fields are authoritative only on terminal generations
+  ([`8fe558b`](https://github.com/marcinpsk/nso-adapter/commit/8fe558ba90744bd0a41b76f23d4a6a48eddf569a))
+
+### Testing
+
+- **refusal**: Bound the wait for the first held send
+  ([`e6d4f47`](https://github.com/marcinpsk/nso-adapter/commit/e6d4f4789a103b677457c93e8351da6604b979f1))
+
+- **refusal**: Count a budget wait as held only when the send is still pending
+  ([`10e047d`](https://github.com/marcinpsk/nso-adapter/commit/10e047d8c33b8bd9b4d6d7527004d55c2ad393e9))
+
+- **refusal**: Drive the budget helper self-tests through the worker
+  ([`487957c`](https://github.com/marcinpsk/nso-adapter/commit/487957c062a66ec0916f8d202dd569c85ba96186))
+
+- **refusal**: Fail the budget tests when the held send is not reached
+  ([`c2f703f`](https://github.com/marcinpsk/nso-adapter/commit/c2f703f3c8edd7f7f251def8982eebb9352779b9))
+
+- **refusal**: Start the execution budget only after the held send
+  ([`bc748cb`](https://github.com/marcinpsk/nso-adapter/commit/bc748cbfafd1b038cc7fe077ba0ff1e44dfb50bc))
+
+
 ## v1.14.0 (2026-10-18)
 
 
