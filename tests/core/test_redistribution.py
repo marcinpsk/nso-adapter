@@ -16,7 +16,7 @@ from nso_adapter.nso.client import NsoExportUnavailableError
 from nso_adapter.nso.read_outcome import Freshness, Present, Unavailable, UnavailableReason
 from nso_adapter.store.models import Device, DeviceRedistribution
 from tests._secret_discipline import assert_records_free_of, assert_text_free_of
-from tests.collection_coverage_helpers import covered
+from tests.collection_coverage_helpers import covered_sections
 from tests.conftest import AUTH, seed_device, session
 
 
@@ -47,7 +47,7 @@ def _nso_client_with_data(ospf=None, isis=None, bgp=None) -> AsyncMock:
         value = sections[wire_family]
         if isinstance(value, Exception):
             raise value
-        return covered(wire_family, value) if isinstance(value, dict) else value  # the client decodes sections
+        return covered_sections({wire_family: value})[wire_family]  # an unmarked non-ok section decodes to itself
 
     client.get_device_state_section.side_effect = _get
     return client
