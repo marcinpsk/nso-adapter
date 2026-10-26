@@ -389,16 +389,20 @@ async def evidence(device_id):
         return attempts, outcomes
 
 
-@pytest.mark.parametrize("residue_found", [True, False])
-async def test_removal_residue_withholds_durable_success(adapter_client, monkeypatch, residue_found):
+# An unsupported section checks nothing, so the removal is not proven clean.
+RESIDUE_SECTIONS = {
+    "found": {"status": "ok", "vlan": [{"vlan-id": 101}, {"vlan-id": 102}]},
+    "clean": {"status": "ok", "vlan": [{"vlan-id": 101}]},
+    "unsupported": {"status": "unsupported"},
+}
+
+
+@pytest.mark.parametrize("residue_check", sorted(RESIDUE_SECTIONS))
+async def test_removal_residue_withholds_durable_success(adapter_client, monkeypatch, residue_check):
+    residue_found = residue_check == "found"
     device_id, transport = await setup(adapter_client, monkeypatch, operation="removal")
     transport.refuse = False
-    transport.device_sections = {
-        "vlan-database": {
-            "status": "ok",
-            "vlan": [{"vlan-id": vlan} for vlan in ([101, 102] if residue_found else [101])],
-        }
-    }
+    transport.device_sections = {"vlan-database": RESIDUE_SECTIONS[residue_check]}
     async with session() as db:
         row = await db.scalar(select(VlanIntent).where(VlanIntent.device_id == device_id))
         row.last_apply_at = PRIOR_AT
@@ -412,26 +416,27 @@ async def test_removal_residue_withholds_durable_success(adapter_client, monkeyp
     assert job.status == JobStatus.succeeded
     assert attempt.commit_acknowledged and attempt.phase == "terminal"
     assert attempt.response_classification["post_commit_verification"]["kind"] == "verified"
-    assert job.result["residue_check"] == ("found" if residue_found else "clean")
+    assert job.result["residue_check"] == residue_check
     if residue_found:
         assert job.result["residue"] == {"vlan": [["102"]]}
     settled = [row for row in outcomes if row.execution_attempt_id == attempt.id]
     assert settled
-    expected = "unavailable" if residue_found else "in_sync"
+    clean = residue_check == "clean"
+    expected = "in_sync" if clean else "unavailable"
     assert {row.disposition for row in settled} == {expected}
     assert {row["disposition"] for row in job.result["row_outcomes"]} == {expected}
     assert job.result["vlan_count_by_outcome"] == {
-        "in_sync": 0 if residue_found else 1,
+        "in_sync": 1 if clean else 0,
         "apply_failed": 0,
         "not_applied": 0,
-        "unavailable": 1 if residue_found else 0,
+        "unavailable": 0 if clean else 1,
     }
     async with session() as db:
         row = await db.scalar(select(VlanIntent).where(VlanIntent.device_id == device_id))
-        if residue_found:
-            assert row.last_apply_at == PRIOR_AT and row.last_apply_error == PRIOR_ERROR
-        else:
+        if clean:
             assert row.last_apply_at > PRIOR_AT and row.last_apply_error is None
+        else:
+            assert row.last_apply_at == PRIOR_AT and row.last_apply_error == PRIOR_ERROR
 
 
 @pytest.mark.parametrize("write_fails", [True, False])

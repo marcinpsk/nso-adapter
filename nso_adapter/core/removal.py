@@ -596,6 +596,10 @@ async def _residue_after_removal(client, device, scope: str, context: dict) -> t
     return (residue if checked else None), unverifiable
 
 
+#: The residue verdicts that let a verified removal settle in sync (a detach leaves the keys by design).
+RESIDUE_PROVEN = frozenset({"clean", "skipped_detach"})
+
+
 async def _record_residue(
     result: dict, client, device, scope: str, context: dict, *, job_id: int, device_id: int
 ) -> None:
@@ -1794,7 +1798,7 @@ async def enqueue_static_route_removals(
     return list(jobs.values())
 
 
-async def _completed_removal_result(db: AsyncSession, job_id: int, reg, certified, *, residue_found: bool) -> dict:
+async def _completed_removal_result(db: AsyncSession, job_id: int, reg, certified, *, residue_clean: bool) -> dict:
     from nso_adapter.core.execution import active_attempt, record_send_history
     from nso_adapter.store.execution_attempt_store import complete_execution_result
 
@@ -1805,7 +1809,7 @@ async def _completed_removal_result(db: AsyncSession, job_id: int, reg, certifie
     verified = execution.response_classification.get("post_commit_verification", {}).get("kind") == "verified"
     dispositions = {
         (row["stream"], row["row"]["subject"], row["row"]["key"], row["settlement_cohort"]): "in_sync"
-        if verified and not residue_found
+        if verified and residue_clean
         else "unavailable"
         for row in execution.logical_membership
     }
@@ -1903,7 +1907,7 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
             certified = await read_send_history(db, job_id, client, device)
             result.update(
                 await _completed_removal_result(
-                    db, job_id, reg, certified, residue_found=result.get("residue_check") == "found"
+                    db, job_id, reg, certified, residue_clean=result.get("residue_check") in RESIDUE_PROVEN
                 )
             )
             if (
