@@ -1143,7 +1143,11 @@ async def test_f4_a_a_successors_changed_row_is_not_stamped_by_the_older_documen
         )
         assert resp.status_code == 200
 
-    client, rec = recorded_client("gen-stamp-changed", on_sync_from=successor)
+    client, rec = recorded_client(
+        "gen-stamp-changed",
+        on_sync_from=successor,
+        device_state={"vlan-database": {"status": "ok", "vlan": [{"vlan-id": 10}, {"vlan-id": 20}]}},
+    )
     job_id = await run_head(device_id, client)
     assert job_id is not None
     job = await job_row(job_id)
@@ -1178,7 +1182,11 @@ async def test_f5_a_atomic_mode_pushes_the_document_and_stamps_the_live_rows(ada
         )
         assert resp.status_code == 200
 
-    client, rec = recorded_client("gen-atomic-doc", on_sync_from=successor)
+    client, rec = recorded_client(
+        "gen-atomic-doc",
+        on_sync_from=successor,
+        device_state={"vlan-database": {"status": "ok", "vlan": [{"vlan-id": 10}]}},
+    )
     job_id = await run_head(device_id, client)
     assert job_id is not None
     job = await job_row(job_id)

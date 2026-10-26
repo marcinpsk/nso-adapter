@@ -56,6 +56,19 @@ def covered_sections(served: dict) -> dict:
     }
 
 
+def serve_device_state(client, served: dict) -> None:
+    """Configure the device-state action with decoded sections for the requested families."""
+
+    async def _read(device_name, families, *, timeout=None):
+        return {
+            "atomic": True,
+            "device-name": device_name,
+            **covered_sections({wire: served.get(wire, {"status": "unsupported"}) for wire in families}),
+        }
+
+    client.run_device_state_read.side_effect = _read
+
+
 def section_client() -> AsyncMock:
     """An NSO client stand-in whose ``get_device_state_section`` decodes its configured section.
 

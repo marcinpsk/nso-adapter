@@ -484,7 +484,21 @@ async def test_bgp_action_apply_executes_the_selected_graph(adapter_client):
         result = await _put_bgp(adapter_client, device_id, "64514", seq=6562, query="?store_only=true")
         assert result.status_code == 200
 
-    client, recorder = recorded_client("bgp-exact-selection", on_sync_from=successor)
+    client, recorder = recorded_client(
+        "bgp-exact-selection",
+        on_sync_from=successor,
+        device_state={
+            "bgp-config": {
+                "status": "ok",
+                "router": [
+                    {
+                        "asn": 64512,
+                        "scope": [{"vrf": "", "peer": [{"peer-address": "192.0.2.1", "remote-as": "64513"}]}],
+                    }
+                ],
+            }
+        },
+    )
     job_id = await run_head(device_id, client)
     assert job_id is not None
     job = await job_row(job_id)
@@ -2507,9 +2521,10 @@ async def test_consumed_static_route_tombstone_is_not_planned_as_an_intent_delet
 
 
 @pytest.mark.parametrize("select_snmp", [False, True])
-async def test_action_apply_job_executes_only_the_selected_generation_document(adapter_client, select_snmp):
+async def test_action_apply_job_executes_only_the_selected_generation_document(adapter_client, vault, select_snmp):
     """An unselected live row must not ride a document-executed Apply."""
     from nso_adapter.store.models import SnmpCommunityIntent
+    from tests.conftest import SNMP_COMMUNITY, community_export_name
     from tests.core.test_generation_protocol import recorded_client, run_head
 
     device_id = await seed_device(nso_device_name="apply-document-only", netbox_device_id=9982)
@@ -2523,7 +2538,15 @@ async def test_action_apply_job_executes_only_the_selected_generation_document(a
     response = await _apply(adapter_client, device_id, selected)
     assert response.status_code == 202, response.text
 
-    client, recorder = recorded_client("apply-document-only")
+    if select_snmp:
+        vault(secrets={("kv", "snmp"): {"stored": SNMP_COMMUNITY}})
+    client, recorder = recorded_client(
+        "apply-document-only",
+        device_state={
+            "vlan-database": {"status": "ok", "vlan": [{"vlan-id": 10}]},
+            "snmp-config": {"status": "ok", "community": [{"name": community_export_name(SNMP_COMMUNITY)}]},
+        },
+    )
     assert await run_head(device_id, client) is not None
 
     assert recorder.vlan_ids() == [[10]]
