@@ -71,10 +71,10 @@ def section_client() -> AsyncMock:
     return client
 
 
-def exported_sections(served: dict) -> dict:
-    """Return *served* with each ``ok`` family section in wire form, every collection covered."""
+def exported_sections(served: dict, *, cover_all: bool = True) -> dict:
+    """Return *served* with each ``ok`` family section in wire form (see ``exported``)."""
     return {
-        key: exported(key, value)
+        key: exported(key, value, cover_all=cover_all)
         if key in FAMILIES and isinstance(value, dict) and value.get("status") == "ok"
         else value
         for key, value in served.items()

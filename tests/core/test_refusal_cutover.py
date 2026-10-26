@@ -69,6 +69,7 @@ class RuntimeTransport(httpx.AsyncBaseTransport):
         self.verification_error = None
         self.preview_error = None
         self.device_sections = None
+        self.cover_all = True
         self.before_send = asyncio.Event()
         self.release_send = asyncio.Event()
         self.release_send.set()
@@ -92,7 +93,11 @@ class RuntimeTransport(httpx.AsyncBaseTransport):
             if "device-state-read" in url and self.device_sections is not None:
                 request_body = json.loads(request.content)["network-state-export:input"]
                 sections = exported_sections(
-                    {wire: self.device_sections.get(wire, {"status": "unsupported"}) for wire in request_body["family"]}
+                    {
+                        wire: self.device_sections.get(wire, {"status": "unsupported"})
+                        for wire in request_body["family"]
+                    },
+                    cover_all=self.cover_all,
                 )
                 return httpx.Response(
                     200,
@@ -1387,6 +1392,31 @@ async def test_missing_peer_proof_withholds_carrier_success(adapter_client, monk
     )
     job = await job_row(attempts[-1].job_correlation_id)
     assert job.result["bgp_count_by_outcome"] == {"in_sync": 0, "apply_failed": 0, "not_applied": 0, "unavailable": 1}
+
+
+@pytest.mark.parametrize("peer_covered", [True, False])
+async def test_uncovered_peer_proof_withholds_carrier_success(adapter_client, monkeypatch, peer_covered):
+    device_id, transport = await setup(adapter_client, monkeypatch, family="bgp")
+    transport.refuse = False
+    # Without cover_all the marker names only the carried collections, so an omitted peer list is not read.
+    transport.cover_all = peer_covered
+    peers = [{"peer-address": "192.0.2.1"}, {"peer-address": "192.0.2.2"}]
+    scope = {"vrf": "", "peer": peers} if peer_covered else {"vrf": ""}
+    transport.device_sections = {"bgp-config": {"status": "ok", "router": [{"asn": 64512, "scope": [scope]}]}}
+    await run_next(device_id)
+    attempts, outcomes = await evidence(device_id)
+    job = await job_row(attempts[-1].job_correlation_id)
+    assert job.result["reader_compare"]["bgp"] == ("ok" if peer_covered else "partial")
+    expected = "in_sync" if peer_covered else "unavailable"
+    assert outcomes and {row.disposition for row in outcomes} == {expected}, (
+        "a carrier whose peer key the read did not cover is unproven, never in sync"
+    )
+    assert job.result["bgp_count_by_outcome"] == {
+        "in_sync": 1 if peer_covered else 0,
+        "apply_failed": 0,
+        "not_applied": 0,
+        "unavailable": 0 if peer_covered else 1,
+    }
 
 
 async def lock_wait_seen(db, query, pid):

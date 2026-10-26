@@ -1663,7 +1663,12 @@ async def _settle_document_success(
             successful = any(source.frozen_row_identity[0] in certified_routes for source in logical.source_refs)
         section = _section_by_container().get(logical.row.subject.split(".")[0])
         carrier_join = carrier_sources.get(logical.carrier)
-        if section and carrier_join is not None and evidence.get(section, {}).get(carrier_join) == "missing":
+        # A read that did not cover the carrier's key proves nothing, so the row gets no green (#1833).
+        if (
+            section
+            and carrier_join is not None
+            and evidence.get(section, {}).get(carrier_join) in {"missing", "unproven"}
+        ):
             successful = False
         identity = logical_record(logical)
         key = identity["stream"], identity["row"]["subject"], identity["row"]["key"], identity["settlement_cohort"]
@@ -1898,7 +1903,7 @@ def _reader_compare_walk(
                 evidence.setdefault((row.__tablename__, pk), "present")
             continue
         if not covered[label]:
-            # Absent from an uncovered collection: unproven, so the row gets no evidence (#1833 R2-1).
+            # Absent from an uncovered collection: unproven, so the row gets no "present" evidence (#1833 R2-1).
             unproven.add(label)
             if pk is not None and evidence.get((row.__tablename__, pk)) != "missing":
                 evidence[(row.__tablename__, pk)] = "unproven"
