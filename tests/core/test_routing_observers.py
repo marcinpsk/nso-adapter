@@ -282,9 +282,10 @@ def test_redistribution_observer_reports_component_coverage_and_invalid_rows():
     ]
     assert len(document["unprojectable"]) == 1
     assert "redistribute[1]" in document["unprojectable"][0]["reason"]
-    empty = observe_family("redistribution", {"bgp": {}, "isis": {}, "ospf": {}})
+    empty = observe_family("redistribution", {"bgp": {"router": []}, "isis": {"process": []}, "ospf": {"instance": []}})
     assert empty.document.entries == [] and empty.document.unprojectable == []
     assert [component.protocol for component in empty.document.components] == ["bgp", "isis", "ospf"]
+    assert [component.status for component in empty.document.components] == ["covered"] * 3
     assert empty.coverage.model_dump()["components"] == [
         {"protocol": proto, "destinations": [], "sources": []} for proto in ["bgp", "isis", "ospf"]
     ]
@@ -422,12 +423,16 @@ async def test_bgp_mirror_keeps_device_group_precedence_while_observation_sorts(
 
 
 @pytest.mark.parametrize("protocol,key", [("ospf", "instance"), ("isis", "process"), ("bgp", "router")])
-def test_redistribution_component_inventory_presence_stays_distinct(protocol, key):
-    documents = [
-        observe_family("redistribution", {protocol: payload}).document.model_dump()
-        for payload in [{}, {key: None}, {key: []}]
-    ]
-    assert len({str(document) for document in documents}) == 3
+def test_redistribution_component_without_inventory_is_unavailable(protocol, key):
+    for payload in [{}, {key: None}]:
+        observation = observe_family("redistribution", {protocol: payload})
+        component = next(item for item in observation.document.components if item.protocol == protocol)
+        assert (component.status, component.inventory, component.present) == ("unavailable", None, [])
+        assert observation.coverage.components == []
+    observation = observe_family("redistribution", {protocol: {key: []}})
+    component = next(item for item in observation.document.components if item.protocol == protocol)
+    assert (component.status, component.inventory, component.present) == ("covered", [], ["inventory"])
+    assert [item.protocol for item in observation.coverage.components] == [protocol]
 
 
 @pytest.mark.parametrize(
