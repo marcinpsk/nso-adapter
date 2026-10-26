@@ -394,6 +394,7 @@ RESIDUE_SECTIONS = {
     "found": {"status": "ok", "vlan": [{"vlan-id": 101}, {"vlan-id": 102}]},
     "clean": {"status": "ok", "vlan": [{"vlan-id": 101}]},
     "unsupported": {"status": "unsupported"},
+    "partial": {"status": "ok", "vlan": [{"vlan-id": 101}]},
 }
 
 
@@ -403,6 +404,12 @@ async def test_removal_residue_withholds_durable_success(adapter_client, monkeyp
     device_id, transport = await setup(adapter_client, monkeypatch, operation="removal")
     transport.refuse = False
     transport.device_sections = {"vlan-database": RESIDUE_SECTIONS[residue_check]}
+    if residue_check == "partial":
+        # vlan has one grain; the snmp reader test proves a clean grain beside an unverifiable one reads so.
+        async def clean_beside_unverifiable(*_args):
+            return {}, ["community"]
+
+        monkeypatch.setattr("nso_adapter.core.removal._residue_after_removal", clean_beside_unverifiable)
     async with session() as db:
         row = await db.scalar(select(VlanIntent).where(VlanIntent.device_id == device_id))
         row.last_apply_at = PRIOR_AT
