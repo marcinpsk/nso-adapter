@@ -2,6 +2,46 @@
 
 <!-- version list -->
 
+## v1.17.0 (2026-10-27)
+
+### Bug Fixes
+
+- **apply**: Settle a row unavailable when its read-back checked nothing
+  ([`631fe62`](https://github.com/marcinpsk/nso-adapter/commit/631fe62f79efb5d10f01e776efd632aaf59db3a5))
+
+- **apply**: Settle a row unavailable when the read did not cover its key
+  ([`6517c53`](https://github.com/marcinpsk/nso-adapter/commit/6517c531de0e4860040fdf16fcbed96392118fe5))
+
+- **read**: Keep a coverage contract violation in its own family
+  ([#1833](https://github.com/marcinpsk/nso-adapter/pull/1833),
+  [`7a5fe7d`](https://github.com/marcinpsk/nso-adapter/commit/7a5fe7d01bdbed969c594b8c833e4fb10994df2d))
+
+- **read**: Report a redistribution component without inventory as unavailable
+  ([#1833](https://github.com/marcinpsk/nso-adapter/pull/1833),
+  [`01e3065`](https://github.com/marcinpsk/nso-adapter/commit/01e3065da2d10e144c1979858c1c682197d486c7))
+
+- **removal**: Settle a removal in sync only after a clean residue check
+  ([`2684a98`](https://github.com/marcinpsk/nso-adapter/commit/2684a98b898ac054012e3f4a90fe3277cdd2e87f))
+
+### Chores
+
+- **deps**: Bump the python-minor-patch group with 6 updates
+  ([`9f4cf23`](https://github.com/marcinpsk/nso-adapter/commit/9f4cf236b5b9899d82f991a5ab85ecaf9a97cabc))
+
+### Documentation
+
+- **refresh**: State that nonfailing unavailable reads return True
+  ([`baf46b2`](https://github.com/marcinpsk/nso-adapter/commit/baf46b2f36997f0c3af9cd3546ae3ebc6495057e))
+
+### Testing
+
+- **redistribution**: Decode only ok sections in the fake client
+  ([`434de1f`](https://github.com/marcinpsk/nso-adapter/commit/434de1fa4539dedbab567dcc2d366f8cf1c19208))
+
+- **removal**: Prove a partial residue check settles the removal unavailable
+  ([`49c4ba6`](https://github.com/marcinpsk/nso-adapter/commit/49c4ba660f7edbea57aa7f2c00a549a77dd1b781))
+
+
 ## v1.16.0 (2026-10-23)
 
 ### Features
