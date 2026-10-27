@@ -328,8 +328,9 @@ async def run_family_refresh(
     """Refresh one family's mirror for one device via the shared engine.
 
     Behaviour-equivalent to the hand-written ``refresh_<family>_for_device`` it replaces:
-    returns ``True`` on a successful read (including an authoritative clear or an intentional
-    skip) and ``False`` when the read was unavailable and the last-known rows were left intact.
+    returns ``True`` on a successful read, an authoritative clear, an intentional skip, or a
+    declared nonfailing unavailable read (``NONFAILING_KEEP_REASONS``); returns ``False`` only
+    for a failing unavailable read that leaves the last-known rows intact.
     """
     if not device.nso_device_name:
         logger.debug(f"{spec.name}.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
