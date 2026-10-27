@@ -8,7 +8,7 @@ import hmac
 from collections.abc import AsyncGenerator
 
 import structlog
-from fastapi import Depends, HTTPException, Request, Security
+from fastapi import Depends, Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,17 +18,8 @@ from nso_adapter.store.db import get_session
 logger = structlog.get_logger(__name__)
 
 
-class _OptionalBearer(HTTPBearer):
-    """HTTPBearer that returns None instead of raising when no credentials."""
-
-    async def __call__(self, request: Request) -> HTTPAuthorizationCredentials | None:
-        try:
-            return await super().__call__(request)
-        except HTTPException:  # pragma: no cover — auto_error=False means super() never raises
-            return None  # pragma: no cover
-
-
-bearer = _OptionalBearer(auto_error=False)
+# auto_error=False answers None for absent or non-bearer credentials; the name keeps the published OpenAPI scheme.
+bearer = HTTPBearer(auto_error=False, scheme_name="_OptionalBearer")
 
 _UNAUTH = ApiError(
     status_code=401,

@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+import pytest
+
 from tests._secret_discipline import assert_text_free_of
 from tests.conftest import VALID_TOKEN, seed_device
 
@@ -27,6 +29,17 @@ async def test_healthz_no_auth(adapter_client):
 
 async def test_devices_requires_auth(adapter_client):
     resp = await adapter_client.get("/api/v1/devices")
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "unauthorized"
+
+
+@pytest.mark.parametrize(
+    "authorization",
+    [None, "", "Bearer", "Bearer ", "Basic placeholder-credentials", "Bearer placeholder-wrong-token"],
+)
+async def test_bad_credentials_answer_the_unauthorized_envelope(adapter_client, authorization):
+    headers = {} if authorization is None else {"Authorization": authorization}
+    resp = await adapter_client.get("/api/v1/devices", headers=headers)
     assert resp.status_code == 401
     assert resp.json()["error"]["code"] == "unauthorized"
 
