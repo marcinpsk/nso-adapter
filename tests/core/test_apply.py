@@ -30,8 +30,15 @@ from nso_adapter.store.models import (
     VlanIntent,
 )
 from tests._secret_discipline import assert_records_free_of, assert_text_free_of
-from tests.collection_coverage_helpers import covered_sections
-from tests.conftest import attach_apply_generation, note_projection_write, session
+from tests.collection_coverage_helpers import covered_sections, serve_device_state
+from tests.conftest import (
+    SNMP_COMMUNITY,
+    SNMP_VAULT_REF,
+    attach_apply_generation,
+    community_export_name,
+    note_projection_write,
+    session,
+)
 from tests.core.execution_helpers import run_apply as _run_apply_worker
 
 # ── nokia_routed_kind (pure: derives SR OS router context from kind/service/vrf) ──
@@ -129,7 +136,7 @@ async def run_apply(job_id: int, device_id: int, reg=None) -> None:
 _SENDER = "nso_adapter.nso.apply.apply_device_intent"
 
 
-def _nso_client(**attrs) -> AsyncMock:
+def _nso_client(*, readback=None, **attrs) -> AsyncMock:
     """A client whose ``device-intent`` instance is ABSENT.
 
     Nothing is retained and the device-wide collateral guard has no live row to block on, so a
@@ -140,6 +147,8 @@ def _nso_client(**attrs) -> AsyncMock:
     client = AsyncMock(spec=NsoClient)
     client.get_service_config = AsyncMock(return_value=None)
     client.service_instance_state = AsyncMock(return_value=ServiceInstanceState("absent", None))
+    if readback is not None:
+        serve_device_state(client, readback)
     for name, value in attrs.items():
         setattr(client, name, value)
     return client
@@ -1310,7 +1319,7 @@ async def test_run_apply_bgp_intent_does_not_crash_on_commit(adapter_client):
         db.add(BgpRouterIntent(device_id=device_id, asn="65100", accepted_at=datetime.now(UTC)))
         await db.commit()
 
-    mock_client = _nso_client()
+    mock_client = _nso_client(readback={"bgp-config": {"status": "ok", "router": [{"asn": 65100}]}})
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
@@ -1384,9 +1393,24 @@ _SCOPE_CASES = [
 ]
 
 
+_SCOPE_READBACK = {
+    "static_route": None,
+    "logging": {"logging-config": {"status": "ok", "host": [{"address": "10.9.0.99"}]}},
+    "svi": {"svi": {"status": "ok", "interface": [{"interface-name": "Vlan10"}]}},
+    "subinterface": {"subinterface": {"status": "ok", "interface": [{"interface-name": "GigabitEthernet0/0.10"}]}},
+    "vlan": {"vlan-database": {"status": "ok", "vlan": [{"vlan-id": 20}]}},
+    "bfd": {"bfd-config": {"status": "ok", "interface": [{"interface-name": "GigabitEthernet0/1"}]}},
+    "interface_mtu": {"interface-mtu": {"status": "ok", "interface": [{"interface-name": "GigabitEthernet0/2"}]}},
+    "l2_sap": {"l2-service": {"status": "ok", "service": [{"service-name": "EPIPE-1", "sap": [{"sap-id": "1/1/1"}]}]}},
+    "snmp": {"snmp-config": {"status": "ok", "community": [{"name": community_export_name(SNMP_COMMUNITY)}]}},
+    "ospf": {"ospf-config": {"status": "ok", "instance": [{"process-id": "1"}]}},
+    "isis": {"isis-interface": {"status": "ok", "interface": [{"interface-name": "GigabitEthernet0/3", "af": "ipv4"}]}},
+}
+
+
 @pytest.mark.parametrize("model_name, kwargs, container, label, result_key", _SCOPE_CASES)
 async def test_run_apply_family_is_transmitted_and_stamped(
-    adapter_client, model_name, kwargs, container, label, result_key
+    adapter_client, vault, model_name, kwargs, container, label, result_key
 ):
     """Each single-list family reaches the wire under its container and reports in_sync.
 
@@ -1401,9 +1425,14 @@ async def test_run_apply_family_is_transmitted_and_stamped(
         db.add(model(device_id=device_id, accepted_at=datetime.now(UTC), **kwargs))
         await db.commit()
 
+    if result_key == "snmp":
+        vault(secrets={("network", "netbox/snmp/community/ro"): {"community": SNMP_COMMUNITY}})
     sender = AsyncMock(return_value=None)
     with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(
+            "nso_adapter.core.importer.get_nso_client",
+            return_value=_nso_client(readback=_SCOPE_READBACK[result_key]),
+        ),
         patch(_SENDER, sender),
     ):
         await run_apply(job_id=job_id, device_id=device_id)
@@ -1438,7 +1467,18 @@ async def test_run_apply_logging_transmits_and_stamps_the_levels_singleton(adapt
 
     sender = AsyncMock(return_value=None)
     with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(
+            "nso_adapter.core.importer.get_nso_client",
+            return_value=_nso_client(
+                readback={
+                    "logging-config": {
+                        "status": "ok",
+                        "host": [{"address": "10.9.0.98"}],
+                        "local-levels": {"console-severity": "CRITICAL"},
+                    }
+                }
+            ),
+        ),
         patch(_SENDER, sender),
         patch("nso_adapter.nso.apply.local_levels_write_enabled", return_value=True),
     ):
@@ -1686,7 +1726,10 @@ async def test_run_apply_isis_subscope_success_is_counted(adapter_client, model_
         await db.commit()
 
     with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(
+            "nso_adapter.core.importer.get_nso_client",
+            return_value=_nso_client(readback={"isis-interface": {"status": "ok", "process": [{"process-tag": "1"}]}}),
+        ),
         patch(_SENDER, new_callable=AsyncMock) as mock_apply,
     ):
         await run_apply(job_id=job_id, device_id=device_id)
@@ -1732,7 +1775,21 @@ async def test_run_apply_isis_applies_process_redist_and_flexalgo(adapter_client
         )
         await db.commit()
 
-    mock_client = _nso_client()
+    mock_client = _nso_client(
+        readback={
+            "isis-interface": {
+                "status": "ok",
+                "interface": [{"interface-name": "Gi0/3", "af": "ipv4"}],
+                "process": [
+                    {
+                        "process-tag": "",
+                        "redistribute": [{"source-protocol": "connected"}],
+                        "flex-algo": [{"algo-id": 128}],
+                    }
+                ],
+            }
+        }
+    )
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock) as sender,
@@ -1788,7 +1845,15 @@ async def test_run_apply_ospf_applies_instance_interface_and_redist(adapter_clie
         )
         await db.commit()
 
-    mock_client = _nso_client()
+    mock_client = _nso_client(
+        readback={
+            "ospf-config": {
+                "status": "ok",
+                "interface": [{"interface-name": "Gi0/4"}],
+                "instance": [{"process-id": "1", "redistribute": [{"source-protocol": "static"}]}],
+            }
+        }
+    )
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock) as sender,
@@ -1810,7 +1875,7 @@ async def test_run_apply_ospf_applies_instance_interface_and_redist(adapter_clie
         }
 
 
-async def test_run_apply_snmp_applies_all_row_types(adapter_client):
+async def test_run_apply_snmp_applies_all_row_types(adapter_client, vault):
     """The SNMP pass stamps communities, v3 users, hosts and the single system-info row."""
     from nso_adapter.store.models import (
         SnmpCommunityIntent,
@@ -1845,7 +1910,18 @@ async def test_run_apply_snmp_applies_all_row_types(adapter_client):
         db.add(SnmpSystemInfoIntent(device_id=device_id, location="rack-7", accepted_at=datetime.now(UTC)))
         await db.commit()
 
-    mock_client = _nso_client()
+    vault(secrets={("network", "netbox/snmp/community/ro"): {"community": SNMP_COMMUNITY}})
+    mock_client = _nso_client(
+        readback={
+            "snmp-config": {
+                "status": "ok",
+                "community": [{"name": community_export_name(SNMP_COMMUNITY), "access": "ro"}],
+                "v3-user": [{"username": "v3-test-group"}],
+                "host": [{"address": "10.7.0.5"}],
+                "location": "rack-7",
+            }
+        }
+    )
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock) as sender,
@@ -2120,7 +2196,23 @@ async def test_the_document_carries_the_subif_and_its_address_in_one_commit(adap
 
     sender = AsyncMock(return_value=None)
     with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=_nso_client()),
+        patch(
+            "nso_adapter.core.importer.get_nso_client",
+            return_value=_nso_client(
+                readback={
+                    "subinterface": {"status": "ok", "interface": [{"interface-name": "ae99.999"}]},
+                    "interface-ip": {
+                        "status": "ok",
+                        "interface": [
+                            {
+                                "interface-name": "ae99.999",
+                                "address": [{"address": "198.18.1.1/24", "family": "ipv4"}],
+                            }
+                        ],
+                    },
+                }
+            ),
+        ),
         patch(_SENDER, sender),
     ):
         await run_apply(job_id=job_id, device_id=device_id)
@@ -2688,9 +2780,6 @@ async def test_run_apply_reader_compare_ok_when_key_lands(adapter_client):
         assert row.last_apply_at is not None
 
 
-from tests.conftest import SNMP_COMMUNITY, SNMP_VAULT_REF, community_export_name  # noqa: E402
-
-
 def _community_export_name(secret: str) -> str:
     """The export's community key: sha256(community string)[:16] — never the intent label."""
     import hashlib
@@ -2698,7 +2787,7 @@ def _community_export_name(secret: str) -> str:
     return hashlib.sha256(secret.encode()).hexdigest()[:16]
 
 
-async def test_run_apply_reader_compare_does_not_fail_a_landed_community(adapter_client):
+async def test_run_apply_reader_compare_does_not_fail_a_landed_community(adapter_client, vault):
     """A community that DID land must not be re-flagged as a silent writer drop.
 
     The check keyed SnmpCommunityIntent by `label`, but network-state-export keys a
@@ -2722,14 +2811,18 @@ async def test_run_apply_reader_compare_does_not_fail_a_landed_community(adapter
         )
         await db.commit()
 
-    mock_client = _nso_client()
-    # The community IS on the device — under its hashed export identity.
-    mock_client.get_device_state_section.return_value = {
-        "status": "ok",
-        "community": [{"name": _community_export_name("s3cr3t"), "access": "ro"}],
-        "v3-user": [],
-        "host": [],
-    }
+    vault()
+    # The community is on the device under its hashed export identity.
+    mock_client = _nso_client(
+        readback={
+            "snmp-config": {
+                "status": "ok",
+                "community": [{"name": community_export_name(SNMP_COMMUNITY), "access": "ro"}],
+                "v3-user": [],
+                "host": [],
+            }
+        }
+    )
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch(_SENDER, new_callable=AsyncMock),
@@ -3407,6 +3500,12 @@ async def test_mixed_community_and_host_vault_down_is_PARTIAL_not_ok(adapter_cli
     async with session() as db:
         host = (await db.execute(select(SnmpHostIntent).where(SnmpHostIntent.device_id == device_id))).scalars().one()
         assert host.last_apply_error is None  # the host landed and was verified
+    assert job.result["snmp_count_by_outcome"] == {
+        "in_sync": 1,
+        "apply_failed": 0,
+        "not_applied": 0,
+        "unavailable": 1,
+    }, "the unchecked community is not proven, so only the verified host settles in sync"
 
 
 async def test_all_unverifiable_scope_runs_NO_action_and_is_unknown(adapter_client, vault):
@@ -3430,6 +3529,12 @@ async def test_all_unverifiable_scope_runs_NO_action_and_is_unknown(adapter_clie
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result["reader_compare"]["snmp"] == "unknown"
+        assert job.result["snmp_count_by_outcome"] == {
+            "in_sync": 0,
+            "apply_failed": 0,
+            "not_applied": 0,
+            "unavailable": 1,
+        }
 
 
 async def test_reader_compare_batches_ONE_action_for_every_family(adapter_client):
@@ -3646,6 +3751,12 @@ async def test_action_failure_preserves_unverifiable_labels(adapter_client, vaul
         assert job.status == JobStatus.succeeded  # a read error never fails a good apply
         assert job.result["reader_compare"]["snmp"] == "error"
         assert job.result["reader_compare_unverifiable"]["snmp"], "the unverifiable community must survive the error"
+        assert job.result["snmp_count_by_outcome"] == {
+            "in_sync": 0,
+            "apply_failed": 0,
+            "not_applied": 0,
+            "unavailable": 2,
+        }
 
 
 @pytest.mark.parametrize("reader_refuses_asn", [False, True], ids=["static-route-claim-loss", "reader-asn-refusal"])

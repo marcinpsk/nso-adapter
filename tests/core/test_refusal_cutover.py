@@ -1419,6 +1419,38 @@ async def test_uncovered_peer_proof_withholds_carrier_success(adapter_client, mo
     }
 
 
+class _TranslationBroke(RuntimeError):
+    pass
+
+
+@pytest.mark.parametrize("read_back", ["action-raises", "section-error", "unsupported", "translation-raises"])
+async def test_a_failed_read_back_withholds_carrier_success(adapter_client, monkeypatch, read_back):
+    device_id, transport = await setup(adapter_client, monkeypatch, family="bgp")
+    transport.refuse = False
+    sections = {
+        "action-raises": None,
+        "section-error": {"bgp-config": {"status": "error", "error": "placeholder read error"}},
+        "unsupported": {},
+    }
+    if read_back == "translation-raises":
+
+        async def broken(*_args):
+            raise _TranslationBroke("placeholder translation error")
+
+        monkeypatch.setattr("nso_adapter.core.apply._translate_expected", broken)
+        sections[read_back] = {}
+    transport.device_sections = sections[read_back]
+    await run_next(device_id)
+    attempts, outcomes = await evidence(device_id)
+    job = await job_row(attempts[-1].job_correlation_id)
+    assert job.status == JobStatus.succeeded
+    assert job.result["reader_compare"]["bgp"] == ("unknown" if read_back == "unsupported" else "error")
+    assert outcomes and {row.disposition for row in outcomes} == {"unavailable"}, (
+        "a read-back that checked nothing proves nothing, so the carrier is never in sync"
+    )
+    assert job.result["bgp_count_by_outcome"] == {"in_sync": 0, "apply_failed": 0, "not_applied": 0, "unavailable": 1}
+
+
 async def lock_wait_seen(db, query, pid):
     from sqlalchemy import text
 
@@ -1803,6 +1835,7 @@ async def test_certified_success_preserves_a_new_writer_context(adapter_client, 
 
     device_id, transport = await setup(adapter_client, monkeypatch)
     transport.refuse = False
+    transport.device_sections = {"vlan-database": {"status": "ok", "vlan": [{"vlan-id": 101}, {"vlan-id": 102}]}}
     gate = CommitGate(monkeypatch, "response_recorded")
     task = asyncio.create_task(run_next(device_id))
     try:
@@ -1846,6 +1879,17 @@ async def test_certified_success_stamps_unchanged_child_rows_at_a_new_revision(a
 
     device_id, transport = await setup(adapter_client, monkeypatch, family="bgp")
     transport.refuse = False
+    transport.device_sections = {
+        "bgp-config": {
+            "status": "ok",
+            "router": [
+                {
+                    "asn": 64512,
+                    "scope": [{"vrf": "", "peer": [{"peer-address": "192.0.2.1"}, {"peer-address": "192.0.2.2"}]}],
+                }
+            ],
+        }
+    }
     gate = CommitGate(monkeypatch, "response_recorded")
     task = asyncio.create_task(run_next(device_id))
     try:
@@ -1883,6 +1927,7 @@ async def test_certified_success_stamps_unchanged_child_rows_at_a_new_revision(a
 async def test_removal_unsent_failure_retains_attempt_evidence(adapter_client, monkeypatch):
     device_id, transport = await setup(adapter_client, monkeypatch)
     transport.refuse = False
+    transport.device_sections = {"vlan-database": {"status": "ok", "vlan": [{"vlan-id": 101}, {"vlan-id": 102}]}}
     await run_next(device_id)
     monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "1")
     response = await adapter_client.put(
