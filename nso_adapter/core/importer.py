@@ -37,6 +37,7 @@ from nso_adapter.domain.models import Interface, InterfaceAttr
 from nso_adapter.domain.observation import observe_family, project_interface_attributes
 from nso_adapter.nso import actions as nso_actions
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError, failure_detail
+from nso_adapter.nso.collection_coverage import admit_coverage, validate_paths
 from nso_adapter.nso.read_outcome import (  # noqa: F401 — Present used below
     WHOLE_DEVICE,
     Present,
@@ -65,6 +66,17 @@ from nso_adapter.store.models import (
 )
 
 logger = structlog.get_logger(__name__)
+
+#: The interface-attributes publishers reconcile and publish the root interface inventory (#1833 R2-1).
+INTERFACE_ATTRIBUTES_WIRE = "interface-attributes"
+INTERFACE_ATTRIBUTES_REQUIRES = validate_paths(INTERFACE_ATTRIBUTES_WIRE, ("interface",))
+
+
+def _admit_attrs(outcome: ReadOutcome) -> ReadOutcome:
+    return admit_coverage(
+        outcome, INTERFACE_ATTRIBUTES_WIRE, INTERFACE_ATTRIBUTES_REQUIRES, consumer="interface_attributes"
+    )
+
 
 if TYPE_CHECKING:
     from nso_adapter.bindings.netbox.client import NetboxClient
@@ -105,12 +117,12 @@ def _attrs_to_interface_list(data: dict | None, *, device_id: int) -> list[Inter
         logger.warning(
             "interface_attributes.entry_skipped",
             device_id=device_id,
-            family="interface-attributes",
+            family=INTERFACE_ATTRIBUTES_WIRE,
             index=invalid.index,
             reason=invalid.reason,
         )
     result = []
-    for entry in projection.interfaces:
+    for entry in projection.interfaces or []:
         result.append(
             Interface(
                 name=entry.name,
@@ -413,7 +425,7 @@ def _projection_layout(
     lock_names = {spec.name for spec in spec_by_name.values() if spec is not None}
     if "redistribution" in spec_by_name:
         # Redistribution is one outcome family assembled from three projected wires.
-        wire_names.update(wire for _protocol, wire, _builder in _REDIST_COMPONENTS)
+        wire_names.update(component.wire_name for component in _REDIST_COMPONENTS)
         lock_names.add("redistribution")
     wire_names.update(extra_wires)
     lock_names.update(extra_lock_names)
@@ -474,7 +486,7 @@ async def _apply_projected(
         try:
             if spec is None and name == "redistribution":
                 component_outcomes = {
-                    protocol: projection.outcome_for(wire) for protocol, wire, _builder in _REDIST_COMPONENTS
+                    component.protocol: projection.outcome_for(component.wire_name) for component in _REDIST_COMPONENTS
                 }
                 ok = await refresh_redistribution_from_outcomes(
                     db,
@@ -1044,6 +1056,7 @@ async def _consume_interface_attributes(
     """Reconcile one already-classified projected attrs outcome and terminalize it."""
     from nso_adapter.store import outcome_store
 
+    outcome = _admit_attrs(outcome)
     device_id = device.id
     source_epoch = device.source_epoch
     available = isinstance(outcome, Present)
@@ -1236,13 +1249,13 @@ async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False,
         client,
         surfaces,
         atomic=atomic,
-        extra_wires=("interface-attributes",),
+        extra_wires=(INTERFACE_ATTRIBUTES_WIRE,),
         extra_lock_names=("interface_attributes",),
     ) as (layout, projection):
         attrs = await _consume_interface_attributes(
             db,
             device,
-            projection.outcome_for("interface-attributes"),
+            projection.outcome_for(INTERFACE_ATTRIBUTES_WIRE),
             nb_client,
             refresh_source="sync",
         )
@@ -1337,11 +1350,13 @@ async def _detect_drift_attributes(
     # Route the attrs read through the vocabulary (present-policy family): a 404/None or read
     # error is Unavailable, not "zero interfaces", so drift is computed only from an authoritative
     # Present read. An Unavailable read leaves the stored sync_state untouched (drift is read-only).
-    attrs_outcome = await classify_envelope_family_read(
-        device,
-        client,
-        wire_name="interface-attributes",
-        family_name="interface_attributes",
+    attrs_outcome = _admit_attrs(
+        await classify_envelope_family_read(
+            device,
+            client,
+            wire_name=INTERFACE_ATTRIBUTES_WIRE,
+            family_name="interface_attributes",
+        )
     )
     if isinstance(attrs_outcome, Present):
         interfaces = _attrs_to_interface_list(attrs_outcome.data, device_id=device_id)

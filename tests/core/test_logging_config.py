@@ -6,13 +6,13 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
 
 from nso_adapter.core.logging_config import refresh_logging_config_for_device
 from nso_adapter.store.models import Device, DeviceLoggingHost, DeviceLoggingLevels
+from tests.collection_coverage_helpers import section_client
 from tests.conftest import seed_device, session
 from tests.fixtures.family_read_payloads import LOGGING_LEVELS_READ_PAYLOAD
 
@@ -35,7 +35,7 @@ async def _hosts(db, device_id):
 async def test_refresh_inserts_hosts(adapter_client):
     device_id = await seed_device(nso_device_name="log-sw01", netbox_device_id=970)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "device-name": "log-sw01",
@@ -52,7 +52,7 @@ async def test_refresh_inserts_hosts(adapter_client):
 async def test_refresh_full_replace(adapter_client):
     device_id = await seed_device(nso_device_name="log-sw02", netbox_device_id=971)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "host": [{"address": "10.0.0.1"}, {"address": "10.0.0.2"}],
@@ -68,7 +68,7 @@ async def test_refresh_full_replace(adapter_client):
 async def test_refresh_authoritative_empty_clears(adapter_client):
     device_id = await seed_device(nso_device_name="log-sw03", netbox_device_id=972)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {"status": "ok", "host": [{"address": "10.0.0.9"}]}
         await refresh_logging_config_for_device(db, device, nso_client, refresh_source="test")
         assert len(await _hosts(db, device_id)) == 1
@@ -90,7 +90,7 @@ async def _levels(db, device_id):
 async def test_refresh_inserts_local_levels(adapter_client):
     device_id = await seed_device(nso_device_name="log-nx01", netbox_device_id=973)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             **deepcopy(LOGGING_LEVELS_READ_PAYLOAD),
@@ -109,7 +109,7 @@ async def test_refresh_inserts_local_levels(adapter_client):
 async def test_refresh_partial_levels_leaves_unset_none(adapter_client):
     device_id = await seed_device(nso_device_name="log-nx02", netbox_device_id=974)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "local-levels": {"console-severity": "ERROR"},
@@ -127,7 +127,7 @@ async def test_refresh_levels_absent_deletes_row(adapter_client):
     """A payload that stops reporting local-levels is an authoritative device mirror — clear it."""
     device_id = await seed_device(nso_device_name="log-nx03", netbox_device_id=975)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "local-levels": {"console-severity": "CRITICAL"},
@@ -146,7 +146,7 @@ async def test_refresh_authoritative_empty_clears_levels_too(adapter_client):
     covers the levels singleton. (Device-absence, section None, now KEEPS rows — READSEM S5.)"""
     device_id = await seed_device(nso_device_name="log-nx04", netbox_device_id=976)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "local-levels": {"module-severity": "DEBUG"},

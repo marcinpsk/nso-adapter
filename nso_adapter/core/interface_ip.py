@@ -18,7 +18,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.domain.observation import project_interface_ips
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, InterfaceIpAddress
 
 logger = structlog.get_logger(__name__)
@@ -34,11 +33,11 @@ async def _upsert_ip_addresses(
     await db.execute(delete(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device.id))
 
     now = datetime.now(UTC)
-    projection = project_interface_ips(interfaces_data)
+    projection = project_interface_ips({"interface": interfaces_data})
     for invalid in projection.unprojectable:
         logger.warning("interface_ip.entry_skipped", device_id=device.id, index=invalid.index, reason=invalid.reason)
-    for iface in projection.interfaces:
-        for address in iface.addresses:
+    for iface in projection.interfaces or []:
+        for address in iface.addresses or []:
             db.add(
                 InterfaceIpAddress(
                     device_id=device.id,
@@ -54,16 +53,15 @@ async def _upsert_ip_addresses(
             )
 
 
-# interface_ip is a PRESENT-EMPTY "inventory" family: a synced device always returns a 200 (a
-# present entry, empty `interface: []` when it genuinely has no addresses — see
-# network-state-export ips.py `_refresh_device`). Under the device-state envelope the meaning is
-# read straight off the `status` leaf (ok+empty full-replaces to empty; unsupported/error/absent
-# keep the mirror) — READSEM S5 retired the per-family `empty_policy` pop/present column.
+# interface_ip is a PRESENT-EMPTY "inventory" family: the `status` leaf and the coverage of
+# `interface` and every `address` decide (ok + covered full-replaces, even to empty;
+# unsupported/error/not covered keep the mirror).
 INTERFACE_IP_SPEC = FamilySpec(
     name="interface_ip",
-    extract=lambda data: as_list(data.get("interface")),
+    extract=lambda data: data["interface"],
     materialize=_upsert_ip_addresses,
     wire_name="interface-ip",  # READSEM S3: fetch from the device-state envelope
+    requires=("interface", "interface/address"),
 )
 
 

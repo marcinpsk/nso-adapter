@@ -43,7 +43,8 @@ from nso_adapter.core.request_flags import (
 )
 from nso_adapter.domain.asn import AsnRuleViolation, checked_asn, validate_asn_rows, validate_source_as_numbers
 from nso_adapter.domain.diagnostics import device_fields
-from nso_adapter.nso.client import failure_detail
+from nso_adapter.nso.client import NsoReadContractError, failure_detail
+from nso_adapter.nso.collection_coverage import uncovered_paths
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device
 
@@ -81,7 +82,11 @@ async def _live_family_sections(client, device_name: str, wire_names: list[str],
 
     async with _action_semaphore():
         output = await client.run_device_state_read(device_name, list(wire_names), timeout=timeout)
-    return {wire: output[wire] for wire in wire_names}
+    sections = {wire: output[wire] for wire in wire_names}
+    for section in sections.values():
+        if not isinstance(section, dict):  # decode_sections nulls a section that broke the coverage contract
+            raise NsoReadContractError("a device-state-read section broke the collection coverage contract")
+    return sections
 
 
 def _verifier_section_status(section: dict) -> str:
@@ -339,6 +344,27 @@ _READER_LIST_PATHS: dict[tuple[str, str], tuple[str, ...]] = {
 }
 
 
+def _reader_path(scope: str, guard_list: _GuardList) -> tuple[str, ...]:
+    """Return the export collection path that holds *guard_list*'s keys (see :func:`_reader_keys`)."""
+    if scope == "l2_sap":
+        return ("service", "sap")
+    if scope == "switchport" and guard_list.scalar:
+        return (guard_list.path[0],)
+    return _READER_LIST_PATHS.get((scope, guard_list.label), guard_list.path)
+
+
+def _reader_covered(scope: str, entry: dict, guard_list: _GuardList) -> bool:
+    """Whether the decoded export *entry* covers every collection on *guard_list*'s path.
+
+    An absent key on an uncovered path proves nothing: the verifier reports it unproven,
+    never clean and never missing (#1833 R2-1). ``_leaf_keys`` keeps its own contract.
+    """
+    wire = residue_wire_name(scope)
+    if wire is None:
+        raise ValueError(f"{scope}: no export section to verify against")
+    return not uncovered_paths(wire, entry, ["/".join(_reader_path(scope, guard_list))])
+
+
 def _reader_keys(scope: str, entry: dict, guard_list: _GuardList) -> set[tuple[str, ...]]:
     """Key tuples of *guard_list* present in a network-state-export reader *entry*.
 
@@ -364,10 +390,7 @@ def _reader_keys(scope: str, entry: dict, guard_list: _GuardList) -> set[tuple[s
             for iface in entry.get(guard_list.path[0]) or []
             for vlan_id in parse_vlan_string(iface.get("tagged-vlans"))
         }
-    path = _READER_LIST_PATHS.get((scope, guard_list.label))
-    if path is not None:
-        guard_list = guard_list._replace(path=path)
-    return _leaf_keys(scope, entry, guard_list)
+    return _leaf_keys(scope, entry, guard_list._replace(path=_reader_path(scope, guard_list)))
 
 
 # (scope, guard-list label) pairs whose intent key and export key live in DIFFERENT
@@ -475,7 +498,12 @@ async def _interface_config_residue(client, device, context: dict) -> dict[str, 
         for addr in iface.get("address") or []
     }
     survivors = sorted([str(p) for p in t] for t in removed if _norm_ip_triple(t) in present)
-    return {"address": survivors} if survivors else {}
+    if survivors:
+        return {"address": survivors}
+    if uncovered_paths(wire, section, ["interface/address"]):
+        logger.info("removal.residue_not_covered", scope="interface_config", family=wire)
+        return None  # an address absent from an uncovered collection proves nothing
+    return {}
 
 
 async def _residue_after_removal(client, device, scope: str, context: dict) -> tuple[dict[str, list] | None, list[str]]:
@@ -497,7 +525,8 @@ async def _residue_after_removal(client, device, scope: str, context: dict) -> t
                      all (no wire mapping / no captured keys / the NED does not export
                      the section — status ``unsupported``) → residue_check "unsupported".
     ``unverifiable`` labels whose grain cannot be key-matched against the export
-                     (:data:`UNCOMPARABLE_LISTS`). Their keys are neither silently
+                     (:data:`UNCOMPARABLE_LISTS`), or whose export collection the
+                     section does not cover. Their keys are neither silently
                      intersected (an empty intersection would read as "clean" for a
                      credential still live on the router) nor guessed at.
 
@@ -547,6 +576,7 @@ async def _residue_after_removal(client, device, scope: str, context: dict) -> t
         return None, unverifiable
     entry = section
     residue: dict[str, list] = {}
+    checked = False
     for guard_list in guard_lists:
         guard_keymap = keymaps.get(guard_list.label)
         if not guard_keymap:
@@ -555,7 +585,19 @@ async def _residue_after_removal(client, device, scope: str, context: dict) -> t
         survivors = sorted(intent for intent, exported in guard_keymap.items() if exported in present)
         if survivors:
             residue[guard_list.label] = [list(k) for k in survivors]
-    return residue, unverifiable
+            checked = True
+        elif _reader_covered(scope, entry, guard_list):
+            checked = True
+        else:
+            # A key absent from an uncovered collection proves nothing (#1833 R2-1).
+            logger.info("removal.residue_not_covered", scope=scope, family=wire, list=guard_list.label)
+            unverifiable.append(guard_list.label)
+    unverifiable.sort()
+    return (residue if checked else None), unverifiable
+
+
+#: The residue verdicts that let a verified removal settle in sync (a detach leaves the keys by design).
+RESIDUE_PROVEN = frozenset({"clean", "skipped_detach"})
 
 
 async def _record_residue(
@@ -1756,7 +1798,7 @@ async def enqueue_static_route_removals(
     return list(jobs.values())
 
 
-async def _completed_removal_result(db: AsyncSession, job_id: int, reg, certified, *, residue_found: bool) -> dict:
+async def _completed_removal_result(db: AsyncSession, job_id: int, reg, certified, *, residue_clean: bool) -> dict:
     from nso_adapter.core.execution import active_attempt, record_send_history
     from nso_adapter.store.execution_attempt_store import complete_execution_result
 
@@ -1767,7 +1809,7 @@ async def _completed_removal_result(db: AsyncSession, job_id: int, reg, certifie
     verified = execution.response_classification.get("post_commit_verification", {}).get("kind") == "verified"
     dispositions = {
         (row["stream"], row["row"]["subject"], row["row"]["key"], row["settlement_cohort"]): "in_sync"
-        if verified and not residue_found
+        if verified and residue_clean
         else "unavailable"
         for row in execution.logical_membership
     }
@@ -1865,7 +1907,7 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
             certified = await read_send_history(db, job_id, client, device)
             result.update(
                 await _completed_removal_result(
-                    db, job_id, reg, certified, residue_found=result.get("residue_check") == "found"
+                    db, job_id, reg, certified, residue_clean=result.get("residue_check") in RESIDUE_PROVEN
                 )
             )
             if (

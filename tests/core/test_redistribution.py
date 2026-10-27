@@ -16,7 +16,8 @@ from nso_adapter.nso.client import NsoExportUnavailableError
 from nso_adapter.nso.read_outcome import Freshness, Present, Unavailable, UnavailableReason
 from nso_adapter.store.models import Device, DeviceRedistribution
 from tests._secret_discipline import assert_records_free_of, assert_text_free_of
-from tests.conftest import seed_device, session
+from tests.collection_coverage_helpers import covered_sections
+from tests.conftest import AUTH, seed_device, session
 
 
 @asynccontextmanager
@@ -46,7 +47,7 @@ def _nso_client_with_data(ospf=None, isis=None, bgp=None) -> AsyncMock:
         value = sections[wire_family]
         if isinstance(value, Exception):
             raise value
-        return value
+        return covered_sections({wire_family: value})[wire_family]  # an unmarked non-ok section decodes to itself
 
     client.get_device_state_section.side_effect = _get
     return client
@@ -671,6 +672,12 @@ async def _seed_redist_rows(db, device_id: int, entries: list[tuple[str, str]]) 
     await db.commit()
 
 
+async def _family_observation(client, device_id: int) -> dict:
+    response = await client.get(f"/api/v1/devices/{device_id}/redistribution", headers=AUTH)
+    assert response.status_code == 200, response.text
+    return response.json()["observation"]
+
+
 async def _latest_outcome(device_id: int):
     from nso_adapter.store.models import RefreshOutcome
 
@@ -733,6 +740,13 @@ async def test_mixed_replaced_and_error_retained_is_degraded_present(adapter_cli
         True,
     ), "mixed replaced+error-retained is degraded-success on the wire, not unavailable"
     assert_text_free_of(outcome.read_failures, ["placeholder-secret"])
+    observation = (await _family_observation(adapter_client, device_id))["document"]
+    assert {component["protocol"]: component["status"] for component in observation["components"]} == {
+        "bgp": "unavailable",
+        "isis": "covered",
+        "ospf": "unavailable",
+    }, "R2-2: a retained partition is published as an unavailable component, not as stale-present"
+    assert {entry["dest_protocol"] for entry in observation["entries"]} == {"isis"}
     assert outcome.read_failures == [
         {
             "read_operation": "section_classify",

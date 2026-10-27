@@ -16,6 +16,7 @@ from nso_adapter.core.removal import _document_orphans, promotion_removal_contex
 from nso_adapter.domain.asn import AsnRuleViolation, checked_asn
 from nso_adapter.store.models import BgpRouterIntent, Device, DeviceBgpRouter, JobStatus
 from tests._secret_discipline import assert_chain_free_of, assert_text_free_of
+from tests.collection_coverage_helpers import REDIST_WIRES, covered, covered_sections
 from tests.conftest import AUTH, push_seq, seed_device, session
 from tests.core.test_generation_protocol import job_row, recorded_client, run_head, seed_settings
 
@@ -119,7 +120,7 @@ async def test_refresh_replaces_invalid_stored_bgp_mirror(adapter_client, invali
 
     class ValidDeviceRead:
         async def get_device_state_section(self, device_name, section):
-            return {"status": "ok", "router": [{"asn": "64512"}]}
+            return covered(section, {"status": "ok", "router": [{"asn": "64512"}]})
 
     device_id = await seed_device(nso_device_name="placeholder-device")
     async with session() as db:
@@ -159,7 +160,7 @@ async def test_refresh_replaces_invalid_stored_bgp_mirror(adapter_client, invali
 async def test_refresh_refuses_invalid_incoming_bgp_and_retains_mirror(adapter_client):
     class InvalidDeviceRead:
         async def get_device_state_section(self, device_name, section):
-            return {"status": "ok", "router": [{"asn": "064512"}]}
+            return covered(section, {"status": "ok", "router": [{"asn": "064512"}]})
 
     device_id = await seed_device(nso_device_name="placeholder-device")
     async with session() as db:
@@ -277,7 +278,7 @@ async def test_apply_job_fails_closed_on_invalid_device_read(adapter_client):
     assert response.status_code == 200
     client, recorder = recorded_client(
         "placeholder-device",
-        device_state={"bgp-config": {"status": "ok", "router": [{"asn": "064512"}]}},
+        device_state={"bgp-config": covered("bgp-config", {"status": "ok", "router": [{"asn": "064512"}]})},
     )
     job = await job_row(await run_head(device_id, client))
     assert recorder.commits
@@ -316,7 +317,7 @@ async def test_redistribution_refresh_replaces_invalid_stored_mirror(adapter_cli
             ]
         }
         outcomes = {
-            protocol: Present(ospf if protocol == "ospf" else {}, Freshness.fresh)
+            protocol: Present(covered(REDIST_WIRES[protocol], ospf if protocol == "ospf" else {}), Freshness.fresh)
             for protocol in ["ospf", "isis", "bgp"]
         }
         assert await refresh_redistribution_from_outcomes(db, device, outcomes)
@@ -347,7 +348,9 @@ async def test_redistribution_refresh_keeps_unavailable_partition(adapter_client
             )
         )
         await db.commit()
-        outcomes = {protocol: Present({}, Freshness.fresh) for protocol in ["isis", "bgp"]}
+        outcomes = {
+            protocol: Present(covered(REDIST_WIRES[protocol], {}), Freshness.fresh) for protocol in ["isis", "bgp"]
+        }
         outcomes["ospf"] = Unavailable(UnavailableReason(reason))
         with capture_logs() as logs:
             assert await refresh_redistribution_from_outcomes(db, device, outcomes) == (reason == "unsupported")
@@ -383,7 +386,7 @@ async def test_redistribution_refresh_refuses_invalid_incoming_source(adapter_cl
             ]
         }
         outcomes = {
-            protocol: Present(ospf if protocol == "ospf" else {}, Freshness.fresh)
+            protocol: Present(covered(REDIST_WIRES[protocol], ospf if protocol == "ospf" else {}), Freshness.fresh)
             for protocol in ["ospf", "isis", "bgp"]
         }
         with pytest.raises(AsnRuleViolation):
@@ -419,7 +422,7 @@ async def test_comprehensive_refresh_surfaces_the_typed_refusal(adapter_client):
             sections = {wire: {"status": "ok"} for wire in _ALL_PROJECTED_WIRES}
             sections["bgp-config"] = {"status": "ok", "router": [{"asn": "064512"}]}
             sections["static-route"] = {"status": "error", "error-reason": "placeholder-read-failure"}
-            return sections
+            return covered_sections(sections)
 
     device_id = await seed_device(nso_device_name="placeholder-device")
     async with session() as db:
@@ -455,7 +458,7 @@ async def test_partial_refresh_commits_config_before_notifying(adapter_client, m
                 "status": "ok",
                 "interface": [{"interface-name": "Vlan42", "vlan-id": 42}],
             }
-            return sections
+            return covered_sections(sections)
 
         async def run_device_state_read(self, device_name, wire_names, *, timeout):
             return {"atomic": True, **await self.get_device_state_doc(device_name)}
@@ -509,7 +512,7 @@ async def test_mirror_refresh_logs_asn_refusal_with_degraded_surfaces(adapter_cl
             sections = {wire: {"status": "ok"} for wire in _ALL_PROJECTED_WIRES}
             sections["bgp-config"] = {"status": "ok", "router": [{"asn": "064512"}]}
             sections["static-route"] = {"status": "error", "error-reason": "placeholder-read-failure"}
-            return sections
+            return covered_sections(sections)
 
         async def run_device_state_read(self, device_name, wire_names, *, timeout):
             return {"atomic": True, **await self.get_device_state_doc(device_name)}
@@ -537,8 +540,7 @@ def test_reader_compare_refuses_colliding_stored_routers():
 
 
 @pytest.mark.parametrize("protocol", ["ospf", "isis"])
-@pytest.mark.parametrize("singleton", [False, True])
-async def test_protocol_refresh_refuses_invalid_bgp_source_and_retains_mirror(adapter_client, protocol, singleton):
+async def test_protocol_refresh_refuses_invalid_bgp_source_and_retains_mirror(adapter_client, protocol):
     from nso_adapter.core.isis import refresh_isis_interfaces_for_device
     from nso_adapter.core.ospf import refresh_ospf_for_device
     from nso_adapter.store.models import DeviceIsisProcess, DeviceOspfInstance
@@ -549,11 +551,11 @@ async def test_protocol_refresh_refuses_invalid_bgp_source_and_retains_mirror(ad
         else (refresh_isis_interfaces_for_device, DeviceIsisProcess, "process", "process-tag")
     )
     source = {"source-protocol": "bgp", "source-ref": "064512"}
-    process = {identity_key: "placeholder-new", "redistribute": source if singleton else [source]}
+    process = {identity_key: "placeholder-new", "redistribute": [source]}
 
     class InvalidDeviceRead:
         async def get_device_state_section(self, device_name, section):
-            return {"status": "ok", list_key: process if singleton else [process]}
+            return covered(section, {"status": "ok", list_key: [process]})
 
     device_id = await seed_device(nso_device_name="placeholder-device")
     async with session() as db:

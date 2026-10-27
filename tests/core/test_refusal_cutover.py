@@ -46,6 +46,7 @@ from nso_adapter.store.models import (
     VlanIntent,
 )
 from tests._secret_discipline import assert_records_free_of, assert_text_free_of
+from tests.collection_coverage_helpers import exported_sections
 from tests.conftest import push_seq, seed_device, session
 from tests.core.test_action_apply_promotion import _apply, _put_routes
 from tests.core.test_generation_protocol import AUTH, generations, job_row, put_vlans, seed_settings
@@ -68,6 +69,7 @@ class RuntimeTransport(httpx.AsyncBaseTransport):
         self.verification_error = None
         self.preview_error = None
         self.device_sections = None
+        self.cover_all = True
         self.before_send = asyncio.Event()
         self.release_send = asyncio.Event()
         self.release_send.set()
@@ -90,9 +92,13 @@ class RuntimeTransport(httpx.AsyncBaseTransport):
         if request.method == "POST":
             if "device-state-read" in url and self.device_sections is not None:
                 request_body = json.loads(request.content)["network-state-export:input"]
-                sections = {
-                    wire: self.device_sections.get(wire, {"status": "unsupported"}) for wire in request_body["family"]
-                }
+                sections = exported_sections(
+                    {
+                        wire: self.device_sections.get(wire, {"status": "unsupported"})
+                        for wire in request_body["family"]
+                    },
+                    cover_all=self.cover_all,
+                )
                 return httpx.Response(
                     200,
                     json={
@@ -388,16 +394,27 @@ async def evidence(device_id):
         return attempts, outcomes
 
 
-@pytest.mark.parametrize("residue_found", [True, False])
-async def test_removal_residue_withholds_durable_success(adapter_client, monkeypatch, residue_found):
+# An unsupported section checks nothing, so the removal is not proven clean.
+RESIDUE_SECTIONS = {
+    "found": {"status": "ok", "vlan": [{"vlan-id": 101}, {"vlan-id": 102}]},
+    "clean": {"status": "ok", "vlan": [{"vlan-id": 101}]},
+    "unsupported": {"status": "unsupported"},
+    "partial": {"status": "ok", "vlan": [{"vlan-id": 101}]},
+}
+
+
+@pytest.mark.parametrize("residue_check", sorted(RESIDUE_SECTIONS))
+async def test_removal_residue_withholds_durable_success(adapter_client, monkeypatch, residue_check):
+    residue_found = residue_check == "found"
     device_id, transport = await setup(adapter_client, monkeypatch, operation="removal")
     transport.refuse = False
-    transport.device_sections = {
-        "vlan-database": {
-            "status": "ok",
-            "vlan": [{"vlan-id": vlan} for vlan in ([101, 102] if residue_found else [101])],
-        }
-    }
+    transport.device_sections = {"vlan-database": RESIDUE_SECTIONS[residue_check]}
+    if residue_check == "partial":
+        # vlan has one grain; the snmp reader test proves a clean grain beside an unverifiable one reads so.
+        async def clean_beside_unverifiable(*_args):
+            return {}, ["community"]
+
+        monkeypatch.setattr("nso_adapter.core.removal._residue_after_removal", clean_beside_unverifiable)
     async with session() as db:
         row = await db.scalar(select(VlanIntent).where(VlanIntent.device_id == device_id))
         row.last_apply_at = PRIOR_AT
@@ -411,26 +428,27 @@ async def test_removal_residue_withholds_durable_success(adapter_client, monkeyp
     assert job.status == JobStatus.succeeded
     assert attempt.commit_acknowledged and attempt.phase == "terminal"
     assert attempt.response_classification["post_commit_verification"]["kind"] == "verified"
-    assert job.result["residue_check"] == ("found" if residue_found else "clean")
+    assert job.result["residue_check"] == residue_check
     if residue_found:
         assert job.result["residue"] == {"vlan": [["102"]]}
     settled = [row for row in outcomes if row.execution_attempt_id == attempt.id]
     assert settled
-    expected = "unavailable" if residue_found else "in_sync"
+    clean = residue_check == "clean"
+    expected = "in_sync" if clean else "unavailable"
     assert {row.disposition for row in settled} == {expected}
     assert {row["disposition"] for row in job.result["row_outcomes"]} == {expected}
     assert job.result["vlan_count_by_outcome"] == {
-        "in_sync": 0 if residue_found else 1,
+        "in_sync": 1 if clean else 0,
         "apply_failed": 0,
         "not_applied": 0,
-        "unavailable": 1 if residue_found else 0,
+        "unavailable": 0 if clean else 1,
     }
     async with session() as db:
         row = await db.scalar(select(VlanIntent).where(VlanIntent.device_id == device_id))
-        if residue_found:
-            assert row.last_apply_at == PRIOR_AT and row.last_apply_error == PRIOR_ERROR
-        else:
+        if clean:
             assert row.last_apply_at > PRIOR_AT and row.last_apply_error is None
+        else:
+            assert row.last_apply_at == PRIOR_AT and row.last_apply_error == PRIOR_ERROR
 
 
 @pytest.mark.parametrize("write_fails", [True, False])
@@ -1376,6 +1394,63 @@ async def test_missing_peer_proof_withholds_carrier_success(adapter_client, monk
     assert job.result["bgp_count_by_outcome"] == {"in_sync": 0, "apply_failed": 0, "not_applied": 0, "unavailable": 1}
 
 
+@pytest.mark.parametrize("peer_covered", [True, False])
+async def test_uncovered_peer_proof_withholds_carrier_success(adapter_client, monkeypatch, peer_covered):
+    device_id, transport = await setup(adapter_client, monkeypatch, family="bgp")
+    transport.refuse = False
+    # Without cover_all the marker names only the carried collections, so an omitted peer list is not read.
+    transport.cover_all = peer_covered
+    peers = [{"peer-address": "192.0.2.1"}, {"peer-address": "192.0.2.2"}]
+    scope = {"vrf": "", "peer": peers} if peer_covered else {"vrf": ""}
+    transport.device_sections = {"bgp-config": {"status": "ok", "router": [{"asn": 64512, "scope": [scope]}]}}
+    await run_next(device_id)
+    attempts, outcomes = await evidence(device_id)
+    job = await job_row(attempts[-1].job_correlation_id)
+    assert job.result["reader_compare"]["bgp"] == ("ok" if peer_covered else "partial")
+    expected = "in_sync" if peer_covered else "unavailable"
+    assert outcomes and {row.disposition for row in outcomes} == {expected}, (
+        "a carrier whose peer key the read did not cover is unproven, never in sync"
+    )
+    assert job.result["bgp_count_by_outcome"] == {
+        "in_sync": 1 if peer_covered else 0,
+        "apply_failed": 0,
+        "not_applied": 0,
+        "unavailable": 0 if peer_covered else 1,
+    }
+
+
+class _TranslationBroke(RuntimeError):
+    pass
+
+
+@pytest.mark.parametrize("read_back", ["action-raises", "section-error", "unsupported", "translation-raises"])
+async def test_a_failed_read_back_withholds_carrier_success(adapter_client, monkeypatch, read_back):
+    device_id, transport = await setup(adapter_client, monkeypatch, family="bgp")
+    transport.refuse = False
+    sections = {
+        "action-raises": None,
+        "section-error": {"bgp-config": {"status": "error", "error": "placeholder read error"}},
+        "unsupported": {},
+    }
+    if read_back == "translation-raises":
+
+        async def broken(*_args):
+            raise _TranslationBroke("placeholder translation error")
+
+        monkeypatch.setattr("nso_adapter.core.apply._translate_expected", broken)
+        sections[read_back] = {}
+    transport.device_sections = sections[read_back]
+    await run_next(device_id)
+    attempts, outcomes = await evidence(device_id)
+    job = await job_row(attempts[-1].job_correlation_id)
+    assert job.status == JobStatus.succeeded
+    assert job.result["reader_compare"]["bgp"] == ("unknown" if read_back == "unsupported" else "error")
+    assert outcomes and {row.disposition for row in outcomes} == {"unavailable"}, (
+        "a read-back that checked nothing proves nothing, so the carrier is never in sync"
+    )
+    assert job.result["bgp_count_by_outcome"] == {"in_sync": 0, "apply_failed": 0, "not_applied": 0, "unavailable": 1}
+
+
 async def lock_wait_seen(db, query, pid):
     from sqlalchemy import text
 
@@ -1760,6 +1835,7 @@ async def test_certified_success_preserves_a_new_writer_context(adapter_client, 
 
     device_id, transport = await setup(adapter_client, monkeypatch)
     transport.refuse = False
+    transport.device_sections = {"vlan-database": {"status": "ok", "vlan": [{"vlan-id": 101}, {"vlan-id": 102}]}}
     gate = CommitGate(monkeypatch, "response_recorded")
     task = asyncio.create_task(run_next(device_id))
     try:
@@ -1803,6 +1879,17 @@ async def test_certified_success_stamps_unchanged_child_rows_at_a_new_revision(a
 
     device_id, transport = await setup(adapter_client, monkeypatch, family="bgp")
     transport.refuse = False
+    transport.device_sections = {
+        "bgp-config": {
+            "status": "ok",
+            "router": [
+                {
+                    "asn": 64512,
+                    "scope": [{"vrf": "", "peer": [{"peer-address": "192.0.2.1"}, {"peer-address": "192.0.2.2"}]}],
+                }
+            ],
+        }
+    }
     gate = CommitGate(monkeypatch, "response_recorded")
     task = asyncio.create_task(run_next(device_id))
     try:
@@ -1840,6 +1927,7 @@ async def test_certified_success_stamps_unchanged_child_rows_at_a_new_revision(a
 async def test_removal_unsent_failure_retains_attempt_evidence(adapter_client, monkeypatch):
     device_id, transport = await setup(adapter_client, monkeypatch)
     transport.refuse = False
+    transport.device_sections = {"vlan-database": {"status": "ok", "vlan": [{"vlan-id": 101}, {"vlan-id": 102}]}}
     await run_next(device_id)
     monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "1")
     response = await adapter_client.put(

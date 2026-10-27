@@ -49,12 +49,16 @@ dev = [
     "types-PyYAML>=6.0.0,<7.0.0",
     "watchfiles>=1.0",
     # This pin owns the Zizmor version used by pre-commit and CI through uv.lock.
-    "zizmor==1.30.1",
+    "zizmor==1.31.1",
 ]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["nso_adapter*"]
+
+[tool.setuptools.package-data]
+# The collection decoder reads its manifest at import, so wheels must carry it.
+"nso_adapter.nso" = ["*.json"]
 
 [tool.semantic_release]
 allow_zero_version = true

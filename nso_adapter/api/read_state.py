@@ -50,7 +50,9 @@ class FamilyReadState(BaseModel):
     """The declared truth of one family's newest terminal read attempt."""
 
     outcome: Literal["present", "absent_authoritative", "unavailable"]
-    reason: Literal["export_down", "read_error", "not_authoritative", "unsupported", "not_ready"] | None = None
+    reason: (
+        Literal["export_down", "read_error", "not_authoritative", "unsupported", "not_ready", "not_covered"] | None
+    ) = None
     freshness: Literal["fresh", "stale"] | None = None
     # 'error' included deliberately: the engine terminalizes materializer failures as
     # result="error"/succeeded=False (refresh_engine) — a narrower literal would

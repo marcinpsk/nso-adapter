@@ -13,6 +13,7 @@ path = [
     "alembic/README",
     "alembic/script.py.mako",
     "docs/**",
+    "nso_adapter/nso/collection_manifest.json",
     "nso_adapter/nso/refusal_protocol_corpus.json",
     "tests/**/*.json",
     "uv.lock",

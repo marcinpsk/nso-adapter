@@ -86,19 +86,8 @@ async def _upsert_ospf_data(
 
 
 async def _materialize_ospf(db: AsyncSession, device: Device, entry: dict, refresh_source: str) -> None:
-    """Engine materializer: destructure the OSPF entry into its two lists and full-replace.
-
-    ``as_list`` normalizes the RESTCONF singleton-as-bare-object case for the ``instance`` and
-    ``interface`` YANG lists. An empty entry ``{}`` (the AbsentAuthoritative clear) yields two
-    empty lists → clear.
-    """
-    await _upsert_ospf_data(
-        db,
-        device,
-        as_list(entry.get("instance")),
-        as_list(entry.get("interface")),
-        refresh_source,
-    )
+    """Engine materializer: destructure the OSPF entry into its two covered lists and full-replace."""
+    await _upsert_ospf_data(db, device, entry["instance"], entry["interface"], refresh_source)
 
 
 OSPF_SPEC = FamilySpec(
@@ -106,6 +95,7 @@ OSPF_SPEC = FamilySpec(
     extract=lambda data: data,
     materialize=_materialize_ospf,
     wire_name="ospf-config",  # READSEM S3: fetch from the device-state envelope
+    requires=("instance", "instance/area", "interface"),
 )
 
 

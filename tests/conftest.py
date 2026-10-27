@@ -597,8 +597,10 @@ def vault():
     """
     from nso_adapter.core import snmp_verify
 
-    def _register(**kwargs) -> FakeVault:
-        provider = FakeVault({_SNMP_VAULT_PATH: {"community": SNMP_COMMUNITY}}, **kwargs)
+    def _register(*, secrets=None, **kwargs) -> FakeVault:
+        provider = FakeVault(
+            {_SNMP_VAULT_PATH: {"community": SNMP_COMMUNITY}} if secrets is None else secrets, **kwargs
+        )
         snmp_verify.register_secrets_provider(provider)
         return provider
 

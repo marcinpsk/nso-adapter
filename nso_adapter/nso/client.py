@@ -12,6 +12,7 @@ import httpx
 import structlog
 
 from nso_adapter.config import NsoInstanceConfig
+from nso_adapter.nso.collection_coverage import FAMILIES, decode_section, decode_sections
 from nso_adapter.nso.neds import _ned_oper_status
 from nso_adapter.nso.neds import extract_ned_component as _extract_ned_component
 
@@ -372,10 +373,10 @@ class NsoClient:
         """GET one family's section from the device-state envelope.
 
         *wire_family* is the YANG section name (e.g. ``"ospf-config"``, ``"interface-ip"``).
-        Returns the section dict — ``status`` (``ok|stale|unsupported|not-ready|error``) plus
-        optional ``error-reason``/``last-updated`` and the family's list keys. RESTCONF omits
-        empty lists, so an authoritative empty is ``status=ok`` with the list keys ABSENT —
-        consumers must ``.get(key, [])``, never infer from key presence.
+        Returns the decoded section dict — ``status`` (``ok|stale|unsupported|not-ready|error``)
+        plus optional ``error-reason``/``last-updated`` and the family's collections. A covered
+        collection is present (``[]`` when empty) and an uncovered one is absent
+        (:func:`~nso_adapter.nso.collection_coverage.decode_section`).
 
         A section on an EXISTING device always serves (the status leaf is always set), so a
         404 here can only mean the device is unknown to NSO — or the whole export is down.
@@ -399,7 +400,10 @@ class NsoClient:
             section = data.get(f"network-state-export:{wire_family}")
             if section is None:
                 section = data.get(wire_family)
-            return section if section is not None else {}
+            if section is None:
+                section = {}
+            # A non-object section stays as served: the classifier names it malformed.
+            return decode_section(wire_family, section) if isinstance(section, dict) else section
 
     async def get_device_state_doc(self, device_name: str) -> dict | None:
         """GET one device's WHOLE device-state envelope entry (all 18 family sections).
@@ -435,7 +439,7 @@ class NsoClient:
                 or entries[0].get("device-name") != device_name
             ):
                 raise NsoReadContractError("device-state GET returned a malformed body")
-            return entries[0]
+            return decode_sections(FAMILIES, entries[0])
 
     async def run_device_state_read(
         self, device_name: str, wire_families: list[str], *, timeout: float | None = None
@@ -463,7 +467,7 @@ class NsoClient:
             if output is None:
                 output = data.get("output", {})
             _certify_device_state_output(output, device_name, wire_families)
-            return output
+            return decode_sections(FAMILIES, output)
 
     async def check_sync(self, device_name: str) -> bool:
         """Return True if the device is in-sync with NSO's internal CDB.

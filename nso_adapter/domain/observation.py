@@ -101,7 +101,8 @@ class InterfaceAttributesEntry(BaseModel):
 
 
 class InterfaceAttributesDocument(BaseModel):
-    interfaces: list[InterfaceAttributesEntry]
+    interfaces: list[InterfaceAttributesEntry] | None
+    present: list[str]
     unprojectable: list[UnprojectableEntry]
 
 
@@ -120,11 +121,13 @@ class InterfaceIpEntry(BaseModel):
 
     interface: str
     bound_port: str | None
-    addresses: list[InterfaceIpAddressEntry]
+    addresses: list[InterfaceIpAddressEntry] | None
+    present: list[str]
 
 
 class InterfaceIpDocument(BaseModel):
-    interfaces: list[InterfaceIpEntry]
+    interfaces: list[InterfaceIpEntry] | None
+    present: list[str]
     unprojectable: list[UnprojectableEntry]
 
 
@@ -170,9 +173,10 @@ def _invalid_entry(index: int, error: ValidationError) -> UnprojectableEntry:
 
 
 def project_interface_attributes(data: dict | None) -> InterfaceAttributesDocument:
+    data = data or {}
     interfaces = []
     unprojectable = []
-    for index, entry in enumerate(as_list((data or {}).get("interface"))):
+    for index, entry in enumerate(as_list(data.get("interface"))):
         name = entry.get("interface-name") if isinstance(entry, dict) else None
         if not isinstance(name, str) or not name:
             unprojectable.append(UnprojectableEntry(index=index, reason="missing or invalid interface-name"))
@@ -192,7 +196,11 @@ def project_interface_attributes(data: dict | None) -> InterfaceAttributesDocume
             )
         except ValidationError as exc:
             unprojectable.append(_invalid_entry(index, exc))
-    return InterfaceAttributesDocument(interfaces=interfaces, unprojectable=unprojectable)
+    return InterfaceAttributesDocument(
+        interfaces=None if "interface" in data and data["interface"] is None else interfaces,
+        present=["interfaces"] if "interface" in data else [],
+        unprojectable=unprojectable,
+    )
 
 
 def extract_prefix_length(address: str) -> int | None:
@@ -230,14 +238,16 @@ def _project_addresses(entries: object, index: int) -> tuple[list[InterfaceIpAdd
     return addresses, unprojectable
 
 
-def project_interface_ips(interfaces_data: list) -> InterfaceIpDocument:
+def project_interface_ips(data: dict | None) -> InterfaceIpDocument:
+    data = data or {}
     interfaces = []
     unprojectable = []
-    for index, entry in enumerate(interfaces_data):
+    for index, entry in enumerate(as_list(data.get("interface"))):
         name = entry.get("interface-name") if isinstance(entry, dict) else None
         if not isinstance(name, str) or not name:
             unprojectable.append(UnprojectableEntry(index=index, reason="missing or invalid interface-name"))
             continue
+        covered = "address" in entry and entry["address"] is not None
         addresses, invalid_addresses = _project_addresses(entry.get("address"), index)
         unprojectable.extend(invalid_addresses)
         try:
@@ -245,17 +255,22 @@ def project_interface_ips(interfaces_data: list) -> InterfaceIpDocument:
                 InterfaceIpEntry(
                     interface=name,
                     bound_port=None if entry.get("bound-port") in (None, "") else entry.get("bound-port"),
-                    addresses=addresses,
+                    addresses=addresses if covered else None,
+                    present=["addresses"] if covered else [],
                 )
             )
         except ValidationError as exc:
             unprojectable.append(_invalid_entry(index, exc))
-    return InterfaceIpDocument(interfaces=interfaces, unprojectable=unprojectable)
+    return InterfaceIpDocument(
+        interfaces=None if "interface" in data and data["interface"] is None else interfaces,
+        present=["interfaces"] if "interface" in data else [],
+        unprojectable=unprojectable,
+    )
 
 
 def observe_interface_attributes(data: dict | None) -> ObservationDocument:
     document = project_interface_attributes(data)
-    document.interfaces.sort(key=lambda item: item.name)
+    (document.interfaces or []).sort(key=lambda item: item.name)
     return ObservationDocument(
         family="interface_attributes",
         document=document,
@@ -264,10 +279,10 @@ def observe_interface_attributes(data: dict | None) -> ObservationDocument:
 
 
 def observe_interface_ips(data: dict | None) -> ObservationDocument:
-    document = project_interface_ips(as_list((data or {}).get("interface")))
-    document.interfaces.sort(key=lambda item: item.interface)
-    for interface in document.interfaces:
-        interface.addresses.sort(key=lambda item: (item.family, item.address, item.vrf or ""))
+    document = project_interface_ips(data)
+    (document.interfaces or []).sort(key=lambda item: item.interface)
+    for interface in document.interfaces or []:
+        (interface.addresses or []).sort(key=lambda item: (item.family, item.address, item.vrf or ""))
     return ObservationDocument(
         family="interface_ip",
         document=document,

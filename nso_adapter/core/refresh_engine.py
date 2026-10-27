@@ -35,6 +35,7 @@ from nso_adapter.domain.diagnostics import device_fields
 from nso_adapter.domain.observation import observe_family
 from nso_adapter.domain.read_projection import UnprojectableEntry
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError, failure_detail
+from nso_adapter.nso.collection_coverage import admit_coverage, empty_section, validate_paths
 from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
     Present,
@@ -171,6 +172,14 @@ async def _record_result(
         return None
 
 
+#: Declared states that keep the mirror without degrading the surface.
+NONFAILING_KEEP_REASONS = (
+    UnavailableReason.not_authoritative,
+    UnavailableReason.unsupported,
+    UnavailableReason.not_covered,
+)
+
+
 @dataclass(frozen=True)
 class FamilySpec[PayloadT]:
     """Declarative description of one read-mirror family (the policy-table row).
@@ -185,17 +194,23 @@ class FamilySpec[PayloadT]:
     * ``wire_name`` — the device-state envelope section name (e.g. ``"static-route"``). Every
       family reads its envelope section (status-declared); READSEM S5 retired the legacy
       per-family getters + the ``empty_policy`` pop/present column.
+    * ``requires`` — every manifest collection path (``"router/scope/peer"``) the materializer
+      reads. A ``Present`` read that does not cover one keeps the rows and publishes nothing
+      (``Unavailable(not_covered)``, #1833).
 
-    An authoritative clear (``AbsentAuthoritative``) is expressed by feeding the extractor an
-    empty entry ``{}`` — so ``extract({})`` yields the family's "nothing" payload (``[]`` for a
-    list family, ``{}`` for a dict family) and the SAME materialize path performs the clear. No
-    separate clear hook, and no per-family "empty value" to keep in sync.
+    An authoritative clear (``AbsentAuthoritative``) is expressed by feeding the extractor the
+    covered empty section (``empty_section``), so the SAME materialize path performs the clear.
+    No separate clear hook, and no per-family "empty value" to keep in sync.
     """
 
     name: str
     extract: Callable[[dict], PayloadT]
     materialize: Callable[[AsyncSession, Device, PayloadT, str], Awaitable[None]]
     wire_name: str
+    requires: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        validate_paths(self.wire_name, self.requires)
 
 
 async def _escalate_not_ready(device: Device, nso_client: NsoClient, wire_name: str) -> ReadOutcome:
@@ -313,8 +328,9 @@ async def run_family_refresh(
     """Refresh one family's mirror for one device via the shared engine.
 
     Behaviour-equivalent to the hand-written ``refresh_<family>_for_device`` it replaces:
-    returns ``True`` on a successful read (including an authoritative clear or an intentional
-    skip) and ``False`` when the read was unavailable and the last-known rows were left intact.
+    returns ``True`` on a successful read, an authoritative clear, an intentional skip, or a
+    declared nonfailing unavailable read (``NONFAILING_KEEP_REASONS``); returns ``False`` only
+    for a failing unavailable read that leaves the last-known rows intact.
     """
     if not device.nso_device_name:
         logger.debug(f"{spec.name}.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
@@ -454,7 +470,9 @@ async def _materialize_guarded(
             row_count=row_count,
             publish_payload=True,
             observation=observe_family(
-                spec.name, outcome.data if isinstance(outcome, Present) else {}, ned_id=device.ned_id
+                spec.name,
+                outcome.data if isinstance(outcome, Present) else empty_section(spec.wire_name),
+                ned_id=device.ned_id,
             ),
         )
         if not selected:
@@ -501,6 +519,7 @@ async def _apply_outcome(
     refresh_source: str,
 ) -> bool:
     """Drive the mirror action + two-phase outcome record for a classified read."""
+    outcome = admit_coverage(outcome, spec.wire_name, spec.requires, consumer=spec.name)
     # Phase 1: record the read outcome before the materializer runs, on the CALLER's session.
     attempt_id = await _record_read(db, device, spec, outcome, refresh_source)
 
@@ -538,7 +557,13 @@ async def _apply_outcome(
         # entry). Same cancellation-atomic span as the Present branch (S5a A3).
         async def _cleared_span() -> bool:
             _, superseded = await _materialize_guarded(
-                db, device, spec, attempt_id, lambda: spec.extract({}), refresh_source, outcome
+                db,
+                device,
+                spec,
+                attempt_id,
+                lambda: spec.extract(empty_section(spec.wire_name)),
+                refresh_source,
+                outcome,
             )
             if superseded:
                 return True
@@ -553,11 +578,12 @@ async def _apply_outcome(
 
     # Unavailable — keep the last-known rows in every case.
     assert isinstance(outcome, Unavailable)
-    if outcome.reason in (UnavailableReason.not_authoritative, UnavailableReason.unsupported):
+    if outcome.reason in NONFAILING_KEEP_REASONS:
         # Declared/expected absence of authority: a keep-on-None inventory family's 404
-        # (legacy path) or the envelope's declared `unsupported` (this NED has no reader for
-        # the family). Not a read failure — keep the rows and report success (NOT a degraded
-        # surface), so it never flips the device to `partial` on every poll.
+        # (legacy path), the envelope's declared `unsupported` (this NED has no reader for
+        # the family) or a reader that does not cover a needed collection. Not a read failure:
+        # keep the rows and report success (NOT a degraded surface), so it never flips the
+        # device to `partial` on every poll.
         logger.info(
             f"{spec.name}.refresh.not_authoritative",
             device_id=device.id,

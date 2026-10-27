@@ -15,9 +15,11 @@ from nso_adapter.core.families import ENGINE_FAMILY_KEYS
 from nso_adapter.core.importer import refresh_routing_surfaces_for_device
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh_from_outcome
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.collection_coverage import empty_section
 from nso_adapter.nso.read_outcome import AbsentAuthoritative, Freshness, Present
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device, DeviceStaticRoute
+from tests.collection_coverage_helpers import covered, covered_sections
 from tests.conftest import seed_device, session
 
 
@@ -93,6 +95,7 @@ async def test_engine_publishes_mirror_and_phase_two_in_one_commit(
         extract=lambda data: data.get("route", []),
         materialize=_stage_routes,
         wire_name="static-route",
+        requires=("route",),
     )
     real_stage_result = outcome_store.stage_result
     visible_during_phase_two: list[list[str]] = []
@@ -220,8 +223,8 @@ def _materializer_cases() -> Iterator[tuple[FamilySpec, str, dict]]:
     assert tuple(spec.name for spec in specs) == ENGINE_FAMILY_KEYS
     assert set(_PRESENT_DATA) == set(ENGINE_FAMILY_KEYS)
     for spec in specs:
-        yield spec, "clear", {}
-        yield spec, "present", _PRESENT_DATA[spec.name]
+        yield spec, "clear", empty_section(spec.wire_name)
+        yield spec, "present", covered(spec.wire_name, _PRESENT_DATA[spec.name])
 
 
 async def test_all_family_materializers_leave_commit_to_the_engine(adapter_client):
@@ -236,25 +239,33 @@ async def test_all_family_materializers_leave_commit_to_the_engine(adapter_clien
             await db.rollback()
 
 
-async def test_projected_fanout_keeps_an_earlier_family_durable_after_later_failure(adapter_client):
+async def test_projected_fanout_keeps_an_earlier_family_durable_after_later_failure(adapter_client, monkeypatch):
     """A later materializer failure cannot roll back an earlier projected family."""
+    from nso_adapter.core import isis
+
+    async def _crash(*_args, **_kwargs):
+        raise RuntimeError("deterministic materializer crash")
+
+    monkeypatch.setattr(isis, "_upsert_isis_data", _crash)
     device_id = await seed_device(nso_device_name="projected-family-commits")
     nso_client = AsyncMock(spec=NsoClient)
-    nso_client.get_device_state_doc.return_value = {
-        "device-name": "projected-family-commits",
-        "static-route": {
-            "status": "ok",
-            "route": [{"vrf": "", "prefix": "198.18.30.0/24", "next-hop": "198.18.0.1"}],
-        },
-        "isis-interface": {"status": "ok", "process": 42},
-        "bgp-config": {"status": "error", "error-reason": "test failure"},
-        "ospf-config": {"status": "ok"},
-        "route-policy": {"status": "ok"},
-        "snmp-config": {"status": "ok"},
-        "logging-config": {"status": "ok"},
-        "bfd-config": {"status": "ok"},
-        "interface-ip": {"status": "ok"},
-    }
+    nso_client.get_device_state_doc.return_value = covered_sections(
+        {
+            "device-name": "projected-family-commits",
+            "static-route": {
+                "status": "ok",
+                "route": [{"vrf": "", "prefix": "198.18.30.0/24", "next-hop": "198.18.0.1"}],
+            },
+            "isis-interface": {"status": "ok", "process": [{"process-tag": "CORE"}]},
+            "bgp-config": {"status": "error", "error-reason": "test failure"},
+            "ospf-config": {"status": "ok"},
+            "route-policy": {"status": "ok"},
+            "snmp-config": {"status": "ok"},
+            "logging-config": {"status": "ok"},
+            "bfd-config": {"status": "ok"},
+            "interface-ip": {"status": "ok"},
+        }
+    )
 
     async with _device_session(device_id) as (db, device):
         failed = await refresh_routing_surfaces_for_device(

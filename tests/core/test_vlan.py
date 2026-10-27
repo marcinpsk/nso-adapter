@@ -18,6 +18,7 @@ from nso_adapter.core.vlan import (
 )
 from nso_adapter.nso.client import NsoExportUnavailableError
 from nso_adapter.store.models import Device, DeviceSwitchport, DeviceSwitchportTaggedVlan, DeviceVlan
+from tests.collection_coverage_helpers import covered_sections, section_client
 from tests.conftest import seed_device, session
 from tests.fixtures.switching_read_payloads import SWITCHING_READ_PAYLOADS
 
@@ -44,7 +45,7 @@ def _serve_sections(nso: AsyncMock) -> dict:
         value = sections[wire_family]
         if isinstance(value, Exception):
             raise value
-        return value
+        return covered_sections({wire_family: value})[wire_family]
 
     nso.get_device_state_section.side_effect = _get
     return sections
@@ -55,7 +56,7 @@ class _SectionsClient:
         self.sections = {}
 
     async def get_device_state_section(self, device_name, wire_name):
-        return self.sections[wire_name]
+        return covered_sections({wire_name: self.sections[wire_name]})[wire_name]
 
 
 @pytest.mark.parametrize("raw", [[], ["10", "20"], ("10", "20"), 10])
@@ -74,7 +75,7 @@ def test_tagged_vlan_parser_rejects_empty_chunks(raw):
 async def test_refresh_vlan_database_upserts_and_prunes(adapter_client):
     device_id = await seed_device(nso_device_name="vsw", netbox_device_id=1300)
     async with _device_session(device_id) as (db, device):
-        nso = AsyncMock()
+        nso = section_client()
         sections = _serve_sections(nso)
         sections["vlan-database"] = {"status": "ok", **deepcopy(SWITCHING_READ_PAYLOADS["vlan"])}
         await refresh_vlan_database_for_device(db, device, nso)
@@ -99,7 +100,7 @@ async def test_refresh_vlan_database_rejects_a_malformed_item_and_keeps_rows(
     """An item without a usable vlan id must reject the refresh, never prune the unseen rows."""
     device_id = await seed_device(nso_device_name="vsw-malformed", netbox_device_id=1304)
     async with _device_session(device_id) as (db, device):
-        nso = AsyncMock()
+        nso = section_client()
         sections = _serve_sections(nso)
         sections["vlan-database"] = {
             "status": "ok",
@@ -126,7 +127,7 @@ async def test_a_malformed_item_is_named_by_its_FIELD_and_never_repeated_verbati
 
     device_id = await seed_device(nso_device_name="vsw-sink", netbox_device_id=1309)
     async with _device_session(device_id) as (db, device):
-        nso = AsyncMock()
+        nso = section_client()
         sections = _serve_sections(nso)
         sections["vlan-database"] = {
             "status": "ok",
@@ -156,7 +157,7 @@ async def _switchport_surface_failure(device_id: int, interface: dict) -> tuple[
     from nso_adapter.core.importer import _run_surfaces
 
     async with _device_session(device_id) as (db, device):
-        nso = AsyncMock()
+        nso = section_client()
         sections = _serve_sections(nso)
         sections["vlan-database"] = {"status": "ok", "vlan": [{"vlan-id": 10, "name": "MGMT"}]}
         await refresh_vlan_database_for_device(db, device, nso)
@@ -225,7 +226,7 @@ async def test_a_malformed_TAGGED_VLAN_entry_is_named_by_its_field_and_never_rep
 async def test_refresh_switchport_links_vlans(adapter_client):
     device_id = await seed_device(nso_device_name="vsw2", netbox_device_id=1301)
     async with _device_session(device_id) as (db, device):
-        nso = AsyncMock()
+        nso = section_client()
         sections = _serve_sections(nso)
         sections["vlan-database"] = {
             "status": "ok",
@@ -258,7 +259,7 @@ async def test_refresh_switchport_rejects_an_empty_tagged_vlan_list_without_clea
     """A malformed falsy wire value must fail before replacing the stored VLAN links."""
     device_id = await seed_device(nso_device_name="vsw-empty-tagged", netbox_device_id=1313)
     async with _device_session(device_id) as (db, device):
-        nso = AsyncMock()
+        nso = section_client()
         sections = _serve_sections(nso)
         sections["vlan-database"] = {
             "status": "ok",
@@ -305,7 +306,7 @@ async def test_refresh_switchport_treats_an_empty_tagged_vlans_leaf_as_none(adap
     """
     device_id = await seed_device(nso_device_name=f"vsw-none-tagged-{len(wire)}", netbox_device_id=1316 + len(wire))
     async with _device_session(device_id) as (db, device):
-        nso = AsyncMock()
+        nso = section_client()
         sections = _serve_sections(nso)
         sections["vlan-database"] = {
             "status": "ok",
@@ -347,7 +348,7 @@ async def test_refresh_switchport_rejects_invalid_tagged_vlan_chunks_without_cle
     """A malformed provider string must fail before replacing the stored VLAN links."""
     device_id = await seed_device(nso_device_name="vsw-invalid-tagged", netbox_device_id=1314)
     async with _device_session(device_id) as (db, device):
-        nso = AsyncMock()
+        nso = section_client()
         sections = _serve_sections(nso)
         sections["vlan-database"] = {
             "status": "ok",
@@ -388,7 +389,7 @@ async def test_refresh_vlan_database_authoritative_empty_prunes_all(adapter_clie
     every VLAN row for this pop family. (Device-absence, section None, now KEEPS — READSEM S5.)"""
     device_id = await seed_device(nso_device_name="vsw-clr", netbox_device_id=1302)
     async with _device_session(device_id) as (db, device):
-        nso = AsyncMock()
+        nso = section_client()
         sections = _serve_sections(nso)
         sections["vlan-database"] = {"status": "ok", "vlan": [{"vlan-id": 10, "name": "MGMT"}]}
         await refresh_vlan_database_for_device(db, device, nso)
@@ -406,7 +407,7 @@ async def test_refresh_vlan_database_keep_on_export_down(adapter_client):
     """A confirmed export outage keeps the last-known VLAN rows and reports degraded (False)."""
     device_id = await seed_device(nso_device_name="vsw-keep", netbox_device_id=1303)
     async with _device_session(device_id) as (db, device):
-        nso = AsyncMock()
+        nso = section_client()
         sections = _serve_sections(nso)
         sections["vlan-database"] = {"status": "ok", "vlan": [{"vlan-id": 10, "name": "MGMT"}]}
         await refresh_vlan_database_for_device(db, device, nso)
@@ -424,7 +425,7 @@ async def test_refresh_switchport_authoritative_empty_prunes_all(adapter_client)
     (Device-absence, section None, now KEEPS — READSEM S5.)"""
     device_id = await seed_device(nso_device_name="vsw-sp-clr", netbox_device_id=1304)
     async with _device_session(device_id) as (db, device):
-        nso = AsyncMock()
+        nso = section_client()
         sections = _serve_sections(nso)
         sections["vlan-database"] = {"status": "ok", "vlan": [{"vlan-id": 10, "name": "A"}]}
         await refresh_vlan_database_for_device(db, device, nso)
@@ -448,7 +449,7 @@ async def test_refresh_switchport_keep_on_read_error(adapter_client):
     """A read error keeps the last-known switchport rows and reports degraded (False)."""
     device_id = await seed_device(nso_device_name="vsw-sp-keep", netbox_device_id=1305)
     async with _device_session(device_id) as (db, device):
-        nso = AsyncMock()
+        nso = section_client()
         sections = _serve_sections(nso)
         sections["vlan-database"] = {"status": "ok", "vlan": [{"vlan-id": 10, "name": "A"}]}
         await refresh_vlan_database_for_device(db, device, nso)
@@ -473,7 +474,7 @@ async def test_a_BOOLEAN_vlan_id_is_refused_and_never_bound_to_a_real_vlan(adapt
     """
     device_id = await seed_device(nso_device_name="vsw-bool-vid", netbox_device_id=1315)
     async with _device_session(device_id) as (db, device):
-        nso = AsyncMock()
+        nso = section_client()
         sections = _serve_sections(nso)
         sections["vlan-database"] = {"status": "ok", "vlan": [{"vlan-id": 10, "name": "MGMT"}]}
         await refresh_vlan_database_for_device(db, device, nso)
@@ -555,7 +556,7 @@ async def test_a_BOOLEAN_untagged_vlan_is_refused_and_never_bound_to_vlan_1(adap
 async def test_a_duplicate_vlan_id_is_reported_as_a_duplicate(adapter_client):
     device_id = await seed_device(nso_device_name="vsw-duplicate-vlan", netbox_device_id=1321)
     async with _device_session(device_id) as (db, device):
-        nso = AsyncMock()
+        nso = section_client()
         sections = _serve_sections(nso)
         sections["vlan-database"] = {
             "status": "ok",
@@ -570,7 +571,7 @@ async def test_a_duplicate_switchport_identity_is_reported_as_a_duplicate(adapte
     device_id = await seed_device(nso_device_name="vsw-duplicate-switchport", netbox_device_id=1322)
     interface = {"interface-name": "Gi0/1", "mode": "access", "untagged-vlan": 10}
     async with _device_session(device_id) as (db, device):
-        nso = AsyncMock()
+        nso = section_client()
         sections = _serve_sections(nso)
         sections["vlan-database"] = {"status": "ok", "vlan": [{"vlan-id": 10, "name": "MGMT"}]}
         await refresh_vlan_database_for_device(db, device, nso)

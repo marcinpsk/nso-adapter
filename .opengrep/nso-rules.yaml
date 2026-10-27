@@ -760,6 +760,63 @@ rules:
     severity: ERROR
     message: Query the store with select() and execute()/scalars(); Session.query is the legacy API.
     pattern: $SESSION.query(...)
+  - id: nso-export-read-outside-the-census
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Read network-state-export sections only in a census consumer that admits collection
+      coverage before it uses the data (#1833). Admit the required collections, then add the
+      consumer to this rule and to the census tests.
+    paths:
+      include: [nso_adapter/**, review-patterns.py]
+      exclude: [nso_adapter/nso/client.py]
+    patterns:
+      - pattern-either:
+          - pattern: $CLIENT.get_device_state_section(...)
+          - pattern: $CLIENT.get_device_state_doc(...)
+          - pattern: $CLIENT.run_device_state_read(...)
+          - pattern: classify_envelope_family_read(...)
+          - pattern: _live_family_sections(...)
+          - pattern: $READ.outcome_for(...)
+      - pattern-not-inside: |
+          def classify_envelope_family_read(...):
+              ...
+      - pattern-not-inside: |
+          def _escalate_not_ready(...):
+              ...
+      - pattern-not-inside: |
+          def _classify_family_read(...):
+              ...
+      - pattern-not-inside: |
+          def _fetch_projection(...):
+              ...
+      - pattern-not-inside: |
+          def _apply_projected(...):
+              ...
+      - pattern-not-inside: |
+          def sync_device(...):
+              ...
+      - pattern-not-inside: |
+          def _detect_drift_attributes(...):
+              ...
+      - pattern-not-inside: |
+          def refresh_redistribution_for_device(...):
+              ...
+      - pattern-not-inside: |
+          def _live_family_sections(...):
+              ...
+      - pattern-not-inside: |
+          def _static_route_device_state(...):
+              ...
+      - pattern-not-inside: |
+          def _document_reader_compare(...):
+              ...
+      - pattern-not-inside: |
+          def _interface_config_residue(...):
+              ...
+      - pattern-not-inside: |
+          def _residue_after_removal(...):
+              ...
   - id: nso-store-async-engine-factory
     languages: [python]
     severity: ERROR

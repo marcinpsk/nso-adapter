@@ -1,0 +1,460 @@
+{
+  "marker": "covered-collections",
+  "families": {
+    "lag-topology": {
+      "collections": {
+        "lag": {
+          "kind": "list",
+          "keys": [
+            "name"
+          ],
+          "collections": {
+            "member": {
+              "kind": "list",
+              "keys": [
+                "interface-name"
+              ],
+              "collections": {}
+            }
+          }
+        }
+      }
+    },
+    "lag-config": {
+      "collections": {
+        "lag": {
+          "kind": "list",
+          "keys": [
+            "name"
+          ],
+          "collections": {
+            "member": {
+              "kind": "list",
+              "keys": [
+                "interface-name"
+              ],
+              "collections": {}
+            }
+          }
+        }
+      }
+    },
+    "vlan-database": {
+      "collections": {
+        "vlan": {
+          "kind": "list",
+          "keys": [
+            "vlan-id"
+          ],
+          "collections": {}
+        }
+      }
+    },
+    "switchport": {
+      "collections": {
+        "interface": {
+          "kind": "list",
+          "keys": [
+            "interface-name"
+          ],
+          "collections": {}
+        }
+      }
+    },
+    "interface-attributes": {
+      "collections": {
+        "interface": {
+          "kind": "list",
+          "keys": [
+            "interface-name"
+          ],
+          "collections": {}
+        }
+      }
+    },
+    "interface-ip": {
+      "collections": {
+        "interface": {
+          "kind": "list",
+          "keys": [
+            "interface-name"
+          ],
+          "collections": {
+            "address": {
+              "kind": "list",
+              "keys": [
+                "address",
+                "vrf"
+              ],
+              "collections": {}
+            }
+          }
+        }
+      }
+    },
+    "interface-mtu": {
+      "collections": {
+        "interface": {
+          "kind": "list",
+          "keys": [
+            "interface-name"
+          ],
+          "collections": {}
+        }
+      }
+    },
+    "snmp-config": {
+      "collections": {
+        "community": {
+          "kind": "list",
+          "keys": [
+            "name"
+          ],
+          "collections": {}
+        },
+        "v3-user": {
+          "kind": "list",
+          "keys": [
+            "username"
+          ],
+          "collections": {}
+        },
+        "host": {
+          "kind": "list",
+          "keys": [
+            "address"
+          ],
+          "collections": {}
+        }
+      }
+    },
+    "logging-config": {
+      "collections": {
+        "host": {
+          "kind": "list",
+          "keys": [
+            "address"
+          ],
+          "collections": {}
+        }
+      }
+    },
+    "static-route": {
+      "collections": {
+        "route": {
+          "kind": "list",
+          "keys": [
+            "vrf",
+            "prefix",
+            "next-hop"
+          ],
+          "collections": {}
+        }
+      }
+    },
+    "isis-interface": {
+      "collections": {
+        "process": {
+          "kind": "list",
+          "keys": [
+            "process-tag"
+          ],
+          "collections": {
+            "setting": {
+              "kind": "list",
+              "keys": [
+                "key"
+              ],
+              "collections": {}
+            },
+            "level": {
+              "kind": "list",
+              "keys": [
+                "level"
+              ],
+              "collections": {}
+            },
+            "srv6-locator": {
+              "kind": "list",
+              "keys": [
+                "name"
+              ],
+              "collections": {}
+            },
+            "flex-algo": {
+              "kind": "list",
+              "keys": [
+                "algo-id"
+              ],
+              "collections": {}
+            },
+            "redistribute": {
+              "kind": "list",
+              "keys": [
+                "source-protocol",
+                "source-ref"
+              ],
+              "collections": {}
+            }
+          }
+        },
+        "interface": {
+          "kind": "list",
+          "keys": [
+            "interface-name",
+            "af"
+          ],
+          "collections": {
+            "setting": {
+              "kind": "list",
+              "keys": [
+                "key"
+              ],
+              "collections": {}
+            },
+            "level": {
+              "kind": "list",
+              "keys": [
+                "level"
+              ],
+              "collections": {}
+            },
+            "prefix-sid": {
+              "kind": "list",
+              "keys": [
+                "algorithm"
+              ],
+              "collections": {}
+            }
+          }
+        }
+      }
+    },
+    "bgp-config": {
+      "collections": {
+        "router": {
+          "kind": "list",
+          "keys": [
+            "asn"
+          ],
+          "collections": {
+            "scope": {
+              "kind": "list",
+              "keys": [
+                "vrf"
+              ],
+              "collections": {
+                "address-family": {
+                  "kind": "list",
+                  "keys": [
+                    "afi"
+                  ],
+                  "collections": {
+                    "redistribute": {
+                      "kind": "list",
+                      "keys": [
+                        "source-protocol",
+                        "source-ref"
+                      ],
+                      "collections": {}
+                    }
+                  }
+                },
+                "peer": {
+                  "kind": "list",
+                  "keys": [
+                    "peer-address"
+                  ],
+                  "collections": {
+                    "peer-address-family": {
+                      "kind": "list",
+                      "keys": [
+                        "afi"
+                      ],
+                      "collections": {}
+                    }
+                  }
+                },
+                "peer-group": {
+                  "kind": "list",
+                  "keys": [
+                    "name"
+                  ],
+                  "collections": {
+                    "peer-group-address-family": {
+                      "kind": "list",
+                      "keys": [
+                        "afi"
+                      ],
+                      "collections": {}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "route-policy": {
+      "collections": {
+        "prefix-list": {
+          "kind": "list",
+          "keys": [
+            "name"
+          ],
+          "collections": {
+            "entry": {
+              "kind": "list",
+              "keys": [
+                "sequence"
+              ],
+              "collections": {}
+            }
+          }
+        },
+        "community-list": {
+          "kind": "list",
+          "keys": [
+            "name"
+          ],
+          "collections": {
+            "entry": {
+              "kind": "list",
+              "keys": [
+                "sequence"
+              ],
+              "collections": {}
+            }
+          }
+        },
+        "as-path": {
+          "kind": "list",
+          "keys": [
+            "name"
+          ],
+          "collections": {
+            "entry": {
+              "kind": "list",
+              "keys": [
+                "sequence"
+              ],
+              "collections": {}
+            }
+          }
+        },
+        "route-map": {
+          "kind": "list",
+          "keys": [
+            "name"
+          ],
+          "collections": {
+            "entry": {
+              "kind": "list",
+              "keys": [
+                "sequence"
+              ],
+              "collections": {
+                "match-prefix-lists": {
+                  "kind": "leaf-list"
+                },
+                "match-community-lists": {
+                  "kind": "leaf-list"
+                },
+                "match-as-paths": {
+                  "kind": "leaf-list"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "ospf-config": {
+      "collections": {
+        "instance": {
+          "kind": "list",
+          "keys": [
+            "process-id"
+          ],
+          "collections": {
+            "area": {
+              "kind": "list",
+              "keys": [
+                "area-id"
+              ],
+              "collections": {}
+            },
+            "redistribute": {
+              "kind": "list",
+              "keys": [
+                "source-protocol",
+                "source-ref"
+              ],
+              "collections": {}
+            }
+          }
+        },
+        "interface": {
+          "kind": "list",
+          "keys": [
+            "interface-name"
+          ],
+          "collections": {}
+        }
+      }
+    },
+    "bfd-config": {
+      "collections": {
+        "interface": {
+          "kind": "list",
+          "keys": [
+            "interface-name"
+          ],
+          "collections": {}
+        }
+      }
+    },
+    "l2-service": {
+      "collections": {
+        "service": {
+          "kind": "list",
+          "keys": [
+            "service-name"
+          ],
+          "collections": {
+            "sap": {
+              "kind": "list",
+              "keys": [
+                "sap-id"
+              ],
+              "collections": {}
+            }
+          }
+        }
+      }
+    },
+    "svi": {
+      "collections": {
+        "interface": {
+          "kind": "list",
+          "keys": [
+            "interface-name"
+          ],
+          "collections": {}
+        }
+      }
+    },
+    "subinterface": {
+      "collections": {
+        "interface": {
+          "kind": "list",
+          "keys": [
+            "interface-name"
+          ],
+          "collections": {}
+        }
+      }
+    }
+  }
+}

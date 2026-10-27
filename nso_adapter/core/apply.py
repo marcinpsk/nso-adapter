@@ -206,10 +206,12 @@ async def _static_route_device_state(client, device) -> tuple[str, dict]:
 
     One read serves both post-write consumers: the residue check over the consumed
     predecessor keys, and §4.11's per-field evidence for the clear carrier. ``status`` is
-    ``ok`` / ``unsupported`` (the NED exports no such section — absence proves nothing) /
-    ``error``; only ``ok`` yields entries, and only entries can consume anything.
+    ``ok`` / ``unsupported`` (the NED exports no such section, or the section does not cover
+    ``route`` — absence proves nothing) / ``error``; only ``ok`` yields entries, and only entries
+    can consume anything.
     """
     from nso_adapter.core.removal import _VERIFY_BATCH_TIMEOUT, _live_family_sections, _verifier_section_status
+    from nso_adapter.nso.collection_coverage import uncovered_paths
 
     try:
         sections = await _live_family_sections(
@@ -219,6 +221,9 @@ async def _static_route_device_state(client, device) -> tuple[str, dict]:
         status = _verifier_section_status(section)
         if status != "ok":
             return ("unsupported" if status == "unknown" else "error"), {}
+        if uncovered_paths("static-route", section, ["route"]):
+            logger.info("static_route.device_state_not_covered", device_id=device.id)
+            return "unsupported", {}
         entries: dict[tuple[str, str, str], dict] = {}
         for entry in section.get("route") or []:
             if isinstance(entry, dict):
@@ -1395,7 +1400,7 @@ async def _document_reader_compare(
         if prep == "error":
             reader_compare[section] = "error"
             continue
-        translated, unverifiable, lists, wire = prep
+        translated, unverifiable, lists, wire, dropped = prep
         evidence: dict[tuple[str, int], str] = {}
         fails: list[Any]
         if not translated:  # every key Vault-unverifiable → nothing to look for
@@ -1428,6 +1433,7 @@ async def _document_reader_compare(
                     error=failure_detail(exc),
                 )
                 n_ok, n_failed, fails, status, evidence = s_ok, 0, [], "error", {}
+        _mark_unverifiable(evidence, dropped)
         reader_compare[section] = status
         evidence_by_section[section] = evidence
         reader_compare_unverifiable[section] = unverifiable
@@ -1439,6 +1445,13 @@ async def _document_reader_compare(
         {key: values for key, values in reader_compare_unverifiable.items() if values},
         evidence_by_section,
     )
+
+
+def _mark_unverifiable(evidence: dict[tuple[str, int], str], dropped: list) -> None:
+    """Record each row whose key could not be translated as ``unverifiable``, unless a sibling grain is missing."""
+    for row in dropped:
+        if getattr(row, "id", None) is not None and evidence.get((row.__tablename__, row.id)) != "missing":
+            evidence[(row.__tablename__, row.id)] = "unverifiable"
 
 
 class _SectionApply(NamedTuple):
@@ -1658,7 +1671,14 @@ async def _settle_document_success(
             successful = any(source.frozen_row_identity[0] in certified_routes for source in logical.source_refs)
         section = _section_by_container().get(logical.row.subject.split(".")[0])
         carrier_join = carrier_sources.get(logical.carrier)
-        if section and carrier_join is not None and evidence.get(section, {}).get(carrier_join) == "missing":
+        # A read-back that failed, or did not check the carrier's key, proves nothing, so the row gets no green.
+        if section and reader_compare.get(section) in {"error", "unknown"}:
+            successful = False
+        if (
+            section
+            and carrier_join is not None
+            and evidence.get(section, {}).get(carrier_join) in {"missing", "unproven", "unverifiable"}
+        ):
             successful = False
         identity = logical_record(logical)
         key = identity["stream"], identity["row"]["subject"], identity["row"]["key"], identity["settlement_cohort"]
@@ -1781,21 +1801,21 @@ def _reader_compare_expected(section: str, rows, ned_id: str | None = None) -> l
     raise RuntimeError(f"section {section!r} declares a bespoke expansion that has no implementation")
 
 
-async def _translate_expected(scope: str, expected: list[tuple[Any, str, tuple]]) -> tuple[list, list[str]]:
+async def _translate_expected(scope: str, expected: list[tuple[Any, str, tuple]]) -> tuple[list, list[str], list]:
     """Re-key the expected rows into the namespace the EXPORT uses (CR-A17).
 
     Identity for every grain but snmp/community, whose export key is ``sha256(secret)[:16]`` of a
     Vault-held community string. Returns ``(translatable, unverifiable_labels)``: a row whose key
     cannot be translated — no Vault provider, a Vault outage, a ref that no longer resolves — is
-    DROPPED from the check rather than stamped ``reader_compare_missing``. Failing open is the only
-    safe direction: a Vault blip must not permanently pin an SNMP scope apply_failed for a
-    community that is sitting on the device exactly as intended.
+    DROPPED from the check rather than stamped ``reader_compare_missing``: a Vault blip must not
+    pin an SNMP scope apply_failed for a community that is sitting on the device exactly as
+    intended. The third element names the dropped rows, which settle unavailable, never in sync.
     """
     from nso_adapter.core.removal import UNCOMPARABLE_LISTS
     from nso_adapter.core.snmp_verify import community_fingerprints
 
     if not any((scope, label) in UNCOMPARABLE_LISTS for _row, label, _key in expected):
-        return expected, []
+        return expected, [], []
 
     refs = {
         str(row.label): row.vault_ref
@@ -1804,7 +1824,7 @@ async def _translate_expected(scope: str, expected: list[tuple[Any, str, tuple]]
     }
     digests = await community_fingerprints(refs)
 
-    out, unverifiable = [], []
+    out, unverifiable, dropped = [], [], []
     for row, label, key in expected:
         if (scope, label) not in UNCOMPARABLE_LISTS:
             out.append((row, label, key))
@@ -1812,13 +1832,14 @@ async def _translate_expected(scope: str, expected: list[tuple[Any, str, tuple]]
         digest = digests.get(str(getattr(row, "label", "")))
         if digest is None:
             unverifiable.append(f"{label} {list(key)}")
+            dropped.append(row)
             continue
         out.append((row, label, (digest,)))
-    return out, sorted(unverifiable)
+    return out, sorted(unverifiable), dropped
 
 
 async def _reader_compare_prepare(scope, rows, ned_id):
-    """Compute the translatable expected set for *scope* → ``(translated, unverifiable, lists, wire)``.
+    """Compute the translatable expected set for *scope* → ``(translated, unverifiable, lists, wire, dropped)``.
 
     Returns ``None`` when the section is structurally uncheckable (no expected keyed grain, no
     envelope wire, no guarded list) — the caller records no reader_compare entry. Otherwise
@@ -1834,11 +1855,11 @@ async def _reader_compare_prepare(scope, rows, ned_id):
     wire = residue_wire_name(scope)
     if not expected or not lists or wire is None:
         return None
-    translated, unverifiable = await _translate_expected(scope, expected)
+    translated, unverifiable, dropped = await _translate_expected(scope, expected)
     if unverifiable:
         # Named, never folded into "ok" silently: these keys were not checked at all.
         logger.warning("apply.reader_compare_unverifiable", scope=scope, keys=unverifiable)
-    return translated, unverifiable, lists, wire
+    return translated, unverifiable, lists, wire, dropped
 
 
 def _reader_compare_walk(
@@ -1855,7 +1876,7 @@ def _reader_compare_walk(
 ) -> tuple[Any, Any, Any, Any, Any]:
     """Walk an ``ok`` device-state *section* for the presence of every translated key.
 
-    Present-all → ``ok``, unless some grain was ``unverifiable`` (never checked) → ``partial``
+    Present-all → ``ok``, unless some grain was ``unverifiable`` or not covered (never checked) → ``partial``
     (the r3-M2 fix for the mixed community+host false-green — ``partial`` beats ``ok`` but
     ``missing`` still beats ``partial``). A missing key stamps its rows ``reader_compare_missing``
     and fails the scope. Returns ``(ok, failed, fails, status, evidence)``.
@@ -1870,15 +1891,19 @@ def _reader_compare_walk(
     alongside the unchanged aggregate. The aggregate collapses a two-row walk with one
     missing key into ``missing`` for BOTH, so a consumer that reads it CASes neither row —
     while the rule that a proven sibling must still CAS demands the opposite. A row absent
-    from the map was never checked and its consumer must treat it as unverifiable.
+    from the map was never checked and its consumer must treat it as unverifiable. A row with a
+    key absent from a collection the section does not cover is ``unproven`` (#1833), never
+    ``missing`` and never ``present``.
     """
-    from nso_adapter.core.removal import _norm_key, _reader_keys
+    from nso_adapter.core.removal import _norm_key, _reader_covered, _reader_keys
 
     present = {gl.label: _reader_keys(scope, section, gl) for gl in lists}
+    covered = {gl.label: _reader_covered(scope, section, gl) for gl in lists}
     guards = {gl.label: gl for gl in lists}
     row_by_id: dict[int, Any] = {}
     missing: dict[int, list[str]] = {}
     evidence: dict[tuple[str, int], str] = {}
+    unproven: set[str] = set()
     for row, label, key in translated:
         pk = getattr(row, "id", None)
         if _norm_key(key, scope, guards[label]) in present.get(label, set()):
@@ -1888,12 +1913,22 @@ def _reader_compare_walk(
             if pk is not None:
                 evidence.setdefault((row.__tablename__, pk), "present")
             continue
+        if not covered[label]:
+            # Absent from an uncovered collection: unproven, so the row gets no "present" evidence (#1833 R2-1).
+            unproven.add(label)
+            if pk is not None and evidence.get((row.__tablename__, pk)) != "missing":
+                evidence[(row.__tablename__, pk)] = "unproven"
+            continue
         if pk is not None:
             evidence[(row.__tablename__, pk)] = "missing"
         row_by_id[id(row)] = row
         missing.setdefault(id(row), []).append(f"{label} {list(key)}")
+    if unproven:
+        logger.info(
+            "apply.reader_compare_not_covered", job_id=job_id, **device_fields(device_id=device_id), scope=scope
+        )
     if not missing:
-        return ok, 0, [], ("partial" if unverifiable else "ok"), evidence
+        return ok, 0, [], ("partial" if unverifiable or unproven else "ok"), evidence
     fails = []
     for rid, keys in missing.items():
         msg = (

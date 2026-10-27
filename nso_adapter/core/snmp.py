@@ -105,16 +105,11 @@ async def _upsert_snmp_config(
 
 SNMP_SPEC = FamilySpec(
     name="snmp",
-    # snmp-config is a POP-ON-EMPTY export family: a genuinely SNMP-less but synced device 404s,
-    # and get_snmp_config confirms that bare 404 against the parent container before returning
-    # None (a fleet-wide outage raises NsoExportUnavailableError → Unavailable → keep). So a None
-    # here is a container-confirmed per-device absence → AbsentAuthoritative → clear. This is the
-    # opposite of interface_ip, a present-empty inventory family whose 404 means only
-    # unsupported-NED, so it KEEPS.
-    # The materializer takes the whole entry dict; extract({}) → the clear (delete all + add none).
+    # The materializer takes the whole decoded entry; covered empty lists clear (delete all + add none).
     extract=lambda data: data,
     materialize=_upsert_snmp_config,
     wire_name="snmp-config",  # READSEM S3: fetch from the device-state envelope
+    requires=("community", "v3-user", "host"),
 )
 
 

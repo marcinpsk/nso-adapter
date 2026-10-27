@@ -6,13 +6,13 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
 
 from nso_adapter.core.subinterface import refresh_subinterface_for_device
 from nso_adapter.store.models import Device, DeviceSubinterface
+from tests.collection_coverage_helpers import section_client
 from tests.conftest import seed_device, session
 from tests.fixtures.switching_read_payloads import SWITCHING_READ_PAYLOADS
 
@@ -45,7 +45,7 @@ class _SectionClient:
 async def test_refresh_inserts_subinterfaces(adapter_client):
     device_id = await seed_device(nso_device_name="subif-rtr01", netbox_device_id=970)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "device-name": "subif-rtr01",
@@ -63,7 +63,7 @@ async def test_refresh_inserts_subinterfaces(adapter_client):
 async def test_refresh_full_replace(adapter_client):
     device_id = await seed_device(nso_device_name="subif-rtr02", netbox_device_id=971)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "interface": [{"interface-name": "ge-0/0/0.10", "parent-interface": "ge-0/0/0", "dot1q-vlan": 10}],
@@ -81,7 +81,7 @@ async def test_refresh_full_replace(adapter_client):
 async def test_missing_tag_refuses_family_read_and_keeps_previous_rows(adapter_client):
     device_id = await seed_device(nso_device_name="subif-missing-tag", netbox_device_id=973)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "interface": [{"interface-name": "xe-0/0/1.5000", "dot1q-vlan": 100}],
@@ -135,7 +135,7 @@ async def test_refresh_authoritative_empty_clears(adapter_client):
     """An authoritatively-empty read (status=ok, no list keys) clears the rows. (Device-absence, section None, now KEEPS — READSEM S5.)"""
     device_id = await seed_device(nso_device_name="subif-rtr03", netbox_device_id=972)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "interface": [{"interface-name": "ge-0/0/0.10", "parent-interface": "ge-0/0/0", "dot1q-vlan": 10}],
@@ -151,7 +151,7 @@ async def test_a_BOOLEAN_dot1q_vlan_is_refused(adapter_client):
     """``int(True)`` stored dot1q VLAN 1 for a subinterface the device tagged with nothing."""
     device_id = await seed_device(nso_device_name="subif-bool", netbox_device_id=974)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "device-name": "subif-bool",
@@ -166,7 +166,7 @@ async def test_a_duplicate_subinterface_is_reported_as_a_duplicate(adapter_clien
     device_id = await seed_device(nso_device_name="subif-duplicate", netbox_device_id=979)
     row = {"interface-name": "xe-0/0/1.200", "dot1q-vlan": 200}
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
+        nso_client = section_client()
         nso_client.get_device_state_section.return_value = {"status": "ok", "interface": [row, dict(row)]}
         with pytest.raises(ValueError, match="^subinterface item has a duplicate interface-name$"):
             await refresh_subinterface_for_device(db, device, nso_client, refresh_source="test")

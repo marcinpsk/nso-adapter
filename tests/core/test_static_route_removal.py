@@ -27,7 +27,9 @@ import pytest
 from sqlalchemy import func, select
 
 from nso_adapter.core.claim import acquire_claim, release_claim
+from nso_adapter.nso.collection_coverage import MARKER
 from nso_adapter.store.models import Job, JobStatus, StaticRouteIntent, StaticRouteTombstone
+from tests.collection_coverage_helpers import covered_sections
 from tests.conftest import seed_device, session, start_job
 from tests.core.removal_helpers import seed_removal_job, seed_tomb
 from tests.core.test_static_route_put import A, B, C, D, seed_apply_job, seed_rows, wire
@@ -85,9 +87,10 @@ class SrFake:
         return ServiceInstanceState("present", entry)
 
     def section(self) -> dict:
+        """The static-route section in wire form: the reader covers its route list."""
         if self.section_status != "ok":
             return {"status": self.section_status}
-        return {"status": "ok", "route": [dict(e) for e in self.device]}
+        return {"status": "ok", MARKER: ["route"], "route": [dict(e) for e in self.device]}
 
     # ── the write boundary ──
     async def handle(self, method: str, url: str, content=None, headers=None):
@@ -193,7 +196,7 @@ def sr_client(fake: SrFake):
     # caught by the assertions rather than hidden by it.
     client.get_service_config = AsyncMock(return_value=None)
     client.run_device_state_read = AsyncMock(
-        side_effect=lambda _d, _wires, timeout=None: {"static-route": fake.section()}
+        side_effect=lambda _d, _wires, timeout=None: covered_sections({"static-route": fake.section()})
     )
     return client
 
