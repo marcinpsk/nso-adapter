@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.projection import section_operation, section_registry, stream_result_key
-from nso_adapter.nso.origins import AttributionFailure, LogicalRow, OriginIndex, resolve_refusals
+from nso_adapter.nso.origins import AttributionFailure, LogicalRow, OriginIndex, content_digest, resolve_refusals
 from nso_adapter.nso.refusal_protocol import Refusal
 from nso_adapter.nso.refusals import DefiniteRefusal, ErrorClassification, OrdinaryRejection, ProtocolFault, Unavailable
 from nso_adapter.store.execution_bookkeeping import restore_bookkeeping, snapshot_bookkeeping, stamp_refused_bookkeeping
@@ -389,7 +389,7 @@ def _disposition_evidence(attempt: ApplyExecutionAttempt) -> tuple[str, dict, li
         causes: dict = {}
         for site in attributed:
             for logical in site.logical_rows:
-                causes.setdefault(_identity(logical.public_record()), []).extend(catalog_records((site.refusal,)))
+                causes.setdefault(content_digest(logical.public_record()), []).extend(catalog_records((site.refusal,)))
         document_records = attributed_catalog_records(attributed, origins_from_records(attempt.safe_origins), phase)
         return "refused", causes, document_records
     if attempt.commit_acknowledged:
@@ -580,15 +580,16 @@ async def dispose_execution_attempt(
         attempt.phase = "response_recorded"
     outcomes = []
     for frozen in attempt.logical_membership:
-        row_causes = causes.get(_identity(frozen), [])
+        logical = logical_from_record(frozen)
+        row_causes = causes.get(content_digest(logical.public_record()), [])
         disposition: Literal["in_sync", "refused", "not_applied", "unavailable"] = (
             "refused" if row_causes else "not_applied" if kind in {"refused", "rejected"} else "unavailable"
         )
-        logical = logical_from_record(frozen)
         outcome = await _stage_outcome(db, attempt, logical, disposition, refusals_from_payload(row_causes))
         outcomes.append(outcome)
     await _restore_attempt_bookkeeping(db, attempt)
-    await stamp_refused_bookkeeping(db, attempt.device_id, attempt.prior_bookkeeping, causes)
+    staged_causes = {_identity(outcome.logical_identity): outcome.refusals for outcome in outcomes if outcome.refusals}
+    await stamp_refused_bookkeeping(db, attempt.device_id, attempt.prior_bookkeeping, staged_causes)
     result = _outcome_result(
         attempt.attempted_carriers, outcomes, refusals=records, commit_acknowledged=attempt.commit_acknowledged
     )
