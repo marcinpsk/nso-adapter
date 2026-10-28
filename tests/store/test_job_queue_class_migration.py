@@ -9,6 +9,7 @@ import json
 import pytest
 import sqlalchemy as sa
 
+from tests.conftest import empty_execution_result
 from tests.store.migration_harness import (
     alembic,
     assert_single_head_containing,
@@ -54,7 +55,7 @@ def _seed_job(
             "job_type": job_type,
             "status": status,
             "device_id": device_id,
-            "result": json.dumps(token),
+            "result": json.dumps({**empty_execution_result(), "fixture_token": token}),
             "context": json.dumps(context) if context is not None else None,
         },
     ).scalar_one()
@@ -93,7 +94,7 @@ def _insert_classified_job(
             "status": status,
             "device_id": device_id,
             "coalescible": coalescible,
-            "result": json.dumps(token),
+            "result": json.dumps({**empty_execution_result(), "fixture_token": token}),
         },
     ).scalar_one()
 
@@ -180,7 +181,7 @@ def test_existing_jobs_use_their_construction_lane_for_backfill(pg_provisioner):
         alembic(sync_url, "upgrade", module.revision)
 
         with engine_on(sync_url) as engine, engine.connect() as conn:
-            landed = dict(conn.exec_driver_sql("SELECT result #>> '{}', coalescible FROM jobs").all())
+            landed = dict(conn.exec_driver_sql("SELECT result ->> 'fixture_token', coalescible FROM jobs").all())
         assert landed == expected
 
 
@@ -305,7 +306,7 @@ def test_queued_deduplication_applies_only_to_coalescible_jobs(pg_provisioner):
                 _insert_classified_job(conn, "second-coalescible-apply", "apply", "queued", device_id, True)
 
         with engine_on(sync_url) as engine, engine.connect() as conn:
-            landed = dict(conn.exec_driver_sql("SELECT result #>> '{}', coalescible FROM jobs").all())
+            landed = dict(conn.exec_driver_sql("SELECT result ->> 'fixture_token', coalescible FROM jobs").all())
         assert landed == {"coalescible-apply": True, "dedicated-apply": False}
 
 
@@ -349,7 +350,7 @@ def test_downgrade_rejects_a_queue_the_old_index_cannot_represent(pg_provisioner
                 )
                 == 1
             )
-            assert dict(conn.execute(sa.text("SELECT result #>> '{}', status::text FROM jobs")).all()) == {
+            assert dict(conn.execute(sa.text("SELECT result ->> 'fixture_token', status::text FROM jobs")).all()) == {
                 "coalescible-apply": "queued",
                 "dedicated-retry-apply": "queued",
             }
@@ -369,7 +370,7 @@ def test_downgrade_rejects_a_queue_the_old_index_cannot_represent(pg_provisioner
             assert index_predicates(engine, "jobs")["uq_job_queued_per_device_type"][2] == (
                 "((status = 'queued'::jobstatus) AND (job_type <> 'removal'::jobtype))"
             )
-            assert dict(conn.execute(sa.text("SELECT result #>> '{}', status::text FROM jobs")).all()) == {
+            assert dict(conn.execute(sa.text("SELECT result ->> 'fixture_token', status::text FROM jobs")).all()) == {
                 "coalescible-apply": "queued",
                 "dedicated-retry-apply": "failed",
             }

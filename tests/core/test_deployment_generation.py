@@ -27,7 +27,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, empty_execution_result, seed_device, session
 from tests.core.removal_helpers import authorize_static_route
 from tests.core.test_generation_protocol import (
     _VLAN_CONTAINER,
@@ -294,7 +294,7 @@ async def test_restart_outcome_unknown_snapshots_the_current_carrier(adapter_cli
     await _vlan(device_id, 112)
     await _push(adapter_client, device_id)
     (generation,) = await _generations(device_id)
-    result = {"observed": "before-restart"}
+    result = {**empty_execution_result(), "observed": "before-restart"}
     error = {"code": "lost_observer", "message": "runner disappeared", "detail": {}}
     async with session() as db:
         await db.execute(

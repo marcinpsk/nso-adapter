@@ -45,6 +45,11 @@ os.environ.pop("DATABASE_URL", None)
 MAX_PARALLEL_WORKERS = 8
 
 
+def empty_execution_result() -> dict:
+    """Return complete execution evidence for a fixture with no attempted rows."""
+    return {"row_outcomes": [], "refusals": [], "settlement_owners": [], "commit_acknowledged": False}
+
+
 @pytest.fixture(autouse=True)
 def terminal_execution_result_contract():
     """Check every persisted execution result, including Core and raw SQL writes."""
