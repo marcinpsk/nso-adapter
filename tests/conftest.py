@@ -51,7 +51,7 @@ def empty_execution_result() -> dict:
 
 @pytest.fixture(autouse=True)
 def terminal_execution_result_contract():
-    """Check every persisted execution result, including Core and raw SQL writes."""
+    """Check SQLAlchemy SQL naming jobs; miss driver COPY, Unicode-escaped names, and database-side writes at commit."""
     violations: set[str] = set()
 
     def inspect_job_write(conn, _cursor, statement, _parameters, _context, _executemany):
