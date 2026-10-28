@@ -18,11 +18,14 @@ def test_terminal_execution_guard_rejects_invalid_persisted_results(tmp_path, wr
         """
 import pytest
 import sqlalchemy as sa
-from nso_adapter.store.models import Job, JobStatus, JobType
+from nso_adapter.store.models import Device, Job, JobStatus, JobType
 
 @pytest.mark.anyio
 async def test_invalid_execution(db_session):
-    job = Job(job_type=JobType.apply, status=JobStatus.running, coalescible=False)
+    device = Device(nso_instance="test", nso_device_name="placeholder-device")
+    db_session.add(device)
+    await db_session.flush()
+    job = Job(device_id=device.id, job_type=JobType.apply, status=JobStatus.running, coalescible=False)
     db_session.add(job)
     await db_session.commit()
     try:

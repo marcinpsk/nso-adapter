@@ -8,6 +8,7 @@ import hashlib
 import itertools
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -23,7 +24,7 @@ import pytest
 import sqlalchemy as sa
 import structlog
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.orm import Session as SyncSession
 from structlog.testing import capture_logs
@@ -31,7 +32,9 @@ from structlog.testing import capture_logs
 from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.main import create_app
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.execution_contract import ContractError, validate_result
 from nso_adapter.store.db import session
+from nso_adapter.store.models import Job, JobStatus, JobType
 
 # Hermetic tests: ignore any ambient DATABASE_URL. The dev container sets one to
 # point at the dev Postgres; without this, get_config()'s env override would make
@@ -40,6 +43,37 @@ os.environ.pop("DATABASE_URL", None)
 
 # Every worker clones its own databases from the one test Postgres.
 MAX_PARALLEL_WORKERS = 8
+
+
+@pytest.fixture(autouse=True)
+def terminal_execution_result_contract():
+    """Check every persisted execution result, including Core and raw SQL writes."""
+    violations: set[str] = set()
+
+    def inspect_job_write(conn, _cursor, statement, _parameters, _context, _executemany):
+        if not re.match(r'\s*(?:INSERT\s+INTO|UPDATE)\s+(?:"?\w+"?\.)?"?jobs"?(?=\W|$)', statement, re.I):
+            return
+        rows = conn.execute(
+            sa.select(Job.id, Job.result).where(
+                Job.status.in_((JobStatus.succeeded, JobStatus.failed)),
+                Job.job_type.in_((JobType.apply, JobType.removal)),
+            )
+        )
+        for job_id, result in rows:
+            if result is None:
+                continue
+            try:
+                validate_result(result)
+            except ContractError as exc:
+                violations.add(f"job {job_id}: {exc}")
+
+    sa.event.listen(Engine, "after_cursor_execute", inspect_job_write)
+    try:
+        yield
+    finally:
+        sa.event.remove(Engine, "after_cursor_execute", inspect_job_write)
+        if violations:
+            pytest.fail("terminal execution result violates contract:\n" + "\n".join(sorted(violations)))
 
 
 def pytest_xdist_auto_num_workers(config: pytest.Config) -> int:
