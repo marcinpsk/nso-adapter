@@ -56,7 +56,7 @@ def terminal_execution_result_contract():
     violations: set[str] = set()
 
     def inspect_job_write(conn, _cursor, statement, _parameters, _context, _executemany):
-        if not re.match(r'\s*(?:INSERT\s+INTO|UPDATE)\s+(?:"?\w+"?\.)?"?jobs"?(?=\W|$)', statement, re.I):
+        if not re.search(r'\b(?:INSERT\s+INTO|UPDATE)\s+(?:"?\w+"?\.)?"?jobs"?(?=\W|$)', statement, re.I):
             return
         rows = conn.execute(
             sa.select(Job.id, Job.result).where(
