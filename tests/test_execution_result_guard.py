@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 
-@pytest.mark.parametrize("writer", ["orm", "core", "raw", "cte"])
+@pytest.mark.parametrize("writer", ["orm", "core", "raw", "cte", "comment", "only"])
 def test_terminal_execution_guard_rejects_invalid_persisted_results(tmp_path, writer):
     repo = Path(__file__).resolve().parents[1]
     (tmp_path / "conftest.py").write_text("from tests.conftest import *\n")
@@ -36,6 +36,10 @@ async def test_invalid_execution(db_session):
             await db_session.execute(sa.update(Job).where(Job.id == job.id).values(status=JobStatus.failed, result={}))
         elif WRITER == "raw":
             await db_session.execute(sa.text("UPDATE jobs SET status = 'failed', result = '{}' WHERE id = :id"), {"id": job.id})
+        elif WRITER == "comment":
+            await db_session.execute(sa.text("UPDATE /* finalize */ jobs SET status = 'failed', result = '{}' WHERE id = :id"), {"id": job.id})
+        elif WRITER == "only":
+            await db_session.execute(sa.text("UPDATE ONLY jobs SET status = 'failed', result = '{}' WHERE id = :id"), {"id": job.id})
         else:
             await db_session.execute(sa.text("WITH terminal AS (UPDATE jobs SET status = 'failed', result = '{}' WHERE id = :id RETURNING id) SELECT id FROM terminal"), {"id": job.id})
         await db_session.commit()

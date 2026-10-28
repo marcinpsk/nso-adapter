@@ -8,7 +8,6 @@ import hashlib
 import itertools
 import logging
 import os
-import re
 import subprocess
 import sys
 import threading
@@ -56,13 +55,15 @@ def terminal_execution_result_contract():
     violations: set[str] = set()
 
     def inspect_job_write(conn, _cursor, statement, _parameters, _context, _executemany):
-        if not re.search(r'\b(?:INSERT\s+INTO|UPDATE)\s+(?:"?\w+"?\.)?"?jobs"?(?=\W|$)', statement, re.I):
+        if _context.execution_options.get("terminal_contract_inspection") or "jobs" not in statement.lower():
             return
         rows = conn.execute(
-            sa.select(Job.id, Job.result).where(
+            sa.select(Job.id, Job.result)
+            .where(
                 Job.status.in_((JobStatus.succeeded, JobStatus.failed)),
                 Job.job_type.in_((JobType.apply, JobType.removal)),
             )
+            .execution_options(terminal_contract_inspection=True)
         )
         for job_id, result in rows:
             if result is None:
