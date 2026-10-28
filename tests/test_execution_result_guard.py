@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
+"""The test guard checks real persistence and cannot be swallowed by a runner."""
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+
+@pytest.mark.parametrize("writer", ["orm", "core", "raw"])
+def test_terminal_execution_guard_rejects_invalid_persisted_results(tmp_path, writer):
+    repo = Path(__file__).resolve().parents[1]
+    (tmp_path / "conftest.py").write_text("from tests.conftest import *\n")
+    (tmp_path / "test_persistence.py").write_text(
+        """
+import pytest
+import sqlalchemy as sa
+from nso_adapter.store.models import Job, JobStatus, JobType
+
+@pytest.mark.anyio
+async def test_invalid_execution(db_session):
+    job = Job(job_type=JobType.apply, status=JobStatus.running, coalescible=False)
+    db_session.add(job)
+    await db_session.commit()
+    try:
+        if WRITER == "orm":
+            job.status = JobStatus.failed
+            job.result = {}
+        elif WRITER == "core":
+            await db_session.execute(sa.update(Job).where(Job.id == job.id).values(status=JobStatus.failed, result={}))
+        else:
+            await db_session.execute(sa.text("UPDATE jobs SET status = 'failed', result = '{}' WHERE id = :id"), {"id": job.id})
+        await db_session.commit()
+    except Exception:
+        await db_session.rollback()
+""".replace("WRITER", repr(writer))
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "anyio", "-o", "addopts=", str(tmp_path)],
+        cwd=repo,
+        env={**os.environ, "PYTHONPATH": str(repo)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == pytest.ExitCode.TESTS_FAILED, output
+    assert "terminal execution result violates contract" in output, output
+    assert "missing structured execution evidence" in output, output
