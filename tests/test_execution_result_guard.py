@@ -8,6 +8,12 @@ import sys
 from pathlib import Path
 
 import pytest
+import sqlalchemy as sa
+
+
+def test_terminal_execution_guard_allows_schema_inspection_without_jobs(pg_provisioner):
+    with pg_provisioner.connect() as conn:
+        assert conn.execute(sa.text("SELECT to_regclass('jobs')")).scalar_one() is None
 
 
 @pytest.mark.parametrize("writer", ["orm", "core", "raw", "cte", "comment", "only"])

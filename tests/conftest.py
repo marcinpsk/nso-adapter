@@ -57,6 +57,11 @@ def terminal_execution_result_contract():
     def inspect_job_write(conn, _cursor, statement, _parameters, _context, _executemany):
         if _context.execution_options.get("terminal_contract_inspection") or "jobs" not in statement.lower():
             return
+        table = conn.execute(
+            sa.select(sa.func.to_regclass("jobs")).execution_options(terminal_contract_inspection=True)
+        ).scalar_one()
+        if table is None:
+            return
         rows = conn.execute(
             sa.select(Job.id, Job.result)
             .where(
