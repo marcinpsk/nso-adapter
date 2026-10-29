@@ -21,6 +21,7 @@ from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATIO
 from nso_adapter.api.execution import EvidenceEnvelope, evidence_digest, evidence_envelope
 from nso_adapter.api.intent_receipts import IntentReceiptOut, _receipt_out
 from nso_adapter.api.jobs import JobEvidenceOut, JobIdentityOut, _job_out
+from nso_adapter.core.intent_protocol import INTENT_STREAMS
 from nso_adapter.store.models import (
     ApplyExecutionAttempt,
     DeploymentApplyAttempt,
@@ -162,7 +163,7 @@ async def settlement_observation(
     for generation in generation_rows:
         for mapping in (generation.source_push_seq, generation.stream_revisions):
             if isinstance(mapping, dict):
-                sections.update(mapping)
+                sections.update(INTENT_STREAMS.intersection(mapping))
     selections = await db.scalars(
         select(DeploymentApplyAttempt.selected).where(
             DeploymentApplyAttempt.device_id == device_id,
@@ -171,7 +172,7 @@ async def settlement_observation(
     )
     for selected in selections:
         if isinstance(selected, dict):
-            sections.update(selected)
+            sections.update(INTENT_STREAMS.intersection(selected))
     observed = {
         "request": body.model_dump(mode="json"),
         "store_incarnation": meta.incarnation,

@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from nso_adapter.api.timestamps import iso_z
 from nso_adapter.nso.execution_contract import ContractError, validate_result
+from nso_adapter.store.json_codec import UnrepresentableJSONNumber
 
 
 class _ClosedOut(BaseModel):
@@ -118,6 +119,8 @@ _IDENTITY_COLLECTIONS = frozenset(
 
 def canonical_evidence(value, *, field: str = ""):
     """Preserve stored evidence, including values that cannot be normalized."""
+    if isinstance(value, UnrepresentableJSONNumber):
+        return {"$json_number": value.literal}
     if isinstance(value, Enum):
         return canonical_evidence(value.value, field=field)
     if isinstance(value, UUID):
@@ -154,6 +157,12 @@ def evidence_digest(candidate) -> str:
     return hashlib.sha256(_canonical_json(canonical_evidence(candidate)).encode(errors="surrogatepass")).hexdigest()
 
 
+def _projection_json_value(value):
+    if isinstance(value, UnrepresentableJSONNumber):
+        raise ValueError("Stored JSON number exceeds the finite float range")
+    return canonical_evidence(value)
+
+
 def evidence_envelope(
     identity: dict, candidate: dict, schema: type[BaseModel], *, construct=None, validate=None, project=None
 ) -> dict:
@@ -167,7 +176,7 @@ def evidence_envelope(
         finally:
             digest = evidence_digest(candidate)
         projection = schema.model_validate_json(
-            json.dumps(candidate, default=canonical_evidence, allow_nan=False), strict=True
+            json.dumps(candidate, default=_projection_json_value, allow_nan=False), strict=True
         ).model_dump(mode="json")
         if validate is not None:
             validate(projection)

@@ -20,6 +20,79 @@ def terminal_execution_result_contract():
     yield
 
 
+@pytest.mark.parametrize(
+    "field,bad_key",
+    [
+        ("source_push_seq", "\ud800"),
+        ("stream_revisions", "\ud800"),
+        ("source_push_seq", "unknown_section"),
+        ("stream_revisions", "unknown_section"),
+        ("selected", "unknown_section"),
+    ],
+)
+async def test_observation_contains_invalid_section_keys_and_retains_sibling_evidence(adapter_client, field, bad_key):
+    import uuid
+
+    from nso_adapter.store.models import DeploymentApplyAttempt, GenerationStatus, IntentPushReceipt
+    from tests.api.test_deployment_evidence import _generation
+
+    device_id = await seed_device(nso_device_name="invalid-section-evidence", netbox_device_id=18523)
+    attempt_id = uuid.uuid4()
+    mapping = {"vlan": 1, "snmp": 2, bad_key: 1}
+    async with session() as db:
+        job = Job(device_id=device_id, job_type=JobType.sync, status=JobStatus.queued, coalescible=True)
+        attempt = DeploymentApplyAttempt(
+            id=attempt_id,
+            device_id=device_id,
+            selected=mapping if field == "selected" else {"vlan": 1, "snmp": 2},
+            admission_state="admitted",
+            http_status=202,
+            response={},
+        )
+        db.add_all([job, attempt])
+        await db.flush()
+        rows = [
+            _generation(device_id, seq, GenerationStatus.pending, job_id=job.id, apply_attempt_id=attempt_id)
+            for seq in (1, 2)
+        ]
+        if field != "selected":
+            setattr(rows[0], field, mapping)
+        db.add_all(rows)
+        await db.flush()
+        generation_id, sibling_id = [row.id for row in rows]
+        attempt.response = {"generations": [{"generation_id": row.id} for row in rows]}
+        db.add(
+            IntentPushReceipt(
+                device_id=device_id,
+                section="vlan",
+                push_seq=1,
+                request_digest="a" * 64,
+                response={"generation_id": generation_id},
+                generation_id=generation_id,
+            )
+        )
+        await db.commit()
+        job_id = job.id
+    listing = await adapter_client.get(f"/api/v1/devices/{device_id}/generations", headers=AUTH)
+    assert listing.status_code == 200, listing.text
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/settlement-observation",
+        headers=AUTH,
+        json={"job_id": job_id, "after_settle_seq": 0, "apply_attempt_ids": [str(attempt_id)]},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["generations"] == listing.json()
+    assert [item["identity"]["generation_id"] for item in body["generations"]] == [generation_id, sibling_id]
+    assert body["generations"][1]["evidence_error"] is None
+    assert body["receipts"][0]["projection"]["response"] == {"generation_id": generation_id}
+    assert body["absent"]["receipt_sections"] == ["snmp"]
+    if bad_key == "\ud800":
+        item = body["deployment"]["attempts"][0] if field == "selected" else body["generations"][0]
+        assert item["projection"] is None
+        assert item["evidence_error"]["code"] in {"schema_validation", "projection_construction"}
+
+
 @pytest.mark.parametrize("endpoint", ["feed", "listing", "deployment", "observation"])
 @pytest.mark.parametrize("stamp", ["0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00"])
 async def test_unnormalizable_evidence_stays_inside_its_item(adapter_client, endpoint, stamp):
@@ -209,8 +282,8 @@ async def test_large_stored_json_numbers_keep_distinct_digests(adapter_client):
         await db.commit()
         job_id = row.id
     digests = []
-    magnitude = "1" + "0" * 400 + ".1"
-    for number in (magnitude, "-" + magnitude):
+    for leading in ("1", "2"):
+        number = leading + "0" * 400 + ".1"
         async with session() as db:
             await db.execute(
                 text(
@@ -233,6 +306,48 @@ async def test_large_stored_json_numbers_keep_distinct_digests(adapter_client):
         assert observation.json()["job"] == item
         digests.append(item["digest"])
     assert digests[0] != digests[1]
+
+
+@pytest.mark.parametrize("surface", ["receipt", "attempt"])
+async def test_distinct_positive_json_numbers_keep_item_and_observation_digests(adapter_client, surface):
+    from sqlalchemy import text
+
+    from tests.api.test_settlement_observation import _seed_observation
+
+    device_id, job_id, attempt_id, generation_id = await _seed_observation()
+    table, column, identity_column, identity = {
+        "receipt": ("intent_push_receipt", "response", "device_id", device_id),
+        "attempt": ("deployment_apply_attempt", "response", "id", attempt_id),
+    }[surface]
+    item_digests = []
+    observation_digests = []
+    for leading in ("1", "2"):
+        number = leading + "0" * 400 + ".1"
+        async with session() as db:
+            await db.execute(
+                text(
+                    f"UPDATE {table} SET {column} = jsonb_set(CAST({column} AS jsonb), "
+                    f"'{{unbounded}}', CAST(:number AS jsonb)) WHERE {identity_column} = :id"
+                ),
+                {"number": number, "id": identity},
+            )
+            await db.commit()
+        response = await adapter_client.post(
+            f"/api/v1/devices/{device_id}/settlement-observation",
+            headers=AUTH,
+            json={"job_id": job_id, "after_settle_seq": 0, "apply_attempt_ids": [str(attempt_id)]},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        item = body["receipts"][0] if surface == "receipt" else body["deployment"]["attempts"][0]
+        assert item["projection"] is None
+        assert item["evidence_error"]["code"] in {"schema_validation", "projection_construction"}
+        assert body["generations"][0]["identity"]["generation_id"] == generation_id
+        assert body["generations"][0]["evidence_error"] is None
+        item_digests.append(item["digest"])
+        observation_digests.append(body["digest"])
+    assert item_digests[0] != item_digests[1]
+    assert observation_digests[0] != observation_digests[1]
 
 
 @pytest.mark.parametrize("value", ["\ud800", "\udfff"])
