@@ -12,8 +12,8 @@ import pytest
 import sqlalchemy as sa
 
 from nso_adapter.api.timestamps import iso_z
-from tests.api.evidence import deployment_projections
-from tests.conftest import VALID_TOKEN, empty_execution_result, seed_device, session
+from tests.api.evidence import deployment_projections, empty_vlan_execution_result
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 pytestmark = pytest.mark.anyio
 
@@ -63,7 +63,7 @@ async def test_evidence_serves_terminal_attempt_after_carrier_deletion(adapter_c
     device_id = await seed_device(nso_device_name="evidence-retained-carrier", netbox_device_id=16230)
     attempt_id = uuid.uuid4()
     unknown_id = uuid.uuid4()
-    result = {**empty_execution_result(), "sections": {"vlan": {"outcome": "failed"}}}
+    result = {**empty_vlan_execution_result(), "sections": {"vlan": {"outcome": "failed"}}}
     error = {"code": "nso_commit_failed", "message": "device refused the deployment", "detail": {}}
     async with session() as db:
         attempt = DeploymentApplyAttempt(
@@ -274,7 +274,7 @@ async def test_terminal_snapshots_survive_carrier_deletion_in_evidence(
         }[generation_status],
     )
     attempt_id = uuid.uuid4()
-    result = {**empty_execution_result(), "terminal_path": generation_status}
+    result = {**empty_vlan_execution_result(), "terminal_path": generation_status}
     error = (
         None
         if job_status == "succeeded"

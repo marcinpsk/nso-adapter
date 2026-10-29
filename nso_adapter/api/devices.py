@@ -31,11 +31,11 @@ from nso_adapter.api.execution import (
     RowOutcomeOut,
     evidence_envelope,
     evidence_projection,
-    validate_execution_result,
 )
 from nso_adapter.api.pagination import DEFAULT_PAGE, LIMIT_MAX, LIMIT_MIN, validate_page_limit
 from nso_adapter.api.timestamps import iso_z
 from nso_adapter.domain.diagnostics import DEVICE_REF_PATTERN, device_ref
+from nso_adapter.nso.execution_contract import GENERATION_FIELDS, validate_generation
 from nso_adapter.store.models import (
     DbInterface,
     DeploymentApplyAttempt,
@@ -293,6 +293,10 @@ class DeploymentEvidenceAttemptOut(BaseModel):
     generation_ids: list[int]
 
 
+class _DeviceGenerationExecutionOut(DeviceGenerationOut, DeploymentEvidenceGenerationOut):
+    pass
+
+
 class DeploymentEvidenceHeadOut(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -463,9 +467,7 @@ def _construct_generation_evidence(candidate: dict, generation: DeploymentGenera
 
 
 def _validate_generation_execution(projection: dict) -> None:
-    validate_execution_result(
-        projection["carrier_job_result"], required=projection["carrier_job_status"] in ("succeeded", "failed")
-    )
+    validate_generation({field: projection[field] for field in GENERATION_FIELDS})
 
 
 def _attempt_generation_out(generation: DeploymentGeneration) -> dict:
@@ -519,21 +521,21 @@ def _evidence_attempt_out(attempt: DeploymentApplyAttempt, generations: list[Dep
 
 def _device_generation_out(row) -> dict:
     candidate = {
-        "generation_id": row.id,
-        "seq": row.seq,
-        "status": row.status,
+        **_generation_candidate(row),
         "job_id": row.job_id,
-        "carrier_job_id": row.carrier_job_id,
-        "carrier_job_status": row.carrier_job_status,
         "mode": row.mode,
         "settlement_cohort": row.settlement_cohort,
         "digest": row.digest,
-        "stream_revisions": row.stream_revisions,
-        "source_push_seq": row.source_push_seq,
         "created_at": row.created_at,
-        "updated_at": row.updated_at,
     }
-    return evidence_envelope(_generation_identity(row), candidate, DeviceGenerationOut)
+    return evidence_envelope(
+        _generation_identity(row),
+        candidate,
+        _DeviceGenerationExecutionOut,
+        construct=lambda value: _construct_generation_evidence(value, row),
+        validate=_validate_generation_execution,
+        project=lambda value: {field: value[field] for field in DeviceGenerationOut.model_fields},
+    )
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -738,7 +740,7 @@ async def list_device_generations(
     if not await db.get(Device, device_id):
         raise api_error(404, "not_found", "Device not found")
 
-    # metadata columns only: the immutable document JSON is large and never served here
+    # Load execution evidence without the immutable document.
     query = (
         select(
             DeploymentGeneration.id,
@@ -749,6 +751,8 @@ async def list_device_generations(
             DeploymentGeneration.job_id,
             DeploymentGeneration.carrier_job_id,
             DeploymentGeneration.carrier_job_status,
+            DeploymentGeneration.carrier_job_result,
+            DeploymentGeneration.carrier_job_error,
             DeploymentGeneration.mode,
             DeploymentGeneration.settlement_cohort,
             DeploymentGeneration.digest,

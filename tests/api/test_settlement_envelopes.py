@@ -8,6 +8,7 @@ import json
 import pytest
 
 from nso_adapter.store.models import Job, JobStatus, JobType
+from tests.api.evidence import empty_vlan_execution_result
 from tests.conftest import AUTH, empty_execution_result, seed_device, session
 
 pytestmark = pytest.mark.anyio
@@ -17,6 +18,250 @@ pytestmark = pytest.mark.anyio
 def terminal_execution_result_contract():
     """These fixtures deliberately retain corrupt evidence to test the read boundary."""
     yield
+
+
+@pytest.mark.parametrize("endpoint", ["feed", "listing", "deployment", "observation"])
+@pytest.mark.parametrize("stamp", ["0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00"])
+async def test_unnormalizable_evidence_stays_inside_its_item(adapter_client, endpoint, stamp):
+    import uuid
+
+    from nso_adapter.store.models import DeploymentApplyAttempt, GenerationStatus
+    from tests.api.test_deployment_evidence import _generation
+
+    device_id = await seed_device(nso_device_name="unnormalizable-evidence", netbox_device_id=18518)
+    attempt_id = uuid.uuid4()
+    bad_result = {**empty_execution_result(), "row_outcomes": [{}], "accepted_at": stamp}
+    async with session() as db:
+        jobs = [
+            Job(
+                device_id=device_id,
+                job_type=JobType.apply,
+                status=JobStatus.failed,
+                coalescible=True,
+                settle_seq=seq,
+                result=bad_result if seq == 2 else empty_execution_result(),
+            )
+            for seq in range(1, 4)
+        ]
+        attempt = DeploymentApplyAttempt(
+            id=attempt_id, device_id=device_id, selected={}, admission_state="admitted", http_status=202, response={}
+        )
+        db.add_all([*jobs, attempt])
+        await db.flush()
+        generations = [
+            _generation(device_id, seq, GenerationStatus.pending, apply_attempt_id=attempt_id, job_id=jobs[seq - 1].id)
+            for seq in range(1, 4)
+        ]
+        for generation in generations:
+            generation.carrier_job_result = bad_result if generation.seq == 2 else empty_vlan_execution_result()
+        if endpoint == "listing":
+            generations[1].source_push_seq = {"accepted_at": stamp}
+        db.add_all(generations)
+        await db.flush()
+        attempt.response = {"generations": [{"generation_id": row.id} for row in generations]}
+        await db.commit()
+        job_id = jobs[1].id
+        generation_ids = [row.id for row in generations]
+
+    async def read():
+        if endpoint == "feed":
+            return await adapter_client.get(
+                "/api/v1/jobs", headers=AUTH, params={"device_id": device_id, "order": "asc"}
+            )
+        if endpoint == "listing":
+            return await adapter_client.get(f"/api/v1/devices/{device_id}/generations", headers=AUTH)
+        if endpoint == "deployment":
+            return await adapter_client.post(
+                f"/api/v1/devices/{device_id}/deployment-evidence",
+                headers=AUTH,
+                json={"apply_attempt_ids": [str(attempt_id)]},
+            )
+        return await adapter_client.post(
+            f"/api/v1/devices/{device_id}/settlement-observation",
+            headers=AUTH,
+            json={"job_id": job_id, "after_settle_seq": 0, "apply_attempt_ids": [str(attempt_id)]},
+        )
+
+    first, second = await read(), await read()
+    assert first.status_code == second.status_code == 200
+    assert first.json() == second.json()
+    body = first.json()
+    if endpoint in ("feed", "listing"):
+        a, b, c = body
+    else:
+        deployment = body if endpoint == "deployment" else body["deployment"]
+        a, b, c = deployment["attempts"][0]["generations"]
+        assert [item["identity"]["generation_id"] for item in (a, b, c)] == generation_ids
+        if endpoint == "observation":
+            assert body["job"]["identity"]["id"] == job_id
+            assert body["job"]["projection"] is None
+            assert body["job"]["evidence_error"]["code"] == "schema_validation"
+    assert a["evidence_error"] is c["evidence_error"] is None
+    assert a["projection"] is not None and c["projection"] is not None
+    assert b["projection"] is None
+    assert b["evidence_error"] == {"code": "schema_validation", "digest": b["digest"]}
+
+
+@pytest.mark.parametrize("endpoint", ["listing", "deployment", "observation"])
+@pytest.mark.parametrize("failure", ["push_seq", "revision", "carrier", "sections"])
+async def test_generation_readers_apply_the_complete_execution_contract(adapter_client, endpoint, failure):
+    import uuid
+
+    from nso_adapter.store.models import DeploymentApplyAttempt, GenerationStatus
+    from tests.api.test_deployment_evidence import _generation
+
+    device_id = await seed_device(nso_device_name="generation-contract", netbox_device_id=18519)
+    attempt_id = uuid.uuid4()
+    async with session() as db:
+        attempt = DeploymentApplyAttempt(
+            id=attempt_id, device_id=device_id, selected={}, admission_state="admitted", http_status=202, response={}
+        )
+        db.add(attempt)
+        await db.flush()
+        rows = [
+            _generation(device_id, seq, GenerationStatus.pending, apply_attempt_id=attempt_id) for seq in range(1, 4)
+        ]
+        bad = rows[1]
+        if failure == "push_seq":
+            bad.source_push_seq = {"vlan": -1}
+        elif failure == "revision":
+            bad.stream_revisions = {"vlan": 0}
+        elif failure == "carrier":
+            bad.carrier_job_status = "succeeded"
+        else:
+            bad.carrier_job_result = empty_execution_result()
+        db.add_all(rows)
+        await db.flush()
+        ids = [row.id for row in rows]
+        attempt.response = {"generations": [{"generation_id": value} for value in ids]}
+        await db.commit()
+
+    if endpoint == "listing":
+        response = await adapter_client.get(f"/api/v1/devices/{device_id}/generations", headers=AUTH)
+    else:
+        body = {"apply_attempt_ids": [str(attempt_id)]}
+        if endpoint == "observation":
+            body.update(job_id=1, after_settle_seq=0)
+        route = "deployment-evidence" if endpoint == "deployment" else "settlement-observation"
+        response = await adapter_client.post(f"/api/v1/devices/{device_id}/{route}", headers=AUTH, json=body)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    if endpoint == "listing":
+        items = body
+    else:
+        deployment = body if endpoint == "deployment" else body["deployment"]
+        items = deployment["attempts"][0]["generations"]
+        if endpoint == "observation":
+            assert body["generations"][1]["evidence_error"] is not None
+            assert body["generations"][1]["evidence_error"]["code"] == "execution_contract"
+    a, b, c = items
+    assert [item["identity"]["generation_id"] for item in items] == ids
+    assert a["evidence_error"] is c["evidence_error"] is None
+    assert b["projection"] is None
+    assert b["evidence_error"] == {"code": "execution_contract", "digest": b["digest"]}
+
+
+@pytest.mark.parametrize("failure", ["push_seq", "revision", "carrier", "sections"])
+async def test_generation_head_applies_the_complete_execution_contract(adapter_client, failure):
+    from nso_adapter.store.models import GenerationStatus
+    from tests.api.test_deployment_evidence import _generation
+
+    device_id = await seed_device(nso_device_name="head-contract", netbox_device_id=18520)
+    async with session() as db:
+        row = _generation(device_id, 1, GenerationStatus.pending)
+        if failure == "push_seq":
+            row.source_push_seq = {"vlan": -1}
+        elif failure == "revision":
+            row.stream_revisions = {"vlan": 0}
+        elif failure == "carrier":
+            row.carrier_job_status = "succeeded"
+        else:
+            row.carrier_job_result = empty_execution_result()
+        db.add(row)
+        await db.commit()
+        generation_id = row.id
+    for route, extra in [("deployment-evidence", {}), ("settlement-observation", {"job_id": 1, "after_settle_seq": 0})]:
+        response = await adapter_client.post(
+            f"/api/v1/devices/{device_id}/{route}", headers=AUTH, json={"apply_attempt_ids": [], **extra}
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        head = body["head"] if route == "deployment-evidence" else body["deployment"]["head"]
+        assert head["identity"]["generation_id"] == generation_id
+        assert head["projection"] is None
+        assert head["evidence_error"] == {"code": "execution_contract", "digest": head["digest"]}
+
+
+async def test_large_stored_json_numbers_keep_distinct_digests(adapter_client):
+    from sqlalchemy import text
+
+    device_id = await seed_device(nso_device_name="large-number-evidence", netbox_device_id=18521)
+    async with session() as db:
+        row = Job(
+            device_id=device_id,
+            job_type=JobType.apply,
+            status=JobStatus.queued,
+            coalescible=True,
+            settle_seq=1,
+            result={**empty_execution_result(), "row_outcomes": [{}]},
+        )
+        db.add(row)
+        await db.commit()
+        job_id = row.id
+    digests = []
+    magnitude = "1" + "0" * 400 + ".1"
+    for number in (magnitude, "-" + magnitude):
+        async with session() as db:
+            await db.execute(
+                text(
+                    "UPDATE jobs SET result = jsonb_set(result::jsonb, '{unbounded}', CAST(:number AS jsonb)) WHERE id = :id"
+                ),
+                {"number": number, "id": job_id},
+            )
+            await db.commit()
+        response = await adapter_client.get("/api/v1/jobs", headers=AUTH, params={"device_id": device_id})
+        assert response.status_code == 200, response.text
+        item = response.json()[0]
+        assert item["projection"] is None
+        assert item["evidence_error"]["code"] == "projection_construction"
+        observation = await adapter_client.post(
+            f"/api/v1/devices/{device_id}/settlement-observation",
+            headers=AUTH,
+            json={"job_id": job_id, "after_settle_seq": 0, "apply_attempt_ids": []},
+        )
+        assert observation.status_code == 200, observation.text
+        assert observation.json()["job"] == item
+        digests.append(item["digest"])
+    assert digests[0] != digests[1]
+
+
+@pytest.mark.parametrize("value", ["\ud800", "\udfff"])
+async def test_invalid_unicode_evidence_stays_attributable(adapter_client, value):
+    device_id = await seed_device(nso_device_name="unicode-evidence", netbox_device_id=18522)
+    async with session() as db:
+        row = Job(
+            device_id=device_id,
+            job_type=JobType.apply,
+            status=JobStatus.queued,
+            coalescible=True,
+            result={**empty_execution_result(), "row_outcomes": [{}], "unpaired": value},
+        )
+        db.add(row)
+        await db.commit()
+        job_id = row.id
+    response = await adapter_client.get("/api/v1/jobs", headers=AUTH, params={"device_id": device_id})
+    assert response.status_code == 200, response.text
+    item = response.json()[0]
+    assert item["identity"]["id"] == job_id
+    assert item["projection"] is None
+    assert item["evidence_error"] == {"code": "schema_validation", "digest": item["digest"]}
+    observation = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/settlement-observation",
+        headers=AUTH,
+        json={"job_id": job_id, "after_settle_seq": 0, "apply_attempt_ids": []},
+    )
+    assert observation.status_code == 200, observation.text
+    assert observation.json()["job"] == item
 
 
 @pytest.mark.parametrize(
@@ -112,7 +357,9 @@ async def test_nested_generation_and_head_errors_leave_sibling_generations_visib
             for seq in range(1, 4)
         ]
         for row in rows:
-            row.carrier_job_result = empty_execution_result()
+            row.carrier_job_id = row.seq
+            row.carrier_job_status = "succeeded" if row.seq == 1 else "failed"
+            row.carrier_job_result = empty_vlan_execution_result()
         bad = rows[1]
         if failure == "row":
             bad.carrier_job_result = {**empty_execution_result(), "row_outcomes": [{}]}

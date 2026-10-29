@@ -20,8 +20,9 @@ from nso_adapter.store.models import (
     JobStatus,
     JobType,
 )
+from tests.api.evidence import empty_vlan_execution_result
 from tests.api.test_deployment_evidence import _generation
-from tests.conftest import AUTH, empty_execution_result, seed_device, session
+from tests.conftest import AUTH, seed_device, session
 
 pytestmark = pytest.mark.anyio
 
@@ -35,7 +36,7 @@ async def _seed_observation():
             job_type=JobType.apply,
             status=JobStatus.failed,
             coalescible=True,
-            result=empty_execution_result(),
+            result=empty_vlan_execution_result(),
             settle_seq=7,
         )
         attempt = DeploymentApplyAttempt(
@@ -51,7 +52,7 @@ async def _seed_observation():
         generation = _generation(device_id, 1, GenerationStatus.failed, job_id=job.id, apply_attempt_id=attempt_id)
         generation.carrier_job_id = job.id
         generation.carrier_job_status = "failed"
-        generation.carrier_job_result = empty_execution_result()
+        generation.carrier_job_result = empty_vlan_execution_result()
         db.add(generation)
         await db.flush()
         attempt.response = {"generations": [{"generation_id": generation.id}]}
@@ -315,7 +316,7 @@ async def test_observation_retains_generation_membership_after_a_retry_replaces_
             job_type=JobType.apply,
             status=JobStatus.failed,
             coalescible=True,
-            result=empty_execution_result(),
+            result=empty_vlan_execution_result(),
             settle_seq=4,
         )
         current = Job(
@@ -323,7 +324,7 @@ async def test_observation_retains_generation_membership_after_a_retry_replaces_
             job_type=JobType.apply,
             status=JobStatus.succeeded,
             coalescible=True,
-            result=empty_execution_result(),
+            result=empty_vlan_execution_result(),
             settle_seq=8,
         )
         db.add_all([old, current])
@@ -335,7 +336,7 @@ async def test_observation_retains_generation_membership_after_a_retry_replaces_
         for generation in generations:
             generation.carrier_job_id = current.id
             generation.carrier_job_status = "succeeded"
-            generation.carrier_job_result = empty_execution_result()
+            generation.carrier_job_result = empty_vlan_execution_result()
         db.add_all(generations)
         await db.flush()
         db.add(

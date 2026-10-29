@@ -4,6 +4,7 @@
 
 import hashlib
 import json
+import math
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Generic, Literal, TypeVar
@@ -116,22 +117,27 @@ _IDENTITY_COLLECTIONS = frozenset(
 
 
 def canonical_evidence(value, *, field: str = ""):
-    """Preserve JSON types and absent keys; normalize aware instants and identified sets."""
+    """Preserve stored evidence, including values that cannot be normalized."""
     if isinstance(value, Enum):
         return canonical_evidence(value.value, field=field)
     if isinstance(value, UUID):
         return str(value)
     if isinstance(value, datetime):
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("Evidence timestamps must be timezone-aware")
-        return iso_z(value.astimezone(UTC))
+        try:
+            if value.tzinfo is not None and value.utcoffset() is not None:
+                return iso_z(value.astimezone(UTC))
+        except (ValueError, OverflowError):
+            pass
+        return {"$datetime": value.isoformat()}
     if isinstance(value, str) and (field.endswith("_at") or field == "acceptance_identity"):
         try:
             instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
+            if instant.tzinfo is not None and instant.utcoffset() is not None:
+                return iso_z(instant.astimezone(UTC))
+        except (ValueError, OverflowError):
             return value
-        if instant.tzinfo is not None and instant.utcoffset() is not None:
-            return iso_z(instant.astimezone(UTC))
+    if isinstance(value, float) and not math.isfinite(value):
+        return {"$float": str(value)}
     if isinstance(value, dict):
         return {key: canonical_evidence(item, field=key) for key, item in value.items()}
     if isinstance(value, list):
@@ -145,32 +151,36 @@ def _canonical_json(value) -> str:
 
 
 def evidence_digest(candidate) -> str:
-    return hashlib.sha256(_canonical_json(canonical_evidence(candidate)).encode()).hexdigest()
+    return hashlib.sha256(_canonical_json(canonical_evidence(candidate)).encode(errors="surrogatepass")).hexdigest()
 
 
 def evidence_envelope(
-    identity: dict, candidate: dict, schema: type[BaseModel], *, construct=None, validate=None
+    identity: dict, candidate: dict, schema: type[BaseModel], *, construct=None, validate=None, project=None
 ) -> dict:
-    """Contain construction and validation failures in the identified item."""
+    """Contain construction, digest, and validation in the identified item."""
     code = None
     projection = None
     try:
-        if construct is not None:
-            construct(candidate)
+        try:
+            if construct is not None:
+                construct(candidate)
+        finally:
+            digest = evidence_digest(candidate)
         projection = schema.model_validate_json(
             json.dumps(candidate, default=canonical_evidence, allow_nan=False), strict=True
         ).model_dump(mode="json")
         if validate is not None:
             validate(projection)
+        if project is not None:
+            projection = project(projection)
     except ValidationError:
         code = "schema_validation"
     except ContractError:
         code = "execution_contract"
     except DeploymentEvidenceInvariantError:
         code = "attempt_generation_membership"
-    except (AttributeError, ValueError, TypeError, KeyError):
+    except (AttributeError, ValueError, TypeError, KeyError, OverflowError):
         code = "projection_construction"
-    digest = evidence_digest(candidate)
     return {
         "identity": identity,
         "projection": projection if code is None else None,

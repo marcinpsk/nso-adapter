@@ -9,8 +9,8 @@ import uuid
 import pytest
 import sqlalchemy as sa
 
-from tests.api.evidence import deployment_projections
-from tests.conftest import VALID_TOKEN, empty_execution_result, seed_device, session
+from tests.api.evidence import deployment_projections, empty_vlan_execution_result
+from tests.conftest import VALID_TOKEN, seed_device, session
 from tests.core.test_generation_protocol import seed_settings
 
 pytestmark = pytest.mark.anyio
@@ -54,7 +54,7 @@ async def _settle(job_id: int) -> None:
         job = await db.get(Job, job_id)
         assert job is not None
         job.status = JobStatus.succeeded
-        job.result = empty_execution_result()
+        job.result = empty_vlan_execution_result()
         await settle_job_generations(db, job_id, outcome=GenerationStatus.settled)
         await db.commit()
 
