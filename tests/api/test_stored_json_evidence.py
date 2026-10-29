@@ -192,6 +192,33 @@ async def test_receipt_reader_rejects_unrepresentable_stored_number(adapter_clie
         assert receipt["evidence_error"] == {"code": "projection_construction", "digest": receipt["digest"]}
 
 
+@pytest.mark.parametrize("depth", [257, 1200])
+async def test_deep_receipt_documents_are_rejected_and_have_distinct_digests(adapter_client, depth):
+    device_id, job_id, attempt_id, _ = await _seed_observation()
+    observations = []
+    for leaf in ("0", "1"):
+        payload = '{"nested":' + "[" * (depth - 1) + leaf + "]" * (depth - 1) + "}"
+        async with session() as db:
+            await db.execute(
+                text("UPDATE intent_push_receipt SET response = CAST(:payload AS json) WHERE device_id = :id"),
+                {"payload": payload, "id": device_id},
+            )
+            await db.commit()
+        async with _reader_client() as client:
+            response = await client.get("/api/v1/intent-receipts", headers=AUTH, params={"device_id": device_id})
+        assert response.status_code == 500, response.text
+        assert response.json()["error"]["code"] == "internal"
+        body = await _observe(adapter_client, device_id, job_id, attempt_id)
+        receipt = body["receipts"][0]
+        assert receipt["projection"] is None
+        assert receipt["evidence_error"] == {"code": "projection_construction", "digest": receipt["digest"]}
+        assert body["job"]["evidence_error"] is None
+        assert all(item["evidence_error"] is None for item in body["generations"])
+        observations.append(body)
+    assert observations[0]["receipts"][0]["digest"] != observations[1]["receipts"][0]["digest"]
+    assert observations[0]["digest"] != observations[1]["digest"]
+
+
 @pytest.mark.parametrize(
     "before,after",
     [

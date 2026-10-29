@@ -4,7 +4,6 @@
 
 import json
 import math
-import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -35,63 +34,31 @@ def _parse_int(literal: str) -> int | UnrepresentableJSONNumber:
         return UnrepresentableJSONNumber(literal)
 
 
-_WHITESPACE = re.compile(r"[ \t\n\r]*")
-_SCALAR_DECODER = json.JSONDecoder(parse_float=_parse_float, parse_int=_parse_int)
+# This limit is far above writer depth and low enough to keep the standard recursive encoder, Pydantic, and canonicalization safe.
+MAX_STORED_JSON_DEPTH = 256
 
 
-def _skip_whitespace(value: str, index: int) -> int:
-    match = _WHITESPACE.match(value, index)
-    assert match is not None
-    return match.end()
+class UnrepresentableJSONDocument:
+    """Retain the stored text and prevent ordinary JSON serialization."""
 
+    __slots__ = ("text",)
 
-def _read_value(value: str, index: int) -> tuple[Any, int]:
-    index = _skip_whitespace(value, index)
-    token = value[index : index + 1]
-    if token == "[":
-        return [], index + 1
-    if token == "{":
-        return {}, index + 1
-    return _SCALAR_DECODER.raw_decode(value, index)
-
-
-def _read_member(value: str, index: int, container: dict | list) -> tuple[Any, int]:
-    if isinstance(container, dict):
-        key, index = _SCALAR_DECODER.raw_decode(value, index)
-        if not isinstance(key, str):
-            raise json.JSONDecodeError("Expected object key", value, index)
-        index = _skip_whitespace(value, index)
-        if value[index : index + 1] != ":":
-            raise json.JSONDecodeError("Expected colon", value, index)
-        item, index = _read_value(value, index + 1)
-        container[key] = item
-    else:
-        item, index = _read_value(value, index)
-        container.append(item)
-    return item, index
+    def __init__(self, text: str) -> None:
+        self.text = text
 
 
 def load_store_json(value: str) -> Any:
-    """Decode stored JSON with exact numbers and no Python recursion limit."""
-    result, index = _read_value(value, 0)
-    stack = [(result, False)] if isinstance(result, (dict, list)) else []
-    while stack:
-        container, has_member = stack[-1]
-        closing = "}" if isinstance(container, dict) else "]"
-        index = _skip_whitespace(value, index)
-        token = value[index : index + 1]
-        if token == closing:
-            stack.pop()
-            index += 1
-            continue
-        if has_member:
-            if token != ",":
-                raise json.JSONDecodeError("Expected comma or container end", value, index)
-            index = _skip_whitespace(value, index + 1)
-        item, index = _read_member(value, index, container)
-        stack[-1] = (container, True)
+    """Decode exact numbers and retain documents beyond the safe depth."""
+    try:
+        result = json.loads(value, parse_float=_parse_float, parse_int=_parse_int)
+    except RecursionError:
+        return UnrepresentableJSONDocument(value)
+    pending = [(result, 1)]
+    while pending:
+        item, depth = pending.pop()
         if isinstance(item, (dict, list)):
-            stack.append((item, False))
-    if _skip_whitespace(value, index) != len(value):
-        raise json.JSONDecodeError("Extra data", value, index)
+            if depth > MAX_STORED_JSON_DEPTH:
+                return UnrepresentableJSONDocument(value)
+            children = item.values() if isinstance(item, dict) else item
+            pending.extend((child, depth + 1) for child in children if isinstance(child, (dict, list)))
     return result

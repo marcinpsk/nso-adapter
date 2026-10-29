@@ -5,7 +5,6 @@
 import hashlib
 import json
 import math
-from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from decimal import MAX_EMAX, MIN_EMIN, Context, Decimal, localcontext
 from enum import Enum
@@ -16,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from nso_adapter.api.timestamps import iso_z
 from nso_adapter.nso.execution_contract import ContractError, validate_result
-from nso_adapter.store.json_codec import UnrepresentableJSONNumber
+from nso_adapter.store.json_codec import UnrepresentableJSONDocument, UnrepresentableJSONNumber
 
 
 class _ClosedOut(BaseModel):
@@ -122,6 +121,8 @@ def _canonical_number(value: int | float | UnrepresentableJSONNumber) -> str:
 
 
 def _canonical_scalar(value: Any) -> Any:
+    if isinstance(value, UnrepresentableJSONDocument):
+        return {"$json_document": value.text}
     if isinstance(value, UUID):
         return str(value)
     if isinstance(value, datetime):
@@ -161,41 +162,16 @@ def canonical_evidence(value: Any) -> Any:
     return root[0]
 
 
-def _json_chunks(value: Any, *, default: Callable[[Any], Any] | None = None) -> Iterator[str]:
-    """Encode containers iteratively and delegate scalar escaping to the standard encoder."""
-    pending = [(False, value)]
-    while pending:
-        literal, item = pending.pop()
-        if literal:
-            yield item
-        elif isinstance(item, dict):
-            yield "{"
-            pending.append((True, "}"))
-            for index, key in enumerate(reversed(sorted(item))):
-                if index:
-                    pending.append((True, ","))
-                pending.extend(((False, item[key]), (True, ":"), (False, key)))
-        elif isinstance(item, list):
-            yield "["
-            pending.append((True, "]"))
-            for index, child in enumerate(reversed(item)):
-                if index:
-                    pending.append((True, ","))
-                pending.append((False, child))
-        else:
-            yield json.dumps(item, default=default, ensure_ascii=False, allow_nan=False)
-
-
 def evidence_digest(candidate: Any) -> str:
-    digest = hashlib.sha256()
-    for chunk in _json_chunks(canonical_evidence(candidate)):
-        digest.update(chunk.encode(errors="surrogatepass"))
-    return digest.hexdigest()
+    encoded = json.dumps(
+        canonical_evidence(candidate), sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    )
+    return hashlib.sha256(encoded.encode(errors="surrogatepass")).hexdigest()
 
 
 def _projection_json_value(value):
-    if isinstance(value, UnrepresentableJSONNumber):
-        raise ValueError("Stored JSON number has no exact native representation")
+    if isinstance(value, (UnrepresentableJSONNumber, UnrepresentableJSONDocument)):
+        raise ValueError("Stored JSON has no exact native representation")
     return canonical_evidence(value)
 
 
@@ -212,7 +188,15 @@ def evidence_envelope(
         finally:
             digest = evidence_digest(candidate)
         projection = schema.model_validate_json(
-            "".join(_json_chunks(candidate, default=_projection_json_value)), strict=True
+            json.dumps(
+                candidate,
+                default=_projection_json_value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ),
+            strict=True,
         ).model_dump(mode="json")
         if validate is not None:
             validate(projection)

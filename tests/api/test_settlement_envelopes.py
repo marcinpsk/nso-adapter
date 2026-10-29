@@ -18,7 +18,8 @@ def terminal_execution_result_contract():
 
 
 @pytest.mark.parametrize("container", ["array", "object"])
-async def test_deep_stored_evidence_has_a_digest_without_hiding_siblings(adapter_client, container):
+@pytest.mark.parametrize("depth", [256, 257, 1200])
+async def test_deep_stored_evidence_has_a_digest_without_hiding_siblings(adapter_client, container, depth):
     from sqlalchemy import text
 
     device_id = await seed_device(nso_device_name="deep-evidence", netbox_device_id=18526)
@@ -38,7 +39,7 @@ async def test_deep_stored_evidence_has_a_digest_without_hiding_siblings(adapter
         await db.commit()
         ids = [job.id for job in jobs]
         opening, closing = ("[", "]") if container == "array" else ('{"nested":', "}")
-        payload = '{"nested":' + opening * 1200 + "0" + closing * 1200 + "}"
+        payload = '{"nested":' + opening * (depth - 1) + "0" + closing * (depth - 1) + "}"
         await db.execute(
             text("UPDATE jobs SET result = CAST(:payload AS json), status = 'succeeded' WHERE id = :id"),
             {"payload": payload, "id": ids[1]},

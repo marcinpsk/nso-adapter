@@ -116,12 +116,22 @@ async def test_writer_float_literals_round_trip_through_postgresql(store_engine)
 
 
 @pytest.mark.parametrize("container", ["array", "object"])
-@pytest.mark.parametrize("sql_type,depth", [("json", 1200), ("jsonb", 1200), ("json", 10000)])
+@pytest.mark.parametrize(
+    "sql_type,depth", [(kind, depth) for kind in ("json", "jsonb") for depth in (256, 257, 1200)] + [("json", 10000)]
+)
 async def test_postgresql_decoder_retains_deep_containers(store_engine, container, sql_type, depth):
+    from nso_adapter.store import json_codec
+
     opening, closing = ("[", "]") if container == "array" else ('{"nested":', "}")
     payload = opening * depth + "0.1" + closing * depth
     async with session() as db:
         stored = await db.scalar(text(f"SELECT CAST(:payload AS {sql_type})"), {"payload": payload})
+        raw = await db.scalar(text(f"SELECT CAST(CAST(:payload AS {sql_type}) AS text)"), {"payload": payload})
+    if depth > 256:
+        assert not isinstance(stored, (dict, list))
+        assert isinstance(stored, json_codec.UnrepresentableJSONDocument)
+        assert stored.text == raw
+        return
     for _ in range(depth):
         stored = stored[0] if container == "array" else stored["nested"]
     assert type(stored) is float
@@ -138,14 +148,14 @@ async def test_postgresql_decoder_retains_deep_containers(store_engine, containe
         "null",
     ],
 )
-async def test_iterative_decoder_matches_standard_json_values(payload):
+async def test_store_decoder_matches_standard_json_values(payload):
     from nso_adapter.store.json_codec import load_store_json
 
     assert load_store_json(payload) == json.loads(payload)
 
 
 @pytest.mark.parametrize("payload", ["", "[", "{", "[1,]", '{"x":1,}', "[1 2]", '{"x" 1}', "{1:2}", "[]{}", "[}"])
-async def test_iterative_decoder_rejects_invalid_json(payload):
+async def test_store_decoder_rejects_invalid_json(payload):
     from nso_adapter.store.json_codec import load_store_json
 
     with pytest.raises(json.JSONDecodeError):
@@ -158,7 +168,7 @@ async def test_deep_canonical_digest_matches_exact_json_encoding(container):
 
     from nso_adapter.api.execution import canonical_evidence, evidence_digest
 
-    depth = 10000
+    depth = 256
     value = 0.1
     for _ in range(depth):
         value = [value] if container == "array" else {"$nested": value}
@@ -179,34 +189,65 @@ async def test_native_and_marker_numbers_share_exact_decimal_identity(literal):
     assert evidence_digest(load_store_json(literal)) == evidence_digest(UnrepresentableJSONNumber(literal))
 
 
-async def test_number_marker_rejects_json_and_pydantic_serialization():
+@pytest.mark.parametrize("marker", ["number", "document"])
+async def test_stored_marker_rejects_json_and_pydantic_serialization(marker):
     from pydantic import TypeAdapter
     from pydantic_core import PydanticSerializationError
 
-    from nso_adapter.store.json_codec import UnrepresentableJSONNumber
+    from nso_adapter.store import json_codec
 
-    value = {"nested": [UnrepresentableJSONNumber("1e-400")]}
+    value = {
+        "nested": [
+            json_codec.UnrepresentableJSONNumber("1e-400")
+            if marker == "number"
+            else json_codec.load_store_json("[" * 257 + "0" + "]" * 257)
+        ]
+    }
     with pytest.raises(TypeError):
         json.dumps(value)
     with pytest.raises(PydanticSerializationError):
         TypeAdapter(dict).dump_json(value)
 
 
-@pytest.mark.parametrize("tag", ["$json_number", "$datetime", "$float"])
+@pytest.mark.parametrize("tag", ["$json_number", "$json_document", "$datetime", "$float"])
 async def test_canonical_tags_cannot_be_imitated_by_stored_objects(tag):
     from datetime import datetime
 
     from nso_adapter.api.execution import canonical_evidence, evidence_digest
-    from nso_adapter.store.json_codec import UnrepresentableJSONNumber
+    from nso_adapter.store.json_codec import UnrepresentableJSONNumber, load_store_json
 
     synthetic = {
         "$json_number": UnrepresentableJSONNumber("1e-400"),
+        "$json_document": load_store_json("[" * 257 + "0" + "]" * 257),
         "$datetime": datetime.fromisoformat("2026-10-01T00:00:00"),  # noqa: DTZ007
         "$float": float("inf"),
     }[tag]
     stored = canonical_evidence(synthetic)
     assert evidence_digest(synthetic) != evidence_digest(stored)
     assert canonical_evidence({"$": {"$$": [stored]}}) == {"$$": {"$$$": [{"$" + tag: stored[tag]}]}}
+
+
+@pytest.mark.parametrize("leaf", ["0.1", "[]", "{}"])
+@pytest.mark.parametrize("depth", [256, 257, 1200])
+async def test_decoder_bounds_container_depth_and_keeps_document_identity(leaf, depth):
+    from nso_adapter.api.execution import canonical_evidence, evidence_digest
+    from nso_adapter.store import json_codec
+
+    containers = depth - (leaf in {"[]", "{}"})
+    payload = "[" * containers + leaf + "]" * containers
+    value = json_codec.load_store_json(payload)
+    if depth == 256:
+        assert isinstance(value, list)
+        for _ in range(containers):
+            value = value[0]
+        assert value == json.loads(leaf)
+    else:
+        assert not isinstance(value, list)
+        assert isinstance(value, json_codec.UnrepresentableJSONDocument)
+        assert value.text == payload
+        assert canonical_evidence(value) == {"$json_document": payload}
+        other = json_codec.load_store_json(payload.replace(leaf, "true" if leaf == "0.1" else "[1]"))
+        assert evidence_digest(value) != evidence_digest(other)
 
 
 async def test_numeric_decode_and_canonicalization_ignore_decimal_context():
