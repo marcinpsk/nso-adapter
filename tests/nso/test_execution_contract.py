@@ -47,8 +47,7 @@ def test_execution_contract_integrity_detects_stale_copy(mutation):
 
 
 def test_overlay_grain_is_a_projection_of_execution_metadata():
-    for subject, grain in OVERLAY_GRAIN.items():
-        assert list(grain) == contract.METADATA["overlay_grain"][subject]
+    assert {subject: list(grain) for subject, grain in OVERLAY_GRAIN.items()} == contract.METADATA["overlay_grain"]
 
 
 def test_installed_contract_accepts_settlement_fixture():
