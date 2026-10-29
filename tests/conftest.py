@@ -238,6 +238,7 @@ def pg_template(pg_provisioner):
                 cwd=_REPO_ROOT,
                 check=True,
                 capture_output=True,
+                timeout=300,
                 # alembic/env.py rewrites +asyncpg -> +psycopg2 itself.
                 env={**os.environ, "DATABASE_URL": _url_for(name, driver="postgresql+asyncpg")},
             )

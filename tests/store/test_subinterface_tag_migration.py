@@ -48,6 +48,7 @@ def test_subinterface_tag_migration_requires_tags(pg_provisioner):
                 capture_output=True,
                 env={**os.environ, "DATABASE_URL": url},
                 check=False,
+                timeout=300,
             )
             failure = proc.stderr.decode()
             assert proc.returncode != 0

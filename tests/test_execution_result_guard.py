@@ -60,6 +60,7 @@ async def test_invalid_execution(db_session):
         capture_output=True,
         text=True,
         check=False,
+        timeout=300,
     )
     output = result.stdout + result.stderr
     assert result.returncode == pytest.ExitCode.TESTS_FAILED, output

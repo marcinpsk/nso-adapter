@@ -47,6 +47,7 @@ def alembic(sync_url: str, *args: str) -> str:
         capture_output=True,
         env={**os.environ, "DATABASE_URL": sync_url},
         check=False,
+        timeout=300,
     )
     if proc.returncode != 0:
         raise AssertionError(f"alembic {args} failed:\n{proc.stdout.decode()}\n{proc.stderr.decode()}")
