@@ -255,6 +255,21 @@ async def test_observation_rejects_invalid_requests(adapter_client, body):
     assert response.json()["error"]["code"] == "validation_error"
 
 
+async def test_observation_accepts_exactly_the_published_sequence_bound(adapter_client):
+    from nso_adapter.main import create_app
+
+    device_id, job_id, _, _ = await _seed_observation()
+    schema = create_app().openapi()["components"]["schemas"]["SettlementObservationIn"]
+    maximum = schema["properties"]["after_settle_seq"]["maximum"]
+    assert isinstance(maximum, int)
+    url = f"/api/v1/devices/{device_id}/settlement-observation"
+    at_bound = {"job_id": job_id, "after_settle_seq": maximum, "apply_attempt_ids": []}
+    above_bound = {**at_bound, "after_settle_seq": maximum + 1}
+
+    assert (await adapter_client.post(url, headers=AUTH, json=at_bound)).status_code == 200
+    assert (await adapter_client.post(url, headers=AUTH, json=above_bound)).status_code == 422
+
+
 async def test_observation_requires_auth_and_a_device(adapter_client):
     body = {"job_id": 1, "after_settle_seq": 0, "apply_attempt_ids": []}
     unauthenticated = await adapter_client.post("/api/v1/devices/999999/settlement-observation", json=body)
