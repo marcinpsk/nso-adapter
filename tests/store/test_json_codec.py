@@ -3,6 +3,7 @@
 """Store JSON decoding must not permit a lossy read-modify-write."""
 
 import json
+import struct
 import uuid
 
 import pytest
@@ -65,8 +66,9 @@ async def test_store_retains_unrepresentable_numbers_and_refuses_to_rewrite_them
         ("1.25", float),
         ("1.0", float),
         ("0.0", float),
-        ("0.1", None),
+        ("0.1", float),
         ("1e-400", None),
+        ("1e400", None),
         ("1.00000000000000001", None),
         ("7", int),
         ("1" + "0" * 4300, None),
@@ -76,8 +78,9 @@ async def test_store_retains_unrepresentable_numbers_and_refuses_to_rewrite_them
         "fraction",
         "integral_float",
         "zero",
-        "rounded",
+        "decimal_fraction",
         "underflow",
+        "overflow",
         "near_integer",
         "integer",
         "large_integer",
@@ -95,7 +98,85 @@ async def test_decoder_retains_only_exact_native_numbers(literal, kind):
         assert value.literal == literal
     else:
         assert type(value) is kind
-        assert Decimal(value) == Decimal(literal)
+        assert Decimal(repr(value)) == Decimal(literal)
+
+
+async def test_writer_float_literals_round_trip_through_postgresql(store_engine):
+    values = [
+        struct.unpack(">d", ((sign << 63) | (exponent << 52) | mantissa).to_bytes(8, "big"))[0]
+        for sign in (0, 1)
+        for exponent in range(2047)
+        for mantissa in (0, 1, (1 << 51) - 1, (1 << 52) - 1)
+    ]
+    values.extend([0.1, 1.25])
+    async with session() as db:
+        stored = await db.scalar(text("SELECT CAST(:payload AS json)"), {"payload": json.dumps(values)})
+    assert len(stored) == len(values)
+    assert all(type(decoded) is float and decoded == original for original, decoded in zip(values, stored, strict=True))
+
+
+@pytest.mark.parametrize("container", ["array", "object"])
+@pytest.mark.parametrize("sql_type,depth", [("json", 1200), ("jsonb", 1200), ("json", 10000)])
+async def test_postgresql_decoder_retains_deep_containers(store_engine, container, sql_type, depth):
+    opening, closing = ("[", "]") if container == "array" else ('{"nested":', "}")
+    payload = opening * depth + "0.1" + closing * depth
+    async with session() as db:
+        stored = await db.scalar(text(f"SELECT CAST(:payload AS {sql_type})"), {"payload": payload})
+    for _ in range(depth):
+        stored = stored[0] if container == "array" else stored["nested"]
+    assert type(stored) is float
+    assert stored == 0.1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        ' {"empty": {}, "list": [], "values": [null, true, false, "[{}],:\\"", {"x": "\\u00e9"}]} \n',
+        '{"duplicate": 1, "duplicate": 2}',
+        "[1, -2, 0.1, 1.25, 1e3, -0.0]",
+        '"plain string"',
+        "null",
+    ],
+)
+async def test_iterative_decoder_matches_standard_json_values(payload):
+    from nso_adapter.store.json_codec import load_store_json
+
+    assert load_store_json(payload) == json.loads(payload)
+
+
+@pytest.mark.parametrize("payload", ["", "[", "{", "[1,]", '{"x":1,}', "[1 2]", '{"x" 1}', "{1:2}", "[]{}", "[}"])
+async def test_iterative_decoder_rejects_invalid_json(payload):
+    from nso_adapter.store.json_codec import load_store_json
+
+    with pytest.raises(json.JSONDecodeError):
+        load_store_json(payload)
+
+
+@pytest.mark.parametrize("container", ["array", "object"])
+async def test_deep_canonical_digest_matches_exact_json_encoding(container):
+    import hashlib
+
+    from nso_adapter.api.execution import canonical_evidence, evidence_digest
+
+    depth = 10000
+    value = 0.1
+    for _ in range(depth):
+        value = [value] if container == "array" else {"$nested": value}
+    canonical = canonical_evidence(value)
+    for _ in range(depth):
+        canonical = canonical[0] if container == "array" else canonical["$$nested"]
+    assert canonical == {"$json_number": "1e-1"}
+    opening, closing = ("[", "]") if container == "array" else ('{"$$nested":', "}")
+    expected = opening * depth + '{"$json_number":"1e-1"}' + closing * depth
+    assert evidence_digest(value) == hashlib.sha256(expected.encode()).hexdigest()
+
+
+@pytest.mark.parametrize("literal", ["0.1", "1.25", "1e-400", "1e400", "1.00000000000000001"])
+async def test_native_and_marker_numbers_share_exact_decimal_identity(literal):
+    from nso_adapter.api.execution import evidence_digest
+    from nso_adapter.store.json_codec import UnrepresentableJSONNumber, load_store_json
+
+    assert evidence_digest(load_store_json(literal)) == evidence_digest(UnrepresentableJSONNumber(literal))
 
 
 async def test_number_marker_rejects_json_and_pydantic_serialization():

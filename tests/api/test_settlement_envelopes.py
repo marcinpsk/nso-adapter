@@ -17,6 +17,57 @@ def terminal_execution_result_contract():
     yield
 
 
+@pytest.mark.parametrize("container", ["array", "object"])
+async def test_deep_stored_evidence_has_a_digest_without_hiding_siblings(adapter_client, container):
+    from sqlalchemy import text
+
+    device_id = await seed_device(nso_device_name="deep-evidence", netbox_device_id=18526)
+    async with session() as db:
+        jobs = [
+            Job(
+                device_id=device_id,
+                job_type=JobType.sync,
+                status=JobStatus.queued if seq == 2 else JobStatus.succeeded,
+                coalescible=True,
+                settle_seq=seq,
+                result={},
+            )
+            for seq in range(1, 4)
+        ]
+        db.add_all(jobs)
+        await db.commit()
+        ids = [job.id for job in jobs]
+        opening, closing = ("[", "]") if container == "array" else ('{"nested":', "}")
+        payload = '{"nested":' + opening * 1200 + "0" + closing * 1200 + "}"
+        await db.execute(
+            text("UPDATE jobs SET result = CAST(:payload AS json), status = 'succeeded' WHERE id = :id"),
+            {"payload": payload, "id": ids[1]},
+        )
+        await db.commit()
+    siblings = [await adapter_client.get(f"/api/v1/jobs/{job_id}", headers=AUTH) for job_id in (ids[0], ids[2])]
+    assert all(response.status_code == 200 for response in siblings)
+    feed = await adapter_client.get("/api/v1/jobs", headers=AUTH, params={"device_id": device_id, "order": "asc"})
+    assert feed.status_code == 200, feed.text
+    a, b, c = feed.json()
+    assert [item["identity"]["id"] for item in (a, b, c)] == ids
+    assert [a, c] == [response.json() for response in siblings]
+    assert a["evidence_error"] is c["evidence_error"] is None
+    assert b["projection"] is None
+    assert b["evidence_error"]["code"] in {"schema_validation", "projection_construction"}
+    assert b["evidence_error"]["digest"] == b["digest"]
+    assert len(bytes.fromhex(b["digest"])) == 32
+    observation = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/settlement-observation",
+        headers=AUTH,
+        json={"job_id": ids[1], "after_settle_seq": 0, "apply_attempt_ids": []},
+    )
+    assert observation.status_code == 200, observation.text
+    assert observation.json()["job"] == b
+    repeated = await adapter_client.get(f"/api/v1/jobs/{ids[1]}", headers=AUTH)
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json() == b
+
+
 @pytest.mark.parametrize(
     "field,bad_key",
     [

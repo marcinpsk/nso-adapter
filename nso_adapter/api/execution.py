@@ -5,10 +5,11 @@
 import hashlib
 import json
 import math
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from decimal import MAX_EMAX, MIN_EMIN, Context, Decimal, localcontext
 from enum import Enum
-from typing import Generic, Literal, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -106,7 +107,7 @@ def _canonical_number(value: int | float | UnrepresentableJSONNumber) -> str:
         mantissa, _, exponent_literal = value.literal.lower().partition("e")
         number = Decimal(mantissa)
     else:
-        number = Decimal.from_float(value) if isinstance(value, float) else Decimal(value)
+        number = Decimal(repr(value)) if isinstance(value, float) else Decimal(value)
     parts = number.as_tuple()
     assert isinstance(parts.exponent, int)
     digits = "".join(str(digit) for digit in parts.digits).rstrip("0")
@@ -120,10 +121,7 @@ def _canonical_number(value: int | float | UnrepresentableJSONNumber) -> str:
     return f"{'-' if parts.sign else ''}{digits}e{exponent:f}"
 
 
-def canonical_evidence(value):
-    """Equal digests imply equal stored JSON values, with numbers compared by exact numeric value."""
-    if isinstance(value, Enum):
-        return canonical_evidence(value.value)
+def _canonical_scalar(value: Any) -> Any:
     if isinstance(value, UUID):
         return str(value)
     if isinstance(value, datetime):
@@ -137,19 +135,62 @@ def canonical_evidence(value):
         return {"$float": str(value)}
     if isinstance(value, UnrepresentableJSONNumber) or isinstance(value, (int, float)) and not isinstance(value, bool):
         return {"$json_number": _canonical_number(value)}
-    if isinstance(value, dict):
-        return {"$" + key if key.startswith("$") else key: canonical_evidence(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [canonical_evidence(item) for item in value]
     return value
 
 
-def _canonical_json(value) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+def canonical_evidence(value: Any) -> Any:
+    """Equal digests imply equal stored JSON values, with numbers compared by exact numeric value."""
+    root: list[Any] = [None]
+    pending: list[tuple[Any, Any, str | int]] = [(value, root, 0)]
+    while pending:
+        item, parent, key = pending.pop()
+        while isinstance(item, Enum):
+            item = item.value
+        if isinstance(item, dict):
+            mapped: dict[str, Any] = {}
+            parent[key] = mapped
+            pending.extend(
+                (child, mapped, "$" + name if name.startswith("$") else name) for name, child in item.items()
+            )
+        elif isinstance(item, list):
+            items = [None] * len(item)
+            parent[key] = items
+            pending.extend((child, items, index) for index, child in enumerate(item))
+        else:
+            parent[key] = _canonical_scalar(item)
+    return root[0]
 
 
-def evidence_digest(candidate) -> str:
-    return hashlib.sha256(_canonical_json(canonical_evidence(candidate)).encode(errors="surrogatepass")).hexdigest()
+def _json_chunks(value: Any, *, default: Callable[[Any], Any] | None = None) -> Iterator[str]:
+    """Encode containers iteratively and delegate scalar escaping to the standard encoder."""
+    pending = [(False, value)]
+    while pending:
+        literal, item = pending.pop()
+        if literal:
+            yield item
+        elif isinstance(item, dict):
+            yield "{"
+            pending.append((True, "}"))
+            for index, key in enumerate(reversed(sorted(item))):
+                if index:
+                    pending.append((True, ","))
+                pending.extend(((False, item[key]), (True, ":"), (False, key)))
+        elif isinstance(item, list):
+            yield "["
+            pending.append((True, "]"))
+            for index, child in enumerate(reversed(item)):
+                if index:
+                    pending.append((True, ","))
+                pending.append((False, child))
+        else:
+            yield json.dumps(item, default=default, ensure_ascii=False, allow_nan=False)
+
+
+def evidence_digest(candidate: Any) -> str:
+    digest = hashlib.sha256()
+    for chunk in _json_chunks(canonical_evidence(candidate)):
+        digest.update(chunk.encode(errors="surrogatepass"))
+    return digest.hexdigest()
 
 
 def _projection_json_value(value):
@@ -171,7 +212,7 @@ def evidence_envelope(
         finally:
             digest = evidence_digest(candidate)
         projection = schema.model_validate_json(
-            json.dumps(candidate, default=_projection_json_value, allow_nan=False), strict=True
+            "".join(_json_chunks(candidate, default=_projection_json_value)), strict=True
         ).model_dump(mode="json")
         if validate is not None:
             validate(projection)

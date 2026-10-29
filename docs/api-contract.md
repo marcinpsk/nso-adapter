@@ -478,11 +478,14 @@ The error codes form a closed set:
 | `attempt_generation_membership` | The admission response disagrees with stamped generations. |
 
 The adapter hashes the underlying candidate, including invalid evidence, with SHA-256.
-Canonical JSON uses sorted object keys, compact separators, UTF-8, and no non-finite numbers.
-It preserves JSON types and absent keys. Aware timestamps, including acceptance identities,
-normalize to UTC. Identified record collections and requested identity sets sort by their
-canonical JSON. Other lists keep their order. Canonicalization changes the hash input only.
-Published projections retain their existing timestamp strings and list order.
+Canonical JSON uses sorted object keys, compact separators, and UTF-8. It preserves JSON
+types, absent keys, stored timestamp strings, and every list's order. Numbers compare by
+their exact stored JSON value. A finite float represents the decimal value of its shortest
+round-trip literal. Numbers that cannot round-trip through a finite float retain their
+exact literal value. Numeric tags cannot collide with stored object keys. Native aware
+datetime values normalize to UTC. Canonicalization changes the hash input only.
+Decoding and hashing use iterative walks. Evidence that exceeds the response schema's
+nesting limit retains its digest and returns an item error without hiding valid siblings.
 
 ### `GET /api/v1/devices/{id}/generations` → `200 | 401 | 404 | 422`
 
