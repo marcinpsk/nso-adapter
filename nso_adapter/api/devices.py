@@ -24,7 +24,15 @@ from nso_adapter.api.errors import (
     RESP_500_INTERNAL,
     api_error,
 )
-from nso_adapter.api.execution import AttributedRefusalOut, RowOutcomeOut, evidence_projection
+from nso_adapter.api.execution import (
+    AttributedRefusalOut,
+    DeploymentEvidenceInvariantError,
+    EvidenceEnvelope,
+    RowOutcomeOut,
+    evidence_envelope,
+    evidence_projection,
+    validate_execution_result,
+)
 from nso_adapter.api.pagination import DEFAULT_PAGE, LIMIT_MAX, LIMIT_MIN, validate_page_limit
 from nso_adapter.api.timestamps import iso_z
 from nso_adapter.domain.diagnostics import DEVICE_REF_PATTERN, device_ref
@@ -186,6 +194,8 @@ class ProvisionOut(BaseModel):
 
 
 class DeviceGenerationOut(BaseModel):
+    model_config = {"extra": "forbid"}
+
     """One deployment generation, with every receipt-facing field always present."""
 
     generation_id: int
@@ -253,6 +263,8 @@ class DeploymentEvidenceIn(BaseModel):
 
 
 class DeploymentEvidenceGenerationOut(BaseModel):
+    model_config = {"extra": "forbid"}
+
     generation_id: int
     seq: int
     status: GenerationStatus
@@ -271,14 +283,19 @@ class DeploymentEvidenceGenerationOut(BaseModel):
 
 
 class DeploymentEvidenceAttemptOut(BaseModel):
+    model_config = {"extra": "forbid"}
+
     apply_attempt_id: UUID
     admission_state: str
     http_status: int
     response: dict
-    generations: list[DeploymentEvidenceGenerationOut]
+    selected: dict[str, int]
+    generation_ids: list[int]
 
 
 class DeploymentEvidenceHeadOut(BaseModel):
+    model_config = {"extra": "forbid"}
+
     generation_id: int
     seq: int
     status: GenerationStatus
@@ -300,19 +317,50 @@ class DeploymentEvidenceHeadOut(BaseModel):
     updated_at: str
 
 
-class DeviceDeploymentEvidenceOut(BaseModel):
+class GenerationIdentityOut(BaseModel):
+    model_config = {"extra": "forbid"}
+
     device_id: int
-    head: DeploymentEvidenceHeadOut | None
+    generation_id: int
+    seq: int
+    carrier_job_id: int | None
+    apply_attempt_id: UUID | None
+
+
+class AttemptIdentityOut(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    device_id: int
+    apply_attempt_id: UUID
+
+
+class DeviceGenerationEvidenceOut(EvidenceEnvelope[GenerationIdentityOut, DeviceGenerationOut]):
+    pass
+
+
+class DeploymentGenerationEvidenceOut(EvidenceEnvelope[GenerationIdentityOut, DeploymentEvidenceGenerationOut]):
+    pass
+
+
+class DeploymentHeadEvidenceOut(EvidenceEnvelope[GenerationIdentityOut, DeploymentEvidenceHeadOut]):
+    pass
+
+
+class DeploymentAttemptEvidenceOut(EvidenceEnvelope[AttemptIdentityOut, DeploymentEvidenceAttemptOut]):
+    generations: list[DeploymentGenerationEvidenceOut]
+
+
+class DeviceDeploymentEvidenceOut(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    device_id: int
+    head: DeploymentHeadEvidenceOut | None
     blocked: bool
     write_work_pending: bool
     held_jobs: list[int]
     pending_generations: int
-    attempts: list[DeploymentEvidenceAttemptOut]
+    attempts: list[DeploymentAttemptEvidenceOut]
     unknown_apply_attempt_ids: list[UUID]
-
-
-class DeploymentEvidenceInvariantError(RuntimeError):
-    """The durable Apply response disagrees with its stamped generations."""
 
 
 def _raise_attempt_generation_evidence_invariant(
@@ -380,36 +428,112 @@ def _generation_sections(generation: DeploymentGeneration) -> list[str]:
 
 
 def _generation_source_push_seq(generation: DeploymentGeneration) -> dict[str, int | None]:
-    return dict(sorted((generation.source_push_seq or {}).items()))
+    return dict(sorted(generation.source_push_seq.items()))
 
 
-def _attempt_generation_out(generation: DeploymentGeneration) -> dict:
+def _generation_identity(generation) -> dict:
+    return {
+        "device_id": generation.device_id,
+        "generation_id": generation.id,
+        "seq": generation.seq,
+        "carrier_job_id": generation.carrier_job_id,
+        "apply_attempt_id": generation.apply_attempt_id,
+    }
+
+
+def _generation_candidate(generation: DeploymentGeneration) -> dict:
     return {
         "generation_id": generation.id,
         "seq": generation.seq,
         "status": generation.status,
-        "sections": _generation_sections(generation),
-        "source_push_seq": _generation_source_push_seq(generation),
+        "source_push_seq": generation.source_push_seq,
         "stream_revisions": generation.stream_revisions,
         "carrier_job_id": generation.carrier_job_id,
         "carrier_job_status": generation.carrier_job_status,
         "carrier_job_result": generation.carrier_job_result,
-        **evidence_projection(generation.carrier_job_result),
         "carrier_job_error": generation.carrier_job_error,
-        "updated_at": iso_z(generation.updated_at),
+        "updated_at": generation.updated_at,
     }
+
+
+def _construct_generation_evidence(candidate: dict, generation: DeploymentGeneration) -> None:
+    candidate["sections"] = _generation_sections(generation)
+    candidate["source_push_seq"] = _generation_source_push_seq(generation)
+    candidate.update(evidence_projection(generation.carrier_job_result))
+
+
+def _validate_generation_execution(projection: dict) -> None:
+    validate_execution_result(
+        projection["carrier_job_result"], required=projection["carrier_job_status"] in ("succeeded", "failed")
+    )
+
+
+def _attempt_generation_out(generation: DeploymentGeneration) -> dict:
+    return evidence_envelope(
+        _generation_identity(generation),
+        _generation_candidate(generation),
+        DeploymentEvidenceGenerationOut,
+        construct=lambda candidate: _construct_generation_evidence(candidate, generation),
+        validate=_validate_generation_execution,
+    )
 
 
 def _evidence_head_out(generation: DeploymentGeneration | None) -> dict | None:
     if generation is None:
         return None
-    return {
-        **_attempt_generation_out(generation),
+    candidate = {
+        **_generation_candidate(generation),
         "mode": generation.mode,
         "settlement_cohort": generation.settlement_cohort,
         "apply_attempt_id": generation.apply_attempt_id,
-        "created_at": iso_z(generation.created_at),
+        "created_at": generation.created_at,
     }
+    return evidence_envelope(
+        _generation_identity(generation),
+        candidate,
+        DeploymentEvidenceHeadOut,
+        construct=lambda value: _construct_generation_evidence(value, generation),
+        validate=_validate_generation_execution,
+    )
+
+
+def _evidence_attempt_out(attempt: DeploymentApplyAttempt, generations: list[DeploymentGeneration]) -> dict:
+    candidate = {
+        "apply_attempt_id": attempt.id,
+        "admission_state": attempt.admission_state,
+        "http_status": attempt.http_status,
+        "response": attempt.response,
+        "selected": attempt.selected,
+        "generation_ids": [generation.id for generation in generations],
+    }
+    return {
+        **evidence_envelope(
+            {"device_id": attempt.device_id, "apply_attempt_id": attempt.id},
+            candidate,
+            DeploymentEvidenceAttemptOut,
+            construct=lambda value: _validate_attempt_generation_evidence(attempt, generations),
+        ),
+        "generations": [_attempt_generation_out(generation) for generation in generations],
+    }
+
+
+def _device_generation_out(row) -> dict:
+    candidate = {
+        "generation_id": row.id,
+        "seq": row.seq,
+        "status": row.status,
+        "job_id": row.job_id,
+        "carrier_job_id": row.carrier_job_id,
+        "carrier_job_status": row.carrier_job_status,
+        "mode": row.mode,
+        "settlement_cohort": row.settlement_cohort,
+        "digest": row.digest,
+        "stream_revisions": row.stream_revisions,
+        "source_push_seq": row.source_push_seq,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+    return evidence_envelope(_generation_identity(row), candidate, DeviceGenerationOut)
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -601,7 +725,7 @@ async def get_device(device_id: int, db: AsyncSession = Depends(get_db)):
 @router.get(
     "/{device_id}/generations",
     dependencies=[Depends(verify_token)],
-    response_model=list[DeviceGenerationOut],
+    response_model=list[DeviceGenerationEvidenceOut],
     responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
 )
 async def list_device_generations(
@@ -618,6 +742,8 @@ async def list_device_generations(
     query = (
         select(
             DeploymentGeneration.id,
+            DeploymentGeneration.device_id,
+            DeploymentGeneration.apply_attempt_id,
             DeploymentGeneration.seq,
             DeploymentGeneration.status,
             DeploymentGeneration.job_id,
@@ -638,24 +764,7 @@ async def list_device_generations(
         query = query.where(DeploymentGeneration.seq > since_seq)
     query = query.limit(limit)
     rows = (await db.execute(query)).all()
-    return [
-        {
-            "generation_id": row.id,
-            "seq": row.seq,
-            "status": row.status,
-            "job_id": row.job_id,
-            "carrier_job_id": row.carrier_job_id,
-            "carrier_job_status": row.carrier_job_status,
-            "mode": row.mode,
-            "settlement_cohort": row.settlement_cohort,
-            "digest": row.digest,
-            "stream_revisions": row.stream_revisions,
-            "source_push_seq": row.source_push_seq,
-            "created_at": iso_z(row.created_at),
-            "updated_at": iso_z(row.updated_at),
-        }
-        for row in rows
-    ]
+    return [_device_generation_out(row) for row in rows]
 
 
 @router.post(
@@ -675,7 +784,7 @@ async def deployment_evidence(
     re-submit the identical Apply request and must not settle or roll back local intent from
     an unknown ID alone. A deterministic rejection can omit ``generations`` or set it to null
     when the attempt stamped none. Any other mismatch between a stored response and its stamped
-    generations is corrupt and NON-ACTIONABLE. It returns the internal invariant error envelope.
+    generations is corrupt and NON-ACTIONABLE. Its item carries an evidence error and a null projection.
     """
     from nso_adapter.core.generation import (
         BLOCKED_STATUSES,
@@ -759,12 +868,6 @@ async def deployment_evidence(
             assert generation.apply_attempt_id is not None  # the query filters on the requested ids
             generations_by_attempt.setdefault(generation.apply_attempt_id, []).append(generation)
 
-        for attempt in attempts_by_id.values():
-            _validate_attempt_generation_evidence(
-                attempt,
-                generations_by_attempt.get(attempt.id, []),
-            )
-
     return {
         "device_id": device_id,
         "head": _evidence_head_out(head),
@@ -773,15 +876,7 @@ async def deployment_evidence(
         "held_jobs": held_jobs,
         "pending_generations": pending_generations,
         "attempts": [
-            {
-                "apply_attempt_id": found.id,
-                "admission_state": found.admission_state,
-                "http_status": found.http_status,
-                "response": found.response,
-                "generations": [
-                    _attempt_generation_out(generation) for generation in generations_by_attempt.get(found.id, [])
-                ],
-            }
+            _evidence_attempt_out(found, generations_by_attempt.get(found.id, []))
             for attempt_id in requested_ids
             if (found := attempts_by_id.get(attempt_id)) is not None
         ],

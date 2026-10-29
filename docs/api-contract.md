@@ -457,6 +457,33 @@ document once the attempt is terminal.
 ### `GET /api/v1/devices/{id}` → `200`
 Device object plus `scope` (see below) and `last_job_id`.
 
+### Evidence envelopes
+
+Jobs, generation listings, deployment heads, and attempt admissions use this closed shape:
+`{identity, projection, evidence_error, digest}`. The identity comes from the relational
+record. A valid item has a complete validated `projection` and `evidence_error: null`.
+An invalid item has `projection: null` and `evidence_error: {code, digest}`. The digest
+inside the error equals the envelope digest. An error never discards a sibling item.
+Attempt envelopes also contain `generations`, a list of independent generation envelopes.
+The admission projection contains `selected` and `generation_ids` from stored records.
+Its invalidity does not hide those generation envelopes.
+
+The error codes form a closed set:
+
+| Code | Failure |
+|---|---|
+| `projection_construction` | The stored value cannot form the candidate projection. |
+| `schema_validation` | The candidate fails its complete response schema. |
+| `execution_contract` | The execution result fails the generated execution contract. |
+| `attempt_generation_membership` | The admission response disagrees with stamped generations. |
+
+The adapter hashes the underlying candidate, including invalid evidence, with SHA-256.
+Canonical JSON uses sorted object keys, compact separators, UTF-8, and no non-finite numbers.
+It preserves JSON types and absent keys. Aware timestamps, including acceptance identities,
+normalize to UTC. Identified record collections and requested identity sets sort by their
+canonical JSON. Other lists keep their order. Canonicalization changes the hash input only.
+Published projections retain their existing timestamp strings and list order.
+
 ### `GET /api/v1/devices/{id}/generations` → `200 | 401 | 404 | 422`
 
 Return the device's deployment generations in ascending `seq` order. The optional
@@ -467,24 +494,40 @@ out-of-range limit returns `422 validation_error`; it is never clamped.
 ```json
 [
   {
-    "generation_id": 81,
-    "seq": 4,
-    "status": "pending",
-    "job_id": null,
-    "carrier_job_id": null,
-    "carrier_job_status": null,
-    "mode": "networked",
-    "settlement_cohort": null,
-    "digest": "7e4a...",
-    "stream_revisions": {"vlan": 12},
-    "source_push_seq": {"vlan": 501},
-    "created_at": "2026-08-12T09:15:00Z",
-    "updated_at": "2026-08-12T09:30:00Z"
+    "identity": {
+      "device_id": 17,
+      "generation_id": 81,
+      "seq": 4,
+      "carrier_job_id": null,
+      "apply_attempt_id": null
+    },
+    "projection": {
+      "generation_id": 81,
+      "seq": 4,
+      "status": "pending",
+      "job_id": null,
+      "carrier_job_id": null,
+      "carrier_job_status": null,
+      "mode": "networked",
+      "settlement_cohort": null,
+      "digest": "7e4a...",
+      "stream_revisions": {
+        "vlan": 12
+      },
+      "source_push_seq": {
+        "vlan": 501
+      },
+      "created_at": "2026-08-12T09:15:00Z",
+      "updated_at": "2026-08-12T09:30:00Z"
+    },
+    "evidence_error": null,
+    "digest": "ebca2507937950ac5bcd69c69cdf886175b7f95c629006cddd5648df3319df84"
   }
 ]
 ```
 
-Every object always contains every shown field. An unset field is `null`, never
+Each item is an evidence envelope. Its `projection` contains the generation fields below.
+Every valid projection contains every shown field. An unset field is `null`, never
 missing. `job_id` is `null` while a pending generation is not attached to a job.
 `carrier_job_id` and `carrier_job_status` retain the terminal carrier identity after
 its job row is deleted. They are authoritative only when `status` is terminal. A
@@ -515,54 +558,126 @@ The response contains:
 {
   "device_id": 17,
   "head": {
-    "generation_id": 301,
-    "seq": 44,
-    "status": "failed",
-    "mode": "networked",
-    "settlement_cohort": null,
-    "sections": ["vlan"],
-    "source_push_seq": {"vlan": 501},
-    "stream_revisions": {"vlan": 12},
-    "apply_attempt_id": "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8",
-    "carrier_job_id": 900,
-    "carrier_job_status": "failed",
-    "carrier_job_result": null,
-    "row_outcomes": null,
-    "refusals": null,
-    "carrier_job_error": {"code": "nso_commit_failed", "message": "commit failed", "detail": {}},
-    "created_at": "2026-08-25T10:00:00Z",
-    "updated_at": "2026-08-25T10:01:00Z"
+    "identity": {
+      "device_id": 17,
+      "generation_id": 301,
+      "seq": 44,
+      "carrier_job_id": 900,
+      "apply_attempt_id": "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8"
+    },
+    "projection": {
+      "generation_id": 301,
+      "seq": 44,
+      "status": "failed",
+      "mode": "networked",
+      "settlement_cohort": null,
+      "sections": [
+        "vlan"
+      ],
+      "source_push_seq": {
+        "vlan": 501
+      },
+      "stream_revisions": {
+        "vlan": 12
+      },
+      "apply_attempt_id": "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8",
+      "carrier_job_id": 900,
+      "carrier_job_status": "failed",
+      "carrier_job_result": {
+        "row_outcomes": [],
+        "refusals": [],
+        "settlement_owners": [],
+        "commit_acknowledged": false
+      },
+      "row_outcomes": [],
+      "refusals": [],
+      "carrier_job_error": {
+        "code": "nso_commit_failed",
+        "message": "commit failed",
+        "detail": {}
+      },
+      "created_at": "2026-08-25T10:00:00Z",
+      "updated_at": "2026-08-25T10:01:00Z"
+    },
+    "evidence_error": null,
+    "digest": "91ae954b86f4d184b66ea3787c4337326cf2c5bdea105be779d6db513e27ab04"
   },
   "blocked": true,
   "write_work_pending": false,
-  "held_jobs": [901],
+  "held_jobs": [
+    901
+  ],
   "pending_generations": 1,
   "attempts": [
     {
-      "apply_attempt_id": "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8",
-      "admission_state": "admitted",
-      "http_status": 202,
-      "response": {
-        "outcome": "promoted",
-        "skipped": {},
-        "skipped_detail": null,
-        "generations": [{"generation_id": 301}]
+      "identity": {
+        "device_id": 17,
+        "apply_attempt_id": "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8"
       },
+      "projection": {
+        "apply_attempt_id": "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8",
+        "admission_state": "admitted",
+        "http_status": 202,
+        "response": {
+          "outcome": "promoted",
+          "skipped": {},
+          "skipped_detail": null,
+          "generations": [
+            {
+              "generation_id": 301
+            }
+          ]
+        },
+        "selected": {
+          "vlan": 501
+        },
+        "generation_ids": [
+          301
+        ]
+      },
+      "evidence_error": null,
+      "digest": "8adfdd0017925ce29b2584c95b284919af3657ea03becc27d5e0ac2a82c442a2",
       "generations": [
         {
-          "generation_id": 301,
-          "seq": 44,
-          "status": "failed",
-          "sections": ["vlan"],
-          "source_push_seq": {"vlan": 501},
-          "stream_revisions": {"vlan": 12},
-          "carrier_job_id": 900,
-          "carrier_job_status": "failed",
-          "carrier_job_result": null,
-          "row_outcomes": null,
-          "refusals": null,
-          "carrier_job_error": {"code": "nso_commit_failed", "message": "commit failed", "detail": {}},
-          "updated_at": "2026-08-25T10:01:00Z"
+          "identity": {
+            "device_id": 17,
+            "generation_id": 301,
+            "seq": 44,
+            "carrier_job_id": 900,
+            "apply_attempt_id": "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8"
+          },
+          "projection": {
+            "generation_id": 301,
+            "seq": 44,
+            "status": "failed",
+            "sections": [
+              "vlan"
+            ],
+            "source_push_seq": {
+              "vlan": 501
+            },
+            "stream_revisions": {
+              "vlan": 12
+            },
+            "carrier_job_id": 900,
+            "carrier_job_status": "failed",
+            "carrier_job_result": {
+              "row_outcomes": [],
+              "refusals": [],
+              "settlement_owners": [],
+              "commit_acknowledged": false
+            },
+            "row_outcomes": [],
+            "refusals": [],
+            "carrier_job_error": {
+              "code": "nso_commit_failed",
+              "message": "commit failed",
+              "detail": {}
+            },
+            "updated_at": "2026-08-25T10:01:00Z"
+          },
+          "evidence_error": null,
+          "digest": "5962810731ced0dcfe4a6e2af71804231b31df9330a9ff154e3311d2792c8ec5"
         }
       ]
     }
@@ -598,8 +713,9 @@ transaction or replays its committed response. If the original transaction faile
 admits the request. The caller must not settle or roll back local intent from an unknown ID
 alone. A generation-bearing replay body is corrupt when it omits the generation list, uses
 a non-list value, contains invalid or duplicate IDs, or does not name exactly the generations
-stamped to its attempt. Corrupt evidence is also non-actionable. The endpoint returns the
-`500 internal` error envelope for this invariant failure. More than 100 **distinct** IDs
+stamped to its attempt. Corrupt evidence is also non-actionable. Its attempt envelope
+returns `projection: null` and `attempt_generation_membership` in `evidence_error`.
+Its independently identified generation envelopes remain available. More than 100 **distinct** IDs
 returns `422 validation_error`, as does a raw list of more than 10 000 entries. A missing
 device returns `404 not_found`.
 
@@ -1121,20 +1237,38 @@ directions* under §Conventions.
 
 ### `GET /api/v1/jobs/{id}` → `200`
 ```json
-{ "id": 7, "type": "sync", "device_id": 1, "status": "succeeded",
-  "result": { "interfaces_written": 12, "interfaces_created": 2,
-              "changes_detected": 1 },
-  "error": null,
-  "row_outcomes": null, "refusals": null,
-  "context": null,
-  "created_at": "2026-05-20T10:05:30Z",
-  "updated_at": "2026-05-20T10:06:00Z",
-  "started_at": "2026-05-20T10:05:31Z",
-  "heartbeat_at": "2026-05-20T10:05:55Z",
-  "settle_seq": 4 }
+{
+  "identity": {
+    "id": 7,
+    "device_id": 1,
+    "settle_seq": 4
+  },
+  "projection": {
+    "id": 7,
+    "type": "sync",
+    "device_id": 1,
+    "status": "succeeded",
+    "result": {
+      "interfaces_written": 12,
+      "interfaces_created": 2,
+      "changes_detected": 1
+    },
+    "error": null,
+    "row_outcomes": null,
+    "refusals": null,
+    "context": null,
+    "created_at": "2026-05-20T10:05:30Z",
+    "updated_at": "2026-05-20T10:06:00Z",
+    "started_at": "2026-05-20T10:05:31Z",
+    "heartbeat_at": "2026-05-20T10:05:55Z",
+    "settle_seq": 4
+  },
+  "evidence_error": null,
+  "digest": "1ee70bfac3f0c5795a71695001903c748233791596ca67de0e1d45bf178c9e61"
+}
 ```
 
-Every key is always present; nullables are emitted as `null`.
+Every projection key is always present; nullables are emitted as `null`.
 `failed` jobs carry `error` in the standard error shape. Failed apply and removal jobs can also carry terminal execution evidence in `result`.
 
 `settle_seq` is this job's position in its **device's** settlement order, described under
@@ -1152,7 +1286,7 @@ routes, `static_route_results` — the per-route record described under
 
 ### `GET /api/v1/jobs?device_id={id}&status={status}` → `200`
 
-Array of job objects, newest first, 100 per page by default and 500 at most (see `limit`
+Array of job evidence envelopes, newest first, 100 per page by default and 500 at most (see `limit`
 under [The ordered settlement feed](#the-ordered-settlement-feed)). Both query params optional.
 
 Ordering is `created_at` descending, tie-broken by `id` descending. The tiebreak matters:

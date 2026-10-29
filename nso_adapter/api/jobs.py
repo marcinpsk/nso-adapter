@@ -20,9 +20,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404, RESP_422_VALIDATION, ResponseSpec, api_error
-from nso_adapter.api.execution import AttributedRefusalOut, RowOutcomeOut, evidence_projection
+from nso_adapter.api.execution import (
+    AttributedRefusalOut,
+    EvidenceEnvelope,
+    RowOutcomeOut,
+    evidence_envelope,
+    evidence_projection,
+    validate_execution_result,
+)
 from nso_adapter.api.pagination import DEFAULT_PAGE, validate_page_limit
-from nso_adapter.api.timestamps import iso_z
 from nso_adapter.store.meta import get_store_incarnation
 from nso_adapter.store.models import Job, JobStatus
 
@@ -32,6 +38,8 @@ STORE_INCARNATION_HEADER = "X-Store-Incarnation"
 
 
 class JobOut(BaseModel):
+    model_config = {"extra": "forbid"}
+
     """EMIT-NULL job shape — every key always present, nullables emitted as null."""
 
     id: int
@@ -51,22 +59,48 @@ class JobOut(BaseModel):
     settle_seq: int | None
 
 
+class JobIdentityOut(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    id: int
+    device_id: int | None
+    settle_seq: int | None
+
+
+class JobEvidenceOut(EvidenceEnvelope[JobIdentityOut, JobOut]):
+    pass
+
+
 def _job_out(j: Job) -> dict:
-    return {
+    candidate = {
         "id": j.id,
         "type": j.job_type.value,
         "device_id": j.device_id,
         "status": j.status.value,
         "result": j.result,
-        **evidence_projection(j.result),
         "error": j.error,
         "context": j.context,
-        "created_at": iso_z(j.created_at),
-        "updated_at": iso_z(j.updated_at),
-        "started_at": iso_z(j.started_at),
-        "heartbeat_at": iso_z(j.heartbeat_at),
+        "created_at": j.created_at,
+        "updated_at": j.updated_at,
+        "started_at": j.started_at,
+        "heartbeat_at": j.heartbeat_at,
         "settle_seq": j.settle_seq,
     }
+
+    return evidence_envelope(
+        {"id": j.id, "device_id": j.device_id, "settle_seq": j.settle_seq},
+        candidate,
+        JobOut,
+        construct=lambda value: value.update(evidence_projection(j.result)),
+        validate=lambda value: (
+            validate_execution_result(
+                value["result"],
+                required=j.job_type.value in ("apply", "removal") and j.status.value in ("succeeded", "failed"),
+            )
+            if j.job_type.value in ("apply", "removal")
+            else None
+        ),
+    )
 
 
 def stamp_store_incarnation(response: Response) -> None:
@@ -96,7 +130,7 @@ _RESP_200_INCARNATION: ResponseSpec = {
 @router.get(
     "",
     dependencies=[Depends(verify_token), Depends(stamp_store_incarnation)],
-    response_model=list[JobOut],
+    response_model=list[JobEvidenceOut],
     responses={**_RESP_200_INCARNATION, **RESP_401, **RESP_422_VALIDATION},
 )
 async def list_jobs(
@@ -165,7 +199,7 @@ async def list_jobs(
 @router.get(
     "/{job_id}",
     dependencies=[Depends(verify_token)],
-    response_model=JobOut,
+    response_model=JobEvidenceOut,
     responses={**RESP_401, **RESP_404, **RESP_422_VALIDATION},
 )
 async def get_job(job_id: int, db: AsyncSession = Depends(get_db)):

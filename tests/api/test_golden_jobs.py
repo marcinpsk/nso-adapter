@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from tests.api.evidence import valid_projection
 from tests.conftest import VALID_TOKEN, empty_execution_result, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -55,7 +56,7 @@ async def test_get_job_maximal_golden(adapter_client):
     device_id = await seed_device(nso_device_name="job-dev", netbox_device_id=201)
     job_id = await _seed_job(device_id, settle_seq=7)
 
-    body = (await adapter_client.get(f"/api/v1/jobs/{job_id}", headers=AUTH)).json()
+    body = valid_projection((await adapter_client.get(f"/api/v1/jobs/{job_id}", headers=AUTH)).json())
 
     assert body == {
         "id": job_id,
@@ -94,7 +95,7 @@ async def test_list_jobs_nullable_golden(adapter_client):
 
     body = (await adapter_client.get("/api/v1/jobs", headers=AUTH)).json()
 
-    assert body == [
+    assert [valid_projection(item) for item in body] == [
         {
             "id": job_id,
             "type": "provision",
@@ -143,4 +144,4 @@ async def test_the_default_page_is_unchanged_descending_at_100(adapter_client):
 
     body = (await adapter_client.get(f"/api/v1/jobs?device_id={device_id}", headers=AUTH)).json()
 
-    assert [r["id"] for r in body] == sorted(ids, reverse=True)[:100]
+    assert [valid_projection(r)["id"] for r in body] == sorted(ids, reverse=True)[:100]
