@@ -2,6 +2,22 @@
 
 <!-- version list -->
 
+## v1.17.1 (2026-10-29)
+
+### Chores
+
+- **deps**: Bump the python-minor-patch group across 1 directory with 2 updates
+  ([`6545c3b`](https://github.com/marcinpsk/nso-adapter/commit/6545c3b99a678ef1c86c7cabe1004fc044f04c34))
+
+### Testing
+
+- Bound every test subprocess that reaches the test database
+  ([`b4b9d7b`](https://github.com/marcinpsk/nso-adapter/commit/b4b9d7b47ad7fe0bbf00f525fe35c3c18e98ccab))
+
+- **execution**: Reject a stale carrier outcome count in the settlement fixture
+  ([`78b30c9`](https://github.com/marcinpsk/nso-adapter/commit/78b30c96abbaabdb9209b6dd6b3bdf931b0c3aed))
+
+
 ## v1.17.0 (2026-10-27)
 
 ### Bug Fixes
