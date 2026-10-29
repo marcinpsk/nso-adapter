@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, empty_execution_result, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -35,7 +35,7 @@ async def _seed_job(device_id: int, **overrides) -> int:
             device_id=device_id,
             status=JobStatus.succeeded,
             coalescible=True,
-            result={"ok": True},
+            result={**empty_execution_result(), "ok": True},
             error=None,
             context={"scope": "bgp"},
             created_at=TS,
@@ -62,7 +62,7 @@ async def test_get_job_maximal_golden(adapter_client):
         "type": "apply",
         "device_id": device_id,
         "status": "succeeded",
-        "result": {"ok": True},
+        "result": {**empty_execution_result(), "ok": True},
         "error": None,
         "context": {"scope": "bgp"},
         "created_at": TS_Z,
@@ -70,8 +70,8 @@ async def test_get_job_maximal_golden(adapter_client):
         "started_at": TS_Z,
         "heartbeat_at": TS_Z,
         "settle_seq": 7,
-        "row_outcomes": None,
-        "refusals": None,
+        "row_outcomes": [],
+        "refusals": [],
     }
 
 

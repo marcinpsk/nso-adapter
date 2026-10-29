@@ -152,6 +152,7 @@ def _alembic_upgrade_head(db_url: str) -> None:
         capture_output=True,
         env={**os.environ, "DATABASE_URL": db_url},
         check=False,
+        timeout=300,
     )
     if proc.returncode != 0:
         raise AssertionError(f"alembic upgrade head failed:\n{proc.stdout.decode()}\n{proc.stderr.decode()}")
