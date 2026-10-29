@@ -2,9 +2,6 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Malformed stored evidence stays attributable without hiding valid siblings."""
 
-import hashlib
-import json
-
 import pytest
 
 from nso_adapter.store.models import Job, JobStatus, JobType
@@ -414,14 +411,9 @@ async def test_feed_isolates_invalid_evidence_between_valid_siblings(adapter_cli
     assert b["projection"] is None
     assert b["evidence_error"] == {"code": code, "digest": b["digest"]}
     assert len(b["digest"]) == 64
-    assert (
-        a["digest"]
-        == hashlib.sha256(
-            json.dumps(
-                a["projection"], sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
-            ).encode()
-        ).hexdigest()
-    )
+    from nso_adapter.api.execution import evidence_digest
+
+    assert a["digest"] == evidence_digest(a["projection"])
 
     observation = await adapter_client.post(
         f"/api/v1/devices/{device_id}/settlement-observation",
@@ -576,9 +568,9 @@ async def test_generation_listing_isolates_invalid_metadata(adapter_client):
 @pytest.mark.parametrize(
     "before,after,equal",
     [
-        ({"accepted_at": "2026-10-01T12:00:00+02:00"}, {"accepted_at": "2026-10-01T10:00:00Z"}, True),
-        ({"acceptance_identity": "2026-10-01T12:00:00+02:00"}, {"acceptance_identity": "2026-10-01T10:00:00Z"}, True),
-        ({"generation_ids": [2, 1]}, {"generation_ids": [1, 2]}, True),
+        ({"accepted_at": "2026-10-01T12:00:00+02:00"}, {"accepted_at": "2026-10-01T10:00:00Z"}, False),
+        ({"acceptance_identity": "2026-10-01T12:00:00+02:00"}, {"acceptance_identity": "2026-10-01T10:00:00Z"}, False),
+        ({"generation_ids": [2, 1]}, {"generation_ids": [1, 2]}, False),
         ({"ordered": [2, 1]}, {"ordered": [1, 2]}, False),
         ({"nested": {}}, {"nested": {"missing": None}}, False),
         ({"typed": True}, {"typed": 1}, False),

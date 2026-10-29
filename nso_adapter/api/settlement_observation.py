@@ -102,6 +102,7 @@ async def settlement_observation(
     The first SELECT acquires the snapshot. All projections use this session until the
     read dependency rolls it back. Missing records carry explicit absence markers.
     """
+    body.apply_attempt_ids.sort()
     device = await db.get(Device, device_id)
     if device is None:
         raise api_error(404, "not_found", "Device not found")

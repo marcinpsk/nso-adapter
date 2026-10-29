@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 from datetime import UTC, datetime
+from decimal import MAX_EMAX, MIN_EMIN, Context, Decimal, localcontext
 from enum import Enum
 from typing import Generic, Literal, TypeVar
 from uuid import UUID
@@ -99,30 +100,30 @@ class EvidenceEnvelope(_ClosedOut, Generic[IdentityT, ProjectionT]):  # noqa: UP
     digest: str = Field(pattern="^[0-9a-f]{64}$")
 
 
-# These lists represent sets of identified records; other lists retain their order.
-_IDENTITY_COLLECTIONS = frozenset(
-    {
-        "row_outcomes",
-        "refusals",
-        "settlement_owners",
-        "logical_rows",
-        "generations",
-        "attempts",
-        "receipts",
-        "generation_ids",
-        "apply_attempt_ids",
-        "unknown_apply_attempt_ids",
-        "receipt_sections",
-    }
-)
-
-
-def canonical_evidence(value, *, field: str = ""):
-    """Preserve stored evidence, including values that cannot be normalized."""
+def _canonical_number(value: int | float | UnrepresentableJSONNumber) -> str:
+    exponent_literal = "0"
     if isinstance(value, UnrepresentableJSONNumber):
-        return {"$json_number": value.literal}
+        mantissa, _, exponent_literal = value.literal.lower().partition("e")
+        number = Decimal(mantissa)
+    else:
+        number = Decimal.from_float(value) if isinstance(value, float) else Decimal(value)
+    parts = number.as_tuple()
+    assert isinstance(parts.exponent, int)
+    digits = "".join(str(digit) for digit in parts.digits).rstrip("0")
+    if not digits:
+        return "0"
+    offset = parts.exponent + len(parts.digits) - len(digits)
+    # JSON exponents can exceed the exponent range of Decimal.
+    precision = max(len(exponent_literal), len(str(offset))) + 1
+    with localcontext(Context(prec=precision, Emax=MAX_EMAX, Emin=MIN_EMIN)):
+        exponent = Decimal(exponent_literal or "0") + offset
+    return f"{'-' if parts.sign else ''}{digits}e{exponent:f}"
+
+
+def canonical_evidence(value):
+    """Equal digests imply equal stored JSON values, with numbers compared by exact numeric value."""
     if isinstance(value, Enum):
-        return canonical_evidence(value.value, field=field)
+        return canonical_evidence(value.value)
     if isinstance(value, UUID):
         return str(value)
     if isinstance(value, datetime):
@@ -132,20 +133,14 @@ def canonical_evidence(value, *, field: str = ""):
         except (ValueError, OverflowError):
             pass
         return {"$datetime": value.isoformat()}
-    if isinstance(value, str) and (field.endswith("_at") or field == "acceptance_identity"):
-        try:
-            instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            if instant.tzinfo is not None and instant.utcoffset() is not None:
-                return iso_z(instant.astimezone(UTC))
-        except (ValueError, OverflowError):
-            return value
     if isinstance(value, float) and not math.isfinite(value):
         return {"$float": str(value)}
+    if isinstance(value, UnrepresentableJSONNumber) or isinstance(value, (int, float)) and not isinstance(value, bool):
+        return {"$json_number": _canonical_number(value)}
     if isinstance(value, dict):
-        return {key: canonical_evidence(item, field=key) for key, item in value.items()}
+        return {"$" + key if key.startswith("$") else key: canonical_evidence(item) for key, item in value.items()}
     if isinstance(value, list):
-        items = [canonical_evidence(item) for item in value]
-        return sorted(items, key=_canonical_json) if field in _IDENTITY_COLLECTIONS else items
+        return [canonical_evidence(item) for item in value]
     return value
 
 
@@ -159,7 +154,7 @@ def evidence_digest(candidate) -> str:
 
 def _projection_json_value(value):
     if isinstance(value, UnrepresentableJSONNumber):
-        raise ValueError("Stored JSON number exceeds the finite float range")
+        raise ValueError("Stored JSON number has no exact native representation")
     return canonical_evidence(value)
 
 
