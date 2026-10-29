@@ -53,6 +53,7 @@ from nso_adapter.api.redistribution import router as redistribution_router
 from nso_adapter.api.route_policy import router as route_policy_router
 from nso_adapter.api.scope import router as scope_router
 from nso_adapter.api.secrets import router as secrets_router
+from nso_adapter.api.settlement_observation import router as settlement_observation_router
 from nso_adapter.api.snmp import router as snmp_router
 from nso_adapter.api.static_route import router as static_route_router
 from nso_adapter.api.subinterface import router as subinterface_router
@@ -588,6 +589,7 @@ def create_app(*, lifespan_context: Callable[[FastAPI], AbstractAsyncContextMana
     app.include_router(secrets_router)
     app.include_router(ospf_router)
     app.include_router(redistribution_router)
+    app.include_router(settlement_observation_router)
     app.include_router(jobs_router)
     app.include_router(provision_attempts_router)
     app.include_router(config_router)

@@ -413,3 +413,34 @@ def test_asn_refusal_operations_declare_error_envelope(openapi_schema, path, met
     response = operation["responses"].get("409")
     assert response is not None
     assert response["content"]["application/json"]["schema"] == {"$ref": "#/components/schemas/ErrorEnvelope"}
+
+
+def test_settlement_envelopes_and_observation_publish_closed_roots(openapi_schema):
+    schemas = openapi_schema["components"]["schemas"]
+    names = (
+        "JobEvidenceOut",
+        "DeviceGenerationEvidenceOut",
+        "DeploymentHeadEvidenceOut",
+        "DeploymentGenerationEvidenceOut",
+        "DeploymentAttemptEvidenceOut",
+        "SettlementReceiptEvidenceOut",
+    )
+    for name in names:
+        schema = schemas[name]
+        assert schema["additionalProperties"] is False
+        fields = {"identity", "projection", "evidence_error", "digest"}
+        if name == "DeploymentAttemptEvidenceOut":
+            fields.add("generations")
+        assert set(schema["required"]) == fields
+    assert set(schemas["EvidenceErrorOut"]["properties"]["code"]["enum"]) == {
+        "projection_construction",
+        "schema_validation",
+        "execution_contract",
+        "attempt_generation_membership",
+    }
+    assert schemas["SettlementObservationIn"]["additionalProperties"] is False
+    assert schemas["SettlementObservationOut"]["additionalProperties"] is False
+    operation = openapi_schema["paths"]["/api/v1/devices/{device_id}/settlement-observation"]["post"]
+    assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/SettlementObservationOut",
+    }

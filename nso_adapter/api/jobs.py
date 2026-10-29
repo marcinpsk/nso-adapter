@@ -38,9 +38,9 @@ STORE_INCARNATION_HEADER = "X-Store-Incarnation"
 
 
 class JobOut(BaseModel):
-    model_config = {"extra": "forbid"}
+    """Emit every job field and retain null values."""
 
-    """EMIT-NULL job shape — every key always present, nullables emitted as null."""
+    model_config = {"extra": "forbid"}
 
     id: int
     type: str
@@ -72,6 +72,7 @@ class JobEvidenceOut(EvidenceEnvelope[JobIdentityOut, JobOut]):
 
 
 def _job_out(j: Job) -> dict:
+    identity = {"id": j.id, "device_id": j.device_id, "settle_seq": j.settle_seq}
     candidate = {
         "id": j.id,
         "type": j.job_type.value,
@@ -88,7 +89,7 @@ def _job_out(j: Job) -> dict:
     }
 
     return evidence_envelope(
-        {"id": j.id, "device_id": j.device_id, "settle_seq": j.settle_seq},
+        identity,
         candidate,
         JobOut,
         construct=lambda value: value.update(evidence_projection(j.result)),
@@ -104,13 +105,10 @@ def _job_out(j: Job) -> dict:
 
 
 def stamp_store_incarnation(response: Response) -> None:
-    """Carry the live store incarnation on the response, not on the rows (§3.4, r2-M5).
+    """Carry the store incarnation on every response, including empty pages.
 
-    A consumer resets its cursor when the store it belongs to is gone, and the page that
-    proves it is gone is an EMPTY one — a cursor past the end of a restarted sequence
-    returns no rows at all. A per-row field would therefore say nothing in the one state
-    where the decision is made, and an envelope would change the body the existing
-    consumers read. The value is a process-cached read, so it costs no query.
+    A cursor past the end of a rebuilt store can return no rows. The header lets the
+    consumer detect that rebuild and reset its cursor. Startup caches this store identity.
     """
     response.headers[STORE_INCARNATION_HEADER] = get_store_incarnation()[0]
 

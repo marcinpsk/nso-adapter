@@ -719,6 +719,43 @@ Its independently identified generation envelopes remain available. More than 10
 returns `422 validation_error`, as does a raw list of more than 10 000 entries. A missing
 device returns `404 not_found`.
 
+### `POST /api/v1/devices/{id}/settlement-observation`
+
+Read one settlement obligation from one REPEATABLE READ snapshot. The first SELECT
+acquires the snapshot. Every query uses the same session, without a transaction boundary.
+The route writes nothing. It never invokes Apply, retry, abandonment, or bookkeeping.
+
+```json
+{
+  "job_id": 900,
+  "after_settle_seq": 40,
+  "apply_attempt_ids": ["8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8"]
+}
+```
+
+All three fields are required. Extra fields are refused. `job_id` is positive;
+`after_settle_seq` is in `0..2^63-1`. Attempt identities use the deployment-evidence bounds.
+
+| Response field | Evidence |
+|---|---|
+| `request` | The requested target, cursor, and deduplicated attempt identities. |
+| `store_incarnation` | The store identity read inside this snapshot. |
+| `device` | Stored adapter device ID, nullable NetBox device ID, NSO instance and device name. |
+| `job` | The target job envelope, or null if absent from this device. Its identity includes `settle_seq`. |
+| `next_feed` | The actual first job identity after the cursor, or null. Sequence gaps do not imply absence. |
+| `generations` | Listing envelopes for current or retained target membership, requested attempts, and current head. |
+| `deployment` | The same head, barrier, attempt admission, and generation projections as deployment-evidence. |
+| `receipts` | Current device receipt envelopes, built with the intent-receipts projection. |
+| `absent` | Missing `job_id`, `apply_attempt_ids`, and relevant `receipt_sections`. |
+| `digest` | The SHA-256 digest of the complete observation, excluding this digest field. |
+
+`absent.job_id` is null when the target exists. The absence lists are empty when their
+records exist. An empty generation list and a null head are explicit absence markers.
+A record from another device is absent. A retained historical target can be behind the
+cursor; its observation does not change that cursor. Every present record uses the same
+projection function as its existing reader. Envelope digests include invalid candidates.
+A missing device returns `404 not_found`; invalid input returns `422 validation_error`.
+
 ### `PATCH /api/v1/devices/{id}` — correct the mapping
 Request (any subset):
 ```json

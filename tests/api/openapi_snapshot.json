@@ -3190,6 +3190,7 @@
       },
       "DeviceGenerationOut": {
         "additionalProperties": false,
+        "description": "Emit every receipt-facing field for one deployment generation.",
         "properties": {
           "carrier_job_id": {
             "anyOf": [
@@ -8564,6 +8565,7 @@
       },
       "JobOut": {
         "additionalProperties": false,
+        "description": "Emit every job field and retain null values.",
         "properties": {
           "context": {
             "anyOf": [
@@ -12127,6 +12129,30 @@
         "title": "ReadCapabilityReport",
         "type": "object"
       },
+      "ReceiptIdentityOut": {
+        "additionalProperties": false,
+        "properties": {
+          "device_id": {
+            "title": "Device Id",
+            "type": "integer"
+          },
+          "push_seq": {
+            "title": "Push Seq",
+            "type": "integer"
+          },
+          "section": {
+            "title": "Section",
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_id",
+          "section",
+          "push_seq"
+        ],
+        "title": "ReceiptIdentityOut",
+        "type": "object"
+      },
       "RedistributionComponentCoverage": {
         "properties": {
           "destinations": {
@@ -13592,6 +13618,189 @@
         "title": "SecretWriteRequest",
         "type": "object"
       },
+      "SettlementAbsenceOut": {
+        "additionalProperties": false,
+        "properties": {
+          "apply_attempt_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Apply Attempt Ids",
+            "type": "array"
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
+          },
+          "receipt_sections": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Receipt Sections",
+            "type": "array"
+          }
+        },
+        "required": [
+          "job_id",
+          "apply_attempt_ids",
+          "receipt_sections"
+        ],
+        "title": "SettlementAbsenceOut",
+        "type": "object"
+      },
+      "SettlementDeviceIdentityOut": {
+        "additionalProperties": false,
+        "properties": {
+          "device_id": {
+            "title": "Device Id",
+            "type": "integer"
+          },
+          "netbox_device_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Netbox Device Id"
+          },
+          "nso_device_name": {
+            "title": "Nso Device Name",
+            "type": "string"
+          },
+          "nso_instance": {
+            "title": "Nso Instance",
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_id",
+          "netbox_device_id",
+          "nso_instance",
+          "nso_device_name"
+        ],
+        "title": "SettlementDeviceIdentityOut",
+        "type": "object"
+      },
+      "SettlementObservationIn": {
+        "additionalProperties": false,
+        "properties": {
+          "after_settle_seq": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "After Settle Seq",
+            "type": "integer"
+          },
+          "apply_attempt_ids": {
+            "description": "At most 100 DISTINCT attempt UUIDs. Duplicates are collapsed before that bound is applied; at most 10000 raw list entries.",
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 10000,
+            "title": "Apply Attempt Ids",
+            "type": "array"
+          },
+          "job_id": {
+            "exclusiveMinimum": 0.0,
+            "maximum": 2147483647.0,
+            "title": "Job Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "apply_attempt_ids",
+          "job_id",
+          "after_settle_seq"
+        ],
+        "title": "SettlementObservationIn",
+        "type": "object"
+      },
+      "SettlementObservationOut": {
+        "additionalProperties": false,
+        "properties": {
+          "absent": {
+            "$ref": "#/components/schemas/SettlementAbsenceOut"
+          },
+          "deployment": {
+            "$ref": "#/components/schemas/DeviceDeploymentEvidenceOut"
+          },
+          "device": {
+            "$ref": "#/components/schemas/SettlementDeviceIdentityOut"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "generations": {
+            "items": {
+              "$ref": "#/components/schemas/DeviceGenerationEvidenceOut"
+            },
+            "title": "Generations",
+            "type": "array"
+          },
+          "job": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobEvidenceOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "next_feed": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobIdentityOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "receipts": {
+            "items": {
+              "$ref": "#/components/schemas/SettlementReceiptEvidenceOut"
+            },
+            "title": "Receipts",
+            "type": "array"
+          },
+          "request": {
+            "$ref": "#/components/schemas/SettlementObservationIn"
+          },
+          "store_incarnation": {
+            "format": "uuid",
+            "title": "Store Incarnation",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request",
+          "store_incarnation",
+          "device",
+          "job",
+          "next_feed",
+          "generations",
+          "deployment",
+          "receipts",
+          "absent",
+          "digest"
+        ],
+        "title": "SettlementObservationOut",
+        "type": "object"
+      },
       "SettlementOwnerOut": {
         "additionalProperties": false,
         "properties": {
@@ -13668,6 +13877,47 @@
           "settlement_cohort"
         ],
         "title": "SettlementOwnerOut",
+        "type": "object"
+      },
+      "SettlementReceiptEvidenceOut": {
+        "additionalProperties": false,
+        "properties": {
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "evidence_error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvidenceErrorOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "identity": {
+            "$ref": "#/components/schemas/ReceiptIdentityOut"
+          },
+          "projection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IntentReceiptOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "identity",
+          "projection",
+          "evidence_error",
+          "digest"
+        ],
+        "title": "SettlementReceiptEvidenceOut",
         "type": "object"
       },
       "SnmpCommunityEntry-Input": {
@@ -21016,6 +21266,84 @@
         "summary": "Harvest Community",
         "tags": [
           "secrets"
+        ]
+      }
+    },
+    "/api/v1/devices/{device_id}/settlement-observation": {
+      "post": {
+        "description": "Observe one target and its actual next-feed proof without changing the store.\n\nThe first SELECT acquires the snapshot. All projections use this session until the\nread dependency rolls it back. Missing records carry explicit absence markers.",
+        "operationId": "settlement_observation_api_v1_devices__device_id__settlement_observation_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SettlementObservationIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettlementObservationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Device not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Request validation failed (envelope shape)"
+          }
+        },
+        "security": [
+          {
+            "_OptionalBearer": []
+          }
+        ],
+        "summary": "Settlement Observation",
+        "tags": [
+          "devices"
         ]
       }
     },

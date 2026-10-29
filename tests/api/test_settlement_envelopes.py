@@ -63,6 +63,15 @@ async def test_feed_isolates_invalid_evidence_between_valid_siblings(adapter_cli
         ).hexdigest()
     )
 
+    observation = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/settlement-observation",
+        headers=AUTH,
+        json={"job_id": ids[1], "after_settle_seq": 0, "apply_attempt_ids": []},
+    )
+    assert observation.status_code == 200, observation.text
+    assert observation.json()["job"] == b
+    assert observation.json()["next_feed"] == a["identity"]
+
 
 @pytest.mark.parametrize(
     "failure,code",

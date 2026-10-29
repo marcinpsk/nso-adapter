@@ -3,9 +3,9 @@
 """Appendix S, chunk S3: the ascending settlement feed and its validation.
 
 The consumer walks one device's terminal jobs in the order they became true, from a
-durable cursor. That is a second reading of ``GET /api/v1/jobs``, not a replacement: the
-default page stays exactly what the three existing consumers read today, and the
-ascending page is reached only by asking for it.
+durable cursor. Both readings of ``GET /api/v1/jobs`` use item evidence envelopes.
+The default page retains its creation order. The ascending page requires an explicit
+request.
 
 Two properties carry the feed. Ordering is ``settle_seq`` alone — ``(device_id,
 settle_seq)`` is unique, so there is nothing to break a tie on. Invisibility of queued and

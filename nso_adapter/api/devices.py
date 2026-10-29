@@ -194,9 +194,9 @@ class ProvisionOut(BaseModel):
 
 
 class DeviceGenerationOut(BaseModel):
-    model_config = {"extra": "forbid"}
+    """Emit every receipt-facing field for one deployment generation."""
 
-    """One deployment generation, with every receipt-facing field always present."""
+    model_config = {"extra": "forbid"}
 
     generation_id: int
     seq: int

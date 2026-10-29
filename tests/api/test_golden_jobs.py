@@ -1,15 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Golden-body tests — the jobs router (list / get).
+"""Golden job projections inside validated evidence envelopes.
 
-EMIT-NULL shape: ``_job_out`` always emits all 12 keys, nullables (device_id,
-result, error, context, started_at, heartbeat_at, settle_seq) as null.
-created_at/updated_at are always-present "<iso>Z" strings; started_at/heartbeat_at
-are "<iso>Z" or null. The goldens pin the full key set (before + after typing).
-
-``settle_seq`` (Appendix S §3.3) is additive: the key joins the shape, and the
-default page keeps its rows, its direction and its limit of 100 (S3.4) — the three
-existing consumers read it unchanged.
+Every projection field is present. Nullable values stay null. Timestamps use UTC.
+The default page retains its creation order and limit.
 """
 
 from __future__ import annotations
