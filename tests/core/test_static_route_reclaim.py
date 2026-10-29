@@ -19,7 +19,7 @@ from sqlalchemy import select
 
 from nso_adapter.core.claim import acquire_claim, release_claim
 from nso_adapter.store.models import Job, JobStatus, JobType, StaticRouteTombstone
-from tests.conftest import seed_device, session
+from tests.conftest import empty_execution_result, seed_device, session
 from tests.core.test_static_route_put import A, B, wire
 from tests.core.test_static_route_removal import SrFake, seed_tomb, sr_client, tombstone_ids
 
@@ -34,7 +34,7 @@ async def seed_succeeded_owner(device_id: int) -> int:
             status=JobStatus.succeeded,
             coalescible=False,
             context={"scope": "static_route"},
-            result={"scope": "static_route"},
+            result={**empty_execution_result(), "scope": "static_route"},
         )
         db.add(job)
         await db.commit()

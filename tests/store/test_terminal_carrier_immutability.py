@@ -16,6 +16,7 @@ from nso_adapter.store.models import (
     JobStatus,
     JobType,
 )
+from tests.conftest import empty_execution_result
 
 
 def _seed(
@@ -29,7 +30,7 @@ def _seed(
         status=job_status,
         device_id=device.id,
         coalescible=False,
-        result=None if empty_payload else {"sections": {"vlan": {"outcome": "failed"}}},
+        result=None if empty_payload else {**empty_execution_result(), "sections": {"vlan": {"outcome": "failed"}}},
         error=None if empty_payload else {"code": "device_refused"},
     )
     db.add(job)
@@ -166,7 +167,7 @@ def test_terminal_generation_snapshot_can_be_filled_once(pg_sync_session, empty_
     assert tuple(snapshot) == (
         job_id,
         "failed",
-        None if empty_payload else {"sections": {"vlan": {"outcome": "failed"}}},
+        None if empty_payload else {**empty_execution_result(), "sections": {"vlan": {"outcome": "failed"}}},
         None if empty_payload else {"code": "device_refused"},
     )
     pg_sync_session.execute(
