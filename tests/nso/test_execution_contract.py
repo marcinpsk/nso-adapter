@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba
+import copy
 import hashlib
 import json
 import re
@@ -75,3 +76,7 @@ def test_installed_contract_accepts_settlement_fixture():
         "commit_acknowledged": False,
     }
     assert contract.validate_result(result, sections=("bgp",)) is result
+    stale_count = copy.deepcopy(result)
+    stale_count["bgp_count_by_outcome"]["apply_failed"] = 0
+    with pytest.raises(contract.ContractError, match="carrier outcome count mismatch"):
+        contract.validate_result(stale_count, sections=("bgp",))
