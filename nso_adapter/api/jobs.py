@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Literal
 
+import anyio.to_thread
 from fastapi import APIRouter, Depends, Response
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -190,8 +191,9 @@ async def list_jobs(
         # consumers polling the same device can then see different orders. The `id` tiebreak
         # makes the existing descending page deterministic; it changes no row or direction.
         query = query.order_by(Job.created_at.desc(), Job.id.desc())
-    result = await db.execute(query)
-    return [_job_out(j) for j in result.scalars().all()]
+    rows = (await db.execute(query)).scalars().all()
+    # Envelope digests and contract checks are CPU-bound: keep them off the event loop.
+    return await anyio.to_thread.run_sync(lambda: [_job_out(j) for j in rows])
 
 
 @router.get(
@@ -204,4 +206,4 @@ async def get_job(job_id: int, db: AsyncSession = Depends(get_db)):
     job = await db.get(Job, job_id)
     if not job:
         raise api_error(404, "not_found", "Job not found")
-    return _job_out(job)
+    return await anyio.to_thread.run_sync(_job_out, job)

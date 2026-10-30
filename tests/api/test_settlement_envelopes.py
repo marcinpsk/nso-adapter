@@ -659,3 +659,69 @@ async def test_evidence_digest_preserves_types_absence_and_meaningful_order(adap
     assert first.json()["projection"]["result"] == before
     assert second.json()["projection"]["result"] == after
     assert (first.json()["digest"] == second.json()["digest"]) is equal
+
+
+@pytest.mark.parametrize("endpoint", ["jobs", "job", "listing", "deployment", "observation"])
+async def test_readers_build_evidence_off_the_event_loop(adapter_client, monkeypatch, endpoint):
+    import threading
+    import uuid
+
+    from nso_adapter.api import devices, execution, jobs, settlement_observation
+    from nso_adapter.store.models import DeploymentApplyAttempt, GenerationStatus
+    from tests.api.test_deployment_evidence import _generation
+
+    loop_thread = threading.get_ident()
+    builder_threads: set[int] = set()
+
+    def record(original):
+        def build(*args, **kwargs):
+            builder_threads.add(threading.get_ident())
+            return original(*args, **kwargs)
+
+        return build
+
+    for module in (devices, jobs, settlement_observation):
+        for name in ("evidence_envelope", "evidence_digest"):
+            if hasattr(module, name):
+                monkeypatch.setattr(module, name, record(getattr(execution, name)))
+
+    device_id = await seed_device(nso_device_name="off-loop-evidence", netbox_device_id=18530)
+    attempt_id = uuid.uuid4()
+    async with session() as db:
+        job = Job(
+            device_id=device_id,
+            job_type=JobType.apply,
+            status=JobStatus.succeeded,
+            coalescible=False,
+            result=empty_execution_result(),
+            settle_seq=1,
+        )
+        attempt = DeploymentApplyAttempt(
+            id=attempt_id, device_id=device_id, selected={}, admission_state="admitted", http_status=202, response={}
+        )
+        db.add_all([job, attempt])
+        await db.flush()
+        generation = _generation(device_id, 1, GenerationStatus.pending, apply_attempt_id=attempt_id)
+        db.add(generation)
+        await db.flush()
+        attempt.response = {"generations": [{"generation_id": generation.id}]}
+        await db.commit()
+        job_id = job.id
+
+    evidence = {"apply_attempt_ids": [str(attempt_id)]}
+    requests = {
+        "jobs": ("GET", f"/api/v1/jobs?device_id={device_id}", None),
+        "job": ("GET", f"/api/v1/jobs/{job_id}", None),
+        "listing": ("GET", f"/api/v1/devices/{device_id}/generations", None),
+        "deployment": ("POST", f"/api/v1/devices/{device_id}/deployment-evidence", evidence),
+        "observation": (
+            "POST",
+            f"/api/v1/devices/{device_id}/settlement-observation",
+            {**evidence, "job_id": job_id, "after_settle_seq": 0},
+        ),
+    }
+    method, url, body = requests[endpoint]
+    response = await adapter_client.request(method, url, headers=AUTH, json=body)
+    assert response.status_code == 200, response.text
+    assert builder_threads
+    assert loop_thread not in builder_threads

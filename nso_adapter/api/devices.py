@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Annotated, Never
 from uuid import UUID
 
+import anyio.to_thread
 import structlog
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field, IPvAnyAddress, field_validator
@@ -789,7 +790,7 @@ async def list_device_generations(
         query = query.where(DeploymentGeneration.seq > since_seq)
     query = query.limit(limit)
     rows = (await db.execute(query)).all()
-    return [_device_generation_listing_out(row) for row in rows]
+    return await anyio.to_thread.run_sync(lambda: [_device_generation_listing_out(row) for row in rows])
 
 
 @router.post(
@@ -893,20 +894,26 @@ async def deployment_evidence(
             assert generation.apply_attempt_id is not None  # the query filters on the requested ids
             generations_by_attempt.setdefault(generation.apply_attempt_id, []).append(generation)
 
-    return {
-        "device_id": device_id,
-        "head": _evidence_head_out(head),
-        "blocked": head is not None and head.status in BLOCKED_STATUSES,
-        "write_work_pending": write_work_pending,
-        "held_jobs": held_jobs,
-        "pending_generations": pending_generations,
-        "attempts": [
-            _evidence_attempt_out(found, generations_by_attempt.get(found.id, []))
-            for attempt_id in requested_ids
-            if (found := attempts_by_id.get(attempt_id)) is not None
-        ],
-        "unknown_apply_attempt_ids": [attempt_id for attempt_id in requested_ids if attempt_id not in attempts_by_id],
-    }
+    def build() -> dict:
+        return {
+            "device_id": device_id,
+            "head": _evidence_head_out(head),
+            "blocked": head is not None and head.status in BLOCKED_STATUSES,
+            "write_work_pending": write_work_pending,
+            "held_jobs": held_jobs,
+            "pending_generations": pending_generations,
+            "attempts": [
+                _evidence_attempt_out(found, generations_by_attempt.get(found.id, []))
+                for attempt_id in requested_ids
+                if (found := attempts_by_id.get(attempt_id)) is not None
+            ],
+            "unknown_apply_attempt_ids": [
+                attempt_id for attempt_id in requested_ids if attempt_id not in attempts_by_id
+            ],
+        }
+
+    # Envelope digests and contract checks are CPU-bound: keep them off the event loop.
+    return await anyio.to_thread.run_sync(build)
 
 
 class DevicePatch(BaseModel):

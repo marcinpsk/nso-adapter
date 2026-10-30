@@ -4,6 +4,7 @@
 
 from uuid import UUID
 
+import anyio.to_thread
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, or_, select
@@ -174,32 +175,37 @@ async def settlement_observation(
     for selected in selections:
         if isinstance(selected, dict):
             sections.update(INTENT_STREAMS.intersection(selected))
-    observed = {
-        "request": body.model_dump(mode="json"),
-        "store_incarnation": meta.incarnation,
-        "device": {
-            "device_id": device.id,
-            "netbox_device_id": device.netbox_device_id,
-            "nso_instance": device.nso_instance,
-            "nso_device_name": device.nso_device_name,
-        },
-        "job": _job_out(job) if job is not None else None,
-        "next_feed": dict(next_feed) if next_feed is not None else None,
-        "generations": [_device_generation_out(row) for row in generation_rows],
-        "deployment": deployment,
-        "receipts": [
-            evidence_envelope(
-                {"device_id": row.device_id, "section": row.section, "push_seq": row.push_seq},
-                {},
-                IntentReceiptOut,
-                construct=lambda candidate, row=row: candidate.update(_receipt_out(row)),
-            )
-            for row in receipts
-        ],
-        "absent": {
-            "job_id": body.job_id if job is None else None,
-            "apply_attempt_ids": deployment["unknown_apply_attempt_ids"],
-            "receipt_sections": sorted(sections - {row.section for row in receipts}),
-        },
-    }
-    return {**observed, "digest": evidence_digest(observed)}
+
+    def build() -> dict:
+        observed = {
+            "request": body.model_dump(mode="json"),
+            "store_incarnation": meta.incarnation,
+            "device": {
+                "device_id": device.id,
+                "netbox_device_id": device.netbox_device_id,
+                "nso_instance": device.nso_instance,
+                "nso_device_name": device.nso_device_name,
+            },
+            "job": _job_out(job) if job is not None else None,
+            "next_feed": dict(next_feed) if next_feed is not None else None,
+            "generations": [_device_generation_out(row) for row in generation_rows],
+            "deployment": deployment,
+            "receipts": [
+                evidence_envelope(
+                    {"device_id": row.device_id, "section": row.section, "push_seq": row.push_seq},
+                    {},
+                    IntentReceiptOut,
+                    construct=lambda candidate, row=row: candidate.update(_receipt_out(row)),
+                )
+                for row in receipts
+            ],
+            "absent": {
+                "job_id": body.job_id if job is None else None,
+                "apply_attempt_ids": deployment["unknown_apply_attempt_ids"],
+                "receipt_sections": sorted(sections - {row.section for row in receipts}),
+            },
+        }
+        return {**observed, "digest": evidence_digest(observed)}
+
+    # Envelope digests and contract checks are CPU-bound: keep them off the event loop.
+    return await anyio.to_thread.run_sync(build)
