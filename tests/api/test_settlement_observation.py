@@ -112,6 +112,9 @@ async def test_observation_reuses_existing_projections_and_performs_no_writes(ad
     assert body["generations"] == listing.json()
     assert body["deployment"] == evidence.json()
     assert [item["projection"] for item in body["receipts"]] == receipts.json()["receipts"]
+    assert [item["identity"] for item in body["receipts"]] == [
+        {key: row[key] for key in ("device_id", "section", "push_seq")} for row in receipts.json()["receipts"]
+    ]
     from nso_adapter.store.meta import get_store_incarnation
 
     assert body["store_incarnation"] == get_store_incarnation()[0]

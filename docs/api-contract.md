@@ -459,9 +459,9 @@ Device object plus `scope` (see below) and `last_job_id`.
 
 ### Evidence envelopes
 
-Jobs, generation listings, deployment heads, and attempt admissions use this closed shape:
-`{identity, projection, evidence_error, digest}`. The identity comes from the relational
-record. A valid item has a complete validated `projection` and `evidence_error: null`.
+Jobs, generation listings, deployment heads, attempt admissions, and settlement-observation
+receipts use this closed shape: `{identity, projection, evidence_error, digest}`. The identity
+comes from the relational record. A receipt identity is `{device_id, section, push_seq}`. A valid item has a complete validated `projection` and `evidence_error: null`.
 An invalid item has `projection: null` and `evidence_error: {code, digest}`. The digest
 inside the error equals the envelope digest. An error never discards a sibling item.
 Attempt envelopes also contain `generations`, a list of independent generation envelopes.
@@ -478,14 +478,30 @@ The error codes form a closed set:
 | `attempt_generation_membership` | The admission response disagrees with stamped generations. |
 
 The adapter hashes the underlying candidate, including invalid evidence, with SHA-256.
-Canonical JSON uses sorted object keys, compact separators, and UTF-8. It preserves JSON
-types, absent keys, stored timestamp strings, and every list's order. Numbers compare by
-their exact stored JSON value. A finite float represents the decimal value of its shortest
-round-trip literal. Numbers that cannot round-trip through a finite float retain their
-exact literal value. Numeric tags cannot collide with stored object keys. Native aware
-datetime values normalize to UTC. Canonicalization changes the hash input only.
-Decoding and hashing use iterative walks. Evidence that exceeds the response schema's
-nesting limit retains its digest and returns an item error without hiding valid siblings.
+The digest is lowercase hex over this canonical form. It is not RFC 8785 (JCS):
+
+- An object key that starts with `$` gets one more leading `$`. The escaped keys sort by
+  Unicode code point.
+- Lists keep their order. Absent keys stay absent. Strings, booleans, and `null` stay as they are.
+  A UUID becomes its string form.
+- Every number, integer or not, becomes `{"$json_number": "<coefficient>e<exponent>"}`.
+  The coefficient is the decimal digits without trailing zeros, with a leading `-` when
+  negative. Zero is `"0"`. So `100` is `"1e2"`, `1.25` is `"125e-2"`, and `0.1` is `"1e-1"`.
+  The tag holds the exact numeric value, not the stored spelling: `1.0` and `1` are equal.
+  A finite float uses its shortest round-trip literal. A number that cannot round-trip
+  through a finite float keeps its exact stored value.
+- A non-finite float becomes `{"$float": "inf" | "-inf" | "nan"}`.
+- A native datetime with a UTC offset becomes its UTC ISO 8601 string with a `Z` suffix.
+  A naive datetime, or one that cannot convert to UTC, becomes `{"$datetime": "<isoformat>"}`.
+  Stored timestamp strings stay strings.
+- A stored document deeper than the nesting limit becomes `{"$json_document": "<stored text>"}`.
+- The result is serialized with compact separators (`,` and `:`) and no ASCII escaping.
+  It is encoded as UTF-8 with `surrogatepass`: a lone surrogate encodes as its 3-byte form.
+
+Because of the key escape, a stored object cannot imitate a tag. Canonicalization changes
+the hash input only. Decoding and hashing use iterative walks. Evidence that exceeds the
+response schema's nesting limit retains its digest and returns an item error without
+hiding valid siblings.
 
 ### `GET /api/v1/devices/{id}/generations` → `200 | 401 | 404 | 422`
 
@@ -1407,7 +1423,7 @@ persisted per device so a process restart does not reset it.
 
 ## Intent push receipts
 
-### `GET /api/v1/intent-receipts` → `200 | 401 | 422`
+### `GET /api/v1/intent-receipts` → `200 | 401 | 422 | 500`
 
 Every per-key push receipt, plus the two fleet-wide maxima a restored pusher needs before
 it resolves a single outstanding claim. Filterable by `device_id` and by `section`; an
@@ -1447,6 +1463,11 @@ table above. The plugin's delivery key for the interface family is `interface` a
 
 `response` is the stored response that push returned. A restored pusher re-validates its
 claim's exact deletion set against it rather than re-sending.
+
+This route has no evidence envelopes. When a stored receipt holds a number with no exact
+native value, or a document deeper than `MAX_STORED_JSON_DEPTH`, the route returns
+`500 internal`. `settlement-observation` contains the same failure in that receipt's
+envelope as `projection_construction`.
 
 **Both maxima are fleet-wide, filter or no filter.** `global_max_push_seq` is the highest
 admitted sequence anywhere, so a restored pusher allocates above it and never re-uses one.

@@ -264,3 +264,44 @@ async def test_numeric_decode_and_canonicalization_ignore_decimal_context():
         assert evidence_digest(load_store_json("1.00000000000000001")) != evidence_digest(
             load_store_json("1.00000000000000002")
         )
+
+
+async def test_evidence_digest_matches_the_documented_wire_format():
+    import hashlib
+    from datetime import datetime, timedelta, timezone
+
+    from nso_adapter.api.execution import evidence_digest
+    from nso_adapter.store.json_codec import UnrepresentableJSONNumber, load_store_json
+
+    # docs/api-contract.md "Evidence envelopes" lists each rule this value exercises.
+    value = {
+        "z": [3, 1],
+        "$tag": 100,
+        "a": {"num": 1.25, "tenth": 0.1, "one": 1.0, "zero": 0, "neg": -0.5},
+        "big": UnrepresentableJSONNumber("1E400"),
+        "inf": float("-inf"),
+        "aware": datetime(2026, 10, 1, 12, 0, tzinfo=timezone(timedelta(hours=2))),
+        "naive": datetime(2026, 10, 1, 12, 0),  # noqa: DTZ001
+        "stamp": "2026-10-01T12:00:00+02:00",
+        "uuid": uuid.UUID(int=1),
+        "deep": load_store_json("[" * 257 + "0" + "]" * 257),
+        "text": "é\ud800",
+        "flags": [True, None],
+    }
+    expected = (
+        '{"$$tag":{"$json_number":"1e2"},'
+        '"a":{"neg":{"$json_number":"-5e-1"},"num":{"$json_number":"125e-2"},"one":{"$json_number":"1e0"},'
+        '"tenth":{"$json_number":"1e-1"},"zero":{"$json_number":"0"}},'
+        '"aware":"2026-10-01T10:00:00Z",'
+        '"big":{"$json_number":"1e400"},'
+        '"deep":{"$json_document":"' + "[" * 257 + "0" + "]" * 257 + '"},'
+        '"flags":[true,null],'
+        '"inf":{"$float":"-inf"},'
+        '"naive":{"$datetime":"2026-10-01T12:00:00"},'
+        '"stamp":"2026-10-01T12:00:00+02:00",'
+        '"text":"é\ud800",'
+        '"uuid":"00000000-0000-0000-0000-000000000001",'
+        '"z":[{"$json_number":"3e0"},{"$json_number":"1e0"}]}'
+    )
+    assert evidence_digest(value) == hashlib.sha256(expected.encode("utf-8", "surrogatepass")).hexdigest()
+    assert evidence_digest({"x": 1}) == evidence_digest({"x": 1.0}) == evidence_digest({"x": load_store_json("1.00")})
