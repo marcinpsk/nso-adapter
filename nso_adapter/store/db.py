@@ -12,6 +12,8 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.sql.dml import UpdateBase
 
+from nso_adapter.store.json_codec import load_store_json
+
 _engine = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
@@ -97,6 +99,7 @@ def create_store_engine(database_url: str, *, application_name: str, **engine_kw
     return create_async_engine(
         database_url,
         connect_args={"server_settings": {"application_name": application_name}},
+        json_deserializer=load_store_json,
         **engine_kwargs,
     )
 

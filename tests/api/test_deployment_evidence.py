@@ -12,7 +12,8 @@ import pytest
 import sqlalchemy as sa
 
 from nso_adapter.api.timestamps import iso_z
-from tests.conftest import VALID_TOKEN, empty_execution_result, seed_device, session
+from tests.api.evidence import deployment_projections, empty_vlan_execution_result
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 pytestmark = pytest.mark.anyio
 
@@ -62,7 +63,7 @@ async def test_evidence_serves_terminal_attempt_after_carrier_deletion(adapter_c
     device_id = await seed_device(nso_device_name="evidence-retained-carrier", netbox_device_id=16230)
     attempt_id = uuid.uuid4()
     unknown_id = uuid.uuid4()
-    result = {**empty_execution_result(), "sections": {"vlan": {"outcome": "failed"}}}
+    result = {**empty_vlan_execution_result(), "sections": {"vlan": {"outcome": "failed"}}}
     error = {"code": "nso_commit_failed", "message": "device refused the deployment", "detail": {}}
     async with session() as db:
         attempt = DeploymentApplyAttempt(
@@ -132,7 +133,7 @@ async def test_evidence_serves_terminal_attempt_after_carrier_deletion(adapter_c
     )
 
     assert response.status_code == 200, response.text
-    body = response.json()
+    body = deployment_projections(response.json())
     assert body == {
         "device_id": device_id,
         "head": {
@@ -164,6 +165,8 @@ async def test_evidence_serves_terminal_attempt_after_carrier_deletion(adapter_c
                 "admission_state": "admitted",
                 "http_status": 202,
                 "response": replay,
+                "selected": {"vlan": 71},
+                "generation_ids": [generation_id],
                 "generations": [
                     {
                         "generation_id": generation_id,
@@ -231,7 +234,7 @@ async def test_evidence_preserves_stream_revisions_and_provenance(
     )
 
     assert response.status_code == 200, response.text
-    body = response.json()
+    body = deployment_projections(response.json())
     for served_generation in (body["head"], body["attempts"][0]["generations"][0]):
         assert served_generation["sections"] == sections
         assert served_generation["source_push_seq"] == source_push_seq
@@ -271,7 +274,7 @@ async def test_terminal_snapshots_survive_carrier_deletion_in_evidence(
         }[generation_status],
     )
     attempt_id = uuid.uuid4()
-    result = {**empty_execution_result(), "terminal_path": generation_status}
+    result = {**empty_vlan_execution_result(), "terminal_path": generation_status}
     error = (
         None
         if job_status == "succeeded"
@@ -344,7 +347,7 @@ async def test_terminal_snapshots_survive_carrier_deletion_in_evidence(
     )
 
     assert response.status_code == 200, response.text
-    body = response.json()
+    body = deployment_projections(response.json())
     if generation_status in {"settled", "abandoned"}:
         assert body["head"] is None
     else:
@@ -402,7 +405,7 @@ async def test_evidence_reports_a_blocked_removal_and_its_held_apply(adapter_cli
     )
 
     assert response.status_code == 200, response.text
-    body = response.json()
+    body = deployment_projections(response.json())
     assert body["head"]["generation_id"] == head_id
     assert body["head"]["status"] == "failed"
     assert body["blocked"] is True
@@ -449,7 +452,7 @@ async def test_evidence_keeps_the_device_head_before_cohortless_and_reissue_succ
     )
 
     assert response.status_code == 200, response.text
-    assert response.json()["head"]["generation_id"] == failed_id
+    assert deployment_projections(response.json())["head"]["generation_id"] == failed_id
     assert response.json()["pending_generations"] == 2
 
 
@@ -471,7 +474,10 @@ async def test_evidence_finds_the_head_after_120_settled_predecessors(adapter_cl
     )
 
     assert response.status_code == 200, response.text
-    assert (response.json()["head"]["generation_id"], response.json()["head"]["seq"]) == (head_id, 121)
+    assert (
+        deployment_projections(response.json())["head"]["generation_id"],
+        deployment_projections(response.json())["head"]["seq"],
+    ) == (head_id, 121)
 
 
 async def test_unknown_attempt_ids_are_reported_as_non_actionable(adapter_client):
@@ -537,12 +543,14 @@ async def test_unstamped_rejection_envelope_is_valid_attempt_evidence(adapter_cl
     )
 
     assert response.status_code == 200, response.text
-    assert response.json()["attempts"] == [
+    assert deployment_projections(response.json())["attempts"] == [
         {
             "apply_attempt_id": str(attempt_id),
             "admission_state": "rejected",
             "http_status": 409,
             "response": replay,
+            "selected": {"vlan": 74},
+            "generation_ids": [],
             "generations": [],
         }
     ]
@@ -586,11 +594,14 @@ async def test_rejection_envelope_without_generation_list_is_corrupt_when_a_gene
         json={"apply_attempt_ids": [str(attempt_id)]},
     )
 
-    assert response.status_code == 500
-    assert response.json() == {"error": {"code": "internal", "message": "Internal server error", "detail": {}}}
+    assert response.status_code == 200
+    (attempt,) = response.json()["attempts"]
+    assert attempt["identity"]["apply_attempt_id"] == str(attempt_id)
+    assert attempt["projection"] is None
+    assert attempt["evidence_error"] == {"code": "attempt_generation_membership", "digest": attempt["digest"]}
 
 
-async def test_corrupt_attempt_generation_evidence_returns_the_internal_error_envelope(
+async def test_corrupt_attempt_generation_evidence_returns_an_identified_error(
     adapter_client,
 ):
     from structlog.testing import capture_logs
@@ -626,8 +637,11 @@ async def test_corrupt_attempt_generation_evidence_returns_the_internal_error_en
             json={"apply_attempt_ids": [str(attempt_id)]},
         )
 
-    assert response.status_code == 500
-    assert response.json() == {"error": {"code": "internal", "message": "Internal server error", "detail": {}}}
+    assert response.status_code == 200
+    (attempt,) = response.json()["attempts"]
+    assert attempt["identity"]["apply_attempt_id"] == str(attempt_id)
+    assert attempt["projection"] is None
+    assert attempt["evidence_error"] == {"code": "attempt_generation_membership", "digest": attempt["digest"]}
     invariant = next(log for log in logs if log["event"] == "deployment_evidence.invariant_violation")
     assert invariant["apply_attempt_id"] == attempt_id
     assert invariant["response_generation_ids"] == [999999]
@@ -752,7 +766,9 @@ async def test_evidence_deduplicates_attempt_ids_before_applying_the_request_bou
     )
 
     assert response.status_code == 200, response.text
-    assert [attempt["apply_attempt_id"] for attempt in response.json()["attempts"]] == [str(attempt_id)]
+    assert [attempt["apply_attempt_id"] for attempt in deployment_projections(response.json())["attempts"]] == [
+        str(attempt_id)
+    ]
     assert response.json()["unknown_apply_attempt_ids"] == [str(unknown_id)]
 
 
@@ -897,7 +913,7 @@ def test_api_contract_documents_unknown_attempts_and_retention():
 
     assert "non-actionable" in section.lower()
     assert "corrupt" in section.lower()
-    assert "500 internal" in section.lower()
+    assert "attempt_generation_membership" in section
     assert "referenced by a generation is never deleted" in section
     assert "unique document section names" in section
     assert "keyed by intent stream" in section

@@ -46,6 +46,7 @@ from nso_adapter.store.models import (
     VlanIntent,
 )
 from tests._secret_discipline import assert_records_free_of, assert_text_free_of
+from tests.api.evidence import valid_projection
 from tests.collection_coverage_helpers import exported_sections
 from tests.conftest import push_seq, seed_device, session
 from tests.core.test_action_apply_promotion import _apply, _put_routes
@@ -610,7 +611,7 @@ async def terminal(api, device_id, *, refused=True):
     assert_text_free_of(response.text, [CANARY])
     assert response.status_code == 200
     projection = {key: job.result[key] for key in ("row_outcomes", "refusals")}
-    assert {key: response.json()[key] for key in projection} == projection
+    assert {key: valid_projection(response.json())[key] for key in projection} == projection
     for key, counts in job.result.items():
         if key.endswith("_count_by_outcome"):
             assert set(counts) == {"in_sync", "apply_failed", "not_applied", "unavailable"}
@@ -625,7 +626,7 @@ async def terminal(api, device_id, *, refused=True):
     )
     assert_text_free_of(response.text, [CANARY])
     assert response.status_code == 200
-    assert {key: response.json()["head"][key] for key in projection} == projection
+    assert {key: valid_projection(response.json()["head"])[key] for key in projection} == projection
     return job
 
 
@@ -1194,8 +1195,8 @@ async def test_refused_removal_is_not_reissued_by_sweeper(adapter_client, monkey
     )
     assert_text_free_of(response.text, [CANARY])
     assert response.status_code == 200
-    assert response.json()["head"]["row_outcomes"] == frozen_result["row_outcomes"]
-    assert response.json()["head"]["refusals"] == frozen_result["refusals"]
+    assert valid_projection(response.json()["head"])["row_outcomes"] == frozen_result["row_outcomes"]
+    assert valid_projection(response.json()["head"])["refusals"] == frozen_result["refusals"]
     head = (await generations(device_id))[-1]
     response = await adapter_client.post(
         f"/api/v1/devices/{device_id}/actions/abandon-generation", json={"generation_id": head.id}, headers=AUTH
@@ -2114,13 +2115,13 @@ async def test_apply_build_failure_preserves_selected_unsent_rows(adapter_client
     assert len(job.result["settlement_owners"]) == 6
     response = await adapter_client.get(f"/api/v1/jobs/{job_id}", headers=AUTH)
     assert response.status_code == 200
-    assert response.json()["error"] == job.error
-    assert response.json()["row_outcomes"] == job.result["row_outcomes"]
+    assert valid_projection(response.json())["error"] == job.error
+    assert valid_projection(response.json())["row_outcomes"] == job.result["row_outcomes"]
     response = await adapter_client.post(
         f"/api/v1/devices/{device_id}/deployment-evidence", json={"apply_attempt_ids": []}, headers=AUTH
     )
     assert response.status_code == 200
-    assert response.json()["head"]["row_outcomes"] == job.result["row_outcomes"]
+    assert valid_projection(response.json()["head"])["row_outcomes"] == job.result["row_outcomes"]
     async with session() as db:
         for row in await db.scalars(select(VlanIntent).where(VlanIntent.device_id == device_id)):
             assert row.last_apply_at == PRIOR_AT and row.last_apply_error == PRIOR_ERROR
@@ -2250,7 +2251,7 @@ async def test_post_commit_attribution_failure_remains_public(adapter_client, mo
         assert all(owner["disposition"] == "unavailable" for owner in job.result["settlement_owners"])
         response = await adapter_client.get(f"/api/v1/jobs/{job.id}", headers=AUTH)
         assert response.status_code == 200
-        assert response.json()["error"]["code"] == "attribution_failed"
+        assert valid_projection(response.json())["error"]["code"] == "attribution_failed"
         async with session() as db:
             generation = await db.get(DeploymentGeneration, attempt.generation_id)
             assert generation.status == GenerationStatus.outcome_unknown

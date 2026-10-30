@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from tests.api.evidence import valid_projection
 from tests.conftest import VALID_TOKEN, seed_device, session
 
 pytestmark = pytest.mark.anyio
@@ -76,7 +77,7 @@ async def test_generations_list_has_the_complete_emit_null_shape_in_sequence_ord
     response = await adapter_client.get(f"/api/v1/devices/{device_id}/generations", headers=AUTH)
 
     assert response.status_code == 200, response.text
-    assert response.json() == [
+    assert [valid_projection(item) for item in response.json()] == [
         {
             "generation_id": early_id,
             "seq": 4,
@@ -138,7 +139,7 @@ async def test_generations_list_serves_a_null_source_push_seq_value(adapter_clie
     response = await adapter_client.get(f"/api/v1/devices/{device_id}/generations", headers=AUTH)
 
     assert response.status_code == 200, response.text
-    assert response.json()[0]["source_push_seq"] == {"static_route": None}
+    assert valid_projection(response.json()[0])["source_push_seq"] == {"static_route": None}
 
 
 async def test_generations_list_filters_strictly_after_since_seq(adapter_client):
@@ -152,7 +153,9 @@ async def test_generations_list_filters_strictly_after_since_seq(adapter_client)
     )
 
     assert response.status_code == 200, response.text
-    assert [(row["generation_id"], row["seq"]) for row in response.json()] == [(late_id, 9)]
+    assert [(row["generation_id"], row["seq"]) for row in [valid_projection(item) for item in response.json()]] == [
+        (late_id, 9)
+    ]
 
 
 @pytest.mark.parametrize(
@@ -196,7 +199,9 @@ async def test_generations_list_applies_a_fail_fast_page_limit(adapter_client):
     )
 
     assert page.status_code == 200, page.text
-    assert [(row["generation_id"], row["seq"]) for row in page.json()] == [(early_id, 4)]
+    assert [(row["generation_id"], row["seq"]) for row in [valid_projection(item) for item in page.json()]] == [
+        (early_id, 4)
+    ]
     assert invalid.status_code == 422
     error = invalid.json()["error"]
     assert error["code"] == "validation_error"

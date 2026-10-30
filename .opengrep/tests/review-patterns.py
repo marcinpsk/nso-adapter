@@ -874,3 +874,46 @@ async def new_consumer(client, projection, name, wire):
     await _live_family_sections(client, name, [wire])
     # ruleid: nso-export-read-outside-the-census
     return projection.outcome_for(wire)
+
+
+async def evidence_on_the_loop(db, rows, job):
+    # ruleid: nso-api-evidence-on-event-loop
+    items = [_job_out(row) for row in rows]
+    # ruleid: nso-api-evidence-on-event-loop
+    head = _evidence_head_out(job)
+    # ruleid: nso-api-evidence-on-event-loop
+    listing = [_device_generation_listing_out(row) for row in rows]
+    # ruleid: nso-api-evidence-on-event-loop
+    return {"items": items, "head": head, "listing": listing, "digest": evidence_digest(items)}
+
+
+@router.get("/{job_id}")
+async def decorated_evidence_on_the_loop(job):
+    # ruleid: nso-api-evidence-on-event-loop
+    return _job_out(job)
+
+
+@router.get("")
+async def decorated_evidence_off_the_loop(rows):
+    # ok: nso-api-evidence-on-event-loop
+    return await anyio.to_thread.run_sync(lambda: [_job_out(row) for row in rows])
+
+
+async def evidence_off_the_loop(db, rows, job):
+    # ok: nso-api-evidence-on-event-loop
+    items = await anyio.to_thread.run_sync(lambda: [_job_out(row) for row in rows])
+    # ok: nso-api-evidence-on-event-loop
+    single = await anyio.to_thread.run_sync(_job_out, job)
+
+    def build():
+        # ok: nso-api-evidence-on-event-loop
+        observed = {"head": _evidence_head_out(job), "items": items, "single": single}
+        # ok: nso-api-evidence-on-event-loop
+        return {**observed, "digest": evidence_digest(observed)}
+
+    return await anyio.to_thread.run_sync(build)
+
+
+def sync_evidence_builder(row):
+    # ok: nso-api-evidence-on-event-loop
+    return evidence_envelope({}, {}, None, construct=lambda candidate: candidate.update(row))

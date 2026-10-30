@@ -27,6 +27,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from tests.api.evidence import valid_projection
 from tests.conftest import VALID_TOKEN, empty_execution_result, seed_device, session
 from tests.core.removal_helpers import authorize_static_route
 from tests.core.test_generation_protocol import (
@@ -281,7 +282,7 @@ async def test_worker_terminalization_snapshots_the_carrier(
 
     response = await adapter_client.get(f"/api/v1/devices/{device_id}/generations", headers=_AUTH)
     assert response.status_code == 200, response.text
-    (listed,) = response.json()
+    (listed,) = [valid_projection(item) for item in response.json()]
     assert listed["job_id"] is None
     assert (listed["carrier_job_id"], listed["carrier_job_status"]) == (job_id, job_status)
 
@@ -957,7 +958,10 @@ async def test_restart_marks_a_stranded_running_generation_unknown(adapter_clien
     ) == (None, None, None, None)
     listing = await adapter_client.get(f"/api/v1/devices/{device_id}/generations", headers=_AUTH)
     assert listing.status_code == 200, listing.text
-    assert (listing.json()[0]["carrier_job_id"], listing.json()[0]["carrier_job_status"]) == (None, None)
+    assert (
+        valid_projection(listing.json()[0])["carrier_job_id"],
+        valid_projection(listing.json()[0])["carrier_job_status"],
+    ) == (None, None)
     assert await _job_status(generation.job_id) is JobStatus.queued
 
     assert await _finish(device_id, JobStatus.succeeded) == generation.job_id
@@ -976,7 +980,10 @@ async def test_restart_marks_a_stranded_running_generation_unknown(adapter_clien
     ) == (job.id, "succeeded", job.result, job.error)
     listing = await adapter_client.get(f"/api/v1/devices/{device_id}/generations", headers=_AUTH)
     assert listing.status_code == 200, listing.text
-    assert (listing.json()[0]["carrier_job_id"], listing.json()[0]["carrier_job_status"]) == (job.id, "succeeded")
+    assert (
+        valid_projection(listing.json()[0])["carrier_job_id"],
+        valid_projection(listing.json()[0])["carrier_job_status"],
+    ) == (job.id, "succeeded")
 
     async with session() as db:
         with pytest.raises(sa.exc.IntegrityError):
@@ -1023,7 +1030,10 @@ async def test_restart_clears_the_previous_snapshot_when_the_retry_carrier_is_de
     ) == (None, None, None, None)
     listing = await adapter_client.get(f"/api/v1/devices/{device_id}/generations", headers=_AUTH)
     assert listing.status_code == 200, listing.text
-    assert (listing.json()[0]["carrier_job_id"], listing.json()[0]["carrier_job_status"]) == (None, None)
+    assert (
+        valid_projection(listing.json()[0])["carrier_job_id"],
+        valid_projection(listing.json()[0])["carrier_job_status"],
+    ) == (None, None)
 
 
 async def test_a_running_retry_serves_the_previous_carrier_as_the_contract_documents(adapter_client):
@@ -1039,14 +1049,14 @@ async def test_a_running_retry_serves_the_previous_carrier_as_the_contract_docum
 
     listing = await adapter_client.get(f"/api/v1/devices/{device_id}/generations", headers=_AUTH)
     assert listing.status_code == 200, listing.text
-    (row,) = listing.json()
+    (row,) = [valid_projection(item) for item in listing.json()]
     assert (row["status"], row["job_id"]) == (GenerationStatus.running.value, retry_id)
     assert (row["carrier_job_id"], row["carrier_job_status"]) == (previous.id, "failed")
     evidence = await adapter_client.post(
         f"/api/v1/devices/{device_id}/deployment-evidence", json={"apply_attempt_ids": []}, headers=_AUTH
     )
     assert evidence.status_code == 200, evidence.text
-    head = evidence.json()["head"]
+    head = valid_projection(evidence.json()["head"])
     assert head["status"] == GenerationStatus.running.value
     assert (head["carrier_job_id"], head["carrier_job_status"], head["carrier_job_error"]) == (
         previous.id,
@@ -1899,7 +1909,7 @@ async def _retry_head_http(client, device_id: int) -> int:
 async def _job_snapshot(client, job_id: int) -> dict:
     response = await client.get(f"/api/v1/jobs/{job_id}", headers=_AUTH)
     assert response.status_code == 200, response.text
-    return response.json()
+    return valid_projection(response.json())
 
 
 async def _blocked_apply_with_successor(client, name: str, netbox_device_id: int) -> tuple[int, int, int, int]:

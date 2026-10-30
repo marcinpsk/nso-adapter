@@ -9,6 +9,7 @@ import pytest
 from nso_adapter.api.errors import ApiError
 from nso_adapter.api.jobs import get_job, list_jobs
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
+from tests.api.evidence import valid_projection
 from tests.conftest import session
 
 
@@ -33,7 +34,7 @@ async def test_list_jobs_all(adapter_client):
     device_id, job_id = await _seed_device_and_job("jobs-list-01", 1400)
     async with session() as db:
         result = await list_jobs(db=db)
-        assert any(r["id"] == job_id for r in result)
+        assert any(r["id"] == job_id for r in [valid_projection(item) for item in result])
 
 
 async def test_list_jobs_filter_by_device_id(adapter_client):
@@ -41,8 +42,8 @@ async def test_list_jobs_filter_by_device_id(adapter_client):
     device_id, job_id = await _seed_device_and_job("jobs-list-02", 1410)
     async with session() as db:
         result = await list_jobs(device_id=device_id, db=db)
-        assert all(r["device_id"] == device_id for r in result)
-        assert any(r["id"] == job_id for r in result)
+        assert all(r["device_id"] == device_id for r in [valid_projection(item) for item in result])
+        assert any(r["id"] == job_id for r in [valid_projection(item) for item in result])
 
 
 async def test_list_jobs_filter_by_status(adapter_client):
@@ -50,7 +51,7 @@ async def test_list_jobs_filter_by_status(adapter_client):
     device_id, job_id = await _seed_device_and_job("jobs-list-03", 1420, status=JobStatus.succeeded)
     async with session() as db:
         result = await list_jobs(status="succeeded", db=db)
-        assert all(r["status"] == "succeeded" for r in result)
+        assert all(r["status"] == "succeeded" for r in [valid_projection(item) for item in result])
 
 
 async def test_list_jobs_filter_invalid_status_raises_422(adapter_client):
@@ -101,7 +102,7 @@ async def test_list_jobs_breaks_a_created_at_tie_by_id(adapter_client):
 
     async with session() as db:
         listed = await list_jobs(device_id=d.id, db=db)
-        assert [r["id"] for r in listed] == sorted(ids, reverse=True)
+        assert [valid_projection(r)["id"] for r in listed] == sorted(ids, reverse=True)
 
 
 # ── get_job ───────────────────────────────────────────────────────────────────
@@ -119,7 +120,7 @@ async def test_get_job_found(adapter_client):
     """get_job() returns job dict with expected fields."""
     device_id, job_id = await _seed_device_and_job("jobs-get-01", 1430)
     async with session() as db:
-        result = await get_job(job_id=job_id, db=db)
+        result = valid_projection(await get_job(job_id=job_id, db=db))
         assert result["id"] == job_id
         assert result["type"] == "sync"
         assert result["device_id"] == device_id
@@ -149,7 +150,7 @@ async def test_job_out_serializes_context(adapter_client):
         db.add(j)
         await db.commit()
         await db.refresh(j)
-        result = await get_job(job_id=j.id, db=db)
+        result = valid_projection(await get_job(job_id=j.id, db=db))
         assert result["context"] == {"scope": "isis", "force": True}
         listed = await list_jobs(device_id=d.id, db=db)
-        assert listed[0]["context"] == {"scope": "isis", "force": True}
+        assert valid_projection(listed[0])["context"] == {"scope": "isis", "force": True}

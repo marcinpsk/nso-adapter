@@ -3,9 +3,9 @@
 """Appendix S, chunk S3: the ascending settlement feed and its validation.
 
 The consumer walks one device's terminal jobs in the order they became true, from a
-durable cursor. That is a second reading of ``GET /api/v1/jobs``, not a replacement: the
-default page stays exactly what the three existing consumers read today, and the
-ascending page is reached only by asking for it.
+durable cursor. Both readings of ``GET /api/v1/jobs`` use item evidence envelopes.
+The default page retains its creation order. The ascending page requires an explicit
+request.
 
 Two properties carry the feed. Ordering is ``settle_seq`` alone — ``(device_id,
 settle_seq)`` is unique, so there is nothing to break a tie on. Invisibility of queued and
@@ -23,7 +23,8 @@ import pytest
 from nso_adapter.core.claim import terminalize
 from nso_adapter.store.meta import get_store_incarnation
 from nso_adapter.store.models import Job, JobStatus, JobType
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.api.evidence import valid_projection
+from tests.conftest import VALID_TOKEN, empty_execution_result, seed_device, session
 
 pytestmark = pytest.mark.anyio
 
@@ -44,7 +45,9 @@ async def _terminal_job(
         )
         db.add(job)
         await db.flush()
-        await terminalize(db, job.id, status=status, expect=JobStatus.running, run_attempt=1)
+        await terminalize(
+            db, job.id, status=status, expect=JobStatus.running, run_attempt=1, result=empty_execution_result()
+        )
         await db.commit()
         return job.id
 
@@ -74,7 +77,7 @@ async def _walk(client, device_id: int, *, limit: int = 1) -> list[dict]:
             headers=AUTH,
         )
         assert resp.status_code == 200, resp.text
-        page = resp.json()
+        page = [valid_projection(item) for item in resp.json()]
         if not page:
             return rows
         rows.extend(page)
@@ -107,7 +110,7 @@ async def test_non_terminal_jobs_are_invisible_to_the_ascending_feed(adapter_cli
     ):
         resp = await adapter_client.get("/api/v1/jobs", params=params, headers=AUTH)
         assert resp.status_code == 200, resp.text
-        body = resp.json()
+        body = [valid_projection(item) for item in resp.json()]
         assert [r["id"] for r in body] == [first, second]
         assert [r["settle_seq"] for r in body] == [1, 2]
         assert queued not in [r["id"] for r in body]
@@ -119,7 +122,7 @@ async def test_non_terminal_jobs_are_invisible_to_the_ascending_feed(adapter_cli
         params={"device_id": device_id, "order": "asc", "after_settle_seq": 1},
         headers=AUTH,
     )
-    assert [r["id"] for r in resp.json()] == [second]
+    assert [r["id"] for r in [valid_projection(item) for item in resp.json()]] == [second]
 
 
 # ── S3.2 (§9 item 4): a per-device sequence needs a device ────────────────────
@@ -208,7 +211,7 @@ async def test_status_cannot_thin_the_ascending_feed(adapter_client):
         headers=AUTH,
     )
     assert listed.status_code == 200, listed.text
-    assert [r["id"] for r in listed.json()] == [failed]
+    assert [r["id"] for r in [valid_projection(item) for item in listed.json()]] == [failed]
 
 
 # ── S3.3: the limit is validated, not clamped ────────────────────────────────
@@ -241,7 +244,7 @@ async def test_limit_is_validated_not_clamped(adapter_client):
         headers=AUTH,
     )
     assert inside.status_code == 200, inside.text
-    assert [r["id"] for r in inside.json()] == [first]
+    assert [r["id"] for r in [valid_projection(item) for item in inside.json()]] == [first]
     for limit in (1, 500):
         resp = await adapter_client.get("/api/v1/jobs", params={"limit": limit}, headers=AUTH)
         assert resp.status_code == 200, (limit, resp.text)

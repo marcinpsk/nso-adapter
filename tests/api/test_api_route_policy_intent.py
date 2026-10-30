@@ -40,6 +40,28 @@ async def _read_intent(device_id: int):
         )
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize("extra", [0.1, 1.25])
+async def test_store_only_decimal_entries_remain_readable_and_replayable(adapter_client, extra):
+    device_id = await seed_device(nso_device_name="decimal-policy", netbox_device_id=18525)
+    url = f"/api/v1/devices/{device_id}/route-policy-intent?store_only=true"
+    initial = {"objects": [_obj("prefix_list", "example-policy")]}
+    created = await adapter_client.put(url, headers=AUTH | push_seq(1), json=initial)
+    assert created.status_code == 200, created.text
+    payload = {"objects": [_obj("prefix_list", "example-policy", entries=[{"sequence": 10, "extra": extra}])]}
+    headers = AUTH | push_seq(2)
+    updated = await adapter_client.put(url, headers=headers, json=payload)
+    assert updated.status_code == 200, updated.text
+    receipt = await adapter_client.get(
+        "/api/v1/intent-receipts", headers=AUTH, params={"device_id": device_id, "section": "route_policy"}
+    )
+    replay = await adapter_client.put(url, headers=headers, json=payload)
+    assert receipt.status_code == replay.status_code == 200
+    assert receipt.json()["receipts"][0]["response"] == updated.json()
+    assert replay.json() == updated.json()
+    assert (await _read_intent(device_id))[0].entries == payload["objects"][0]["entries"]
+
+
 # ── validation ────────────────────────────────────────────────────────────────
 
 

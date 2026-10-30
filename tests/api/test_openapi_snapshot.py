@@ -269,6 +269,44 @@ def test_action_apply_sequence_schema_preserves_the_exact_receipt_bound(openapi_
     assert isinstance(sequence["maximum"], int)
 
 
+def _lossy_integer_bounds(node, path="#"):
+    """Yield each integer bound that FastAPI rendered as a float above the exact float range."""
+    if isinstance(node, dict):
+        if node.get("type") == "integer":
+            for key in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"):
+                value = node.get(key)
+                if isinstance(value, float) and abs(value) > 2**53:
+                    yield f"{path}/{key}"
+        for key, value in node.items():
+            yield from _lossy_integer_bounds(value, f"{path}/{key}")
+    elif isinstance(node, list):
+        for index, item in enumerate(node):
+            yield from _lossy_integer_bounds(item, f"{path}/{index}")
+
+
+def test_no_integer_bound_loses_precision(openapi_schema):
+    assert list(_lossy_integer_bounds(openapi_schema)) == []
+
+
+@pytest.mark.parametrize(
+    ("module", "model", "field"),
+    [
+        ("nso_adapter.api.settlement_observation", "SettlementObservationIn", "after_settle_seq"),
+        ("nso_adapter.api.lag_config", "LagConfigApplyRequest", "source_revision"),
+        ("nso_adapter.api.vlan", "SwitchportApplyRequest", "source_revision"),
+    ],
+)
+def test_wide_integer_fields_publish_their_model_bounds(openapi_schema, module, model, field):
+    import importlib
+
+    declared = getattr(importlib.import_module(module), model).model_json_schema()["properties"][field]
+    published = openapi_schema["components"]["schemas"][model]["properties"][field]
+
+    assert (published["minimum"], published["maximum"]) == (declared["minimum"], declared["maximum"])
+    assert isinstance(published["minimum"], int)
+    assert isinstance(published["maximum"], int)
+
+
 def test_action_apply_documents_its_internal_error_envelope(openapi_schema):
     responses = openapi_schema["paths"]["/api/v1/devices/{device_id}/actions/apply"]["post"]["responses"]
 
@@ -413,3 +451,34 @@ def test_asn_refusal_operations_declare_error_envelope(openapi_schema, path, met
     response = operation["responses"].get("409")
     assert response is not None
     assert response["content"]["application/json"]["schema"] == {"$ref": "#/components/schemas/ErrorEnvelope"}
+
+
+def test_settlement_envelopes_and_observation_publish_closed_roots(openapi_schema):
+    schemas = openapi_schema["components"]["schemas"]
+    names = (
+        "JobEvidenceOut",
+        "DeviceGenerationEvidenceOut",
+        "DeploymentHeadEvidenceOut",
+        "DeploymentGenerationEvidenceOut",
+        "DeploymentAttemptEvidenceOut",
+        "SettlementReceiptEvidenceOut",
+    )
+    for name in names:
+        schema = schemas[name]
+        assert schema["additionalProperties"] is False
+        fields = {"identity", "projection", "evidence_error", "digest"}
+        if name == "DeploymentAttemptEvidenceOut":
+            fields.add("generations")
+        assert set(schema["required"]) == fields
+    assert set(schemas["EvidenceErrorOut"]["properties"]["code"]["enum"]) == {
+        "projection_construction",
+        "schema_validation",
+        "execution_contract",
+        "attempt_generation_membership",
+    }
+    assert schemas["SettlementObservationIn"]["additionalProperties"] is False
+    assert schemas["SettlementObservationOut"]["additionalProperties"] is False
+    operation = openapi_schema["paths"]["/api/v1/devices/{device_id}/settlement-observation"]["post"]
+    assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/SettlementObservationOut",
+    }
