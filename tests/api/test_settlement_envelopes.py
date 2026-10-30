@@ -626,6 +626,7 @@ async def test_generation_listing_isolates_invalid_metadata(adapter_client):
         ({"ordered": [2, 1]}, {"ordered": [1, 2]}, False),
         ({"nested": {}}, {"nested": {"missing": None}}, False),
         ({"typed": True}, {"typed": 1}, False),
+        ({"a": 1, "b": 2}, {"b": 2, "a": 1}, True),
     ],
 )
 async def test_evidence_digest_preserves_types_absence_and_meaningful_order(adapter_client, before, after, equal):
