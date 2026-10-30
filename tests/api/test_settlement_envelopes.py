@@ -122,8 +122,6 @@ async def test_observation_contains_invalid_section_keys_and_retains_sibling_evi
         )
         await db.commit()
         job_id = job.id
-    listing = await adapter_client.get(f"/api/v1/devices/{device_id}/generations", headers=AUTH)
-    assert listing.status_code == 200, listing.text
     response = await adapter_client.post(
         f"/api/v1/devices/{device_id}/settlement-observation",
         headers=AUTH,
@@ -131,7 +129,6 @@ async def test_observation_contains_invalid_section_keys_and_retains_sibling_evi
     )
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["generations"] == listing.json()
     assert [item["identity"]["generation_id"] for item in body["generations"]] == [generation_id, sibling_id]
     assert body["generations"][1]["evidence_error"] is None
     assert body["receipts"][0]["projection"]["response"] == {"generation_id": generation_id}
@@ -226,7 +223,7 @@ async def test_unnormalizable_evidence_stays_inside_its_item(adapter_client, end
 
 @pytest.mark.parametrize("endpoint", ["listing", "deployment", "observation"])
 @pytest.mark.parametrize("failure", ["push_seq", "revision", "carrier", "sections"])
-async def test_generation_readers_apply_the_complete_execution_contract(adapter_client, endpoint, failure):
+async def test_generation_readers_apply_their_execution_contract(adapter_client, endpoint, failure):
     import uuid
 
     from nso_adapter.store.models import DeploymentApplyAttempt, GenerationStatus
@@ -279,8 +276,12 @@ async def test_generation_readers_apply_the_complete_execution_contract(adapter_
     a, b, c = items
     assert [item["identity"]["generation_id"] for item in items] == ids
     assert a["evidence_error"] is c["evidence_error"] is None
-    assert b["projection"] is None
-    assert b["evidence_error"] == {"code": "execution_contract", "digest": b["digest"]}
+    if endpoint == "listing" and failure in {"carrier", "sections"}:
+        assert b["projection"] is not None
+        assert b["evidence_error"] is None
+    else:
+        assert b["projection"] is None
+        assert b["evidence_error"] == {"code": "execution_contract", "digest": b["digest"]}
 
 
 @pytest.mark.parametrize("failure", ["push_seq", "revision", "carrier", "sections"])

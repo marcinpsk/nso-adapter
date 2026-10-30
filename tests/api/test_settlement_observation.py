@@ -109,7 +109,11 @@ async def test_observation_reuses_existing_projections_and_performs_no_writes(ad
     )
     receipts = await adapter_client.get("/api/v1/intent-receipts", headers=AUTH, params={"device_id": device_id})
     assert body["job"] == job.json()
-    assert body["generations"] == listing.json()
+    for observed, listed in zip(body["generations"], listing.json(), strict=True):
+        assert observed["identity"] == listed["identity"]
+        assert observed["projection"] == listed["projection"]
+        assert observed["evidence_error"] is listed["evidence_error"] is None
+        assert observed["digest"] != listed["digest"]
     assert body["deployment"] == evidence.json()
     assert [item["projection"] for item in body["receipts"]] == receipts.json()["receipts"]
     assert [item["identity"] for item in body["receipts"]] == [

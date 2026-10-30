@@ -35,7 +35,7 @@ from nso_adapter.api.execution import (
 from nso_adapter.api.pagination import DEFAULT_PAGE, LIMIT_MAX, LIMIT_MIN, validate_page_limit
 from nso_adapter.api.timestamps import iso_z
 from nso_adapter.domain.diagnostics import DEVICE_REF_PATTERN, device_ref
-from nso_adapter.nso.execution_contract import GENERATION_FIELDS, validate_generation
+from nso_adapter.nso.execution_contract import GENERATION_FIELDS, validate_generation, validate_generation_listing
 from nso_adapter.store.models import (
     DbInterface,
     DeploymentApplyAttempt,
@@ -519,14 +519,38 @@ def _evidence_attempt_out(attempt: DeploymentApplyAttempt, generations: list[Dep
     }
 
 
-def _device_generation_out(row) -> dict:
-    candidate = {
-        **_generation_candidate(row),
+def _generation_listing_candidate(row) -> dict:
+    return {
+        "generation_id": row.id,
+        "seq": row.seq,
+        "status": row.status,
         "job_id": row.job_id,
+        "carrier_job_id": row.carrier_job_id,
+        "carrier_job_status": row.carrier_job_status,
         "mode": row.mode,
         "settlement_cohort": row.settlement_cohort,
         "digest": row.digest,
+        "stream_revisions": row.stream_revisions,
+        "source_push_seq": row.source_push_seq,
         "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+
+
+def _device_generation_listing_out(row) -> dict:
+    return evidence_envelope(
+        _generation_identity(row),
+        _generation_listing_candidate(row),
+        DeviceGenerationOut,
+        validate=validate_generation_listing,
+    )
+
+
+def _device_generation_out(row) -> dict:
+    candidate = {
+        **_generation_listing_candidate(row),
+        "carrier_job_result": row.carrier_job_result,
+        "carrier_job_error": row.carrier_job_error,
     }
     return evidence_envelope(
         _generation_identity(row),
@@ -740,7 +764,6 @@ async def list_device_generations(
     if not await db.get(Device, device_id):
         raise api_error(404, "not_found", "Device not found")
 
-    # Load execution evidence without the immutable document.
     query = (
         select(
             DeploymentGeneration.id,
@@ -751,8 +774,6 @@ async def list_device_generations(
             DeploymentGeneration.job_id,
             DeploymentGeneration.carrier_job_id,
             DeploymentGeneration.carrier_job_status,
-            DeploymentGeneration.carrier_job_result,
-            DeploymentGeneration.carrier_job_error,
             DeploymentGeneration.mode,
             DeploymentGeneration.settlement_cohort,
             DeploymentGeneration.digest,
@@ -768,7 +789,7 @@ async def list_device_generations(
         query = query.where(DeploymentGeneration.seq > since_seq)
     query = query.limit(limit)
     rows = (await db.execute(query)).all()
-    return [_device_generation_out(row) for row in rows]
+    return [_device_generation_listing_out(row) for row in rows]
 
 
 @router.post(

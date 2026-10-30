@@ -546,6 +546,15 @@ out-of-range limit returns `422 validation_error`; it is never clamped.
 ```
 
 Each item is an evidence envelope. Its `projection` contains the generation fields below.
+The listing validates the strict projection schema and the shared generation contract:
+identity, status, timestamp, stream provenance, carrier identity and status. A settled
+generation requires a succeeded carrier with an ID. Its envelope digest covers only the
+listing candidate. Stored carrier results and errors are neither loaded nor checked.
+Full carrier validation stays on deployment-evidence and settlement-observation. The
+observation digest includes full carrier evidence, even for a non-head generation outside
+the requested attempts. A listing projection alone does not certify an outcome. Settlement
+can use independently validated feed evidence or a consumed certificate; without either,
+it must refuse the outcome.
 Every valid projection contains every shown field. An unset field is `null`, never
 missing. `job_id` is `null` while a pending generation is not attached to a job.
 `carrier_job_id` and `carrier_job_status` retain the terminal carrier identity after
@@ -762,7 +771,7 @@ All three fields are required. Extra fields are refused. `job_id` is positive;
 | `device` | Stored adapter device ID, nullable NetBox device ID, NSO instance and device name. |
 | `job` | The target job envelope, or null if absent from this device. Its identity includes `settle_seq`. |
 | `next_feed` | The actual first job identity after the cursor, or null. Sequence gaps do not imply absence. |
-| `generations` | Listing envelopes for current or retained target membership, requested attempts, and current head. |
+| `generations` | Listing-shaped projections with full carrier validation and digests for current or retained target membership, requested attempts, and current head. |
 | `deployment` | The same head, barrier, attempt admission, and generation projections as deployment-evidence. |
 | `receipts` | Current device receipt envelopes, built with the intent-receipts projection. |
 | `absent` | Missing `job_id`, `apply_attempt_ids`, and relevant `receipt_sections`. |
@@ -771,8 +780,9 @@ All three fields are required. Extra fields are refused. `job_id` is positive;
 `absent.job_id` is null when the target exists. The absence lists are empty when their
 records exist. An empty generation list and a null head are explicit absence markers.
 A record from another device is absent. A retained historical target can be behind the
-cursor; its observation does not change that cursor. Every present record uses the same
-projection function as its existing reader. Envelope digests include invalid candidates.
+cursor; its observation does not change that cursor. Generation projections have the listing
+shape, with full carrier validation and result-sensitive digests. Other records use their
+existing reader projections. Envelope digests include invalid candidates.
 A missing device returns `404 not_found`; invalid input returns `422 validation_error`.
 
 ### `PATCH /api/v1/devices/{id}` — correct the mapping
