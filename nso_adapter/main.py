@@ -42,6 +42,7 @@ from nso_adapter.api.interfaces import router as interfaces_router
 from nso_adapter.api.isis import router as isis_router
 from nso_adapter.api.jobs import router as jobs_router
 from nso_adapter.api.l2_service import router as l2_service_router
+from nso_adapter.api.lag_config import LagConfigApplyRequest
 from nso_adapter.api.lag_config import router as lag_config_router
 from nso_adapter.api.lag_topology import router as lag_topology_router
 from nso_adapter.api.logging_config import router as logging_config_router
@@ -53,10 +54,13 @@ from nso_adapter.api.redistribution import router as redistribution_router
 from nso_adapter.api.route_policy import router as route_policy_router
 from nso_adapter.api.scope import router as scope_router
 from nso_adapter.api.secrets import router as secrets_router
+from nso_adapter.api.settlement_observation import SettlementObservationIn
+from nso_adapter.api.settlement_observation import router as settlement_observation_router
 from nso_adapter.api.snmp import router as snmp_router
 from nso_adapter.api.static_route import router as static_route_router
 from nso_adapter.api.subinterface import router as subinterface_router
 from nso_adapter.api.svi import router as svi_router
+from nso_adapter.api.vlan import SwitchportApplyRequest
 from nso_adapter.api.vlan import router as vlan_router
 from nso_adapter.config import get_config, get_env_settings
 from nso_adapter.core.generation import ApplyUnexecutable, DeviceProjectionGone
@@ -137,16 +141,30 @@ def _declare_bearer_requirement(app: FastAPI) -> None:
     app.openapi = openapi  # type: ignore[method-assign]
 
 
+#: Request fields whose integer bounds exceed the exact float range of the OpenAPI model.
+_WIDE_INTEGER_FIELDS = (
+    (SettlementObservationIn, "after_settle_seq"),
+    (LagConfigApplyRequest, "source_revision"),
+    (SwitchportApplyRequest, "source_revision"),
+)
+
+
 def _preserve_exact_openapi_integer_bounds(app: FastAPI) -> None:
     """Restore integer bounds that FastAPI coerces to imprecise JSON floats."""
     generated_openapi = app.openapi
 
     def openapi():
         schema = generated_openapi()
-        selected = schema["components"]["schemas"]["ActionApplyIn"]["properties"]["selected"]
+        components = schema["components"]["schemas"]
+        selected = components["ActionApplyIn"]["properties"]["selected"]
         sequence = selected["additionalProperties"]
         sequence["minimum"] = MIN_PUSH_SEQ
         sequence["maximum"] = MAX_PUSH_SEQ
+        for model, field in _WIDE_INTEGER_FIELDS:
+            declared = model.model_json_schema()["properties"][field]
+            published = components[model.__name__]["properties"][field]
+            published["minimum"] = declared["minimum"]
+            published["maximum"] = declared["maximum"]
         return schema
 
     app.openapi = openapi  # type: ignore[method-assign]
@@ -588,6 +606,7 @@ def create_app(*, lifespan_context: Callable[[FastAPI], AbstractAsyncContextMana
     app.include_router(secrets_router)
     app.include_router(ospf_router)
     app.include_router(redistribution_router)
+    app.include_router(settlement_observation_router)
     app.include_router(jobs_router)
     app.include_router(provision_attempts_router)
     app.include_router(config_router)

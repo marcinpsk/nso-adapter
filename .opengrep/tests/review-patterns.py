@@ -874,3 +874,215 @@ async def new_consumer(client, projection, name, wire):
     await _live_family_sections(client, name, [wire])
     # ruleid: nso-export-read-outside-the-census
     return projection.outcome_for(wire)
+
+
+async def evidence_on_the_loop(db, rows, job):
+    # ruleid: nso-api-evidence-on-event-loop
+    items = [_job_out(row) for row in rows]
+    # ruleid: nso-api-evidence-on-event-loop
+    head = _evidence_head_out(job)
+    # ruleid: nso-api-evidence-on-event-loop
+    listing = [_device_generation_listing_out(row) for row in rows]
+    # ruleid: nso-api-evidence-on-event-loop
+    return {"items": items, "head": head, "listing": listing, "digest": evidence_digest(items)}
+
+
+@router.get("/{job_id}")
+async def decorated_evidence_on_the_loop(job):
+    # ruleid: nso-api-evidence-on-event-loop
+    return _job_out(job)
+
+
+async def evidence_as_an_eager_offload_argument(items):
+    # ruleid: nso-api-evidence-on-event-loop
+    return await anyio.to_thread.run_sync(lambda x: x, evidence_digest(items))
+
+
+async def evidence_between_builder_and_offload(job):
+    def build():
+        # ok: nso-api-evidence-on-event-loop
+        return _job_out(job)
+
+    # ruleid: nso-api-evidence-on-event-loop
+    direct = _job_out(job)
+    return direct, await anyio.to_thread.run_sync(build)
+
+
+async def evidence_by_an_eager_builder_call(job):
+    def build():
+        # ok: nso-api-evidence-on-event-loop
+        return _job_out(job)
+
+    # ruleid: nso-api-offloaded-builder-called-on-loop
+    eager = build()
+    # ok: nso-api-offloaded-builder-called-on-loop
+    offloaded = await anyio.to_thread.run_sync(build)
+    # ruleid: nso-api-offloaded-builder-called-on-loop
+    return eager, offloaded, build()
+
+
+async def offloaded_builder_called_on_the_worker(job):
+    def build():
+        return _job_out(job)
+
+    def before():
+        # ok: nso-api-offloaded-builder-called-on-loop
+        return build()
+
+    # ruleid: nso-api-offloaded-builder-called-on-loop
+    eager = build()
+    head = await anyio.to_thread.run_sync(build)
+
+    def after():
+        # ok: nso-api-offloaded-builder-called-on-loop
+        return [build() for _ in range(2)]
+
+    # ok: nso-api-offloaded-builder-called-on-loop
+    wrapped = await anyio.to_thread.run_sync(lambda: build())
+    # ruleid: nso-api-offloaded-builder-called-on-loop
+    argument = await anyio.to_thread.run_sync(lambda value: value, build())
+    first = await anyio.to_thread.run_sync(before)
+    last = await anyio.to_thread.run_sync(after)
+    return eager, head, wrapped, argument, first, last
+
+
+async def offloaded_builder_in_a_default_of_an_offloaded_def(job):
+    def build():
+        return _job_out(job)
+
+    # ruleid: nso-api-offloaded-builder-called-on-loop
+    def other(value=build()):
+        # ok: nso-api-offloaded-builder-called-on-loop
+        return value, build()
+
+    def nested():
+        # ok: nso-api-offloaded-builder-called-on-loop
+        def inner(value=build()):
+            return value
+
+        return inner()
+
+    # ok: nso-api-offloaded-builder-called-on-loop
+    def deferred(value=lambda: build()):
+        return value()
+
+    # ruleid: nso-api-offloaded-builder-called-on-loop
+    def called(value=(lambda: build())()):
+        return value
+
+    head = await anyio.to_thread.run_sync(build)
+    first = await anyio.to_thread.run_sync(nested)
+    second = await anyio.to_thread.run_sync(deferred)
+    third = await anyio.to_thread.run_sync(called)
+    return head, first, second, third, await anyio.to_thread.run_sync(other)
+
+
+@router.get("/{job_id}/eager")
+async def decorated_evidence_by_an_eager_builder_call(job):
+    def build():
+        return _evidence_head_out(job)
+
+    if job:
+        # ruleid: nso-api-offloaded-builder-called-on-loop
+        return build()
+    return await anyio.to_thread.run_sync(build)
+
+
+def _module_level_builder(job):
+    return _job_out(job)
+
+
+async def module_level_builder_in_an_offloaded_lambda(job):
+    # ok: nso-api-offloaded-builder-called-on-loop
+    return await anyio.to_thread.run_sync(lambda: _module_level_builder(job))
+
+
+async def module_level_builder_offloaded_by_name(job):
+    return await anyio.to_thread.run_sync(_module_level_builder, job)
+
+
+async def evidence_by_a_local_helper_off_the_worker(job):
+    def label():
+        return {"job": job}
+
+    # ok: nso-api-offloaded-builder-called-on-loop
+    return label(), await anyio.to_thread.run_sync(lambda: _job_out(job))
+
+
+async def evidence_in_builder_defaults(items, job):
+    # ruleid: nso-api-evidence-in-default-argument
+    def build(digest=evidence_digest(items)):
+        # ok: nso-api-evidence-in-default-argument
+        return digest, _job_out(job)
+
+    return await anyio.to_thread.run_sync(build)
+
+
+async def evidence_in_a_typed_keyword_default(job):
+    # ruleid: nso-api-evidence-in-default-argument
+    def build(*, head: dict = _evidence_head_out(job)):
+        return head
+
+    return await anyio.to_thread.run_sync(build)
+
+
+def sync_builder_default_off_the_handler(job, size=1):
+    # ok: nso-api-evidence-in-default-argument
+    return _job_out(job)
+
+
+async def evidence_deferred_by_a_lambda_default(job):
+    # ok: nso-api-evidence-in-default-argument, nso-api-evidence-on-event-loop
+    def build(render=lambda: _job_out(job)):
+        return render()
+
+    return await anyio.to_thread.run_sync(build)
+
+
+async def evidence_in_a_called_lambda_default(job):
+    # ruleid: nso-api-evidence-in-default-argument
+    def build(digest=(lambda: _job_out(job))()):
+        return digest
+
+    return await anyio.to_thread.run_sync(build)
+
+
+async def evidence_in_a_default_inside_the_offloaded_body(job, items):
+    def build():
+        # ok: nso-api-evidence-in-default-argument
+        def render(digest=evidence_digest(items)):
+            return digest
+
+        return render()
+
+    # ruleid: nso-api-evidence-in-default-argument, nso-api-evidence-on-event-loop
+    def eager(digest=evidence_digest(items)):
+        return digest
+
+    return await anyio.to_thread.run_sync(build), eager()
+
+
+@router.get("")
+async def decorated_evidence_off_the_loop(rows):
+    # ok: nso-api-evidence-on-event-loop
+    return await anyio.to_thread.run_sync(lambda: [_job_out(row) for row in rows])
+
+
+async def evidence_off_the_loop(db, rows, job):
+    # ok: nso-api-evidence-on-event-loop
+    items = await anyio.to_thread.run_sync(lambda: [_job_out(row) for row in rows])
+    # ok: nso-api-evidence-on-event-loop
+    single = await anyio.to_thread.run_sync(_job_out, job)
+
+    def build():
+        # ok: nso-api-evidence-on-event-loop
+        observed = {"head": _evidence_head_out(job), "items": items, "single": single}
+        # ok: nso-api-evidence-on-event-loop
+        return {**observed, "digest": evidence_digest(observed)}
+
+    return await anyio.to_thread.run_sync(build)
+
+
+def sync_evidence_builder(row):
+    # ok: nso-api-evidence-on-event-loop
+    return evidence_envelope({}, {}, None, construct=lambda candidate: candidate.update(row))

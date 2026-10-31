@@ -1,15 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Golden-body tests — the jobs router (list / get).
+"""Golden job projections inside validated evidence envelopes.
 
-EMIT-NULL shape: ``_job_out`` always emits all 12 keys, nullables (device_id,
-result, error, context, started_at, heartbeat_at, settle_seq) as null.
-created_at/updated_at are always-present "<iso>Z" strings; started_at/heartbeat_at
-are "<iso>Z" or null. The goldens pin the full key set (before + after typing).
-
-``settle_seq`` (Appendix S §3.3) is additive: the key joins the shape, and the
-default page keeps its rows, its direction and its limit of 100 (S3.4) — the three
-existing consumers read it unchanged.
+Every projection field is present. Nullable values stay null. Timestamps use UTC.
+The default page retains its creation order and limit.
 """
 
 from __future__ import annotations
@@ -18,6 +12,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from tests.api.evidence import valid_projection
 from tests.conftest import VALID_TOKEN, empty_execution_result, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -55,7 +50,7 @@ async def test_get_job_maximal_golden(adapter_client):
     device_id = await seed_device(nso_device_name="job-dev", netbox_device_id=201)
     job_id = await _seed_job(device_id, settle_seq=7)
 
-    body = (await adapter_client.get(f"/api/v1/jobs/{job_id}", headers=AUTH)).json()
+    body = valid_projection((await adapter_client.get(f"/api/v1/jobs/{job_id}", headers=AUTH)).json())
 
     assert body == {
         "id": job_id,
@@ -94,7 +89,7 @@ async def test_list_jobs_nullable_golden(adapter_client):
 
     body = (await adapter_client.get("/api/v1/jobs", headers=AUTH)).json()
 
-    assert body == [
+    assert [valid_projection(item) for item in body] == [
         {
             "id": job_id,
             "type": "provision",
@@ -143,4 +138,4 @@ async def test_the_default_page_is_unchanged_descending_at_100(adapter_client):
 
     body = (await adapter_client.get(f"/api/v1/jobs?device_id={device_id}", headers=AUTH)).json()
 
-    assert [r["id"] for r in body] == sorted(ids, reverse=True)[:100]
+    assert [valid_projection(r)["id"] for r in body] == sorted(ids, reverse=True)[:100]

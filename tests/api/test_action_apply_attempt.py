@@ -9,6 +9,7 @@ import uuid
 import pytest
 import sqlalchemy as sa
 
+from tests.api.evidence import deployment_projections, empty_vlan_execution_result
 from tests.conftest import VALID_TOKEN, seed_device, session
 from tests.core.test_generation_protocol import seed_settings
 
@@ -53,6 +54,7 @@ async def _settle(job_id: int) -> None:
         job = await db.get(Job, job_id)
         assert job is not None
         job.status = JobStatus.succeeded
+        job.result = empty_vlan_execution_result()
         await settle_job_generations(db, job_id, outcome=GenerationStatus.settled)
         await db.commit()
 
@@ -175,12 +177,14 @@ async def test_deterministic_rejection_is_persisted_replayed_and_served_as_evide
     )
     assert evidence.status_code == 200, evidence.text
     assert evidence.json()["unknown_apply_attempt_ids"] == []
-    assert evidence.json()["attempts"] == [
+    assert deployment_projections(evidence.json())["attempts"] == [
         {
             "apply_attempt_id": str(attempt_id),
             "admission_state": "rejected",
             "http_status": 409,
             "response": rejected.json(),
+            "selected": {"vlan": 7302},
+            "generation_ids": [],
             "generations": [],
         }
     ]
@@ -227,12 +231,14 @@ async def test_complete_no_op_replays_and_serves_its_stored_response_as_evidence
     )
     assert evidence.status_code == 200, evidence.text
     assert evidence.json()["unknown_apply_attempt_ids"] == []
-    assert evidence.json()["attempts"] == [
+    assert deployment_projections(evidence.json())["attempts"] == [
         {
             "apply_attempt_id": str(attempt_id),
             "admission_state": "admitted",
             "http_status": 200,
             "response": expected,
+            "selected": {"vlan": 7401},
+            "generation_ids": [],
             "generations": [],
         }
     ]
@@ -443,7 +449,7 @@ async def test_settled_post_created_attempt_remains_available_after_job_pruning(
     )
 
     assert evidence.status_code == 200, evidence.text
-    body = evidence.json()
+    body = deployment_projections(evidence.json())
     assert body["head"] is None
     assert body["unknown_apply_attempt_ids"] == []
     assert body["attempts"][0]["apply_attempt_id"] == str(attempt_id)

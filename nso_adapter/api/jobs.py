@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Literal
 
+import anyio.to_thread
 from fastapi import APIRouter, Depends, Response
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -20,9 +21,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404, RESP_422_VALIDATION, ResponseSpec, api_error
-from nso_adapter.api.execution import AttributedRefusalOut, RowOutcomeOut, evidence_projection
+from nso_adapter.api.execution import (
+    AttributedRefusalOut,
+    EvidenceEnvelope,
+    RowOutcomeOut,
+    evidence_envelope,
+    evidence_projection,
+    validate_execution_result,
+)
 from nso_adapter.api.pagination import DEFAULT_PAGE, validate_page_limit
-from nso_adapter.api.timestamps import iso_z
 from nso_adapter.store.meta import get_store_incarnation
 from nso_adapter.store.models import Job, JobStatus
 
@@ -32,7 +39,9 @@ STORE_INCARNATION_HEADER = "X-Store-Incarnation"
 
 
 class JobOut(BaseModel):
-    """EMIT-NULL job shape — every key always present, nullables emitted as null."""
+    """Emit every job field and retain null values."""
+
+    model_config = {"extra": "forbid"}
 
     id: int
     type: str
@@ -51,32 +60,56 @@ class JobOut(BaseModel):
     settle_seq: int | None
 
 
+class JobIdentityOut(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    id: int
+    device_id: int | None
+    settle_seq: int | None
+
+
+class JobEvidenceOut(EvidenceEnvelope[JobIdentityOut, JobOut]):
+    pass
+
+
 def _job_out(j: Job) -> dict:
-    return {
+    identity = {"id": j.id, "device_id": j.device_id, "settle_seq": j.settle_seq}
+    candidate = {
         "id": j.id,
         "type": j.job_type.value,
         "device_id": j.device_id,
         "status": j.status.value,
         "result": j.result,
-        **evidence_projection(j.result),
         "error": j.error,
         "context": j.context,
-        "created_at": iso_z(j.created_at),
-        "updated_at": iso_z(j.updated_at),
-        "started_at": iso_z(j.started_at),
-        "heartbeat_at": iso_z(j.heartbeat_at),
+        "created_at": j.created_at,
+        "updated_at": j.updated_at,
+        "started_at": j.started_at,
+        "heartbeat_at": j.heartbeat_at,
         "settle_seq": j.settle_seq,
     }
 
+    return evidence_envelope(
+        identity,
+        candidate,
+        JobOut,
+        construct=lambda value: value.update(evidence_projection(j.result)),
+        validate=lambda value: (
+            validate_execution_result(
+                value["result"],
+                required=j.job_type.value in ("apply", "removal") and j.status.value in ("succeeded", "failed"),
+            )
+            if j.job_type.value in ("apply", "removal")
+            else None
+        ),
+    )
+
 
 def stamp_store_incarnation(response: Response) -> None:
-    """Carry the live store incarnation on the response, not on the rows (§3.4, r2-M5).
+    """Carry the store incarnation on every response, including empty pages.
 
-    A consumer resets its cursor when the store it belongs to is gone, and the page that
-    proves it is gone is an EMPTY one — a cursor past the end of a restarted sequence
-    returns no rows at all. A per-row field would therefore say nothing in the one state
-    where the decision is made, and an envelope would change the body the existing
-    consumers read. The value is a process-cached read, so it costs no query.
+    A cursor past the end of a rebuilt store can return no rows. The header lets the
+    consumer detect that rebuild and reset its cursor. Startup caches this store identity.
     """
     response.headers[STORE_INCARNATION_HEADER] = get_store_incarnation()[0]
 
@@ -96,7 +129,7 @@ _RESP_200_INCARNATION: ResponseSpec = {
 @router.get(
     "",
     dependencies=[Depends(verify_token), Depends(stamp_store_incarnation)],
-    response_model=list[JobOut],
+    response_model=list[JobEvidenceOut],
     responses={**_RESP_200_INCARNATION, **RESP_401, **RESP_422_VALIDATION},
 )
 async def list_jobs(
@@ -158,18 +191,19 @@ async def list_jobs(
         # consumers polling the same device can then see different orders. The `id` tiebreak
         # makes the existing descending page deterministic; it changes no row or direction.
         query = query.order_by(Job.created_at.desc(), Job.id.desc())
-    result = await db.execute(query)
-    return [_job_out(j) for j in result.scalars().all()]
+    rows = (await db.execute(query)).scalars().all()
+    # Envelope digests and contract checks are CPU-bound: keep them off the event loop.
+    return await anyio.to_thread.run_sync(lambda: [_job_out(j) for j in rows])
 
 
 @router.get(
     "/{job_id}",
     dependencies=[Depends(verify_token)],
-    response_model=JobOut,
+    response_model=JobEvidenceOut,
     responses={**RESP_401, **RESP_404, **RESP_422_VALIDATION},
 )
 async def get_job(job_id: int, db: AsyncSession = Depends(get_db)):
     job = await db.get(Job, job_id)
     if not job:
         raise api_error(404, "not_found", "Job not found")
-    return _job_out(job)
+    return await anyio.to_thread.run_sync(_job_out, job)
