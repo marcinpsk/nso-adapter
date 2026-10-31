@@ -2,6 +2,53 @@
 
 <!-- version list -->
 
+## v1.18.0 (2026-10-31)
+
+### Bug Fixes
+
+- **opengrep**: Exempt a lambda-deferred default of an offloaded def
+  ([`99fe7a9`](https://github.com/marcinpsk/nso-adapter/commit/99fe7a9e267f3521e4f8369198bf3106ab1373c8))
+
+- **opengrep**: Exempt deferred calls from the default-argument rule
+  ([`52ba69b`](https://github.com/marcinpsk/nso-adapter/commit/52ba69b306b511edaaf5c8f3d3a51889b922c9b8))
+
+- **opengrep**: Exempt worker-thread calls of an offloaded def
+  ([`73fa5f6`](https://github.com/marcinpsk/nso-adapter/commit/73fa5f64cc9f66bc9400344462dd4d36e3daea2a))
+
+- **opengrep**: Limit the off-loop exemptions to deferred builder bodies
+  ([`8e06c72`](https://github.com/marcinpsk/nso-adapter/commit/8e06c726e464c3b7e1be923bc456800eaa2052cd))
+
+- **opengrep**: Reject an envelope builder in a parameter default
+  ([`201cd0d`](https://github.com/marcinpsk/nso-adapter/commit/201cd0df28984521bbdb04715e4017fc18e96572))
+
+- **opengrep**: Report a direct call of a def that run_sync offloads
+  ([`f81490b`](https://github.com/marcinpsk/nso-adapter/commit/f81490b7e74984ac6e4b5bd7f07a8d44a2928960))
+
+- **opengrep**: Report a lambda that a parameter default calls
+  ([`a8b44a5`](https://github.com/marcinpsk/nso-adapter/commit/a8b44a5917ee91ef4c22a9164301948f95e154b4))
+
+- **opengrep**: Report an offloaded def called in a parameter default
+  ([`260257f`](https://github.com/marcinpsk/nso-adapter/commit/260257f0486a5b0b47e182d08437db162c1d45f6))
+
+### Chores
+
+- **deps**: Bump filelock from 3.29.4 to 4.2.1
+  ([`09b93f2`](https://github.com/marcinpsk/nso-adapter/commit/09b93f286be01f1f7a8f97f78d726b278fb36579))
+
+- **deps**: Bump virtualenv from 21.14.9 to 21.14.13
+  ([`710baa6`](https://github.com/marcinpsk/nso-adapter/commit/710baa679ff3b80fd4cb2b81b62db52fc7ca8428))
+
+### Documentation
+
+- **opengrep**: State the nested-lambda limit of the offloaded-def rule
+  ([`277c7a8`](https://github.com/marcinpsk/nso-adapter/commit/277c7a80bd802ac648715fdbfaf86bc76c1aa7cc))
+
+### Features
+
+- **refusal**: Add the LAG bundle range and BGP VRF peer family catalog ids
+  ([`a7732a5`](https://github.com/marcinpsk/nso-adapter/commit/a7732a585c53ab261d3f8e77d5545aab0109f5ea))
+
+
 ## v1.17.1 (2026-10-29)
 
 ### Chores
