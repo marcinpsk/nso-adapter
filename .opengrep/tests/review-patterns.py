@@ -908,6 +908,28 @@ async def evidence_between_builder_and_offload(job):
     return direct, await anyio.to_thread.run_sync(build)
 
 
+async def evidence_in_builder_defaults(items, job):
+    # ruleid: nso-api-evidence-in-default-argument
+    def build(digest=evidence_digest(items)):
+        # ok: nso-api-evidence-in-default-argument
+        return digest, _job_out(job)
+
+    return await anyio.to_thread.run_sync(build)
+
+
+async def evidence_in_a_typed_keyword_default(job):
+    # ruleid: nso-api-evidence-in-default-argument
+    def build(*, head: dict = _evidence_head_out(job)):
+        return head
+
+    return await anyio.to_thread.run_sync(build)
+
+
+def sync_builder_default_off_the_handler(job, size=1):
+    # ok: nso-api-evidence-in-default-argument
+    return _job_out(job)
+
+
 @router.get("")
 async def decorated_evidence_off_the_loop(rows):
     # ok: nso-api-evidence-on-event-loop

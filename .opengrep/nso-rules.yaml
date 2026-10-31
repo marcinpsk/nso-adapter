@@ -1040,3 +1040,28 @@ rules:
               - pattern-not-inside: |
                   def $BUILD(...):
                       ...
+  - id: nso-api-evidence-in-default-argument
+    languages: [python]
+    severity: ERROR
+    message: A parameter default runs when its def statement runs, on the event loop in an async handler; build the envelope or digest inside the offloaded body.
+    paths:
+      include:
+        - nso_adapter/api/**/*.py
+        - review-patterns.py
+    patterns:
+      - pattern: $BUILDER(...)
+      - metavariable-regex:
+          metavariable: $BUILDER
+          regex: ^(evidence_envelope|evidence_digest|_job_out|_device_generation_out|_device_generation_listing_out|_evidence_head_out|_evidence_attempt_out|_attempt_generation_out)$
+      - pattern-either:
+          - pattern-inside: |
+              async def $HANDLER(...):
+                  ...
+          - pattern-inside: |
+              @$DECORATOR(...)
+              async def $HANDLER(...):
+                  ...
+      - pattern-inside: |
+          def $DEFINED(..., $PARAM=$DEFAULT, ...):
+              ...
+      - pattern-inside: $DEFAULT
