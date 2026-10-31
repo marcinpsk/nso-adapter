@@ -930,6 +930,29 @@ def sync_builder_default_off_the_handler(job, size=1):
     return _job_out(job)
 
 
+async def evidence_deferred_by_a_lambda_default(job):
+    # ok: nso-api-evidence-in-default-argument, nso-api-evidence-on-event-loop
+    def build(render=lambda: _job_out(job)):
+        return render()
+
+    return await anyio.to_thread.run_sync(build)
+
+
+async def evidence_in_a_default_inside_the_offloaded_body(job, items):
+    def build():
+        # ok: nso-api-evidence-in-default-argument
+        def render(digest=evidence_digest(items)):
+            return digest
+
+        return render()
+
+    # ruleid: nso-api-evidence-in-default-argument, nso-api-evidence-on-event-loop
+    def eager(digest=evidence_digest(items)):
+        return digest
+
+    return await anyio.to_thread.run_sync(build), eager()
+
+
 @router.get("")
 async def decorated_evidence_off_the_loop(rows):
     # ok: nso-api-evidence-on-event-loop
