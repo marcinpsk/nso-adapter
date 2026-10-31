@@ -962,9 +962,19 @@ async def offloaded_builder_in_a_default_of_an_offloaded_def(job):
 
         return inner()
 
+    # ok: nso-api-offloaded-builder-called-on-loop
+    def deferred(value=lambda: build()):
+        return value()
+
+    # ruleid: nso-api-offloaded-builder-called-on-loop
+    def called(value=(lambda: build())()):
+        return value
+
     head = await anyio.to_thread.run_sync(build)
     first = await anyio.to_thread.run_sync(nested)
-    return head, first, await anyio.to_thread.run_sync(other)
+    second = await anyio.to_thread.run_sync(deferred)
+    third = await anyio.to_thread.run_sync(called)
+    return head, first, second, third, await anyio.to_thread.run_sync(other)
 
 
 @router.get("/{job_id}/eager")

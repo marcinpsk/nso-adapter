@@ -1090,15 +1090,25 @@ rules:
               - inside: |
                   def $OTHER(...):
                       ...
-              # A parameter default runs when the def statement runs, on the event loop.
+              # A parameter default runs when the def statement runs, on the event loop, unless a lambda defers it.
               - not:
-                  inside:
-                    all:
-                      - |
-                        def $OTHER(..., $PARAM=$DEFAULT, ...):
-                            ...
-                    where:
-                      - focus: $DEFAULT
+                  all:
+                    - $BUILD(...)
+                    - inside:
+                        all:
+                          - |
+                            def $OTHER(..., $PARAM=$DEFAULT, ...):
+                                ...
+                        where:
+                          - focus: $DEFAULT
+                    - any:
+                        - all:
+                            - $BUILD(...)
+                            - inside: "(lambda $...ARGS: $BODY)(...)"
+                        - all:
+                            - $BUILD(...)
+                            - not:
+                                inside: "lambda $...ARGS: $BODY"
   - id: nso-api-evidence-in-default-argument
     languages: [python]
     severity: ERROR
