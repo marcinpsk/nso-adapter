@@ -1000,15 +1000,10 @@ rules:
         - nso_adapter/api/**/*.py
         - review-patterns.py
     patterns:
-      - pattern-either:
-          - pattern: evidence_envelope(...)
-          - pattern: evidence_digest(...)
-          - pattern: _job_out(...)
-          - pattern: _device_generation_out(...)
-          - pattern: _device_generation_listing_out(...)
-          - pattern: _evidence_head_out(...)
-          - pattern: _evidence_attempt_out(...)
-          - pattern: _attempt_generation_out(...)
+      - pattern: $BUILDER(...)
+      - metavariable-regex:
+          metavariable: $BUILDER
+          regex: ^(evidence_envelope|evidence_digest|_job_out|_device_generation_out|_device_generation_listing_out|_evidence_head_out|_evidence_attempt_out|_attempt_generation_out)$
       # A decorated route handler does not match the undecorated form.
       - pattern-either:
           - pattern-inside: |
@@ -1018,10 +1013,30 @@ rules:
               @$DECORATOR(...)
               async def $HANDLER(...):
                   ...
-      - pattern-not-inside: anyio.to_thread.run_sync(...)
-      # A def pattern also matches async def, so a nested builder is excluded only when offloaded.
-      - pattern-not-inside: |
-          def $BUILD(...):
-              ...
-          ...
-          await anyio.to_thread.run_sync($BUILD, ...)
+      # Offloaded only inside a lambda given to run_sync: its other arguments run on the loop.
+      - pattern-either:
+          - patterns:
+              - pattern: $BUILDER(...)
+              - pattern-not-inside: anyio.to_thread.run_sync(...)
+          - patterns:
+              - pattern: $BUILDER(...)
+              - pattern-not-inside: "lambda $...ARGS: $BODY"
+      # Offloaded only inside the body of the def given to run_sync, not in the statements between.
+      - pattern-either:
+          - patterns:
+              - pattern: $BUILDER(...)
+              - pattern-not-inside: |
+                  def $BUILD(...):
+                      ...
+                  ...
+                  await anyio.to_thread.run_sync($BUILD, ...)
+          - patterns:
+              - pattern-inside: |
+                  def $BUILD(...):
+                      ...
+                  ...
+                  await anyio.to_thread.run_sync($BUILD, ...)
+              - pattern: $BUILDER(...)
+              - pattern-not-inside: |
+                  def $BUILD(...):
+                      ...

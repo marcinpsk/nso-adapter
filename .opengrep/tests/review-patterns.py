@@ -893,6 +893,21 @@ async def decorated_evidence_on_the_loop(job):
     return _job_out(job)
 
 
+async def evidence_as_an_eager_offload_argument(items):
+    # ruleid: nso-api-evidence-on-event-loop
+    return await anyio.to_thread.run_sync(lambda x: x, evidence_digest(items))
+
+
+async def evidence_between_builder_and_offload(job):
+    def build():
+        # ok: nso-api-evidence-on-event-loop
+        return _job_out(job)
+
+    # ruleid: nso-api-evidence-on-event-loop
+    direct = _job_out(job)
+    return direct, await anyio.to_thread.run_sync(build)
+
+
 @router.get("")
 async def decorated_evidence_off_the_loop(rows):
     # ok: nso-api-evidence-on-event-loop
