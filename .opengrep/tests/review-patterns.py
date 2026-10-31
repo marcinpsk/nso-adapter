@@ -921,6 +921,31 @@ async def evidence_by_an_eager_builder_call(job):
     return eager, offloaded, build()
 
 
+async def offloaded_builder_called_on_the_worker(job):
+    def build():
+        return _job_out(job)
+
+    def before():
+        # ok: nso-api-offloaded-builder-called-on-loop
+        return build()
+
+    # ruleid: nso-api-offloaded-builder-called-on-loop
+    eager = build()
+    head = await anyio.to_thread.run_sync(build)
+
+    def after():
+        # ok: nso-api-offloaded-builder-called-on-loop
+        return [build() for _ in range(2)]
+
+    # ok: nso-api-offloaded-builder-called-on-loop
+    wrapped = await anyio.to_thread.run_sync(lambda: build())
+    # ruleid: nso-api-offloaded-builder-called-on-loop
+    argument = await anyio.to_thread.run_sync(lambda value: value, build())
+    first = await anyio.to_thread.run_sync(before)
+    last = await anyio.to_thread.run_sync(after)
+    return eager, head, wrapped, argument, first, last
+
+
 @router.get("/{job_id}/eager")
 async def decorated_evidence_by_an_eager_builder_call(job):
     def build():
