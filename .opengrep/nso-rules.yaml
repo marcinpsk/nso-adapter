@@ -1074,11 +1074,14 @@ rules:
         # A lambda given to run_sync runs on the worker; an eager argument does not.
         - not:
             all:
+              - $BUILD(...)
               - inside: anyio.to_thread.run_sync(...)
               - inside: "lambda $...ARGS: $BODY"
         # The body of a def given to run_sync runs on the worker; a statement between them does not.
+        # A negated all: needs a positive term, or a nested not: inside it matches nothing.
         - not:
             all:
+              - $BUILD(...)
               - inside: |
                   def $OTHER(...):
                       ...
@@ -1087,6 +1090,15 @@ rules:
               - inside: |
                   def $OTHER(...):
                       ...
+              # A parameter default runs when the def statement runs, on the event loop.
+              - not:
+                  inside:
+                    all:
+                      - |
+                        def $OTHER(..., $PARAM=$DEFAULT, ...):
+                            ...
+                    where:
+                      - focus: $DEFAULT
   - id: nso-api-evidence-in-default-argument
     languages: [python]
     severity: ERROR

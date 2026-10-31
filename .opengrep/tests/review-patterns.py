@@ -946,6 +946,27 @@ async def offloaded_builder_called_on_the_worker(job):
     return eager, head, wrapped, argument, first, last
 
 
+async def offloaded_builder_in_a_default_of_an_offloaded_def(job):
+    def build():
+        return _job_out(job)
+
+    # ruleid: nso-api-offloaded-builder-called-on-loop
+    def other(value=build()):
+        # ok: nso-api-offloaded-builder-called-on-loop
+        return value, build()
+
+    def nested():
+        # ok: nso-api-offloaded-builder-called-on-loop
+        def inner(value=build()):
+            return value
+
+        return inner()
+
+    head = await anyio.to_thread.run_sync(build)
+    first = await anyio.to_thread.run_sync(nested)
+    return head, first, await anyio.to_thread.run_sync(other)
+
+
 @router.get("/{job_id}/eager")
 async def decorated_evidence_by_an_eager_builder_call(job):
     def build():
