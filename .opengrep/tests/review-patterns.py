@@ -938,6 +938,14 @@ async def evidence_deferred_by_a_lambda_default(job):
     return await anyio.to_thread.run_sync(build)
 
 
+async def evidence_in_a_called_lambda_default(job):
+    # ruleid: nso-api-evidence-in-default-argument
+    def build(digest=(lambda: _job_out(job))()):
+        return digest
+
+    return await anyio.to_thread.run_sync(build)
+
+
 async def evidence_in_a_default_inside_the_offloaded_body(job, items):
     def build():
         # ok: nso-api-evidence-in-default-argument

@@ -1065,8 +1065,14 @@ rules:
           def $DEFINED(..., $PARAM=$DEFAULT, ...):
               ...
       - pattern-inside: $DEFAULT
-      # A lambda in the default defers the call to whoever calls it.
-      - pattern-not-inside: "lambda $...ARGS: $BODY"
+      # A lambda in the default defers the call, unless the default calls the lambda.
+      - pattern-either:
+          - patterns:
+              - pattern: $BUILDER(...)
+              - pattern-not-inside: "lambda $...ARGS: $BODY"
+          - patterns:
+              - pattern-inside: "(lambda $...ARGS: $BODY)(...)"
+              - pattern: $BUILDER(...)
       # A def nested in an offloaded body defines its defaults on the worker thread.
       - pattern-not-inside: |
           def $BUILD(...):
