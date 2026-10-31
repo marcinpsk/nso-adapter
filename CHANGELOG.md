@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.19.0 (2026-10-31)
+
+### Features
+
+- **refusal**: Add the BGP peer family catalog id
+  ([`14cc848`](https://github.com/marcinpsk/nso-adapter/commit/14cc8489ed2edf9a23598bfe8d4b498e8b7a9864))
+
+
 ## v1.18.0 (2026-10-31)
 
 ### Bug Fixes
