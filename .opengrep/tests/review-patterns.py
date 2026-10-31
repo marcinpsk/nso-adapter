@@ -908,6 +908,51 @@ async def evidence_between_builder_and_offload(job):
     return direct, await anyio.to_thread.run_sync(build)
 
 
+async def evidence_by_an_eager_builder_call(job):
+    def build():
+        # ok: nso-api-evidence-on-event-loop
+        return _job_out(job)
+
+    # ruleid: nso-api-offloaded-builder-called-on-loop
+    eager = build()
+    # ok: nso-api-offloaded-builder-called-on-loop
+    offloaded = await anyio.to_thread.run_sync(build)
+    # ruleid: nso-api-offloaded-builder-called-on-loop
+    return eager, offloaded, build()
+
+
+@router.get("/{job_id}/eager")
+async def decorated_evidence_by_an_eager_builder_call(job):
+    def build():
+        return _evidence_head_out(job)
+
+    if job:
+        # ruleid: nso-api-offloaded-builder-called-on-loop
+        return build()
+    return await anyio.to_thread.run_sync(build)
+
+
+def _module_level_builder(job):
+    return _job_out(job)
+
+
+async def module_level_builder_in_an_offloaded_lambda(job):
+    # ok: nso-api-offloaded-builder-called-on-loop
+    return await anyio.to_thread.run_sync(lambda: _module_level_builder(job))
+
+
+async def module_level_builder_offloaded_by_name(job):
+    return await anyio.to_thread.run_sync(_module_level_builder, job)
+
+
+async def evidence_by_a_local_helper_off_the_worker(job):
+    def label():
+        return {"job": job}
+
+    # ok: nso-api-offloaded-builder-called-on-loop
+    return label(), await anyio.to_thread.run_sync(lambda: _job_out(job))
+
+
 async def evidence_in_builder_defaults(items, job):
     # ruleid: nso-api-evidence-in-default-argument
     def build(digest=evidence_digest(items)):

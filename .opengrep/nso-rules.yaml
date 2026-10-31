@@ -1040,6 +1040,35 @@ rules:
               - pattern-not-inside: |
                   def $BUILD(...):
                       ...
+  - id: nso-api-offloaded-builder-called-on-loop
+    languages: [python]
+    severity: ERROR
+    message: This def is the body given to anyio.to_thread.run_sync; a direct call runs its evidence work on the event loop in an async handler.
+    paths:
+      include:
+        - nso_adapter/api/**/*.py
+        - review-patterns.py
+    patterns:
+      # The def is local to the handler; the trailing ellipsis also covers a call after the offload.
+      - pattern-either:
+          - pattern-inside: |
+              async def $HANDLER(...):
+                  ...
+                  def $BUILD(...):
+                      ...
+                  ...
+                  await anyio.to_thread.run_sync($BUILD, ...)
+                  ...
+          - pattern-inside: |
+              @$DECORATOR(...)
+              async def $HANDLER(...):
+                  ...
+                  def $BUILD(...):
+                      ...
+                  ...
+                  await anyio.to_thread.run_sync($BUILD, ...)
+                  ...
+      - pattern: $BUILD(...)
   - id: nso-api-evidence-in-default-argument
     languages: [python]
     severity: ERROR
