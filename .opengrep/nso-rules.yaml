@@ -1040,6 +1040,75 @@ rules:
               - pattern-not-inside: |
                   def $BUILD(...):
                       ...
+  - id: nso-api-offloaded-builder-called-on-loop
+    languages: [python]
+    severity: ERROR
+    message: This def is the body given to anyio.to_thread.run_sync; a direct call runs its evidence work on the event loop in an async handler.
+    paths:
+      include:
+        - nso_adapter/api/**/*.py
+        - review-patterns.py
+    # Syntax 2 (match:) can negate a conjunction with a shared metavariable; patterns: cannot.
+    match:
+      all:
+        # The def is local to the handler; the trailing ellipsis also covers a call after the offload.
+        - any:
+            - inside: |
+                async def $HANDLER(...):
+                    ...
+                    def $BUILD(...):
+                        ...
+                    ...
+                    await anyio.to_thread.run_sync($BUILD, ...)
+                    ...
+            - inside: |
+                @$DECORATOR(...)
+                async def $HANDLER(...):
+                    ...
+                    def $BUILD(...):
+                        ...
+                    ...
+                    await anyio.to_thread.run_sync($BUILD, ...)
+                    ...
+        - $BUILD(...)
+        # A lambda given to run_sync runs on the worker; an eager argument does not.
+        - not:
+            all:
+              - $BUILD(...)
+              - inside: anyio.to_thread.run_sync(...)
+              - inside: "lambda $...ARGS: $BODY"
+        # The body of a def given to run_sync runs on the worker; a statement between them does not.
+        # A negated all: needs a positive term, or a nested not: inside it matches nothing.
+        - not:
+            all:
+              - $BUILD(...)
+              - inside: |
+                  def $OTHER(...):
+                      ...
+                  ...
+                  await anyio.to_thread.run_sync($OTHER, ...)
+              - inside: |
+                  def $OTHER(...):
+                      ...
+              # A parameter default runs when the def statement runs, on the event loop, unless a lambda defers it.
+              - not:
+                  all:
+                    - $BUILD(...)
+                    - inside:
+                        all:
+                          - |
+                            def $OTHER(..., $PARAM=$DEFAULT, ...):
+                                ...
+                        where:
+                          - focus: $DEFAULT
+                    - any:
+                        - all:
+                            - $BUILD(...)
+                            - inside: "(lambda $...ARGS: $BODY)(...)"
+                        - all:
+                            - $BUILD(...)
+                            - not:
+                                inside: "lambda $...ARGS: $BODY"
   - id: nso-api-evidence-in-default-argument
     languages: [python]
     severity: ERROR
