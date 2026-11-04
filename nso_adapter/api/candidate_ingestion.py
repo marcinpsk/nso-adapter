@@ -123,7 +123,7 @@ def validate_candidates(
             body = handler.adapter.validate_python(raw)
             _require_timestamps(body)
             if stream == "route_policy":
-                body = {**body, "objects": [dict(obj) for obj in body.get("objects", [])]}
+                body = {**body, "objects": [dict(obj) for obj in body["objects"]]}
                 for obj in body["objects"]:
                     obj["accepted_at"] = TypeAdapter(UtcInstant).validate_python(obj["accepted_at"])
             bodies[stream] = body

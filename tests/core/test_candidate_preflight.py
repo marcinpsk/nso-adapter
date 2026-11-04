@@ -320,6 +320,7 @@ async def test_candidate_normalizes_body_before_hashing(adapter_client, monkeypa
         {"candidates": None},
         {"candidates": {}},
         {"candidates": {"unknown": {}}},
+        {"candidates": {"route_policy": {}}},
         {
             "candidates": {
                 "ip": {
