@@ -325,7 +325,8 @@ async def test_preflight_ip_backfill_disturbing_blocked_stream(adapter_client, m
     result = await preflight.run_preflight(get_engine(), client, device, {"interface_config": 41, "ip": 42})
     assert result.status == "refused" and not result.admitted_selection
     assert result.streams["ip"]["status"] == "blocked"
-    assert result.streams["interface_config"]["status"] == "blocked" or result.context_disturbed == ["ip"]
+    assert result.streams["interface_config"] == {"status": "blocked", "context_disturbed": ["ip"]}
+    assert result.context_disturbed == []
     assert len(transport.dry_requests) == 1
 
 
