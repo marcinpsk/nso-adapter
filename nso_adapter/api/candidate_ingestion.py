@@ -110,8 +110,9 @@ class CandidateIngestion:
         return selected, self.normalized
 
 
-def validate_candidates(routes, device_id: int, candidates: dict[str, dict]) -> CandidateIngestion:
-    registry = candidate_registry(routes)
+def validate_candidates(
+    registry: dict[str, CandidateHandler], device_id: int, candidates: dict[str, dict]
+) -> CandidateIngestion:
     if not candidates or candidates.keys() - registry.keys():
         raise api_error(422, "validation_error", "candidates must name known ingestion streams")
     bodies, normalized = {}, {}

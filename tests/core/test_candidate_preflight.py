@@ -222,10 +222,8 @@ async def test_candidate_switching_uses_fresh_prepared_slot(adapter_client, monk
 
 
 def test_candidate_registry_covers_every_intent_put():
-    from nso_adapter.api.candidate_ingestion import candidate_registry
-
     app = create_app()
-    registry = candidate_registry(app.routes)
+    registry = app.state.candidate_registry
     routes = {route.path: route for route in iter_route_contexts(app.routes) if "PUT" in route.methods}
     assert {stream for stream, handler in registry.items() if handler.receipt} == {
         entry.stream for entry in INTENT_PUT_ENDPOINTS.values()
@@ -235,6 +233,15 @@ def test_candidate_registry_covers_every_intent_put():
             routes[path].endpoint, "candidate_ingester", routes[path].endpoint
         )
         assert registry[entry.stream].body_name == routes[path].dependant.body_params[0].name
+
+
+def test_app_build_refuses_incomplete_candidate_wiring(monkeypatch):
+    from nso_adapter.api import candidate_ingestion
+
+    posts = {**OUT_OF_PROTOCOL_APPLY_POSTS, "/api/v1/devices/{device_id}/unrouted-intent": "unrouted"}
+    monkeypatch.setattr(candidate_ingestion, "OUT_OF_PROTOCOL_APPLY_POSTS", posts)
+    with pytest.raises(RuntimeError, match="missing an ingestion route"):
+        create_app()
 
 
 def test_candidate_openapi_declares_both_modes():

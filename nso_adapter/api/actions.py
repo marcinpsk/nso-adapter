@@ -404,7 +404,9 @@ async def action_apply_preflight(
     if device is None:
         raise api_error(404, "not_found", "Device not found")
     ingest = (
-        validate_candidates(request.app.routes, device_id, body.candidates) if body.candidates is not None else None
+        validate_candidates(request.app.state.candidate_registry, device_id, body.candidates)
+        if body.candidates is not None
+        else None
     )
     selected = body.selected if body.selected is not None else dict.fromkeys(body.candidates or {}, 1)
     db.expunge(device)

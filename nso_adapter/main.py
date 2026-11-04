@@ -18,6 +18,7 @@ from nso_adapter import __version__
 from nso_adapter.api.actions import router as actions_router
 from nso_adapter.api.bfd import router as bfd_router
 from nso_adapter.api.bgp import router as bgp_router
+from nso_adapter.api.candidate_ingestion import candidate_registry
 from nso_adapter.api.capability import router as capability_router
 from nso_adapter.api.config import router as config_router
 from nso_adapter.api.devices import router as devices_router
@@ -612,6 +613,7 @@ def create_app(*, lifespan_context: Callable[[FastAPI], AbstractAsyncContextMana
     app.include_router(jobs_router)
     app.include_router(provision_attempts_router)
     app.include_router(config_router)
+    app.state.candidate_registry = candidate_registry(app.routes)
     _preserve_exact_openapi_integer_bounds(app)
     _declare_bearer_requirement(app)
     return app
