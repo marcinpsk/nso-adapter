@@ -123,7 +123,10 @@ def validate_candidates(
             body = handler.adapter.validate_python(raw)
             _require_timestamps(body)
             if stream == "route_policy":
-                body = {**body, "objects": [dict(obj) for obj in body["objects"]]}
+                objects = body["objects"]
+                if not isinstance(objects, list) or not all(isinstance(obj, dict) for obj in objects):
+                    raise ValueError("route_policy objects must be a list of JSON objects")
+                body = {**body, "objects": [dict(obj) for obj in objects]}
                 for obj in body["objects"]:
                     obj["accepted_at"] = TypeAdapter(UtcInstant).validate_python(obj["accepted_at"])
             bodies[stream] = body

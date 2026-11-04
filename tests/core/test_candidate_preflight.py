@@ -445,3 +445,24 @@ async def test_candidate_validation_redacts_caller_stream_keys(adapter_client, m
     assert response.status_code == 422
     assert_text_free_of(response.text, ["placeholder-candidate-key"])
     assert response.json()["error"]["detail"]["errors"][0]["loc"] == ["body", "candidates", "[redacted]"]
+
+
+@pytest.mark.parametrize(
+    "objects",
+    [
+        {},
+        "",
+        [[[key, value] for key, value in BODIES["route_policy"]["objects"][0].items()]],
+    ],
+    ids=["empty-mapping", "empty-string", "pair-list"],
+)
+async def test_candidate_route_policy_rejects_objects_the_live_put_rejects(adapter_client, monkeypatch, objects):
+    device, _, _, transport = await setup(adapter_client, monkeypatch)
+    before = await all_rows()
+    live = await push(adapter_client, device.id, "route_policy", {"objects": objects})
+    assert live.status_code == 422, live.text
+    response = await preview(adapter_client, device.id, {"route_policy": {"objects": objects}})
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "validation_error"
+    assert not transport.fake.reads
+    assert await all_rows() == before
