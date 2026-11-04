@@ -1151,6 +1151,8 @@ two passes of one preflight returns `unavailable` with `error.code = "inputs_cha
 A device mapping change after the live read returns the same result. Attribution failures and ordinary
 NSO rejections return `error`. These NSO outcomes use HTTP 200 and omit the identity.
 A live job returns the same `409 conflict` envelope as Apply, including `detail.job_id`.
+A selection that Apply would refuse as unexecutable returns the same `409 apply_unexecutable`
+envelope as Apply, including `detail.streams`.
 
 Candidate mode never drops a candidate stream. Any candidate refusal, collateral guard
 block, or disturbed authorized context returns `refused` and admits nothing. Refusals

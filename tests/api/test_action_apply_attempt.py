@@ -204,6 +204,42 @@ async def test_deterministic_rejection_is_persisted_replayed_and_served_as_evide
     assert still_replayed.content == rejected.content
 
 
+async def test_apply_preflight_returns_the_apply_unexecutable_refusal(adapter_client):
+    from tests.core.test_action_apply_promotion import preflight_and_apply
+
+    device_id = await seed_device(nso_device_name="PROD-LAB03-CRPD-SW01", netbox_device_id=16251)
+    await seed_settings(device_id, auto_apply=False)
+    assert (await _put_vlans(adapter_client, device_id, [10, 20], push_seq=7401)).status_code == 200
+    admitted = await _apply(adapter_client, device_id, uuid.uuid4(), {"vlan": 7401})
+    assert admitted.status_code == 202, admitted.text
+    await _settle(admitted.json()["job_id"])
+    changed = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/vlan-intent?store_only=true",
+        json={"vlans": [{"vlan_id": 10, "name": ""}]},
+        headers=AUTH | {"X-Push-Seq": "7402"},
+    )
+    assert changed.status_code == 200, changed.text
+
+    preview = await preflight_and_apply(adapter_client, device_id, {"vlan": 7402}, preflight_only=True)
+
+    assert preview.status_code == 409, preview.text
+    assert preview.json() == {
+        "error": {
+            "code": "apply_unexecutable",
+            "message": "Selected stream(s) cannot be applied faithfully: vlan",
+            "detail": {"streams": {"vlan": "mixed_detach_replacement"}},
+        }
+    }
+
+
+def test_apply_preflight_contract_documents_the_apply_unexecutable_refusal():
+    from pathlib import Path
+
+    contract = (Path(__file__).resolve().parents[2] / "docs" / "api-contract.md").read_text()
+    section = contract.split("### `POST /api/v1/devices/{id}/actions/apply-preflight`", 1)[1].split("\n### ", 1)[0]
+    assert "`409 apply_unexecutable`" in section and "`detail.streams`" in section
+
+
 async def test_complete_no_op_replays_and_serves_its_stored_response_as_evidence(adapter_client):
     from nso_adapter.store.models import DeploymentApplyAttempt
 
