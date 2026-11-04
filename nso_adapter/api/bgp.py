@@ -609,6 +609,7 @@ async def _sync_redistribution(
             db.add(row)
         else:
             cleared = cleared or is_cleared(row.route_map, entry.route_map) or is_cleared(row.metric, entry.metric)
+            row.accepted_at = accepted[dest_ref]
         row.dest_ref = dest_ref
         row.source_ref = entry.source_ref
         row.route_map = entry.route_map

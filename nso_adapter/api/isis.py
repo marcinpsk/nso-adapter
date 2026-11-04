@@ -497,6 +497,7 @@ async def _sync_isis_redistribution(
             ):
                 if old is not None and new is None:
                     cleared = True
+            row.accepted_at = accepted[dest_ref]
         row.source_ref = entry.source_ref
         row.route_map = entry.route_map
         row.metric = entry.metric

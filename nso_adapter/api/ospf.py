@@ -314,7 +314,8 @@ async def _sync_ospf_redistribution(
             existing_map[key] = existing_row
     await db.flush()
 
-    accepted = {str(inst.process_id): inst.accepted_at or now for inst in instances}
+    # A retained row keeps its acceptance when the instance omits one, as the instance row does.
+    accepted = {str(inst.process_id): inst.accepted_at for inst in instances}
     cleared = False
     for dest_ref, entry in _iter_ospf_redistribution(instances):
         key = (dest_ref, entry.source_protocol, redistribution_source_identity(entry.source_protocol, entry.source_ref))
@@ -326,7 +327,7 @@ async def _sync_ospf_redistribution(
                 dest_ref=dest_ref,
                 source_protocol=entry.source_protocol,
                 source_ref=entry.source_ref,
-                accepted_at=accepted[dest_ref],
+                accepted_at=accepted[dest_ref] or now,
             )
             db.add(row)
         else:
@@ -337,6 +338,8 @@ async def _sync_ospf_redistribution(
             ):
                 if old is not None and new is None:
                     cleared = True
+            if accepted[dest_ref] is not None:
+                row.accepted_at = accepted[dest_ref]
         row.source_ref = entry.source_ref
         row.route_map = entry.route_map
         row.metric = entry.metric
