@@ -3,6 +3,7 @@
 """Candidate admission through real ingestion, PostgreSQL and RESTCONF."""
 
 from copy import deepcopy
+from datetime import UTC, datetime
 
 import pytest
 from fastapi.routing import iter_route_contexts
@@ -12,7 +13,7 @@ from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS, OUT_OF_PROTOC
 from nso_adapter.core.preflight import normalized_plan_digest, plan_action_apply, read_plan_inputs
 from nso_adapter.main import create_app
 from nso_adapter.store.db import get_engine, session
-from nso_adapter.store.models import Base, DbInterface, Device
+from nso_adapter.store.models import Base, DbInterface, Device, LagBundleIntent, SwitchportIntent
 from tests._secret_discipline import assert_keys_absent, assert_text_free_of
 from tests.conftest import AUTH
 from tests.core.test_preflight_loop import ADDRESS, INTERFACE, IP_REFUSAL, authorize, has_ip, setup
@@ -204,6 +205,20 @@ async def test_candidate_refusal_names_candidate_rows(adapter_client, monkeypatc
     assert_keys_absent(result, ["candidate_identity", "plan_digest", "preflight_identity"])
     assert [attempt["dropped"] for attempt in result["attempts"]] == [[]]
     assert await all_rows() == before
+
+
+@pytest.mark.parametrize("stream", ["lag", "switchport"])
+async def test_switching_push_stamps_an_explicit_time_on_unchanged_rows(adapter_client, monkeypatch, stream):
+    device, _, _, _ = await setup(adapter_client, monkeypatch)
+    first = deepcopy(BODIES[stream])
+    first["source_revision"] = 41
+    first["accepted_at"] = "2026-10-19T12:00:00Z"
+    assert (await push(adapter_client, device.id, stream, first)).status_code == 200
+    assert (await push(adapter_client, device.id, stream, BODIES[stream])).status_code == 200
+    model = LagBundleIntent if stream == "lag" else SwitchportIntent
+    async with session() as db:
+        stamps = (await db.execute(select(model.accepted_at).where(model.device_id == device.id))).scalars().all()
+    assert stamps == [datetime(2026, 10, 20, 12, tzinfo=UTC)]
 
 
 @pytest.mark.parametrize("stream", ["lag", "switchport"])

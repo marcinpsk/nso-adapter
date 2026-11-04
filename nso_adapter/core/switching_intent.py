@@ -375,18 +375,20 @@ async def _replace_lag_rows(
     for row in removed:
         await db.delete(row)
 
-    accepted_at = accepted_at or datetime.now(UTC)
+    stamp = accepted_at or datetime.now(UTC)
     for bundle in bundles:
         lag_row = by_name.get(bundle.name)
         changed = lag_row is None or _lag_changed(lag_row, bundle)
         if lag_row is None:
-            lag_row = LagBundleIntent(device_id=device_id, name=bundle.name, accepted_at=accepted_at, members=[])
+            lag_row = LagBundleIntent(device_id=device_id, name=bundle.name, accepted_at=stamp, members=[])
             db.add(lag_row)
 
         for field in _LAG_SCALARS:
             setattr(lag_row, field, getattr(bundle, field))
+        # An explicit time restamps unchanged rows too, like the receipt streams.
+        if changed or accepted_at is not None:
+            lag_row.accepted_at = stamp
         if changed:
-            lag_row.accepted_at = accepted_at
             lag_row.last_apply_at = None
             lag_row.last_apply_error = None
 
@@ -450,7 +452,7 @@ async def _replace_switchport_rows(
     for row in removed:
         await db.delete(row)
 
-    accepted_at = accepted_at or datetime.now(UTC)
+    stamp = accepted_at or datetime.now(UTC)
     for interface in interfaces:
         switchport_row = by_name.get(interface.interface_name)
         desired_tags = set(interface.tagged_vlans)
@@ -465,15 +467,16 @@ async def _replace_switchport_rows(
             switchport_row = SwitchportIntent(
                 device_id=device_id,
                 interface_name=interface.interface_name,
-                accepted_at=accepted_at,
+                accepted_at=stamp,
                 tagged_vlans=[],
             )
             db.add(switchport_row)
 
         switchport_row.mode = interface.mode
         switchport_row.untagged_vlan = interface.untagged_vlan
+        if changed or accepted_at is not None:
+            switchport_row.accepted_at = stamp
         if changed:
-            switchport_row.accepted_at = accepted_at
             switchport_row.last_apply_at = None
             switchport_row.last_apply_error = None
 
