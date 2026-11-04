@@ -276,7 +276,7 @@ def _iter_ospf_redistribution(instances: list[OspfInstanceEntry]):
 
 
 async def _sync_ospf_redistribution(
-    db: AsyncSession, device_id: int, instances: list[OspfInstanceEntry], now: datetime
+    db: AsyncSession, device_id: int, instances: list[OspfInstanceEntry]
 ) -> tuple[list[tuple], bool]:
     """Full-replace OSPF (dest_protocol=ospf) redistribution intent rows.
 
@@ -314,8 +314,9 @@ async def _sync_ospf_redistribution(
             existing_map[key] = existing_row
     await db.flush()
 
-    # A retained row keeps its acceptance when the instance omits one, as the instance row does.
-    accepted = {str(inst.process_id): inst.accepted_at for inst in instances}
+    # Every row takes the acceptance of its synchronized instance row, which keeps it when the PUT omits one.
+    parents = await db.execute(select(OspfInstanceIntent).where(OspfInstanceIntent.device_id == device_id))
+    accepted = {str(inst.process_id): inst.accepted_at for inst in parents.scalars()}
     cleared = False
     for dest_ref, entry in _iter_ospf_redistribution(instances):
         key = (dest_ref, entry.source_protocol, redistribution_source_identity(entry.source_protocol, entry.source_ref))
@@ -327,7 +328,7 @@ async def _sync_ospf_redistribution(
                 dest_ref=dest_ref,
                 source_protocol=entry.source_protocol,
                 source_ref=entry.source_ref,
-                accepted_at=accepted[dest_ref] or now,
+                accepted_at=accepted[dest_ref],
             )
             db.add(row)
         else:
@@ -338,8 +339,7 @@ async def _sync_ospf_redistribution(
             ):
                 if old is not None and new is None:
                     cleared = True
-            if accepted[dest_ref] is not None:
-                row.accepted_at = accepted[dest_ref]
+            row.accepted_at = accepted[dest_ref]
         row.source_ref = entry.source_ref
         row.route_map = entry.route_map
         row.metric = entry.metric
@@ -420,7 +420,7 @@ async def put_ospf_intent(
         ),
         state_fields=("priority", "cost", "network_type", "auth_type", "auth_key"),
     )
-    removed_redist, redist_cleared = await _sync_ospf_redistribution(db, device_id, payload.instances, now)
+    removed_redist, redist_cleared = await _sync_ospf_redistribution(db, device_id, payload.instances)
 
     # Same two-cause split as IS-IS (see api/isis.py): a DROPPED row is an un-own and must
     # not strip config off the device absent ?delete_origin (#106 → detach), while a

@@ -18,23 +18,23 @@ SECOND = "2026-10-21T08:30:00Z"
 REDISTRIBUTION = [{"source_protocol": "connected", "source_ref": "", "route_map": None, "metric": None}]
 
 
-def _bgp(accepted_at):
+def _bgp(accepted_at, redistribution=REDISTRIBUTION):
     router = {
         "asn": "65100",
         "scopes": [
-            {"vrf": "", "address_families": [{"af": "ipv4-unicast", "redistribution": REDISTRIBUTION}], "peers": []}
+            {"vrf": "", "address_families": [{"af": "ipv4-unicast", "redistribution": redistribution}], "peers": []}
         ],
     }
     return {"routers": [router | ({"accepted_at": accepted_at} if accepted_at else {})]}
 
 
-def _isis(accepted_at):
-    process = {"process_tag": "CORE", "redistribution": REDISTRIBUTION}
+def _isis(accepted_at, redistribution=REDISTRIBUTION):
+    process = {"process_tag": "CORE", "redistribution": redistribution}
     return {"interfaces": [], "processes": [process | ({"accepted_at": accepted_at} if accepted_at else {})]}
 
 
-def _ospf(accepted_at):
-    instance = {"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": [], "redistribution": REDISTRIBUTION}
+def _ospf(accepted_at, redistribution=REDISTRIBUTION):
+    instance = {"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": [], "redistribution": redistribution}
     return {"interfaces": [], "instances": [instance | ({"accepted_at": accepted_at} if accepted_at else {})]}
 
 
@@ -70,3 +70,17 @@ async def test_retained_redistribution_row_follows_its_parent_acceptance(adapter
     assert row_accepted == parent_accepted
     if second is not None:
         assert row_accepted == datetime(2026, 10, 21, 8, 30, tzinfo=UTC)
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+async def test_new_redistribution_row_under_a_retained_parent_follows_its_acceptance(adapter_client, family):
+    endpoint, body, _ = FAMILIES[family]
+    device_id = await seed_device(nso_device_name=f"redist-new-{family}", netbox_device_id=7882)
+    for payload in (body(FIRST, redistribution=[]), body(None)):
+        resp = await adapter_client.put(
+            f"/api/v1/devices/{device_id}/{endpoint}", headers=AUTH | push_seq(), json=payload
+        )
+        assert resp.status_code == 200, resp.text
+
+    parent_accepted, row_accepted = await _accepted(device_id, family)
+    assert row_accepted == parent_accepted
