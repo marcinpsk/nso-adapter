@@ -1128,7 +1128,8 @@ The response contains:
   `not_evaluated`. A blocked verdict can include `refusals` (the attributed catalog records
   used by apply-diff), `guard` (collateral keys), or `context_disturbed` (stream names).
 - `baseline_refused`, `cross_stream`, and `context_disturbed`: lists of affected streams.
-  Baseline refusal requires repair of that selected stream or Release. A cross-stream
+  `baseline_refused` can name a stream outside the selection. Baseline refusal requires a
+  repair push for each named stream, selected in the next manual Apply, or Release. A cross-stream
   refusal means the selection caused a refusal that does not occur in the pure baseline.
 - `admitted_selection`: the accepted stream selections. `skips` maps skipped stream names
   to Apply's skip reasons. Skipped streams remain `not_evaluated`.
