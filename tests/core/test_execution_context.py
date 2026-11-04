@@ -781,6 +781,56 @@ async def test_automatic_ip_promotion_keeps_a_backfilled_binding(adapter_client)
     assert entry["encap-tag"] == "99"
 
 
+async def test_manual_apply_of_both_streams_keeps_a_backfilled_binding(adapter_client):
+    """Case E through manual Apply: a preflight of both streams admits ip with the binding."""
+    from nso_adapter.store.models import DbInterface
+
+    name = "PROD-LAB03-SROS-PE01"
+    device_id = await seed_device(nso_device_name=name, netbox_device_id=17010)
+    await seed_settings(device_id, auto_apply=False)
+    await _set_ned(device_id, _NOKIA)
+    async with session() as db:
+        db.add(DbInterface(device_id=device_id, name="1/1/1:100", kind="logical"))
+        await db.commit()
+    attribute = [{"interface": "1/1/1:100", "attribute": "description", "intent_value": "uplink"}]
+    assert (await _put_attrs(adapter_client, device_id, attribute, seq=1762)).status_code == 200
+    assert (await _apply(adapter_client, device_id, {"interface_config": 1762})).status_code == 202
+    await _execute(device_id, name)
+
+    address = {
+        "interface": "1/1/1:100",
+        "address": "192.0.2.9/24",
+        "family": "ipv4",
+        "routed": True,
+        "parent_binding": "lag-99",
+        "encap_tag": "99",
+    }
+    assert (await _put_addresses(adapter_client, device_id, [address], seq=1763)).status_code == 200
+    # A new attribute revision lets both interface streams promote, so neither is disturbed.
+    assert (await _put_attrs(adapter_client, device_id, attribute, seq=1764)).status_code == 200
+    selected = {"interface_config": 1764, "ip": 1763}
+
+    preview = await _apply(adapter_client, device_id, selected, preflight_only=True)
+    assert preview.status_code == 200, preview.text
+    result = preview.json()
+    assert result["status"] == "ready", result
+    assert result["admitted_selection"] == selected
+    assert result["streams"]["ip"] == {"status": "admitted"}
+    response = await _apply(adapter_client, device_id, selected, identity=result["preflight_identity"])
+    assert response.status_code == 202, response.text
+    assert response.json()["selected"] == selected
+
+    generation = (await _generations(device_id))[-1]
+    (composed,) = generation.document["interface_config"]["_execution"]["proof"]["interfaces"].values()
+    assert (composed["parent_binding"], composed["encap_tag"]) == ("lag-99", "99")
+
+    recorder = await _execute(device_id, name)
+    (entry,) = recorder.container("interface")["interface"]
+    assert entry["description"] == "uplink"
+    assert (entry["parent-binding"], entry["encap-tag"]) == ("lag-99", "99")
+    assert entry["ipv4-address"] == [{"address": "192.0.2.9", "prefix-length": 24, "secondary": False}]
+
+
 def test_scenario_5e_composition_refuses_two_different_non_null_interface_values():
     """The refusal half, which no single store can produce: two fragments, two bindings.
 
