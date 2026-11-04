@@ -525,6 +525,16 @@ async def test_preflight_no_change_delta_is_conclusive(adapter_client, monkeypat
     assert result.deltas == [{"order": 0, "native": "", "cli": ""}]
 
 
+async def test_preflight_no_content_dry_run_is_conclusive(adapter_client, monkeypatch):
+    # NSO answers a dry run that changes nothing with 204 and no body.
+    device, selected, client, transport = await setup(adapter_client, monkeypatch)
+    transport.judge = lambda _body, _request: httpx.Response(204)
+    result = await preflight.run_preflight(get_engine(), client, device, selected)
+    assert result.status == "ready", result.error
+    assert result.deltas == [{"order": 0, "native": "", "cli": ""}]
+    assert {request.url.params["dry-run"] for request in transport.dry_requests} == {"native", "cli"}
+
+
 @pytest.mark.parametrize("failure", ["refusal", "unavailable"])
 async def test_preflight_cli_failure_is_not_admitted(adapter_client, monkeypatch, failure):
     device, selected, client, transport = await setup(adapter_client, monkeypatch)
