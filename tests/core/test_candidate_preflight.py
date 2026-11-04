@@ -10,7 +10,7 @@ from fastapi.routing import iter_route_contexts
 from sqlalchemy import select
 
 from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS, OUT_OF_PROTOCOL_APPLY_POSTS
-from nso_adapter.core.preflight import normalized_plan_digest, plan_action_apply, read_plan_inputs
+from nso_adapter.core.preflight import _device_context, normalized_plan_digest, plan_action_apply, read_plan_inputs
 from nso_adapter.main import create_app
 from nso_adapter.store.db import get_engine, session
 from nso_adapter.store.models import Base, DbInterface, Device, LagBundleIntent, SwitchportIntent
@@ -141,7 +141,9 @@ async def test_candidate_preflight_matches_pushed_apply_document(adapter_client,
     assert pushed.status_code == 200, pushed.text
     revision = pushed.json()["selection_revision"] if stream in {"lag", "switchport"} else 42
     live = await read_plan_inputs(client, device)
-    plan = await plan_action_apply(get_engine(), device.id, {stream: revision}, live.section)
+    plan = await plan_action_apply(
+        get_engine(), device.id, {stream: revision}, live.section, expected_context=_device_context(device)
+    )
     assert result["plan_digest"] == normalized_plan_digest(plan)
 
 
@@ -231,7 +233,13 @@ async def test_candidate_switching_uses_fresh_prepared_slot(adapter_client, monk
     result = await ready(adapter_client, device.id, {stream: BODIES[stream]})
     pushed = await push(adapter_client, device.id, stream, BODIES[stream])
     live = await read_plan_inputs(client, device)
-    plan = await plan_action_apply(get_engine(), device.id, {stream: pushed.json()["selection_revision"]}, live.section)
+    plan = await plan_action_apply(
+        get_engine(),
+        device.id,
+        {stream: pushed.json()["selection_revision"]},
+        live.section,
+        expected_context=_device_context(device),
+    )
     assert result["plan_digest"] == normalized_plan_digest(plan)
     assert plan.links[0].containers
 

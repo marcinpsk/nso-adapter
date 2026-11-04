@@ -610,6 +610,33 @@ async def test_apply_preflight_rejects_store_only_mode(adapter_client, monkeypat
     assert response.status_code == 422, response.text
 
 
+async def test_stored_mapping_change_during_live_read_needs_new_preflight(adapter_client, monkeypatch):
+    import httpx
+
+    from nso_adapter.store.models import Device
+    from tests.nso.test_apply_send import _client_with
+
+    device, selected, _, transport = await setup(adapter_client, monkeypatch)
+
+    async def handle(request):
+        response = await transport.handle_async_request(request)
+        if request.method == "GET":
+            async with session() as db:
+                (await db.get(Device, device.id)).nso_device_name = "placeholder-remapped-device"
+                await db.commit()
+        return response
+
+    client = _client_with(httpx.MockTransport(handle))
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda _instance: client)
+    response = await preview(adapter_client, device.id, selected)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "unavailable", body
+    assert body["error"] == {"code": "inputs_changed_during_preflight"}
+    assert_keys_absent(body, ["preflight_identity"])
+    assert not transport.dry_requests
+
+
 async def test_apply_conflicting_interface_proof_after_preview_is_preflight_stale(adapter_client, monkeypatch):
     from sqlalchemy import select
 

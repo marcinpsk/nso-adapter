@@ -393,8 +393,17 @@ class PreflightStale(ValueError):
         self.reason = reason
 
 
+def _device_context(device) -> tuple[str, str, str | None]:
+    return device.nso_instance, device.nso_device_name, device.ned_id
+
+
 async def _diagnose_unselected_refusal(engine, client, device, live, outcome: _DryRun) -> dict:
-    baseline = await plan_action_apply(engine, device.id, {}, live.section, baseline_only=True)
+    try:
+        baseline = await plan_action_apply(
+            engine, device.id, {}, live.section, expected_context=_device_context(device), baseline_only=True
+        )
+    except PreflightStale:
+        return {"status": "unavailable", "error": _INPUTS_MOVED}
     diagnosis = await _dry_run_chain(client, device, baseline)
     if diagnosis.status in {"unavailable", "error"}:
         return {"status": diagnosis.status, "outcome": diagnosis}
@@ -515,7 +524,7 @@ async def _run_candidate_preflight(engine, client, device, selected, ingest) -> 
             current,
             live.section,
             ingest=ingest,
-            expected_context=(device.nso_instance, device.nso_device_name, device.ned_id),
+            expected_context=_device_context(device),
         )
     except PreflightStale:
         return finish("unavailable", error=_INPUTS_MOVED)
@@ -586,7 +595,11 @@ async def _run_selected_preflight(engine: AsyncEngine, client, device, selected:
         if not current and streams:
             return finish("refused")
         try:
-            planned = await plan_action_apply(engine, device.id, current, live.section)
+            planned = await plan_action_apply(
+                engine, device.id, current, live.section, expected_context=_device_context(device)
+            )
+        except PreflightStale:
+            return finish("unavailable", error=_INPUTS_MOVED)
         except _PlanContextConflict as conflict:
             if _skips_moved(skips, conflict.skipped):
                 return finish("unavailable", error=_INPUTS_MOVED)
@@ -704,9 +717,9 @@ async def plan_action_apply(
     selected: dict[str, int],
     snapshot: CertifiedSection,
     *,
+    expected_context: tuple[str, str, str | None],
     baseline_only: bool = False,
     ingest: CandidateIngest | None = None,
-    expected_context: tuple[str, str, str | None] | None = None,
 ) -> PlannedChain:
     """Plan the real Apply chain without persistence, even if a planner commits its session.
 
@@ -724,32 +737,26 @@ async def plan_action_apply(
                 bind=connection, join_transaction_mode="create_savepoint", expire_on_commit=False
             ) as db:
                 await lock_projection(db, device_id)
+                device = await db.get(Device, device_id)
+                if device is None or _device_context(device) != expected_context:
+                    raise PreflightStale("inputs_changed")
                 candidate = None
                 if ingest is not None:
-                    selected, candidate = await _ingest_candidate_plan(
-                        db, device_id, ingest, snapshot, expected_context
-                    )
+                    selected, candidate = await _ingest_candidate_plan(db, device, ingest, snapshot)
                 return await _plan_in_session(db, device_id, selected, snapshot, baseline_only, candidate)
         finally:
             LAST_ENQUEUED_GENERATION_ID.reset(token)
             await outer.rollback()
 
 
-async def _ingest_candidate_plan(db, device_id, ingest, snapshot, expected_context):
-    device = await db.get(Device, device_id)
-    assert device is not None
-    if (
-        expected_context is not None
-        and (device.nso_instance, device.nso_device_name, device.ned_id) != expected_context
-    ):
-        raise PreflightStale("inputs_changed")
+async def _ingest_candidate_plan(db, device, ingest, snapshot):
     selected, bodies = await ingest(db)
     revisions = {
         stream: revision
         for stream, revision in (
             await db.execute(
                 select(DeviceProjectionStream.stream, DeviceProjectionStream.authorized_revision).where(
-                    DeviceProjectionStream.device_id == device_id
+                    DeviceProjectionStream.device_id == device.id
                 )
             )
         ).all()

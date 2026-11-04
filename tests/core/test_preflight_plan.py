@@ -15,7 +15,7 @@ from nso_adapter.core.generation import (
     execution_policy,
     generation_execution_context,
 )
-from nso_adapter.core.preflight import normalized_plan_digest, plan_action_apply, read_plan_inputs
+from nso_adapter.core.preflight import _device_context, normalized_plan_digest, plan_action_apply, read_plan_inputs
 from nso_adapter.nso.origins import AttributionFailure, resolve_refusals
 from nso_adapter.nso.refusal_protocol import refusal, row_ref
 from nso_adapter.store.db import get_engine, session
@@ -110,7 +110,9 @@ async def setup(api, monkeypatch, case="plain"):
 
 async def plan(device, selected, client):
     live = await read_plan_inputs(client, device)
-    return await plan_action_apply(get_engine(), device.id, selected, live.section)
+    return await plan_action_apply(
+        get_engine(), device.id, selected, live.section, expected_context=_device_context(device)
+    )
 
 
 @pytest.mark.parametrize("case", ["plain", "removal", "lag", "switchport", "retention"])
@@ -459,4 +461,6 @@ async def test_live_read_reports_inconclusive(adapter_client, monkeypatch):
     assert live.section.inconclusive
     assert live.digest is None
     with pytest.raises(ValueError, match="certified"):
-        await plan_action_apply(get_engine(), device.id, selected, live.section)
+        await plan_action_apply(
+            get_engine(), device.id, selected, live.section, expected_context=_device_context(device)
+        )

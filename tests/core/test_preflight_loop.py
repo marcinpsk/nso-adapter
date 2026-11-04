@@ -654,6 +654,25 @@ async def test_preflight_behind_blocked_head_reports_baseline_refused(adapter_cl
     assert not result.admitted_selection
 
 
+async def test_mapping_change_before_baseline_diagnosis_is_unavailable(adapter_client, monkeypatch):
+    device, vlan, client, transport = await setup(adapter_client, monkeypatch)
+    selected = await interface_selection(adapter_client, device)
+    await authorize(adapter_client, device, {"ip": selected["ip"]}, GenerationStatus.failed)
+    transport.judge = lambda _body, _request: (IP_REFUSAL,)
+
+    async def remap():
+        transport.before_dry_run = None
+        async with session() as db:
+            (await db.get(Device, device.id)).nso_device_name = "placeholder-remapped-device"
+            await db.commit()
+
+    transport.before_dry_run = remap
+    result = await preflight.run_preflight(get_engine(), client, device, vlan)
+    assert result.status == "unavailable"
+    assert result.error == {"code": "inputs_changed_during_preflight"}
+    assert not result.baseline_refused and not result.admitted_selection
+
+
 async def test_abandoned_refused_immediate_promotion_blocks_unrelated_apply_as_baseline_refused(
     adapter_client, monkeypatch
 ):

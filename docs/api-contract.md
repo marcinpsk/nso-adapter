@@ -1146,7 +1146,8 @@ In stored selection mode, the loop drops refused selected streams and replans, a
 plus one. Blocked streams keep their authorized fragments and remain pending. A baseline
 refusal, cross-stream refusal, or disturbed unpromoted interface context admits nothing.
 Inconclusive live reads or dry-runs return `unavailable`. A skip reason that changes between
-two passes of one preflight returns `unavailable` with `error.code = "inputs_changed_during_preflight"`. Attribution failures and ordinary
+two passes of one preflight returns `unavailable` with `error.code = "inputs_changed_during_preflight"`.
+A device mapping change after the live read returns the same result. Attribution failures and ordinary
 NSO rejections return `error`. These NSO outcomes use HTTP 200 and omit the identity.
 A live job returns the same `409 conflict` envelope as Apply, including `detail.job_id`.
 
