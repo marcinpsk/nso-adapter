@@ -668,7 +668,9 @@ async def test_scenario_5d_a_refused_composition_rolls_the_whole_transaction_bac
 
     from tests.core.test_action_apply_promotion import preflight_and_apply
 
-    preview = await preflight_and_apply(adapter_client, device_id, {"vlan": 1780}, preflight_only=True)
+    assert (await _put_vlans(adapter_client, device_id, [401, 402], seq=1781)).status_code == 200
+    preview = await preflight_and_apply(adapter_client, device_id, {"vlan": 1781}, preflight_only=True)
+    assert preview.json()["status"] == "ready", preview.text
     identity = preview.json()["preflight_identity"]
 
     # An UNSELECTED stored fragment whose dialect names nothing registered: the composition
@@ -686,7 +688,6 @@ async def test_scenario_5d_a_refused_composition_rolls_the_whole_transaction_bac
 
     before = await _generations(device_id)
     revisions = await _revisions(device_id)
-    assert (await _put_vlans(adapter_client, device_id, [401, 402], seq=1781)).status_code == 200
     attempt_id = uuid4()
     response = await _apply(adapter_client, device_id, {"vlan": 1781}, attempt_id=attempt_id, identity=identity)
     assert response.status_code == 500, response.text

@@ -62,6 +62,7 @@ async def test_apply_preflight_route_commits_nothing(adapter_client, monkeypatch
     "change",
     [
         "selected_push",
+        "submitted_selection",
         "baseline",
         "ned",
         "interface_proof",
@@ -100,10 +101,12 @@ async def test_apply_rejects_stale_preflight_identity(adapter_client, monkeypatc
     assert_text_free_of(response.text, [CANARY])
     assert response.status_code == 200 and response.json()["status"] == "ready"
     identity = response.json()["preflight_identity"]
-    if change == "selected_push":
+    if change in {"selected_push", "submitted_selection"}:
         response = await _put_vlans(adapter_client, device.id, [102], seq=42, query="?store_only=true")
         assert_text_free_of(response.text, [CANARY])
         assert response.status_code == 200
+        if change == "submitted_selection":
+            selected = {"vlan": 42}
     elif change == "baseline":
         sibling = await interface_selection(adapter_client, device)
         baseline = (await preview(adapter_client, device.id, sibling)).json()
