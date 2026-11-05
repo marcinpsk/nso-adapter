@@ -16,7 +16,15 @@ from nso_adapter.store.db import get_engine, session
 from nso_adapter.store.models import DbInterface, Device, LagBundleIntent, SwitchportIntent
 from tests._secret_discipline import assert_keys_absent, assert_text_free_of
 from tests.conftest import AUTH
-from tests.core.test_preflight_loop import ADDRESS, INTERFACE, IP_REFUSAL, authorize, has_ip, setup
+from tests.core.test_preflight_loop import (
+    ADDRESS,
+    INTERFACE,
+    IP_REFUSAL,
+    assert_only_dry_runs,
+    authorize,
+    has_ip,
+    setup,
+)
 from tests.core.test_preflight_plan import database_state
 
 pytestmark = pytest.mark.anyio
@@ -161,9 +169,8 @@ async def test_candidate_preflight_persists_nothing(adapter_client, monkeypatch)
     )
     assert await database_state() == before
     assert len(transport.fake.reads) == 1
-    assert not transport.documents
-    assert not transport.locks
-    assert all("dry-run=" in str(request.url) for request in transport.dry_requests)
+    assert_only_dry_runs(transport, len(transport.dry_requests))
+    assert transport.dry_requests and not transport.locks
 
 
 @pytest.mark.parametrize("stream", BODIES)

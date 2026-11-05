@@ -49,8 +49,11 @@ class LoopTransport(PlanTransport):
         self.judge = lambda _body, _request: None
         self.before_dry_run = None
         self.locks = []
+        self.requests = []
 
     async def handle_async_request(self, request):
+        if request.method != "GET":
+            self.requests.append(request)
         if request.method == "PUT":
             assert_text_contains(str(request.url), ["dry-run="])
             async with session() as db:
@@ -81,6 +84,13 @@ class LoopTransport(PlanTransport):
                 request=request,
             )
         return await super().handle_async_request(request)
+
+
+def assert_only_dry_runs(transport, dry_runs):
+    assert transport.requests == transport.dry_requests
+    assert len(transport.dry_requests) == dry_runs
+    assert all(request.method == "PUT" and "dry-run" in request.url.params for request in transport.dry_requests)
+    assert not transport.fake.calls
 
 
 async def setup(api, monkeypatch, case="plain"):
@@ -567,7 +577,7 @@ async def test_preflight_sends_only_dry_runs(adapter_client, monkeypatch):
     device, selected, client, transport = await setup(adapter_client, monkeypatch, "removal")
     result = await preflight.run_preflight(get_engine(), client, device, selected)
     assert result.status == "ready", result.error
-    assert len(transport.dry_requests) == 3
+    assert_only_dry_runs(transport, 3)
     assert not transport.locks
     assert len(transport.fake.reads) == 1
 
