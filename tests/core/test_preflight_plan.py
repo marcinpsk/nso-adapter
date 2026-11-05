@@ -356,8 +356,19 @@ async def test_plan_detach_link_uses_no_networking_policy(adapter_client, monkey
 
 @pytest.mark.parametrize("case", ["plain", "removal"])
 async def test_sender_and_preflight_share_body_and_guard(adapter_client, monkeypatch, case):
+    from nso_adapter.core import removal
+
     device, selected, client, transport = await setup(adapter_client, monkeypatch, case)
     planned = await plan(device, selected, client)
+    guards = []
+    evaluate = removal.evaluate_collateral_guard
+
+    def record_guard(current, containers, **kwargs):
+        orphans = evaluate(current, containers, **kwargs)
+        guards.append((json.loads(json.dumps(kwargs["allowed"])), orphans))
+        return orphans
+
+    monkeypatch.setattr(removal, "evaluate_collateral_guard", record_guard)
     assert (await _apply(adapter_client, device.id, selected)).status_code == 202
     for link in planned.links:
         await run_next(device.id)
@@ -365,6 +376,9 @@ async def test_sender_and_preflight_share_body_and_guard(adapter_client, monkeyp
         sent.pop("device")
         assert sent == link.containers
         assert transport.fake.writes[-1]["no_networking"] == link.policy.no_networking
+        assert guards[-1] == (link.allowed_removal_keys, link.guard_orphans)
+    assert len(guards) == len(planned.links)
+    assert bool(planned.links[0].allowed_removal_keys) == (case == "removal")
 
 
 @pytest.mark.parametrize("case", ["plain", "removal", "lag", "switchport", "retention"])
