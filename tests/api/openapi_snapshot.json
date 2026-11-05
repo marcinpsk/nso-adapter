@@ -70,6 +70,11 @@
             "title": "Apply Attempt Id",
             "type": "string"
           },
+          "preflight_identity": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Preflight Identity",
+            "type": "string"
+          },
           "selected": {
             "additionalProperties": {
               "maximum": 9223372036854775807,
@@ -81,8 +86,9 @@
           }
         },
         "required": [
+          "selected",
           "apply_attempt_id",
-          "selected"
+          "preflight_identity"
         ],
         "title": "ActionApplyIn",
         "type": "object"
@@ -268,99 +274,181 @@
         "title": "ApplyDiffOut",
         "type": "object"
       },
-      "ApplyPreflightOut": {
+      "ApplyPreflightIn": {
+        "additionalProperties": false,
+        "description": "Evaluate exactly one stored selection or candidate body map.",
         "properties": {
-          "coverage_unknown": {
-            "title": "Coverage Unknown",
-            "type": "boolean"
-          },
-          "fully_supported": {
-            "title": "Fully Supported",
-            "type": "boolean"
-          },
-          "known": {
-            "title": "Known",
-            "type": "boolean"
-          },
-          "ned_id": {
+          "candidates": {
             "anyOf": [
               {
-                "type": "string"
+                "additionalProperties": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "object"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "Ned Id"
+            "title": "Candidates"
           },
-          "sw_version": {
+          "selected": {
             "anyOf": [
               {
-                "type": "string"
+                "additionalProperties": {
+                  "maximum": 9223372036854775807,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "type": "object"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "Sw Version"
-          },
-          "unsupported": {
-            "items": {
-              "$ref": "#/components/schemas/ApplyPreflightUnsupported"
-            },
-            "title": "Unsupported",
-            "type": "array"
+            "title": "Selected"
           }
         },
-        "required": [
-          "known",
-          "coverage_unknown",
-          "fully_supported",
-          "unsupported"
-        ],
-        "title": "ApplyPreflightOut",
+        "title": "ApplyPreflightIn",
         "type": "object"
       },
-      "ApplyPreflightRequest": {
+      "ApplyPreflightOut": {
         "properties": {
-          "scopes": {
-            "default": [],
+          "admitted_selection": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Admitted Selection",
+            "type": "object"
+          },
+          "attempts": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Attempts",
+            "type": "array"
+          },
+          "baseline_refused": {
             "items": {
               "type": "string"
             },
-            "title": "Scopes",
+            "title": "Baseline Refused",
             "type": "array"
-          }
-        },
-        "title": "ApplyPreflightRequest",
-        "type": "object"
-      },
-      "ApplyPreflightUnsupported": {
-        "properties": {
-          "detail": {
-            "title": "Detail",
-            "type": "string"
           },
-          "name": {
-            "title": "Name",
-            "type": "string"
+          "candidate_identity": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Identity"
           },
-          "scope": {
-            "title": "Scope",
-            "type": "string"
+          "context_disturbed": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Context Disturbed",
+            "type": "array"
+          },
+          "cross_stream": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Cross Stream",
+            "type": "array"
+          },
+          "diffs": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Diffs",
+            "type": "object"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "plan_digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan Digest"
+          },
+          "preflight_identity": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preflight Identity"
+          },
+          "refusals": {
+            "items": {
+              "$ref": "#/components/schemas/AttributedRefusalOut"
+            },
+            "title": "Refusals",
+            "type": "array"
+          },
+          "skips": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Skips",
+            "type": "object"
           },
           "status": {
+            "enum": [
+              "ready",
+              "refused",
+              "unavailable",
+              "error"
+            ],
             "title": "Status",
             "type": "string"
+          },
+          "streams": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/PreflightStreamOut"
+            },
+            "title": "Streams",
+            "type": "object"
           }
         },
         "required": [
-          "scope",
-          "name",
           "status",
-          "detail"
+          "streams",
+          "baseline_refused",
+          "cross_stream",
+          "context_disturbed",
+          "admitted_selection",
+          "skips",
+          "diffs",
+          "attempts",
+          "refusals",
+          "error"
         ],
-        "title": "ApplyPreflightUnsupported",
+        "title": "ApplyPreflightOut",
         "type": "object"
       },
       "AttemptIdentityOut": {
@@ -3616,6 +3704,7 @@
               "not_implemented",
               "nso_commit_failed",
               "apply_unexecutable",
+              "preflight_stale",
               "asn_rule_violation",
               "bgp_source_as_required",
               "ambiguous_device",
@@ -9307,6 +9396,18 @@
       "LagConfigApplyRequest": {
         "additionalProperties": false,
         "properties": {
+          "accepted_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted At"
+          },
           "bundles": {
             "items": {
               "$ref": "#/components/schemas/LagBundleApply"
@@ -10936,6 +11037,18 @@
       },
       "OspfInstanceEntry-Input": {
         "properties": {
+          "accepted_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted At"
+          },
           "areas": {
             "default": [],
             "items": {
@@ -11145,6 +11258,18 @@
       },
       "OspfInterfaceEntry-Input": {
         "properties": {
+          "accepted_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted At"
+          },
           "area_id": {
             "anyOf": [
               {
@@ -11966,6 +12091,43 @@
           }
         },
         "title": "PreflightRequest",
+        "type": "object"
+      },
+      "PreflightStreamOut": {
+        "properties": {
+          "context_disturbed": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Context Disturbed",
+            "type": "array"
+          },
+          "guard": {
+            "additionalProperties": true,
+            "title": "Guard",
+            "type": "object"
+          },
+          "refusals": {
+            "items": {
+              "$ref": "#/components/schemas/AttributedRefusalOut"
+            },
+            "title": "Refusals",
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "admitted",
+              "blocked",
+              "not_evaluated"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "PreflightStreamOut",
         "type": "object"
       },
       "ProvisionAttemptEvidence": {
@@ -16060,6 +16222,18 @@
       "SwitchportApplyRequest": {
         "additionalProperties": false,
         "properties": {
+          "accepted_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted At"
+          },
           "deleted_roots": {
             "items": {
               "maxLength": 128,
@@ -17329,7 +17503,7 @@
     },
     "/api/v1/devices/{device_id}/actions/apply": {
       "post": {
-        "description": "Promote selected pushes.\n\nCheck queued and running jobs only when the selection contains promotable work.",
+        "description": "Promote selected pushes after revalidating their required preflight identity.\n\nCheck queued and running jobs only when the selection contains promotable work.\nReturn 409 preflight_stale if executable inputs changed or the live read is inconclusive.",
         "operationId": "action_apply_api_v1_devices__device_id__actions_apply_post",
         "parameters": [
           {
@@ -17401,7 +17575,7 @@
                 }
               }
             },
-            "description": "The Apply UUID identifies a different request, a job is already queued or running, or a selected stream cannot be applied faithfully"
+            "description": "The Apply UUID identifies a different request, a job is already queued or running, a selected stream cannot be applied faithfully, or the preflight identity is stale"
           },
           "422": {
             "content": {
@@ -17528,6 +17702,94 @@
           }
         ],
         "summary": "Action Apply Diff",
+        "tags": [
+          "actions"
+        ]
+      }
+    },
+    "/api/v1/devices/{device_id}/actions/apply-preflight": {
+      "post": {
+        "description": "Dry-run a stored selection or candidate bodies without persistence.\n\nNo promotion or NSO commit persists. NSO failures return unavailable or error.",
+        "operationId": "action_apply_preflight_api_v1_devices__device_id__actions_apply_preflight_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApplyPreflightIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplyPreflightOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Device not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A job is already queued or running, or a selection cannot execute faithfully"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Request validation failed (envelope shape)"
+          }
+        },
+        "security": [
+          {
+            "_OptionalBearer": []
+          }
+        ],
+        "summary": "Action Apply Preflight",
         "tags": [
           "actions"
         ]
@@ -18014,104 +18276,6 @@
         "summary": "Action Sync From Nso",
         "tags": [
           "actions"
-        ]
-      }
-    },
-    "/api/v1/devices/{device_id}/apply/preflight": {
-      "post": {
-        "description": "Check the scopes the next apply will push against this device's capability matrix.\n\nThe generic analog of ``/route-policy/preflight``: the plugin passes the scopes from its\napply diff; any the matrix marks ``unsupported``/``skipped`` (recorded reactively on a prior\napply failure, see ``_record_atomic_capability``) are returned so the operator is warned\nBEFORE a device write. ``refresh=false`` (default) is the cheap cache-only read; the device\nmust have a known ``(ned, sw)`` key (probed at least once) or the result is fail-open.",
-        "operationId": "preflight_apply_api_v1_devices__device_id__apply_preflight_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "device_id",
-            "required": true,
-            "schema": {
-              "title": "Device Id",
-              "type": "integer"
-            }
-          },
-          {
-            "in": "query",
-            "name": "refresh",
-            "required": false,
-            "schema": {
-              "default": false,
-              "title": "Refresh",
-              "type": "boolean"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ApplyPreflightRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApplyPreflightOut"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Missing or invalid bearer token"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Device not found"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Conflict"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Request validation failed (envelope shape)"
-          }
-        },
-        "security": [
-          {
-            "_OptionalBearer": []
-          }
-        ],
-        "summary": "Preflight Apply",
-        "tags": [
-          "capability"
         ]
       }
     },
@@ -20798,6 +20962,11 @@
                           "default": false,
                           "description": "When true, stamps accepted_at on the object.",
                           "type": "boolean"
+                        },
+                        "accepted_at": {
+                          "description": "Explicit acceptance time; defaults to now.",
+                          "format": "date-time",
+                          "type": "string"
                         },
                         "entries": {
                           "description": "Per-family entry list (prefix-list lines, community members, as-path patterns, or route-map terms). The shape is family-specific and stored verbatim.",

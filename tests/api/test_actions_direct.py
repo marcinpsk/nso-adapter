@@ -37,6 +37,7 @@ def test_action_apply_validation_does_not_repeat_an_unknown_stream():
             {
                 "apply_attempt_id": "00000000-0000-0000-0000-000000000001",
                 "selected": {unknown_stream: 1},
+                "preflight_identity": "0" * 64,
             }
         )
 
@@ -349,11 +350,18 @@ async def test_an_INVALID_selected_ENTRY_keeps_the_callers_key_out_of_the_422(ad
     ``ActionApplyIn.selected`` is keyed by a name the caller chose, so an unregistered
     location wrote that name straight back into the validation error.
     """
+    from tests.core.test_action_apply_promotion import preflight_and_apply
+
     device_id = await _seed_device("actions-selected-loc", 1360)
+    preview = await preflight_and_apply(adapter_client, device_id, {}, preflight_only=True)
 
     resp = await adapter_client.post(
         f"/api/v1/devices/{device_id}/actions/apply",
-        json={"apply_attempt_id": str(uuid4()), "selected": {"placeholder-secret": "not-an-integer"}},
+        json={
+            "apply_attempt_id": str(uuid4()),
+            "selected": {"placeholder-secret": "not-an-integer"},
+            "preflight_identity": preview.json()["preflight_identity"],
+        },
         headers=AUTH,
     )
 

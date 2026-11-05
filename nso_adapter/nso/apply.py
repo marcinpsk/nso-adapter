@@ -267,6 +267,9 @@ async def native_dry_run(
             error = _classified_apply_error(classification, sender_phase, detail=detail)
             raise error
         return None
+    # NSO answers a dry run that changes nothing with 204 and no body.
+    if response is not None and response.status_code == 204:
+        return ""
     body = None
     try:
         body = response.json() if response is not None else None

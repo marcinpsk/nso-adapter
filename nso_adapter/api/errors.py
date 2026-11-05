@@ -47,6 +47,7 @@ ErrorCode = Literal[
     "not_implemented",
     "nso_commit_failed",
     "apply_unexecutable",
+    "preflight_stale",
     "asn_rule_violation",
     "bgp_source_as_required",
     # per-endpoint
@@ -286,7 +287,9 @@ def unhandled_exception_response(request: Request, exc: BaseException) -> JSONRe
 #: caller's own string whatever the value type is, so every ``dict[str, ...]`` field of a
 #: request body belongs here; ``test_caller_keyed_maps_are_registered_for_loc_redaction``
 #: derives the set from the app's own routes and fails when one is added without it.
-DYNAMIC_KEY_LOCATIONS: frozenset[tuple[str, ...]] = frozenset({("body", "selected"), ("body", "values")})
+DYNAMIC_KEY_LOCATIONS: frozenset[tuple[str, ...]] = frozenset(
+    {("body", "selected"), ("body", "candidates"), ("body", "values")}
+)
 
 #: What replaces a caller-chosen key in a reported location.
 REDACTED_LOC = "[redacted]"
@@ -338,8 +341,14 @@ RESP_409_APPLY_CONFLICT: ResponseSpec = {
         **_ENVELOPE_SCHEMA,
         "description": (
             "The Apply UUID identifies a different request, a job is already queued or running, "
-            "or a selected stream cannot be applied faithfully"
+            "a selected stream cannot be applied faithfully, or the preflight identity is stale"
         ),
+    }
+}
+RESP_409_PREFLIGHT: ResponseSpec = {
+    409: {
+        **_ENVELOPE_SCHEMA,
+        "description": "A job is already queued or running, or a selection cannot execute faithfully",
     }
 }
 RESP_409: ResponseSpec = {409: {**_ENVELOPE_SCHEMA, "description": "Conflict"}}

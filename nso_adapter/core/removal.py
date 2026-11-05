@@ -712,6 +712,20 @@ def guard_allowed(generation, *, scope: str | None = None, context: dict | None 
     return allowed
 
 
+def evaluate_collateral_guard(
+    current: dict | None,
+    containers: dict[str, dict],
+    *,
+    allowed: dict[str, dict],
+    context: dict | None = None,
+    no_networking: bool = False,
+) -> dict[str, list] | None:
+    """Return unauthorized omissions, or None when the write may proceed."""
+    if no_networking or (context or {}).get("force") or not current:
+        return None
+    return _document_orphans(current, containers, allowed) or None
+
+
 async def guarded_device_write(
     client,
     device,
@@ -759,12 +773,17 @@ async def guarded_device_write(
                     "could not certify the live service instance; refusing the device-intent PUT",
                 )
             current = state.entry
-        if current:
-            orphans = _document_orphans(current, containers, allowed)
-            if orphans:
-                if checkpoint is not None:
-                    await checkpoint("pre_commit_dry_run", OrdinaryRejection(), False)
-                raise RemovalBlockedError(orphans)
+    orphans = evaluate_collateral_guard(
+        None if current is _NO_SNAPSHOT else current,
+        containers,
+        allowed=allowed,
+        context=context,
+        no_networking=no_networking,
+    )
+    if orphans:
+        if checkpoint is not None:
+            await checkpoint("pre_commit_dry_run", OrdinaryRejection(), False)
+        raise RemovalBlockedError(orphans)
     return await apply_device_intent(
         client,
         device_name,

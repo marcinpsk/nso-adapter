@@ -760,6 +760,7 @@ async def interrupt(
 
 async def test_apply_refusal_changes_only_named_rows(adapter_client, monkeypatch):
     device_id, transport = await setup(adapter_client, monkeypatch)
+    transport.fake.calls.clear()
     await run_next(device_id)
     job = await terminal(adapter_client, device_id)
     assert job.result["vlan_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1, "not_applied": 1, "unavailable": 0}

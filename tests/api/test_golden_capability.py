@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Golden-body tests — the capability router (get / refresh / read-report / 2 preflights).
+"""Golden-body tests — the capability router (get / refresh / read-report / preflight).
 
 Branchy shapes:
   * GET /capability — known adds coverage_unknown + rich elements; unknown returns a fixed
     empty verdict (coverage_unknown ABSENT when unknown → exclude_unset).
   * POST /capability/refresh + POST /read-capability/report — {ned_id, sw_version, count}.
   * POST /route-policy/preflight — unsupported items keyed by ``element``.
-  * POST /apply/preflight — unsupported items keyed by ``name``.
 
 refresh probes NSO (external boundary) so its delegate is patched; the other paths run
 with ``refresh=false`` against a seeded ``(ned_id, sw_version)`` key + device_capability
@@ -163,48 +162,6 @@ async def test_preflight_route_policy_unknown_golden(adapter_client_with_nso):
             f"/api/v1/devices/{device_id}/route-policy/preflight",
             params={"refresh": "false"},
             json={},
-            headers=AUTH,
-        )
-    ).json()
-    assert body == {"known": False, "fully_supported": True, "unsupported": [], "coverage_unknown": False}
-
-
-@pytest.mark.anyio
-async def test_preflight_apply_known_golden(adapter_client_with_nso):
-    device_id = await seed_device(nso_device_name="cap-apply-known", netbox_device_id=608)
-    await _set_key_and_rows(
-        device_id,
-        _NED,
-        _SW,
-        [{"scope": "bgp", "name": "read", "status": "unsupported", "detail": "no reader", "source": "read"}],
-    )
-
-    body = (
-        await adapter_client_with_nso.post(
-            f"/api/v1/devices/{device_id}/apply/preflight",
-            params={"refresh": "false"},
-            json={"scopes": ["bgp"]},
-            headers=AUTH,
-        )
-    ).json()
-    assert body == {
-        "known": True,
-        "ned_id": _NED,
-        "sw_version": _SW,
-        "coverage_unknown": False,
-        "fully_supported": False,
-        "unsupported": [{"scope": "bgp", "name": "read", "status": "unsupported", "detail": "no reader"}],
-    }
-
-
-@pytest.mark.anyio
-async def test_preflight_apply_unknown_golden(adapter_client_with_nso):
-    device_id = await seed_device(nso_device_name="cap-apply-unknown", netbox_device_id=609)
-    body = (
-        await adapter_client_with_nso.post(
-            f"/api/v1/devices/{device_id}/apply/preflight",
-            params={"refresh": "false"},
-            json={"scopes": ["bgp"]},
             headers=AUTH,
         )
     ).json()

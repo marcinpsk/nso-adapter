@@ -13,8 +13,8 @@ import json
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Response
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from fastapi import APIRouter, Depends, Request, Response
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
@@ -24,6 +24,7 @@ from nso_adapter.api.errors import (
     RESP_404_DEVICE,
     RESP_409,
     RESP_409_APPLY_CONFLICT,
+    RESP_409_PREFLIGHT,
     RESP_409_QUEUED_ACTION,
     RESP_422_VALIDATION,
     RESP_500_INTERNAL,
@@ -64,7 +65,45 @@ class ApplyDiffOut(BaseModel):
     refusals: list[AttributedRefusalOut]
 
 
-class ActionApplyIn(BaseModel):
+class ApplySelectionIn(BaseModel):
+    """The exact stored selection to evaluate without promotion."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    selected: dict[str, SelectedPushSequence]
+
+    @field_validator("selected")
+    @classmethod
+    def _validate_selected(cls, selected: dict[str, int]) -> dict[str, int]:
+        from nso_adapter.core.projection import projection_streams
+        from nso_adapter.store.apply_attempt_store import canonical_selected
+
+        if set(selected) - projection_streams():
+            raise ValueError("selected contains an unknown projection stream")
+        return canonical_selected(selected)
+
+
+class ApplyPreflightIn(BaseModel):
+    """Evaluate exactly one stored selection or candidate body map."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    selected: dict[str, SelectedPushSequence] | None = None
+    candidates: dict[str, dict] | None = None
+
+    @field_validator("selected")
+    @classmethod
+    def _validate_selected(cls, selected):
+        return ApplySelectionIn(selected=selected).selected
+
+    @model_validator(mode="after")
+    def _one_mode(self):
+        modes = self.model_fields_set & {"selected", "candidates"}
+        if len(modes) != 1 or getattr(self, next(iter(modes))) is None:
+            raise ValueError("Exactly one of selected or candidates is required")
+        return self
+
+
+class ActionApplyIn(ApplySelectionIn):
     """The exact per-stream selections this manual Apply is allowed to promote.
 
     A selection value carries one of two identities. For an in-protocol stream it is a
@@ -74,21 +113,44 @@ class ActionApplyIn(BaseModel):
     neither stream carries a receipt.
     """
 
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-
     apply_attempt_id: UUID
-    selected: dict[str, SelectedPushSequence]
+    preflight_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
 
-    @field_validator("selected")
-    @classmethod
-    def _validate_selected(cls, selected: dict[str, int]) -> dict[str, int]:
-        from nso_adapter.core.projection import projection_streams
-        from nso_adapter.store.apply_attempt_store import canonical_selected
 
-        unknown = set(selected) - projection_streams()
-        if unknown:
-            raise ValueError("selected contains an unknown projection stream")
-        return canonical_selected(selected)
+class PreflightStreamOut(BaseModel):
+    status: Literal["admitted", "blocked", "not_evaluated"]
+    refusals: list[AttributedRefusalOut] = Field(default_factory=list, exclude_if=lambda value: not value)
+    guard: dict = Field(default_factory=dict, exclude_if=lambda value: not value)
+    context_disturbed: list[str] = Field(default_factory=list, exclude_if=lambda value: not value)
+
+
+class ApplyPreflightOut(BaseModel):
+    status: Literal["ready", "refused", "unavailable", "error"]
+    streams: dict[str, PreflightStreamOut]
+    baseline_refused: list[str]
+    cross_stream: list[str]
+    context_disturbed: list[str]
+    admitted_selection: dict[str, int]
+    skips: dict[str, str]
+    preflight_identity: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    candidate_identity: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    plan_digest: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    diffs: dict[str, str]
+    attempts: list[dict]
+    refusals: list[AttributedRefusalOut]
+    error: dict | None
+
+
+def _preflight_evidence(value):
+    """Keep local planning markers out of the public catalog records."""
+    if isinstance(value, list):
+        return [_preflight_evidence(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: None if key == "generation_id" and item == 0 else _preflight_evidence(item)
+            for key, item in value.items()
+        }
+    return value
 
 
 class ActionApplyGenerationOut(BaseModel):
@@ -318,6 +380,127 @@ async def sync_notify(
 
 
 @router.post(
+    "/{device_id}/actions/apply-preflight",
+    dependencies=[Depends(verify_token)],
+    response_model=ApplyPreflightOut,
+    responses={**_ACTION_ERRORS, **RESP_409_PREFLIGHT},
+)
+async def action_apply_preflight(
+    device_id: int, body: ApplyPreflightIn, request: Request, db: AsyncSession = Depends(get_db)
+):
+    """Dry-run a stored selection or candidate bodies without persistence.
+
+    No promotion or NSO commit persists. NSO failures return unavailable or error.
+    """
+    from nso_adapter.api.candidate_ingestion import validate_candidates
+    from nso_adapter.core.generation import ApplyJobConflict
+    from nso_adapter.core.preflight import normalized_plan_digest, preflight_identity, run_preflight
+    from nso_adapter.core.request_flags import STORE_ONLY
+    from nso_adapter.store.db import get_engine
+
+    if STORE_ONLY.get():
+        raise api_error(422, "validation_error", "store_only is not valid for the Apply preflight action")
+    device = await db.get(Device, device_id)
+    if device is None:
+        raise api_error(404, "not_found", "Device not found")
+    ingest = (
+        validate_candidates(request.app.state.candidate_registry, device_id, body.candidates)
+        if body.candidates is not None
+        else None
+    )
+    selected = body.selected if body.selected is not None else dict.fromkeys(body.candidates or {}, 1)
+    db.expunge(device)
+    await db.rollback()
+    client = _preflight_client(device.nso_instance)
+    if client is None:
+        return {
+            "status": "unavailable",
+            "streams": {stream: {"status": "not_evaluated"} for stream in selected},
+            "baseline_refused": [],
+            "cross_stream": [],
+            "context_disturbed": [],
+            "admitted_selection": {},
+            "skips": {},
+            "diffs": {"native": "", "cli": ""},
+            "attempts": [],
+            "refusals": [],
+            "error": None,
+        }
+    conflict = None
+    try:
+        result = await run_preflight(get_engine(), client, device, selected, ingest=ingest)
+    except ApplyJobConflict as exc:
+        conflict = api_error(
+            409, "conflict", "A job is already queued or running for this device", {"job_id": exc.job_id}
+        )
+    if conflict is not None:
+        raise conflict
+    payload = {
+        "status": result.status,
+        "streams": _preflight_evidence(result.streams),
+        "baseline_refused": result.baseline_refused,
+        "cross_stream": result.cross_stream,
+        "context_disturbed": result.context_disturbed,
+        "admitted_selection": result.admitted_selection,
+        "skips": result.skips,
+        "diffs": {fmt: "\n".join(delta[fmt] for delta in result.deltas) for fmt in ("native", "cli")},
+        "attempts": result.attempts,
+        "refusals": _preflight_evidence(result.refusals),
+        "error": result.error,
+    }
+    if result.status == "ready":
+        if ingest is not None:
+            assert result.plan is not None
+            payload["candidate_identity"] = result.plan.candidate_identity
+            payload["plan_digest"] = normalized_plan_digest(result.plan)
+        else:
+            payload["preflight_identity"] = preflight_identity(result)
+    return payload
+
+
+def _preflight_client(instance: str):
+    from nso_adapter.core.importer import get_nso_client
+
+    try:
+        return get_nso_client(instance)
+    except RuntimeError:
+        return None
+
+
+async def _create_preflighted_apply(db, device_id, body, live, read_mapping):
+    from nso_adapter.core.generation import create_action_apply, execution_policy
+    from nso_adapter.core.preflight import PreflightStale, manual_apply_identity
+    from nso_adapter.core.projection import InterfaceProofConflict
+    from nso_adapter.domain.asn import AsnRuleViolation
+
+    if live is None or live.digest is None:
+        raise PreflightStale("live_input_inconclusive")
+    stale = None
+    try:
+        result = await create_action_apply(db, device_id, body.selected, body.apply_attempt_id)
+    except (InterfaceProofConflict, AsnRuleViolation):
+        # Interface context or NED rules changed after the preview; the savepoint rolls the promotion back.
+        stale = PreflightStale("inputs_changed")
+    if stale is not None:
+        raise stale
+    device = await db.get(Device, device_id, populate_existing=True)
+    if (device.nso_instance, device.nso_device_name) != read_mapping:
+        raise PreflightStale("inputs_changed")
+    identity = manual_apply_identity(
+        device_id=device_id,
+        nso_instance=device.nso_instance,
+        nso_device_name=device.nso_device_name,
+        selected={stream: revision for stream, revision in body.selected.items() if stream not in result.skipped},
+        skips=result.skipped,
+        links=[(generation.mode, generation.digest, execution_policy(generation)) for generation in result.generations],
+        live_input_digest=live.digest,
+    )
+    if identity != body.preflight_identity:
+        raise PreflightStale("inputs_changed")
+    return result
+
+
+@router.post(
     "/{device_id}/actions/apply",
     status_code=202,
     dependencies=[Depends(verify_token)],
@@ -334,11 +517,13 @@ async def action_apply(
     body: ActionApplyIn,
     db: AsyncSession = Depends(get_db),
 ):
-    """Promote selected pushes.
+    """Promote selected pushes after revalidating their required preflight identity.
 
     Check queued and running jobs only when the selection contains promotable work.
+    Return 409 preflight_stale if executable inputs changed or the live read is inconclusive.
     """
-    from nso_adapter.core.generation import ApplyJobConflict, ApplyUnexecutable, create_action_apply, lock_projection
+    from nso_adapter.core.generation import ApplyJobConflict, ApplyUnexecutable, lock_projection
+    from nso_adapter.core.preflight import PreflightStale, read_plan_inputs
     from nso_adapter.core.request_flags import STORE_ONLY
     from nso_adapter.store.apply_attempt_store import (
         ApplyAttemptIdentityMismatch,
@@ -354,7 +539,9 @@ async def action_apply(
     # other device (even a nonexistent one) is an identity conflict, not a 404.
     mismatched = None
     try:
-        stored = await replay_apply_attempt(db, body.apply_attempt_id, device_id, body.selected)
+        stored = await replay_apply_attempt(
+            db, body.apply_attempt_id, device_id, body.selected, body.preflight_identity
+        )
     except ApplyAttemptIdentityMismatch as exc:
         await db.rollback()
         mismatched = api_error(
@@ -371,10 +558,15 @@ async def action_apply(
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
+    db.expunge(device)
+    await db.rollback()
+    client = _preflight_client(device.nso_instance)
+    live = await read_plan_inputs(client, device) if client is not None else None
+    read_mapping = (device.nso_instance, device.nso_device_name)
     await lock_projection(db, device_id)
     mismatched = None
     try:
-        stored = await begin_apply_attempt(db, body.apply_attempt_id, device_id, body.selected)
+        stored = await begin_apply_attempt(db, body.apply_attempt_id, device_id, body.selected, body.preflight_identity)
     except ApplyAttemptIdentityMismatch as exc:
         await db.rollback()
         mismatched = api_error(
@@ -390,7 +582,20 @@ async def action_apply(
         return _apply_http_response(stored.http_status, stored.response)
     try:
         async with db.begin_nested():
-            apply_result = await create_action_apply(db, device_id, body.selected, body.apply_attempt_id)
+            apply_result = await _create_preflighted_apply(db, device_id, body, live, read_mapping)
+    except PreflightStale as exc:
+        result = {
+            "error": {
+                "code": "preflight_stale",
+                "message": "Manual Apply needs a fresh preflight",
+                "detail": {"reason": exc.reason},
+            }
+        }
+        await complete_apply_attempt(
+            db, body.apply_attempt_id, admission_state="rejected", http_status=409, response=result
+        )
+        await db.commit()
+        return _apply_http_response(409, result)
     except ApplyJobConflict as exc:
         result = {
             "error": {

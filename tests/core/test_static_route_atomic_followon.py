@@ -430,7 +430,7 @@ async def test_a_clean_commit_clears_the_stale_capability_for_every_family_it_ca
     """A clean commit proves every family in the document applies on this ``(ned, sw)``.
 
     A stale apply-sourced ``unsupported`` for static_route would otherwise stick forever — a
-    probe cannot downgrade an apply-sourced row, so ``/apply/preflight`` would keep warning
+    probe cannot downgrade an apply-sourced row, so the capability panel would keep warning
     about a family that now applies cleanly. A REJECTED commit proves nothing and clears
     nothing.
     """

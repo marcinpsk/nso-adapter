@@ -698,6 +698,7 @@ async def test_the_final_settled_cohort_member_rechecks_every_carried_stream(ada
 async def test_an_abandoned_removal_revision_cannot_be_repromoted_as_a_plain_apply(adapter_client):
     """Retry or reconcile owns an authorized but unapplied revision."""
     from nso_adapter.store.models import GenerationStatus, JobStatus
+    from tests.core.test_action_apply_promotion import preflight_and_apply
 
     device_id = await _device("gen-abandoned-same-revision", 9713)
     await _vlan(device_id, 41)
@@ -708,11 +709,7 @@ async def test_an_abandoned_removal_revision_cannot_be_repromoted_as_a_plain_app
     _vlans[device_id] = [41]
     await _push(adapter_client, device_id, store_only=True)
     selected = (await _stream(device_id, "vlan")).source_push_seq
-    first_apply = await adapter_client.post(
-        f"/api/v1/devices/{device_id}/actions/apply",
-        json={"apply_attempt_id": str(uuid4()), "selected": {"vlan": selected}},
-        headers=_AUTH,
-    )
+    first_apply = await preflight_and_apply(adapter_client, device_id, {"vlan": selected}, attempt_id=str(uuid4()))
     assert first_apply.status_code == 202
     removal = (await _generations(device_id))[1]
 
@@ -724,11 +721,7 @@ async def test_an_abandoned_removal_revision_cannot_be_repromoted_as_a_plain_app
     )
     assert abandon.status_code == 202
 
-    apply = await adapter_client.post(
-        f"/api/v1/devices/{device_id}/actions/apply",
-        json={"apply_attempt_id": str(uuid4()), "selected": {"vlan": selected}},
-        headers=_AUTH,
-    )
+    apply = await preflight_and_apply(adapter_client, device_id, {"vlan": selected}, attempt_id=str(uuid4()))
     assert apply.status_code == 200
     assert apply.json()["outcome"] == "no_op"
     assert apply.json()["skipped"] == {"vlan": "already_authorized"}
@@ -2364,22 +2357,21 @@ async def test_manual_apply_ignores_an_unselected_section_committed_alongside_it
     """
     from nso_adapter.core.generation import note_write
     from nso_adapter.store.db import get_engine
+    from tests.core.test_action_apply_promotion import preflight_and_apply
 
     device_id = await _device("gen-apply-under-lock", 9766, auto_apply=False)
     await _vlan(device_id, 68)
     await _push(adapter_client, device_id)
     selected = (await _stream(device_id, "vlan")).source_push_seq
 
+    preview = await preflight_and_apply(adapter_client, device_id, {"vlan": selected}, preflight_only=True)
+    identity = preview.json()["preflight_identity"]
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
     async with rival() as holder:
         await note_write(holder, device_id, "snmp")
 
         applying = asyncio.create_task(
-            adapter_client.post(
-                f"/api/v1/devices/{device_id}/actions/apply",
-                json={"apply_attempt_id": str(uuid4()), "selected": {"vlan": selected}},
-                headers=_AUTH,
-            )
+            preflight_and_apply(adapter_client, device_id, {"vlan": selected}, identity=identity)
         )
         await _wait_for_relation_lock(get_engine(), "devices", timeout=30.0)
         assert not applying.done(), "the Apply did not wait for the projection lock"

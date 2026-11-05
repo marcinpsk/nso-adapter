@@ -360,44 +360,7 @@ async def test_record_probe_capability_tolerates_single_element_dict(adapter_cli
         rows = await get_device_capability(db, _NED, "1.0")
         assert {(r.scope, r.name) for r in rows} == {("rm-set", "set extcommunity")}
 
-
-# ── preflight_scopes (generic apply-preflight: scope-level matrix check) ────────
-
-
-def test_preflight_scopes_flags_unsupported_and_skipped():
-    from types import SimpleNamespace
-
-    from nso_adapter.core.capability import preflight_scopes
-
-    rows = [
-        SimpleNamespace(scope="static_route", name="static_route", status="unsupported", detail="NED rejected"),
-        SimpleNamespace(scope="snmp", name="snmp", status="skipped", detail="no home"),
-        SimpleNamespace(scope="bgp", name="bgp", status="native", detail=""),
-    ]
-    result = preflight_scopes(rows, ["static_route", "snmp", "bgp", "ospf"])
-    assert result["fully_supported"] is False
-    flagged = {(u["scope"], u["status"]) for u in result["unsupported"]}
-    assert flagged == {("static_route", "unsupported"), ("snmp", "skipped")}
     # bgp is native (not flagged); ospf has no matrix row (not flagged)
-
-
-def test_preflight_scopes_only_checks_requested_scopes():
-    from types import SimpleNamespace
-
-    from nso_adapter.core.capability import preflight_scopes
-
-    rows = [SimpleNamespace(scope="static_route", name="static_route", status="unsupported", detail="x")]
-    # static_route is unsupported but NOT requested → not flagged
-    assert preflight_scopes(rows, ["bgp"]) == {"fully_supported": True, "unsupported": []}
-
-
-def test_preflight_scopes_empty_request_is_fully_supported():
-    from types import SimpleNamespace
-
-    from nso_adapter.core.capability import preflight_scopes
-
-    rows = [SimpleNamespace(scope="static_route", name="static_route", status="unsupported", detail="x")]
-    assert preflight_scopes(rows, []) == {"fully_supported": True, "unsupported": []}
 
 
 # ── record_read_capability (the READ half, fed by the vendor-test read matrix) ──
@@ -494,27 +457,6 @@ async def test_record_read_capability_skips_invalid_elements(adapter_client):  #
         assert count == 1
         rows = await get_device_capability(db, _NED, sw)
         assert [(r.scope, r.name, r.status) for r in rows] == [("ospf", "read", "native")]
-
-
-def test_preflight_scopes_flags_read_gap_rows():
-    """A definite read gap ((scope, 'read') unsupported/skipped) participates in the generic
-    apply-preflight: no reader for a scope on this NED strongly implies no writer either
-    (per-NED handler pairs), so the operator is warned before the write fails loudly."""
-    from types import SimpleNamespace
-
-    from nso_adapter.core.capability import preflight_scopes
-
-    rows = [
-        SimpleNamespace(scope="bgp", name="read", status="unsupported", detail="expected read but empty"),
-        SimpleNamespace(scope="vlan", name="read", status="skipped", detail="not applicable"),
-        SimpleNamespace(scope="isis", name="read", status="unknown", detail="empty, no belief"),
-        SimpleNamespace(scope="ospf", name="read", status="native", detail=""),
-    ]
-    result = preflight_scopes(rows, ["bgp", "vlan", "isis", "ospf"])
-    assert result["fully_supported"] is False
-    flagged = {(u["scope"], u["status"]) for u in result["unsupported"]}
-    # unknown carries no verdict (fail-open) and native is positive — only definite gaps flag
-    assert flagged == {("bgp", "unsupported"), ("vlan", "skipped")}
 
 
 # ── H2: attribute a rejected merged interface-config module to its construct ──

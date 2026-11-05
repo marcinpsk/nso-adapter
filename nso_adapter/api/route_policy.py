@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 
 import structlog
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,7 +17,7 @@ from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ,
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.observation import RoutePolicyObservationOut
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
-from nso_adapter.api.timestamps import iso_z
+from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.core.removal import lost_content
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
@@ -328,6 +328,11 @@ _ROUTE_POLICY_INTENT_OPENAPI = {
                                             "family-specific and stored verbatim."
                                         ),
                                     },
+                                    "accepted_at": {
+                                        "type": "string",
+                                        "format": "date-time",
+                                        "description": "Explicit acceptance time; defaults to now.",
+                                    },
                                     "accepted": {
                                         "type": "boolean",
                                         "default": False,
@@ -363,6 +368,15 @@ async def _upsert_route_policy_object(db: AsyncSession, device_id: int, obj: dic
     entries = obj.get("entries")
     accepted = obj.get("accepted", False)
     invert_match = bool(obj.get("invert_match", False))
+    timestamp = now
+    invalid_timestamp = False
+    if obj.get("accepted_at") is not None:
+        try:
+            timestamp = TypeAdapter(UtcInstant).validate_python(obj["accepted_at"])
+        except ValidationError:
+            invalid_timestamp = True
+    if invalid_timestamp:
+        raise api_error(422, "validation_error", "accepted_at must be a timestamp")
 
     if family not in _VALID_FAMILIES:
         raise api_error(422, "invalid_family", "Object has an unknown family")
@@ -389,7 +403,7 @@ async def _upsert_route_policy_object(db: AsyncSession, device_id: int, obj: dic
                 name=name,
                 entries=entries,
                 invert_match=invert_match,
-                accepted_at=now if accepted else None,
+                accepted_at=timestamp if accepted else None,
             )
         )
         return False  # brand new — nothing it could have lost
@@ -398,7 +412,7 @@ async def _upsert_route_policy_object(db: AsyncSession, device_id: int, obj: dic
     row.entries = entries
     row.invert_match = invert_match
     if accepted:
-        row.accepted_at = now
+        row.accepted_at = timestamp
     return shrank
 
 

@@ -39,6 +39,7 @@ async def replay_apply_attempt(
     attempt_id: UUID,
     device_id: int,
     selected: dict[str, int],
+    preflight_identity: str,
 ) -> StoredApplyResponse | None:
     """Return a completed replay, or ``None`` when the UUID is unknown."""
     attempt = await db.scalar(select(DeploymentApplyAttempt).where(DeploymentApplyAttempt.id == attempt_id))
@@ -48,7 +49,14 @@ async def replay_apply_attempt(
         raise ApplyAttemptIdentityMismatch("device_id")
     if canonical_selected(attempt.selected) != canonical_selected(selected):
         raise ApplyAttemptIdentityMismatch("selected")
-    return StoredApplyResponse(http_status=attempt.http_status, response=attempt.response)
+    if attempt.response.get("_preflight_identity") != preflight_identity:
+        raise ApplyAttemptIdentityMismatch("preflight_identity")
+    return StoredApplyResponse(http_status=attempt.http_status, response=apply_response_body(attempt.response))
+
+
+def apply_response_body(response: dict) -> dict:
+    """Project the replay body without the stored request identity."""
+    return {key: value for key, value in response.items() if key != "_preflight_identity"}
 
 
 async def begin_apply_attempt(
@@ -56,6 +64,7 @@ async def begin_apply_attempt(
     attempt_id: UUID,
     device_id: int,
     selected: dict[str, int],
+    preflight_identity: str,
 ) -> StoredApplyResponse | None:
     """Reserve a new UUID in this transaction, or return its completed replay."""
     identity = canonical_selected(selected)
@@ -67,7 +76,7 @@ async def begin_apply_attempt(
             selected=identity,
             admission_state="admitted",
             http_status=500,
-            response={},
+            response={"_preflight_identity": preflight_identity},
         )
         .on_conflict_do_nothing(index_elements=[DeploymentApplyAttempt.id])
         .returning(DeploymentApplyAttempt.id)
@@ -75,7 +84,7 @@ async def begin_apply_attempt(
     if inserted_id is not None:
         return None
 
-    stored = await replay_apply_attempt(db, attempt_id, device_id, identity)
+    stored = await replay_apply_attempt(db, attempt_id, device_id, identity, preflight_identity)
     if stored is None:  # pragma: no cover - INSERT conflict makes the row visible at READ COMMITTED
         raise RuntimeError(f"Apply attempt {attempt_id} conflicted but is not readable")
     return stored
@@ -97,7 +106,7 @@ async def complete_apply_attempt(
         .values(
             admission_state=admission_state,
             http_status=http_status,
-            response=response,
+            response=DeploymentApplyAttempt.response.op("||")(response),
         ),
     )
     if result.rowcount != 1:

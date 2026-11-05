@@ -749,7 +749,7 @@ async def test_evidence_deduplicates_attempt_ids_before_applying_the_request_bou
     unknown_id = uuid.uuid4()
     replay = {"generations": None}
     async with session() as db:
-        assert await begin_apply_attempt(db, attempt_id, device_id, {}) is None
+        assert await begin_apply_attempt(db, attempt_id, device_id, {}, "0" * 64) is None
         await complete_apply_attempt(
             db,
             attempt_id,
@@ -770,6 +770,30 @@ async def test_evidence_deduplicates_attempt_ids_before_applying_the_request_bou
         str(attempt_id)
     ]
     assert response.json()["unknown_apply_attempt_ids"] == [str(unknown_id)]
+
+
+async def test_evidence_attempt_response_omits_the_stored_preflight_identity(adapter_client):
+    from nso_adapter.store.apply_attempt_store import begin_apply_attempt, complete_apply_attempt
+    from nso_adapter.store.models import DeploymentApplyAttempt
+
+    device_id = await seed_device(nso_device_name="evidence-preflight-identity", netbox_device_id=16237)
+    attempt_id = uuid.uuid4()
+    async with session() as db:
+        assert await begin_apply_attempt(db, attempt_id, device_id, {}, "a" * 64) is None
+        await complete_apply_attempt(
+            db, attempt_id, admission_state="rejected", http_status=409, response={"generations": None}
+        )
+        await db.commit()
+        stored = await db.get(DeploymentApplyAttempt, attempt_id)
+        assert stored.response["_preflight_identity"] == "a" * 64
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/deployment-evidence", headers=AUTH, json={"apply_attempt_ids": [str(attempt_id)]}
+    )
+
+    assert response.status_code == 200, response.text
+    (attempt,) = deployment_projections(response.json())["attempts"]
+    assert attempt["response"] == {"generations": None}
 
 
 async def test_evidence_rejects_more_than_100_attempt_ids(adapter_client):

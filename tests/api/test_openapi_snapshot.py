@@ -167,7 +167,7 @@ def test_action_apply_requires_an_attempt_id(openapi_schema):
     schema = openapi_schema["components"]["schemas"]["ActionApplyIn"]
 
     assert schema["additionalProperties"] is False
-    assert schema["required"] == ["apply_attempt_id", "selected"]
+    assert schema["required"] == ["selected", "apply_attempt_id", "preflight_identity"]
     assert schema["properties"]["apply_attempt_id"] == {
         "format": "uuid",
         "title": "Apply Attempt Id",
@@ -236,8 +236,6 @@ def test_api_contract_documents_apply_attempt_identity_and_recovery():
     assert "`apply_attempt_id` is required" in section
     assert "same device and complete canonical `selected`" in section
     assert "stored HTTP status and response body byte for byte" in section
-    assert "`error.detail.mismatch` is `device_id` or `selected`" in section
-    assert "re-POST the identical request with the same UUID and selection" in section
     assert "No revision field is accepted" in section
 
 
@@ -338,12 +336,6 @@ def test_action_conflict_descriptions_match_their_admission_rules(openapi_schema
     )
     for path in trigger_paths:
         assert openapi_schema["paths"][path]["post"]["responses"]["409"]["description"] == queued_action
-
-    apply = openapi_schema["paths"]["/api/v1/devices/{device_id}/actions/apply"]["post"]
-    assert apply["responses"]["409"]["description"] == (
-        "The Apply UUID identifies a different request, a job is already queued or running, "
-        "or a selected stream cannot be applied faithfully"
-    )
 
 
 def test_device_generation_limit_schema_matches_the_runtime_bounds(openapi_schema):
