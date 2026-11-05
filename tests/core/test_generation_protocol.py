@@ -796,6 +796,7 @@ async def test_f5_c_a_detach_head_is_re_admittable(adapter_client):
 
 async def test_f6_a_manual_apply_creates_a_generation_from_authorized_state(adapter_client):
     from nso_adapter.store.models import DeploymentGeneration, GenerationMode
+    from tests.core.test_action_apply_promotion import preflight_and_apply
 
     device_id = await seed_device(nso_device_name="gen-manual-apply", netbox_device_id=9814)
     await seed_settings(device_id, auto_apply=False)
@@ -803,11 +804,7 @@ async def test_f6_a_manual_apply_creates_a_generation_from_authorized_state(adap
     assert await generations(device_id) == []
 
     selected_seq = (await stream_row(device_id, "vlan")).source_push_seq
-    resp = await adapter_client.post(
-        f"/api/v1/devices/{device_id}/actions/apply",
-        json={"apply_attempt_id": str(uuid4()), "selected": {"vlan": selected_seq}},
-        headers=AUTH,
-    )
+    resp = await preflight_and_apply(adapter_client, device_id, {"vlan": selected_seq}, attempt_id=str(uuid4()))
     assert resp.status_code == 202
     job_id = resp.json()["generations"][0]["job_id"]
 

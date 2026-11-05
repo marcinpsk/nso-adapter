@@ -74,6 +74,7 @@ class SwitchportApply(_StrictSwitchportRequest):
 
 
 class SwitchportApplyRequest(_StrictSwitchportRequest):
+    accepted_at: UtcInstant | None = None
     interfaces: list[SwitchportApply]
     source_revision: int = Field(strict=True, ge=0, le=9223372036854775807)
     #: The switchport roots this preparation authorizes RETRACTING from the device.
@@ -227,6 +228,7 @@ async def apply_switchport(
             interfaces,
             deleted_roots=payload.deleted_roots,
             source_revision=payload.source_revision,
+            accepted_at=payload.accepted_at,
         )
     except DeviceProjectionGone:
         # Built in the handler, raised after it: a raise inside attaches the caught exception.

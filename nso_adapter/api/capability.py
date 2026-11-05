@@ -35,10 +35,6 @@ class PreflightRequest(BaseModel):
     aspath_names: list[str] = []
 
 
-class ApplyPreflightRequest(BaseModel):
-    scopes: list[str] = []
-
-
 class ReadCapabilityElement(BaseModel):
     scope: str
     status: Literal["native", "unsupported", "skipped", "unknown"]
@@ -52,7 +48,7 @@ class ReadCapabilityReport(BaseModel):
 
 
 # ── Response models ───────────────────────────────────────────────────────────
-# The GET + both preflights are two-branch: the "known" branch adds a (ned_id,
+# The GET + route-policy preflight are two-branch: the "known" branch adds a (ned_id,
 # sw_version) key and coverage_unknown; the "unknown" branch omits them. Those keys
 # are unset-by-default optionals + response_model_exclude_unset=True, so an omitted
 # key stays absent (never null). The golden tests pin every branch's exact bytes.
@@ -96,22 +92,6 @@ class RoutePolicyPreflightOut(BaseModel):
     fully_supported: bool
     unsupported: list[RoutePolicyPreflightUnsupported]
     coverage_unknown: bool
-
-
-class ApplyPreflightUnsupported(BaseModel):
-    scope: str
-    name: str
-    status: str
-    detail: str
-
-
-class ApplyPreflightOut(BaseModel):
-    known: bool
-    ned_id: str | None = None  # present only in the known branch
-    sw_version: str | None = None  # present only in the known branch
-    coverage_unknown: bool
-    fully_supported: bool
-    unsupported: list[ApplyPreflightUnsupported]
 
 
 async def _device_and_client(device_id: int, db: AsyncSession):
@@ -228,36 +208,3 @@ async def preflight_route_policy(
     rows = await capability.get_device_capability(db, info["ned_id"], info["sw_version"])
     result = capability.preflight(rows, body.community_members, body.set_keys, body.match_keys, body.aspath_names)
     return {"known": True, "ned_id": info["ned_id"], "sw_version": info["sw_version"], **result}
-
-
-@router.post(
-    "/{device_id}/apply/preflight",
-    dependencies=[Depends(verify_token)],
-    response_model=ApplyPreflightOut,
-    response_model_exclude_unset=True,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409, **RESP_422_VALIDATION},
-)
-async def preflight_apply(
-    device_id: int, body: ApplyPreflightRequest, refresh: bool = False, db: AsyncSession = Depends(get_db)
-):
-    """Check the scopes the next apply will push against this device's capability matrix.
-
-    The generic analog of ``/route-policy/preflight``: the plugin passes the scopes from its
-    apply diff; any the matrix marks ``unsupported``/``skipped`` (recorded reactively on a prior
-    apply failure, see ``_record_atomic_capability``) are returned so the operator is warned
-    BEFORE a device write. ``refresh=false`` (default) is the cheap cache-only read; the device
-    must have a known ``(ned, sw)`` key (probed at least once) or the result is fail-open.
-    """
-    device, client = await _device_and_client(device_id, db)
-    info = await capability.resolve_capability_key(db, client, device, refresh=refresh)
-    if not info:
-        return {"known": False, "fully_supported": True, "unsupported": [], "coverage_unknown": False}
-    rows = await capability.get_device_capability(db, info["ned_id"], info["sw_version"])
-    result = capability.preflight_scopes(rows, body.scopes)
-    return {
-        "known": True,
-        "ned_id": info["ned_id"],
-        "sw_version": info["sw_version"],
-        "coverage_unknown": capability.coverage_unknown(rows),
-        **result,
-    }

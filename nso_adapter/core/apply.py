@@ -722,8 +722,8 @@ def _record_route_omissions(
         origins.record_omission(PriorContribution("static-route", row, authority))
 
 
-async def _static_route_snapshot(client, device, document: dict, plan) -> tuple[Any, list[dict]]:
-    """Read the live static-route section ONCE and derive the entries the PUT must retain.
+async def _static_route_snapshot(client, device, document: dict, plan, *, snapshot=None) -> tuple[Any, list[dict]]:
+    """Use one certified static-route snapshot to derive the entries the PUT must retain.
 
     Returns ``(certified, retained)``. Certified ABSENCE retains nothing and sends; an
     INCONCLUSIVE read raises :class:`NsoApplyError`, because a full-document PUT built on a
@@ -734,12 +734,14 @@ async def _static_route_snapshot(client, device, document: dict, plan) -> tuple[
     plane does not authorize removing. They are kept VERBATIM: metric, tag and NED-specific
     leaves live only in the live copy, so rebuilding such an entry from the store triple
     would silently rewrite it.
+
+    A supplied snapshot replaces the live read.
     """
     from nso_adapter.core.static_route_plan import as_triple, triple_of
     from nso_adapter.core.static_route_reader import certified_static_route_section
     from nso_adapter.nso.apply import static_route_entry_key
 
-    certified = await certified_static_route_section(client, device)
+    certified = snapshot if snapshot is not None else await certified_static_route_section(client, device)
     if certified.inconclusive:
         raise NsoApplyError(
             SNAPSHOT_INCONCLUSIVE,
@@ -763,6 +765,7 @@ async def build_device_containers(
     static_route_plan: SrPlan | None = None,
     retain_static_routes: bool = True,
     origin_context: OriginContext | None = None,
+    static_route_snapshot=None,
 ) -> DeviceBody:
     """Build one device's whole PUT body → ``({container: body}, route keys sent, build errors)``.
 
@@ -773,6 +776,8 @@ async def build_device_containers(
     (#1683): its body additionally carries, verbatim, the live certified entries of the keys
     the frozen plan retains. An uncertified read refuses the send; certified absence retains
     nothing.
+
+    ``static_route_snapshot`` supplies the caller's certified read to retention and the guard.
 
     ``retain_static_routes=False`` is the operator's FLUSH: a force-selected static-route
     section emits the document's rows and no retained entries, because a force-removal carries
@@ -792,7 +797,7 @@ async def build_device_containers(
     origins = OriginIndex()
     errors: dict[str, NsoApplyError] = {}
     sent_route_keys: set | None = None
-    certified: Any = None
+    certified: Any = static_route_snapshot
     for section, entry in registry.items():
         if section not in document:
             continue
@@ -813,7 +818,9 @@ async def build_device_containers(
                 retained: list[dict] = []
                 if retain_static_routes:
                     plan = static_route_plan or hydrate_static_route_apply_plan(document)
-                    certified, retained = await _static_route_snapshot(client, device, document, plan)
+                    certified, retained = await _static_route_snapshot(
+                        client, device, document, plan, snapshot=static_route_snapshot
+                    )
                 sent_route_keys = overlay_retained_routes(encoded, retained)
                 _record_route_omissions(encoded.origins, document, sent_route_keys, origin_context)
         except NsoApplyError as exc:

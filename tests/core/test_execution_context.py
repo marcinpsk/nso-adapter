@@ -666,6 +666,13 @@ async def test_scenario_5d_a_refused_composition_rolls_the_whole_transaction_bac
     assert (await _apply(adapter_client, device_id, {"vlan": 1780})).status_code == 202
     await _execute(device_id, "ec-refusal-rollback")
 
+    from tests.core.test_action_apply_promotion import preflight_and_apply
+
+    assert (await _put_vlans(adapter_client, device_id, [401, 402], seq=1781)).status_code == 200
+    preview = await preflight_and_apply(adapter_client, device_id, {"vlan": 1781}, preflight_only=True)
+    assert preview.json()["status"] == "ready", preview.text
+    identity = preview.json()["preflight_identity"]
+
     # An UNSELECTED stored fragment whose dialect names nothing registered: the composition
     # takes every authorized fragment, so the next Apply of another stream has to refuse.
     async with session() as db:
@@ -681,9 +688,8 @@ async def test_scenario_5d_a_refused_composition_rolls_the_whole_transaction_bac
 
     before = await _generations(device_id)
     revisions = await _revisions(device_id)
-    assert (await _put_vlans(adapter_client, device_id, [401, 402], seq=1781)).status_code == 200
     attempt_id = uuid4()
-    response = await _apply(adapter_client, device_id, {"vlan": 1781}, attempt_id=attempt_id)
+    response = await _apply(adapter_client, device_id, {"vlan": 1781}, attempt_id=attempt_id, identity=identity)
     assert response.status_code == 500, response.text
 
     async with session() as db:
@@ -708,7 +714,7 @@ def test_scenario_5d_composition_refuses_a_fragment_whose_context_is_not_a_conte
         _compose_document({"vlan": {"_execution": {**good, "operation": {}}}})
 
 
-async def test_scenario_5e_a_backfilled_binding_survives_composition_and_reaches_the_wire(adapter_client):
+async def test_automatic_ip_promotion_keeps_a_backfilled_binding(adapter_client):
     """Case E. Owner-wins is right for the context and wrong for a row.
 
     Driven by real rows, because that is where the loss happens: the ip endpoint backfills
@@ -716,7 +722,7 @@ async def test_scenario_5e_a_backfilled_binding_survives_composition_and_reaches
     while both were null. Owner-wins would restore the nulls, and SR OS would be told to
     configure the address on an interface with no port binding.
     """
-    from nso_adapter.store.models import DbInterface
+    from nso_adapter.store.models import DbInterface, DeviceSettings
 
     device_id = await seed_device(nso_device_name="ec-split-merge", netbox_device_id=17008)
     await seed_settings(device_id, auto_apply=False)
@@ -740,6 +746,11 @@ async def test_scenario_5e_a_backfilled_binding_survives_composition_and_reaches
     (recorded,) = frozen["_execution"]["proof"]["interfaces"].values()
     assert recorded["parent_binding"] is None, "setup broken: the attribute lane must freeze the bare record"
 
+    async with session() as db:
+        settings = await db.scalar(sa.select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+        settings.auto_apply = True
+        await db.commit()
+
     # The ip push backfills the binding, so the ip fragment records what the attribute
     # fragment could not have known.
     assert (
@@ -759,7 +770,6 @@ async def test_scenario_5e_a_backfilled_binding_survives_composition_and_reaches
             seq=1761,
         )
     ).status_code == 200
-    assert (await _apply(adapter_client, device_id, {"ip": 1761})).status_code == 202
 
     generation = (await _generations(device_id))[-1]
     (merged,) = generation.document["interface_config"]["_execution"]["proof"]["interfaces"].values()
@@ -770,6 +780,56 @@ async def test_scenario_5e_a_backfilled_binding_survives_composition_and_reaches
     assert entry["description"] == "uplink"
     assert entry["parent-binding"] == "lag-99"
     assert entry["encap-tag"] == "99"
+
+
+async def test_manual_apply_of_both_streams_keeps_a_backfilled_binding(adapter_client):
+    """Case E through manual Apply: a preflight of both streams admits ip with the binding."""
+    from nso_adapter.store.models import DbInterface
+
+    name = "PROD-LAB03-SROS-PE01"
+    device_id = await seed_device(nso_device_name=name, netbox_device_id=17010)
+    await seed_settings(device_id, auto_apply=False)
+    await _set_ned(device_id, _NOKIA)
+    async with session() as db:
+        db.add(DbInterface(device_id=device_id, name="1/1/1:100", kind="logical"))
+        await db.commit()
+    attribute = [{"interface": "1/1/1:100", "attribute": "description", "intent_value": "uplink"}]
+    assert (await _put_attrs(adapter_client, device_id, attribute, seq=1762)).status_code == 200
+    assert (await _apply(adapter_client, device_id, {"interface_config": 1762})).status_code == 202
+    await _execute(device_id, name)
+
+    address = {
+        "interface": "1/1/1:100",
+        "address": "192.0.2.9/24",
+        "family": "ipv4",
+        "routed": True,
+        "parent_binding": "lag-99",
+        "encap_tag": "99",
+    }
+    assert (await _put_addresses(adapter_client, device_id, [address], seq=1763)).status_code == 200
+    # A new attribute revision lets both interface streams promote, so neither is disturbed.
+    assert (await _put_attrs(adapter_client, device_id, attribute, seq=1764)).status_code == 200
+    selected = {"interface_config": 1764, "ip": 1763}
+
+    preview = await _apply(adapter_client, device_id, selected, preflight_only=True)
+    assert preview.status_code == 200, preview.text
+    result = preview.json()
+    assert result["status"] == "ready", result
+    assert result["admitted_selection"] == selected
+    assert result["streams"]["ip"] == {"status": "admitted"}
+    response = await _apply(adapter_client, device_id, selected, identity=result["preflight_identity"])
+    assert response.status_code == 202, response.text
+    assert response.json()["selected"] == selected
+
+    generation = (await _generations(device_id))[-1]
+    (composed,) = generation.document["interface_config"]["_execution"]["proof"]["interfaces"].values()
+    assert (composed["parent_binding"], composed["encap_tag"]) == ("lag-99", "99")
+
+    recorder = await _execute(device_id, name)
+    (entry,) = recorder.container("interface")["interface"]
+    assert entry["description"] == "uplink"
+    assert (entry["parent-binding"], entry["encap-tag"]) == ("lag-99", "99")
+    assert entry["ipv4-address"] == [{"address": "192.0.2.9", "prefix-length": 24, "secondary": False}]
 
 
 def test_scenario_5e_composition_refuses_two_different_non_null_interface_values():

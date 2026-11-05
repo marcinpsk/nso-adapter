@@ -877,7 +877,7 @@ async def test_offboard_cascades_an_apply_stamped_generation(adapter_client_with
     )
     attempt_id = uuid4()
     async with session() as db:
-        assert await begin_apply_attempt(db, attempt_id, device_id, {"vlan": 1}) is None
+        assert await begin_apply_attempt(db, attempt_id, device_id, {"vlan": 1}, "0" * 64) is None
         await note_write(db, device_id, "vlan", push_seq=1)
         generation = await create_generation(
             db,

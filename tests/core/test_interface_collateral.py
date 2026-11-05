@@ -318,6 +318,10 @@ async def test_manual_attribute_edit_with_detach_refuses_queued_apply(adapter_cl
     assert (await _put_attrs(adapter_client, device_id, [*_ATTR, enabled], seq=1830)).status_code == 200
     live = (await _execute(device_id, name)).documents[-1]
     before = await stream_row(device_id, "interface_config")
+    from tests.core.test_action_apply_promotion import preflight_and_apply
+
+    preview = await preflight_and_apply(adapter_client, device_id, {"interface_config": 1830}, preflight_only=True)
+    identity = preview.json()["preflight_identity"]
     assert (await _put_vlans(adapter_client, device_id, [100], seq=1)).status_code == 200
     incumbent = (await generations(device_id))[-1]
     if not auto_apply:
@@ -337,7 +341,7 @@ async def test_manual_attribute_edit_with_detach_refuses_queued_apply(adapter_cl
         query="?store_only=true&delete_origin=false",
     )
     assert response.status_code == 200, response.text
-    response = await _apply(adapter_client, device_id, {"interface_config": 1831})
+    response = await _apply(adapter_client, device_id, {"interface_config": 1831}, identity=identity)
     assert response.status_code == 409, response.text
     assert response.json()["error"]["code"] == "conflict"
     assert response.json()["error"]["detail"]["job_id"] == incumbent.job_id

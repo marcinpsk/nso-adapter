@@ -10,6 +10,7 @@ import pytest
 
 from tests._secret_discipline import assert_text_free_of
 from tests.conftest import VALID_TOKEN, seed_device
+from tests.core.test_action_apply_promotion import preflight_and_apply
 
 
 async def test_healthz_no_auth(adapter_client):
@@ -107,11 +108,10 @@ async def test_sync_notify_unknown_device(adapter_client):
     assert resp.json()["error"]["code"] == "not_found"
 
 
-async def test_apply_returns_501(adapter_client):
-    """apply action on unknown device returns 404."""
+async def test_apply_unknown_device_returns_404(adapter_client):
     resp = await adapter_client.post(
         "/api/v1/devices/9999/actions/apply",
-        json={"apply_attempt_id": str(uuid4()), "selected": {}},
+        json={"apply_attempt_id": str(uuid4()), "selected": {}, "preflight_identity": "0" * 64},
         headers={"Authorization": f"Bearer {VALID_TOKEN}"},
     )
     assert resp.status_code == 404
@@ -121,9 +121,10 @@ async def test_apply_returns_501(adapter_client):
 async def test_action_apply_requires_an_attempt_id(adapter_client):
     device_id = await seed_device(nso_device_name="apply-attempt-required", netbox_device_id=16231)
 
+    preview = await preflight_and_apply(adapter_client, device_id, {}, preflight_only=True)
     response = await adapter_client.post(
         f"/api/v1/devices/{device_id}/actions/apply",
-        json={"selected": {}},
+        json={"selected": {}, "preflight_identity": preview.json()["preflight_identity"]},
         headers={"Authorization": f"Bearer {VALID_TOKEN}"},
     )
 
@@ -147,12 +148,14 @@ async def test_action_apply_requires_an_attempt_id(adapter_client):
 
 async def test_action_apply_rejects_a_revision_field(adapter_client):
     device_id = await seed_device(nso_device_name="apply-attempt-no-revision", netbox_device_id=16240)
+    preview = await preflight_and_apply(adapter_client, device_id, {}, preflight_only=True)
 
     response = await adapter_client.post(
         f"/api/v1/devices/{device_id}/actions/apply",
         json={
             "apply_attempt_id": str(uuid4()),
             "source_intent_revision": 7,
+            "preflight_identity": preview.json()["preflight_identity"],
             "selected": {},
         },
         headers={"Authorization": f"Bearer {VALID_TOKEN}"},

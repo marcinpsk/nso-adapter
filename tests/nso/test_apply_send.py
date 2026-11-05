@@ -342,6 +342,13 @@ async def test_verify_passes_when_delta_empty():
     )
 
 
+async def test_verify_reads_a_no_content_dry_run_as_conclusive():
+    # NSO answers a dry run that changes nothing with 204, so a landed commit verifies.
+    client = _client_with(httpx.MockTransport(lambda request: httpx.Response(204, request=request)))
+    verdict = await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", device_id=_DEVICE_ID, scope="snmp")
+    assert verdict == VERIFY_CONCLUSIVE
+
+
 async def test_successful_sender_diagnostics_use_id():
     device_name = "placeholder-success-device"
     client = _client_with(_RecordingTransport())

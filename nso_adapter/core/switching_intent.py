@@ -355,7 +355,9 @@ async def _prepare_snapshot(
     return PreparedSnapshot("prepared", stream, count, removed, revision, revision, unauthorized)
 
 
-async def _replace_lag_rows(db: AsyncSession, device_id: int, bundles: Sequence[LagBundleSnapshot]) -> tuple[int, int]:
+async def _replace_lag_rows(
+    db: AsyncSession, device_id: int, bundles: Sequence[LagBundleSnapshot], accepted_at: datetime | None
+) -> tuple[int, int]:
     existing = (
         (
             await db.execute(
@@ -373,18 +375,20 @@ async def _replace_lag_rows(db: AsyncSession, device_id: int, bundles: Sequence[
     for row in removed:
         await db.delete(row)
 
-    accepted_at = datetime.now(UTC)
+    stamp = accepted_at or datetime.now(UTC)
     for bundle in bundles:
         lag_row = by_name.get(bundle.name)
         changed = lag_row is None or _lag_changed(lag_row, bundle)
         if lag_row is None:
-            lag_row = LagBundleIntent(device_id=device_id, name=bundle.name, accepted_at=accepted_at, members=[])
+            lag_row = LagBundleIntent(device_id=device_id, name=bundle.name, accepted_at=stamp, members=[])
             db.add(lag_row)
 
         for field in _LAG_SCALARS:
             setattr(lag_row, field, getattr(bundle, field))
+        # An explicit time restamps unchanged rows too, like the receipt streams.
+        if changed or accepted_at is not None:
+            lag_row.accepted_at = stamp
         if changed:
-            lag_row.accepted_at = accepted_at
             lag_row.last_apply_at = None
             lag_row.last_apply_error = None
 
@@ -412,6 +416,7 @@ async def replace_lag_snapshot(
     *,
     deleted_roots: Sequence[str],
     source_revision: int,
+    accepted_at: datetime | None = None,
 ) -> PreparedSnapshot:
     """Prepare one device's complete LAG snapshot. Caller commits."""
     _validate_lag_snapshot(bundles)
@@ -423,12 +428,12 @@ async def replace_lag_snapshot(
         source_revision=source_revision,
         source_digest=_snapshot_digest(bundles, LAG_STREAM),
         desired_roots={bundle.name for bundle in bundles},
-        replace=lambda: _replace_lag_rows(db, device_id, bundles),
+        replace=lambda: _replace_lag_rows(db, device_id, bundles, accepted_at),
     )
 
 
 async def _replace_switchport_rows(
-    db: AsyncSession, device_id: int, interfaces: Sequence[SwitchportSnapshot]
+    db: AsyncSession, device_id: int, interfaces: Sequence[SwitchportSnapshot], accepted_at: datetime | None
 ) -> tuple[int, int]:
     existing = (
         (
@@ -447,7 +452,7 @@ async def _replace_switchport_rows(
     for row in removed:
         await db.delete(row)
 
-    accepted_at = datetime.now(UTC)
+    stamp = accepted_at or datetime.now(UTC)
     for interface in interfaces:
         switchport_row = by_name.get(interface.interface_name)
         desired_tags = set(interface.tagged_vlans)
@@ -462,15 +467,16 @@ async def _replace_switchport_rows(
             switchport_row = SwitchportIntent(
                 device_id=device_id,
                 interface_name=interface.interface_name,
-                accepted_at=accepted_at,
+                accepted_at=stamp,
                 tagged_vlans=[],
             )
             db.add(switchport_row)
 
         switchport_row.mode = interface.mode
         switchport_row.untagged_vlan = interface.untagged_vlan
+        if changed or accepted_at is not None:
+            switchport_row.accepted_at = stamp
         if changed:
-            switchport_row.accepted_at = accepted_at
             switchport_row.last_apply_at = None
             switchport_row.last_apply_error = None
 
@@ -493,6 +499,7 @@ async def replace_switchport_snapshot(
     *,
     deleted_roots: Sequence[str],
     source_revision: int,
+    accepted_at: datetime | None = None,
 ) -> PreparedSnapshot:
     """Prepare one device's complete switchport snapshot. Caller commits."""
     _validate_switchport_snapshot(interfaces)
@@ -504,7 +511,7 @@ async def replace_switchport_snapshot(
         source_revision=source_revision,
         source_digest=_snapshot_digest(interfaces, SWITCHPORT_STREAM),
         desired_roots={interface.interface_name for interface in interfaces},
-        replace=lambda: _replace_switchport_rows(db, device_id, interfaces),
+        replace=lambda: _replace_switchport_rows(db, device_id, interfaces, accepted_at),
     )
 
 

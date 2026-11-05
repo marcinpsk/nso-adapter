@@ -37,6 +37,7 @@ from nso_adapter.api.pagination import DEFAULT_PAGE, LIMIT_MAX, LIMIT_MIN, valid
 from nso_adapter.api.timestamps import iso_z
 from nso_adapter.domain.diagnostics import DEVICE_REF_PATTERN, device_ref
 from nso_adapter.nso.execution_contract import GENERATION_FIELDS, validate_generation, validate_generation_listing
+from nso_adapter.store.apply_attempt_store import apply_response_body
 from nso_adapter.store.models import (
     DbInterface,
     DeploymentApplyAttempt,
@@ -515,6 +516,7 @@ def _evidence_attempt_out(attempt: DeploymentApplyAttempt, generations: list[Dep
             candidate,
             DeploymentEvidenceAttemptOut,
             construct=lambda value: _validate_attempt_generation_evidence(attempt, generations),
+            project=lambda value: {**value, "response": apply_response_body(value["response"])},
         ),
         "generations": [_attempt_generation_out(generation) for generation in generations],
     }
