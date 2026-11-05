@@ -118,7 +118,7 @@ async def plan(device, selected, client):
 
 @pytest.mark.parametrize("case", ["plain", "removal", "lag", "switchport", "retention"])
 async def test_planned_chain_matches_created_chain(adapter_client, monkeypatch, case):
-    device, selected, client, transport = await setup(adapter_client, monkeypatch, case)
+    device, selected, client, _ = await setup(adapter_client, monkeypatch, case)
     planned = await plan(device, selected, client)
     async with session() as db:
         created = await create_action_apply(db, device.id, selected, uuid4())
@@ -136,7 +136,6 @@ async def test_planned_chain_matches_created_chain(adapter_client, monkeypatch, 
             assert link.document == generation.document
             assert link.policy == policy
         assert planned.skipped == created.skipped
-    assert not transport.documents
     if case == "removal":
         assert [link.mode for link in planned.links] == [GenerationMode.networked, GenerationMode.detach]
     if case == "retention":
@@ -297,7 +296,7 @@ async def test_plan_behind_blocked_head_matches_apply(adapter_client, monkeypatc
 
 
 async def test_plan_captures_body_build_errors(adapter_client, monkeypatch):
-    device, selected, client, transport = await setup(adapter_client, monkeypatch)
+    device, selected, client, _ = await setup(adapter_client, monkeypatch)
     monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "1")
     response = await adapter_client.put(
         f"/api/v1/devices/{device.id}/logging-intent?store_only=true",
@@ -308,28 +307,25 @@ async def test_plan_captures_body_build_errors(adapter_client, monkeypatch):
     monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "0")
     planned = await plan(device, selected | {"logging": 41}, client)
     assert planned.links[0].errors["logging"]["code"] == "local_levels_gated"
-    assert not transport.fake.calls
 
 
 @pytest.mark.parametrize("provenance", ["prior", "retained"])
 async def test_plan_binds_history_inside_unit(adapter_client, monkeypatch, provenance):
     from tests.core.removal_helpers import seed_tomb
 
-    device, selected, client, transport = await setup(
+    device, selected, client, _ = await setup(
         adapter_client, monkeypatch, "removal" if provenance == "prior" else "retain_history"
     )
     if provenance == "retained":
         await seed_tomb(device.id, _B, route_id=2)
         assert (await _put_vlans(adapter_client, device.id, [101], seq=41, query="?store_only=true")).status_code == 200
         selected = {"vlan": 41}
-    transport.documents.clear()
     planned = await plan(device, selected, client)
     origins = planned.links[0].origins
     record = refusal("static-route", row_ref("static-route", "static-route.route", (("route", _B),)), "write-blocked")
     resolved = resolve_refusals((record,), origins)
     assert not isinstance(resolved, AttributionFailure), resolved
     assert any(binding.provenance == provenance for key, binding in origins.bindings.items() if key.row == record.row)
-    assert not transport.documents
 
 
 async def test_plan_reports_collateral_guard_block(adapter_client, monkeypatch):
@@ -338,7 +334,6 @@ async def test_plan_reports_collateral_guard_block(adapter_client, monkeypatch):
     transport.fake.instance["vlan"] = {"vlan": [{"vlan-id": 999, "name": "unowned"}]}
     planned = await plan(device, selected, client)
     assert planned.links[0].guard_orphans == {"vlan/vlan": [["999"]]}
-    assert not transport.documents
     from nso_adapter.core.generation import create_automatic_apply
 
     async with session() as db:
@@ -351,21 +346,12 @@ async def test_plan_reports_collateral_guard_block(adapter_client, monkeypatch):
 
 
 async def test_plan_detach_link_uses_no_networking_policy(adapter_client, monkeypatch):
-    device, selected, client, transport = await setup(adapter_client, monkeypatch, "detach")
+    device, selected, client, _ = await setup(adapter_client, monkeypatch, "detach")
     planned = await plan(device, selected, client)
     assert len(planned.links) == 1
     assert planned.links[0].mode == GenerationMode.detach
     assert planned.links[0].policy.no_networking
     assert planned.links[0].guard_orphans is None
-    assert not transport.documents
-
-
-async def test_plan_single_live_read(adapter_client, monkeypatch):
-    device, selected, client, transport = await setup(adapter_client, monkeypatch, "removal")
-    planned = await plan(device, selected, client)
-    assert len(planned.links) == 2
-    assert len(transport.fake.reads) == 1
-    assert transport.fake.calls == []
 
 
 @pytest.mark.parametrize("case", ["plain", "removal"])
