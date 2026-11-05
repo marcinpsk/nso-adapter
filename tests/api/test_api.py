@@ -108,17 +108,10 @@ async def test_sync_notify_unknown_device(adapter_client):
     assert resp.json()["error"]["code"] == "not_found"
 
 
-async def test_apply_returns_501(adapter_client):
-    """apply action on unknown device returns 404."""
-    device_id = await seed_device(nso_device_name="placeholder-apply-known")
-    preview = await preflight_and_apply(adapter_client, device_id, {}, preflight_only=True)
+async def test_apply_unknown_device_returns_404(adapter_client):
     resp = await adapter_client.post(
         "/api/v1/devices/9999/actions/apply",
-        json={
-            "apply_attempt_id": str(uuid4()),
-            "selected": {},
-            "preflight_identity": preview.json()["preflight_identity"],
-        },
+        json={"apply_attempt_id": str(uuid4()), "selected": {}, "preflight_identity": "0" * 64},
         headers={"Authorization": f"Bearer {VALID_TOKEN}"},
     )
     assert resp.status_code == 404
