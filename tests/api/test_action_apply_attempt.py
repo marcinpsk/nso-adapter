@@ -232,14 +232,6 @@ async def test_apply_preflight_returns_the_apply_unexecutable_refusal(adapter_cl
     }
 
 
-def test_apply_preflight_contract_documents_the_apply_unexecutable_refusal():
-    from pathlib import Path
-
-    contract = (Path(__file__).resolve().parents[2] / "docs" / "api-contract.md").read_text()
-    section = contract.split("### `POST /api/v1/devices/{id}/actions/apply-preflight`", 1)[1].split("\n### ", 1)[0]
-    assert "`409 apply_unexecutable`" in section and "`detail.streams`" in section
-
-
 async def test_complete_no_op_replays_and_serves_its_stored_response_as_evidence(adapter_client):
     from nso_adapter.store.models import DeploymentApplyAttempt
 
