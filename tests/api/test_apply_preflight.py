@@ -79,7 +79,6 @@ async def test_apply_rejects_stale_preflight_identity(adapter_client, monkeypatc
 
     from nso_adapter.store.models import (
         DbInterface,
-        DeploymentApplyAttempt,
         Device,
         GenerationStatus,
         StaticRouteIntent,
@@ -149,21 +148,37 @@ async def test_apply_rejects_stale_preflight_identity(adapter_client, monkeypatc
     assert_text_free_of(response.text, [CANARY])
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "preflight_stale"
+    await assert_rejected_without_promotion(attempt_id, before)
+
+
+async def assert_rejected_without_promotion(attempt_id, before):
+    from nso_adapter.store.models import DeploymentApplyAttempt
+
     assert await database_state(exclude=ATTEMPTS) == before
     async with session() as db:
-        attempt = await db.get(DeploymentApplyAttempt, attempt_id)
-        assert attempt.admission_state == "rejected"
+        assert (await db.get(DeploymentApplyAttempt, attempt_id)).admission_state == "rejected"
 
 
-async def test_apply_live_input_inconclusive_is_preflight_stale(adapter_client, monkeypatch):
+@pytest.mark.parametrize("queued_job", [False, True])
+async def test_apply_live_input_inconclusive_is_preflight_stale(adapter_client, monkeypatch, queued_job):
+    from nso_adapter.store.models import Job, JobStatus, JobType
+
     device, selected, _, transport = await setup(adapter_client, monkeypatch)
     response = await preview(adapter_client, device.id, selected)
+    if queued_job:
+        # An inconclusive live input outranks the job conflict that promotion would raise.
+        async with session() as db:
+            db.add(Job(device_id=device.id, job_type=JobType.sync, status=JobStatus.queued, coalescible=True))
+            await db.commit()
     transport.fake.service_status = "inconclusive"
     transport.fake.service = []
-    response = await apply(adapter_client, device.id, selected, response.json()["preflight_identity"])
+    before = await database_state(exclude=ATTEMPTS)
+    attempt_id = uuid4()
+    response = await apply(adapter_client, device.id, selected, response.json()["preflight_identity"], attempt_id)
     assert response.status_code == 409, response.text
     assert response.json()["error"]["code"] == "preflight_stale"
     assert response.json()["error"]["detail"]["reason"] == "live_input_inconclusive"
+    await assert_rejected_without_promotion(attempt_id, before)
 
 
 async def test_apply_identity_replay_is_idempotent(adapter_client, monkeypatch):
@@ -535,11 +550,14 @@ async def test_live_read_failure_is_unavailable_and_stale_apply(adapter_client, 
     assert unavailable.json()["status"] == "unavailable"
     assert_keys_absent(unavailable.json(), ["preflight_identity"])
     assert await database_state() == before
-    stale = await apply(adapter_client, device.id, selected, identity)
+    before = await database_state(exclude=ATTEMPTS)
+    attempt_id = uuid4()
+    stale = await apply(adapter_client, device.id, selected, identity, attempt_id)
     assert_text_free_of(stale.text, [CANARY])
     assert stale.status_code == 409, stale.text
     assert stale.json()["error"]["code"] == "preflight_stale"
     assert stale.json()["error"]["detail"] == {"reason": "live_input_inconclusive"}
+    await assert_rejected_without_promotion(attempt_id, before)
     assert_text_free_of(unavailable.text + stale.text, [CANARY])
 
 
@@ -640,7 +658,7 @@ async def test_stored_mapping_change_during_live_read_needs_new_preflight(adapte
 async def test_apply_conflicting_interface_proof_after_preview_is_preflight_stale(adapter_client, monkeypatch):
     from sqlalchemy import select
 
-    from nso_adapter.store.models import DbInterface, DeploymentApplyAttempt
+    from nso_adapter.store.models import DbInterface
     from tests.core.test_preflight_loop import ADDRESS, INTERFACE, _put_interface_attrs, _put_ip, authorize
 
     device, _, _, _ = await setup(adapter_client, monkeypatch)
@@ -670,13 +688,10 @@ async def test_apply_conflicting_interface_proof_after_preview_is_preflight_stal
         "message": "Manual Apply needs a fresh preflight",
         "detail": {"reason": "inputs_changed"},
     }
-    assert await database_state(exclude=ATTEMPTS) == before
-    async with session() as db:
-        assert (await db.get(DeploymentApplyAttempt, attempt_id)).admission_state == "rejected"
+    await assert_rejected_without_promotion(attempt_id, before)
 
 
 async def test_apply_ned_change_rejecting_stored_intent_after_preview_is_preflight_stale(adapter_client, monkeypatch):
-    from nso_adapter.store.models import DeploymentApplyAttempt
     from tests.api.test_bgp_asn_validation import _redistribution_request
     from tests.conftest import push_seq
     from tests.core.test_execution_context import _set_ned
@@ -697,9 +712,7 @@ async def test_apply_ned_change_rejecting_stored_intent_after_preview_is_preflig
     response = await apply(adapter_client, device.id, selected, identity, attempt_id)
     assert response.status_code == 409, response.text
     assert response.json()["error"]["code"] == "preflight_stale"
-    assert await database_state(exclude=ATTEMPTS) == before
-    async with session() as db:
-        assert (await db.get(DeploymentApplyAttempt, attempt_id)).admission_state == "rejected"
+    await assert_rejected_without_promotion(attempt_id, before)
     replay = await apply(adapter_client, device.id, selected, identity, attempt_id)
     assert replay.status_code == 409 and replay.json() == response.json()
 
