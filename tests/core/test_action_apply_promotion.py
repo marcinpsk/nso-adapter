@@ -110,7 +110,7 @@ async def test_freeze_returns_the_fragment_on_the_success_path(adapter_client):
 async def preflight_and_apply(
     client, device_id: int, selected: dict[str, int], *, attempt_id=None, identity=None, preflight_only=False
 ):
-    """Preview through HTTP and reuse that identity for admission or replay."""
+    """Preview through HTTP and reuse that identity for admission or replay; a blocked stream fails the call."""
     from nso_adapter.core import importer
     from nso_adapter.nso.client import NsoClient
     from nso_adapter.store.models import Device
@@ -119,12 +119,7 @@ async def preflight_and_apply(
 
     attempt_id = attempt_id or uuid4()
     identities = client.__dict__.setdefault("_apply_preflight_identities", {})
-    requested = dict(selected)
-    cached = identities.get(attempt_id)
-    if identity is None and cached is not None:
-        identity = cached["identity"]
-        if selected == cached["selected"]:
-            selected = cached["confirmed"]
+    identity = identity or identities.get(attempt_id)
     async with session() as db:
         device = await db.get(Device, device_id)
     get_client = importer.get_nso_client
@@ -153,13 +148,9 @@ async def preflight_and_apply(
                 return preview
             assert preview.status_code == 200 and preview.json()["status"] == "ready", preview.text
             result = preview.json()
+            assert all(verdict["status"] != "blocked" for verdict in result["streams"].values()), result
             identity = result["preflight_identity"]
-            selected = {
-                stream: revision
-                for stream, revision in selected.items()
-                if result["streams"][stream]["status"] != "blocked"
-            }
-        identities[attempt_id] = {"identity": identity, "selected": requested, "confirmed": dict(selected)}
+        identities[attempt_id] = identity
         return await client.post(
             f"/api/v1/devices/{device_id}/actions/apply",
             json={"apply_attempt_id": str(attempt_id), "selected": selected, "preflight_identity": identity},
