@@ -49,7 +49,7 @@ async def replay_apply_attempt(
         raise ApplyAttemptIdentityMismatch("device_id")
     if canonical_selected(attempt.selected) != canonical_selected(selected):
         raise ApplyAttemptIdentityMismatch("selected")
-    if attempt.response["_preflight_identity"] != preflight_identity:
+    if attempt.response.get("_preflight_identity") != preflight_identity:
         raise ApplyAttemptIdentityMismatch("preflight_identity")
     return StoredApplyResponse(http_status=attempt.http_status, response=apply_response_body(attempt.response))
 

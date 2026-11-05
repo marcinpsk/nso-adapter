@@ -373,6 +373,40 @@ async def test_same_uuid_on_a_nonexistent_device_is_an_identity_conflict(adapter
     assert conflict.json()["error"]["detail"] == {"mismatch": "device_id"}
 
 
+async def test_same_uuid_on_a_row_without_a_stored_preflight_identity_is_an_identity_conflict(adapter_client):
+    from nso_adapter.store.models import DeploymentApplyAttempt, DeploymentGeneration, Job
+
+    device_id = await seed_device(nso_device_name="apply-attempt-unbound", netbox_device_id=16243)
+    attempt_id = uuid.uuid4()
+    admitted = await _apply(adapter_client, device_id, attempt_id, {})
+    assert admitted.status_code == 200
+    async with session() as db:
+        await db.execute(
+            sa.update(DeploymentApplyAttempt)
+            .where(DeploymentApplyAttempt.id == attempt_id)
+            .values(response=DeploymentApplyAttempt.response.op("-")("_preflight_identity"))
+        )
+        await db.commit()
+
+    conflict = await _apply(adapter_client, device_id, attempt_id, {})
+
+    assert conflict.status_code == 409, conflict.text
+    assert conflict.json()["error"]["detail"] == {"mismatch": "preflight_identity"}
+    async with session() as db:
+        attempt = await db.get(DeploymentApplyAttempt, attempt_id)
+        assert attempt is not None
+        assert attempt.response == admitted.json()
+        assert (
+            await db.scalar(
+                sa.select(sa.func.count())
+                .select_from(DeploymentGeneration)
+                .where(DeploymentGeneration.device_id == device_id)
+            )
+            == 0
+        )
+        assert await db.scalar(sa.select(sa.func.count()).select_from(Job).where(Job.device_id == device_id)) == 0
+
+
 async def test_skipped_stream_detail_is_stored_and_replayed_with_promoted_work(adapter_client):
     from nso_adapter.store.models import DeploymentApplyAttempt
 
