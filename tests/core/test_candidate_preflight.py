@@ -13,7 +13,7 @@ from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS, OUT_OF_PROTOC
 from nso_adapter.core.preflight import _device_context, normalized_plan_digest, plan_action_apply, read_plan_inputs
 from nso_adapter.main import create_app
 from nso_adapter.store.db import get_engine, session
-from nso_adapter.store.models import Base, DbInterface, Device, LagBundleIntent, SwitchportIntent
+from nso_adapter.store.models import DbInterface, Device, LagBundleIntent, SwitchportIntent
 from tests._secret_discipline import assert_keys_absent, assert_text_free_of
 from tests.conftest import AUTH
 from tests.core.test_preflight_loop import ADDRESS, INTERFACE, IP_REFUSAL, authorize, has_ip, setup
@@ -147,28 +147,19 @@ async def test_candidate_preflight_matches_pushed_apply_document(adapter_client,
     assert result["plan_digest"] == normalized_plan_digest(plan)
 
 
-async def all_rows():
-    async with session() as db:
-        return {
-            table.name: (await db.execute(select(table).order_by(*table.primary_key))).all()
-            for table in Base.metadata.sorted_tables
-        }
-
-
 async def test_candidate_preflight_persists_nothing(adapter_client, monkeypatch):
     device, _, _, transport = await setup(adapter_client, monkeypatch)
     initial = deepcopy(BODIES["switchport"])
     initial["source_revision"] = 41
     initial["interfaces"][0]["tagged_vlans"] = [100]
     assert (await push(adapter_client, device.id, "switchport", initial)).status_code == 200
-    counts, rows = await database_state(), await all_rows()
+    before = await database_state()
     await ready(
         adapter_client,
         device.id,
         {stream: BODIES[stream] for stream in ("ip", "interface_config", "static_route", "lag", "switchport")},
     )
-    assert await database_state() == counts
-    assert await all_rows() == rows
+    assert await database_state() == before
     assert len(transport.fake.reads) == 1
     assert not transport.documents
     assert not transport.locks
@@ -189,7 +180,7 @@ async def test_candidate_refusal_names_candidate_rows(adapter_client, monkeypatc
         (await db.get(Device, device.id)).ned_id = "juniper-junos-nc-4.1"
         await db.commit()
     transport.judge = lambda body, _request: (IP_REFUSAL,) if has_ip(body) else None
-    before = await all_rows()
+    before = await database_state()
     response = await preview(
         adapter_client, device.id, {"ip": BODIES["ip"], "interface_config": BODIES["interface_config"]}
     )
@@ -206,7 +197,7 @@ async def test_candidate_refusal_names_candidate_rows(adapter_client, monkeypatc
     assert record["logical_rows"][0]["carrier"]["accepted_at"] == "2026-10-20T12:00:00+00:00"
     assert_keys_absent(result, ["candidate_identity", "plan_digest", "preflight_identity"])
     assert [attempt["dropped"] for attempt in result["attempts"]] == [[]]
-    assert await all_rows() == before
+    assert await database_state() == before
 
 
 @pytest.mark.parametrize("stream", ["lag", "switchport"])
@@ -290,10 +281,10 @@ async def test_candidate_missing_timestamp_is_422(adapter_client, monkeypatch, s
             return {key: remove_timestamps(item) for key, item in value.items() if key != "accepted_at"}
         return value
 
-    before = await all_rows()
+    before = await database_state()
     response = await preview(adapter_client, device.id, {stream: remove_timestamps(BODIES[stream])})
     assert response.status_code == 422, response.text
-    assert await all_rows() == before
+    assert await database_state() == before
 
 
 @pytest.mark.parametrize("change", ["authorized", "ned_id", "nso_device_name", "nso_instance", "live"])
@@ -355,13 +346,13 @@ async def test_candidate_normalizes_body_before_hashing(adapter_client, monkeypa
 )
 async def test_candidate_rejects_invalid_modes_and_timestamps(adapter_client, monkeypatch, body):
     device, _, _, transport = await setup(adapter_client, monkeypatch)
-    before = await all_rows()
+    before = await database_state()
     response = await adapter_client.post(
         f"/api/v1/devices/{device.id}/actions/apply-preflight", json=body, headers=AUTH
     )
     assert response.status_code == 422, response.text
     assert not transport.fake.reads
-    assert await all_rows() == before
+    assert await database_state() == before
 
 
 @pytest.mark.parametrize("diagnosis", ["baseline_refused", "cross_stream"])
@@ -375,7 +366,7 @@ async def test_candidate_unselected_refusal_uses_baseline_diagnosis(adapter_clie
         or any(row.get("description") for row in body.get("interface", {}).get("interface", []))
         else None
     )
-    before = await all_rows()
+    before = await database_state()
     response = await preview(adapter_client, device.id, {"interface_config": BODIES["interface_config"]})
     assert response.status_code == 200, response.text
     result = response.json()
@@ -383,7 +374,7 @@ async def test_candidate_unselected_refusal_uses_baseline_diagnosis(adapter_clie
     assert result[diagnosis] == ["ip"]
     assert not result["admitted_selection"]
     assert_keys_absent(result, ["candidate_identity", "plan_digest"])
-    assert await all_rows() == before
+    assert await database_state() == before
 
 
 async def test_candidate_guard_block_does_not_drop_candidate(adapter_client, monkeypatch):
@@ -400,7 +391,7 @@ async def test_candidate_guard_block_does_not_drop_candidate(adapter_client, mon
     transport.fake.service = []
     transport.fake.instance["interface"] = {"interface": [{"interface-name": INTERFACE}]}
     transport.dry_requests.clear()
-    before = await all_rows()
+    before = await database_state()
     response = await preview(adapter_client, device.id, candidates)
     assert response.status_code == 200, response.text
     result = response.json()
@@ -410,7 +401,7 @@ async def test_candidate_guard_block_does_not_drop_candidate(adapter_client, mon
     assert [attempt["dropped"] for attempt in result["attempts"]] == [[]]
     assert not transport.dry_requests
     assert_keys_absent(result, ["candidate_identity", "plan_digest"])
-    assert await all_rows() == before
+    assert await database_state() == before
 
 
 async def test_candidate_mapping_change_during_live_read_needs_new_preflight(adapter_client, monkeypatch):
@@ -458,11 +449,11 @@ async def test_candidate_validation_redacts_caller_stream_keys(adapter_client, m
 )
 async def test_candidate_route_policy_rejects_objects_the_live_put_rejects(adapter_client, monkeypatch, objects):
     device, _, _, transport = await setup(adapter_client, monkeypatch)
-    before = await all_rows()
+    before = await database_state()
     live = await push(adapter_client, device.id, "route_policy", {"objects": objects})
     assert live.status_code == 422, live.text
     response = await preview(adapter_client, device.id, {"route_policy": {"objects": objects}})
     assert response.status_code == 422, response.text
     assert response.json()["error"]["code"] == "validation_error"
     assert not transport.fake.reads
-    assert await all_rows() == before
+    assert await database_state() == before

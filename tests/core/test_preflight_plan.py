@@ -7,7 +7,7 @@ from dataclasses import FrozenInstanceError, replace
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import func, select, text
+from sqlalchemy import select, text
 
 from nso_adapter.core.apply import build_device_containers
 from nso_adapter.core.generation import (
@@ -19,7 +19,7 @@ from nso_adapter.core.preflight import _device_context, normalized_plan_digest, 
 from nso_adapter.nso.origins import AttributionFailure, resolve_refusals
 from nso_adapter.nso.refusal_protocol import refusal, row_ref
 from nso_adapter.store.db import get_engine, session
-from nso_adapter.store.models import Base, Device, DeviceProjectionStream, GenerationMode
+from nso_adapter.store.models import Base, Device, GenerationMode
 from tests.api.test_static_route_deleted_routes import deleted
 from tests.api.test_static_route_identity import entry
 from tests.conftest import seed_device
@@ -145,14 +145,13 @@ async def test_planned_chain_matches_created_chain(adapter_client, monkeypatch, 
         assert any(binding.provenance == "retained" for binding in planned.links[0].origins.bindings.values())
 
 
-async def database_state():
+async def database_state(*, exclude=frozenset()):
     async with session() as db:
-        counts = {
-            table.name: await db.scalar(select(func.count()).select_from(table))
+        return {
+            table.name: (await db.execute(select(table).order_by(*table.primary_key))).all()
             for table in Base.metadata.sorted_tables
+            if table.name not in exclude
         }
-        streams = (await db.execute(select(DeviceProjectionStream.__table__).order_by(DeviceProjectionStream.id))).all()
-        return counts, [dict(row._mapping) for row in streams]
 
 
 @pytest.mark.parametrize("case", ["plain", "removal", "lag"])
@@ -163,7 +162,7 @@ async def test_plan_persists_nothing(adapter_client, monkeypatch, case):
     assert planned.links
     assert await database_state() == before
     if case == "plain":
-        assert before[0]["jobs"] == before[0]["deployment_generation"] == before[0]["apply_execution_attempt"] == 0
+        assert not before["jobs"] and not before["deployment_generation"] and not before["apply_execution_attempt"]
     async with session() as db:
         await db.execute(select(Device).where(Device.id == device.id).with_for_update(nowait=True))
         await db.execute(text("SET LOCAL lock_timeout = '100ms'"))

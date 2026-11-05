@@ -15,6 +15,7 @@ from tests.core.test_preflight_plan import database_state
 from tests.nso.test_refusal_sender_cutover import CANARY
 
 pytestmark = pytest.mark.anyio
+ATTEMPTS = {"deployment_apply_attempt"}
 
 
 async def preview(api, device_id, selected):
@@ -142,17 +143,13 @@ async def test_apply_rejects_stale_preflight_identity(adapter_client, monkeypatc
         )
         if change == "service_snapshot":
             transport.fake.instance["vlan"] = {"vlan": [{"vlan-id": 99}]}
-    before = await database_state()
+    before = await database_state(exclude=ATTEMPTS)
     attempt_id = uuid4()
     response = await apply(adapter_client, device.id, selected, identity, attempt_id)
     assert_text_free_of(response.text, [CANARY])
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "preflight_stale"
-    after = await database_state()
-    assert after[1] == before[1]
-    assert {key: count for key, count in after[0].items() if key != "deployment_apply_attempt"} == {
-        key: count for key, count in before[0].items() if key != "deployment_apply_attempt"
-    }
+    assert await database_state(exclude=ATTEMPTS) == before
     async with session() as db:
         attempt = await db.get(DeploymentApplyAttempt, attempt_id)
         assert attempt.admission_state == "rejected"
@@ -664,7 +661,7 @@ async def test_apply_conflicting_interface_proof_after_preview_is_preflight_stal
         interface = await db.scalar(select(DbInterface).where(DbInterface.device_id == device.id))
         interface.parent_binding = "lag-2"
         await db.commit()
-    before = await database_state()
+    before = await database_state(exclude=ATTEMPTS)
     attempt_id = uuid4()
     response = await apply(adapter_client, device.id, selected, response.json()["preflight_identity"], attempt_id)
     assert response.status_code == 409, response.text
@@ -673,11 +670,7 @@ async def test_apply_conflicting_interface_proof_after_preview_is_preflight_stal
         "message": "Manual Apply needs a fresh preflight",
         "detail": {"reason": "inputs_changed"},
     }
-    after = await database_state()
-    assert after[1] == before[1]
-    assert {key: count for key, count in after[0].items() if key != "deployment_apply_attempt"} == {
-        key: count for key, count in before[0].items() if key != "deployment_apply_attempt"
-    }
+    assert await database_state(exclude=ATTEMPTS) == before
     async with session() as db:
         assert (await db.get(DeploymentApplyAttempt, attempt_id)).admission_state == "rejected"
 
@@ -699,16 +692,12 @@ async def test_apply_ned_change_rejecting_stored_intent_after_preview_is_preflig
     assert response.status_code == 200 and response.json()["status"] == "ready", response.text
     identity = response.json()["preflight_identity"]
     await _set_ned(device.id, "cisco-ios-cli-6.95")
-    before = await database_state()
+    before = await database_state(exclude=ATTEMPTS)
     attempt_id = uuid4()
     response = await apply(adapter_client, device.id, selected, identity, attempt_id)
     assert response.status_code == 409, response.text
     assert response.json()["error"]["code"] == "preflight_stale"
-    after = await database_state()
-    assert after[1] == before[1]
-    assert {key: count for key, count in after[0].items() if key != "deployment_apply_attempt"} == {
-        key: count for key, count in before[0].items() if key != "deployment_apply_attempt"
-    }
+    assert await database_state(exclude=ATTEMPTS) == before
     async with session() as db:
         assert (await db.get(DeploymentApplyAttempt, attempt_id)).admission_state == "rejected"
     replay = await apply(adapter_client, device.id, selected, identity, attempt_id)
