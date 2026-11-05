@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Detached Apply planning against PostgreSQL and the RESTCONF boundary."""
 
+import copy
 import json
 from dataclasses import FrozenInstanceError, replace
 from uuid import uuid4
@@ -171,7 +172,8 @@ async def test_plan_persists_nothing(adapter_client, monkeypatch, case):
         await lock_projection(db, device.id)
     with pytest.raises(FrozenInstanceError):
         planned.links = ()
-    original = planned.links[0].containers
+    original = copy.deepcopy(planned.links[0].containers)
+    assert original
     planned.links[0].containers.clear()
     assert planned.links[0].containers == original
 
