@@ -274,7 +274,7 @@ async def test_plan_preserves_apply_conflict_and_selection_skips(adapter_client,
     assert not skipped.links
     async with session() as db:
         real = await create_action_apply(db, device.id, {"vlan": 999}, uuid4())
-    assert skipped.skipped == real.skipped
+    assert skipped.skipped == real.skipped == {"vlan": "no_receipt"}
     assert await database_state() == before
 
 
@@ -293,6 +293,7 @@ async def test_plan_behind_blocked_head_matches_apply(adapter_client, monkeypatc
         created = await create_action_apply(db, device.id, {"vlan": 42}, uuid4())
         assert [link.digest for link in planned.links] == [link.digest for link in created.generations]
         await db.rollback()
+    assert [link.mode for link in planned.links] == [GenerationMode.networked, GenerationMode.detach]
 
 
 async def test_plan_captures_body_build_errors(adapter_client, monkeypatch):
