@@ -386,10 +386,49 @@ async def test_normalized_plan_digest_is_stable_and_binds_complete_plan(adapter_
     first = await plan(device, selected, client)
     second = await plan(device, selected, client)
     assert normalized_plan_digest(first) == normalized_plan_digest(second)
-    payload = json.loads(second.links[0]._json)
-    payload["containers"] = {}
-    changed = replace(second.links[0], _json=json.dumps(payload))
-    assert normalized_plan_digest(first) != normalized_plan_digest(replace(second, links=(changed, *second.links[1:])))
+
+
+ORPHAN = {"vlan/vlan": [["999"]]}
+LINK_MUTATIONS = {
+    "containers": lambda link: link.update(containers={}),
+    "policy_no_networking": lambda link: link["policy"].update(no_networking=not link["policy"]["no_networking"]),
+    "policy_retain_static_routes": lambda link: link["policy"].update(
+        retain_static_routes=not link["policy"]["retain_static_routes"]
+    ),
+    "policy_context": lambda link: link["policy"]["context"].update(scope="vlan"),
+    "allowed_removal_keys": lambda link: link.update(allowed_removal_keys=ORPHAN),
+    "guard_orphans": lambda link: link.update(guard_orphans=ORPHAN),
+    "guard_contributions": lambda link: link.update(guard_contributions={"vlan/vlan": {"vlan": [["999"]]}}),
+    "origin_provenance": lambda link: link["origins"][0].update(provenance="prior"),
+    "errors": lambda link: link.update(
+        errors={"logging": {"code": "local_levels_gated", "message": "placeholder", "detail": {}}}
+    ),
+    "mode": lambda link: link.update(mode=GenerationMode.detach.value),
+    "streams": lambda link: link.update(streams=[*link["streams"], "ip"]),
+    "order": lambda link: link.update(order=link["order"] + 1),
+}
+CHAIN_MUTATIONS = {
+    "skipped": lambda chain: chain.update(skipped={"snmp": "no_receipt"}),
+    "skipped_detail": lambda chain: chain.update(skipped_detail={"snmp": {"reason": "no_receipt"}}),
+    "baseline_interface_proofs": lambda chain: chain.update(
+        baseline_interface_proofs={"ip": {"7": {"id": 7, "name": "GigabitEthernet0/1", "vrf": None}}}
+    ),
+}
+
+
+@pytest.mark.parametrize("field", [*LINK_MUTATIONS, *CHAIN_MUTATIONS])
+async def test_normalized_plan_digest_binds_each_plan_field(adapter_client, monkeypatch, field):
+    device, selected, client, _ = await setup(adapter_client, monkeypatch)
+    planned = await plan(device, selected, client)
+    link, chain = json.loads(planned.links[0]._json), json.loads(planned._json)
+    assert link["origins"] and not link["policy"]["no_networking"] and "scope" not in link["policy"]["context"]
+    if field in LINK_MUTATIONS:
+        LINK_MUTATIONS[field](link)
+        changed = replace(planned, links=(replace(planned.links[0], _json=json.dumps(link)), *planned.links[1:]))
+    else:
+        CHAIN_MUTATIONS[field](chain)
+        changed = replace(planned, _json=json.dumps(chain))
+    assert normalized_plan_digest(changed) != normalized_plan_digest(planned)
 
 
 async def test_normalized_digest_ignores_carrier_job_identity(adapter_client, monkeypatch):
