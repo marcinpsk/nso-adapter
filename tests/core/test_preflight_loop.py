@@ -661,7 +661,7 @@ async def test_preflight_behind_blocked_head_reports_baseline_refused(adapter_cl
     transport.judge = lambda _body, _request: (IP_REFUSAL,)
     result = await preflight.run_preflight(get_engine(), client, device, vlan)
     assert result.status == "refused" and result.baseline_refused == ["ip"]
-    assert "ip" not in vlan
+    assert "ip" not in result.streams and not result.cross_stream
     assert not result.admitted_selection
 
 
