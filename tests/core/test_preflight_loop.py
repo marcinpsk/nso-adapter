@@ -436,6 +436,42 @@ async def test_preflight_detach_only_selection_is_dry_run_with_no_networking(ada
     assert result.deltas == []
 
 
+async def test_preflight_previews_a_repeated_networked_body_once(adapter_client, monkeypatch):
+    from tests.api.test_static_route_deleted_routes import deleted
+    from tests.api.test_static_route_identity import entry
+    from tests.core.test_action_apply_promotion import _A, _C, _put_routes
+    from tests.core.test_refusal_cutover import run_next
+
+    device, _, _, previous = await setup_plan(adapter_client, monkeypatch)
+    routes = [entry(key, route_id=index, generation=1) for index, key in enumerate((_A, _B, _C), 1)]
+    assert (await _put_routes(adapter_client, device.id, routes, seq=51)).status_code == 200
+    assert (await _apply(adapter_client, device.id, {"static_route": 51})).status_code == 202
+    await run_next(device.id)
+    response = await _put_routes(
+        adapter_client,
+        device.id,
+        [entry(_A, route_id=1, generation=2, metric=30), entry(_C, route_id=3, generation=1)],
+        seq=52,
+        query="?store_only=true",
+        deleted=[deleted(2, [_B])],
+    )
+    assert response.status_code == 200, response.text
+    previous.fake.calls.clear()
+    transport = LoopTransport(device.nso_device_name)
+    transport.fake = previous.fake
+    client = _client_with(transport)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda _instance: client)
+
+    result = await preflight.run_preflight(get_engine(), client, device, {"static_route": 52})
+
+    assert result.status == "ready", result.error
+    links = result.plan.links
+    assert [link.policy.no_networking for link in links] == [False, False]
+    assert links[0].containers == links[1].containers
+    assert result.deltas == [{"order": 0, "native": "native delta", "cli": "cli delta"}]
+    assert_only_dry_runs(transport, 2)
+
+
 @pytest.mark.parametrize("selected_scope", [True, False])
 async def test_preflight_reports_collateral_guard_block(adapter_client, monkeypatch, selected_scope):
     device, selected, client, transport = await setup(adapter_client, monkeypatch)

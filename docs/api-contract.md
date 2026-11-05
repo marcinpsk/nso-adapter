@@ -1118,8 +1118,10 @@ prepared-slot and planning changes roll back. PostgreSQL sequences can advance.
 
 The route reads one certified live service snapshot. It plans the exact Apply chain in an
 owned rollback-only transaction, then dry-runs every NSO-writing link outside that
-transaction, including detach with its own no-networking policy. It persists no promotion,
-job, receipt or attempt and sends no NSO commit.
+transaction, including detach with its own no-networking policy, in chain order. A link
+that sends the same body with the same policy as the link before it changes nothing in order,
+so it is not dry-run again and adds no diff. It persists no promotion, job, receipt or attempt
+and sends no NSO commit.
 
 The response contains:
 

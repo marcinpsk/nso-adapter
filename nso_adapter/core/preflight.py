@@ -267,7 +267,12 @@ async def _dry_run_link(client, device, link: PlannedLink) -> _DryRun:
 async def _dry_run_chain(client, device, planned: PlannedChain) -> _DryRun:
     """Check every ready link; a refused link requires immediate recomposition."""
     deltas: list[dict] = []
+    previous = None
     for link in planned.links:
+        sent = (link.containers, link.policy.no_networking)
+        if sent == previous and not link.errors:
+            continue  # in order this link resends the preceding body unchanged, so NSO commits nothing
+        previous = sent
         outcome = await _dry_run_link(client, device, link)
         if outcome.status != "ready":
             return outcome
