@@ -9,9 +9,12 @@ import pytest
 from fastapi.routing import iter_route_contexts
 from sqlalchemy import select, text, update
 
+from nso_adapter.api.errors import api_error
+from nso_adapter.core import apply
 from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS, OUT_OF_PROTOCOL_APPLY_POSTS
 from nso_adapter.core.preflight import _device_context, normalized_plan_digest, plan_action_apply, read_plan_inputs
 from nso_adapter.core.receipt import digest_body
+from nso_adapter.core.request_flags import STORE_ONLY
 from nso_adapter.main import create_app
 from nso_adapter.store.db import get_engine, session
 from nso_adapter.store.models import DbInterface, Device, DeviceSettings, LagBundleIntent, SwitchportIntent
@@ -310,6 +313,30 @@ async def test_candidate_delivery_probe_failure_is_not_ready(adapter_client, mon
         """)
         )
         await db.commit()
+    before = await database_state()
+    response = await preview(adapter_client, device.id, {"ip": BODIES["ip"]})
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["status"] == "unavailable", result
+    assert result["error"] == {"code": "delivery_probe_failed"}
+    assert result["admitted_selection"] == {}
+    assert_keys_absent(result, ["candidate_identity", "plan_digest", "delivery_effect"])
+    assert await database_state() == before
+
+
+async def test_candidate_delivery_probe_api_error_is_not_ready(adapter_client, monkeypatch):
+    device, _, _, _ = await setup(adapter_client, monkeypatch)
+    await set_auto_apply(device.id, True)
+
+    enqueue_apply = apply.enqueue_apply
+
+    async def refuse_normal_auto_apply(*args, **kwargs):
+        if STORE_ONLY.get():
+            return await enqueue_apply(*args, **kwargs)
+        raise api_error(409, "conflict", "normal delivery cannot complete")
+
+    # The normal-mode probe fails after the delivery has written its rows.
+    monkeypatch.setattr(apply, "enqueue_apply", refuse_normal_auto_apply)
     before = await database_state()
     response = await preview(adapter_client, device.id, {"ip": BODIES["ip"]})
     assert response.status_code == 200, response.text
