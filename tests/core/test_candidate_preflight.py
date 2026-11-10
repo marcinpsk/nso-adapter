@@ -7,7 +7,8 @@ from datetime import UTC, datetime
 
 import pytest
 from fastapi.routing import iter_route_contexts
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, text, update
+from sqlalchemy.dialects import postgresql
 
 from nso_adapter.api.errors import api_error
 from nso_adapter.core import apply
@@ -17,7 +18,15 @@ from nso_adapter.core.receipt import digest_body
 from nso_adapter.core.request_flags import STORE_ONLY
 from nso_adapter.main import create_app
 from nso_adapter.store.db import get_engine, session
-from nso_adapter.store.models import DbInterface, Device, DeviceSettings, LagBundleIntent, SwitchportIntent
+from nso_adapter.store.models import (
+    DbInterface,
+    DeploymentGeneration,
+    Device,
+    DeviceSettings,
+    Job,
+    LagBundleIntent,
+    SwitchportIntent,
+)
 from tests._secret_discipline import assert_keys_absent, assert_text_free_of
 from tests.conftest import AUTH
 from tests.core.test_preflight_loop import (
@@ -219,6 +228,27 @@ async def test_candidate_probe_reports_only_new_rows_above_a_long_job_history(ad
         "promotes": True,
         "effects": [{"stream": "ip", "kind": kind} for kind in ("auto_apply", "job")],
     }
+
+
+def _index_conditions(plan: dict) -> list[str]:
+    nested = [condition for child in plan.get("Plans", []) for condition in _index_conditions(child)]
+    return [plan["Index Cond"], *nested] if "Index Cond" in plan else nested
+
+
+@pytest.mark.parametrize("model", [DeploymentGeneration, Job])
+async def test_candidate_probe_watermark_queries_reach_rows_by_device_index(adapter_client, monkeypatch, model):
+    device, _, _, _ = await setup(adapter_client, monkeypatch)
+    queries = [
+        select(func.coalesce(func.max(model.id), 0)).where(model.device_id == device.id),
+        select(model.id).where(model.device_id == device.id, model.id > 0),
+    ]
+    async with session() as db:
+        # The probe runs these under the projection lock: a full scan of retained history would hold it.
+        await db.execute(text("SET LOCAL enable_seqscan = off"))
+        for query in queries:
+            sql = query.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})
+            plan = (await db.execute(text(f"EXPLAIN (FORMAT JSON) {sql}"))).scalar_one()[0]["Plan"]
+            assert any("device_id" in condition for condition in _index_conditions(plan)), plan
 
 
 @pytest.mark.parametrize("kind", ["removal", "detach"])
