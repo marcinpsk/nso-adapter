@@ -362,6 +362,16 @@
             "title": "Cross Stream",
             "type": "array"
           },
+          "delivery_effect": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DeliveryEffectOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "diffs": {
             "additionalProperties": {
               "type": "string"
@@ -2470,6 +2480,44 @@
           "unverified"
         ],
         "title": "DeletedRoute",
+        "type": "object"
+      },
+      "DeliveryEffectOut": {
+        "properties": {
+          "effects": {
+            "items": {
+              "$ref": "#/components/schemas/DeliveryPromotionOut"
+            },
+            "title": "Effects",
+            "type": "array"
+          },
+          "promotes": {
+            "title": "Promotes",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "promotes"
+        ],
+        "title": "DeliveryEffectOut",
+        "type": "object"
+      },
+      "DeliveryPromotionOut": {
+        "properties": {
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "stream": {
+            "title": "Stream",
+            "type": "string"
+          }
+        },
+        "required": [
+          "stream",
+          "kind"
+        ],
+        "title": "DeliveryPromotionOut",
         "type": "object"
       },
       "DeploymentAttemptEvidenceOut": {

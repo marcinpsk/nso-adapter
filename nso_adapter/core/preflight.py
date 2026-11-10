@@ -6,13 +6,15 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from typing import Any, Literal, NamedTuple
+from dataclasses import dataclass, replace
+from typing import Any, Literal, NamedTuple, Protocol
 from uuid import uuid4
 
 import httpx
+import structlog
+from fastapi import HTTPException
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from nso_adapter.core.apply import _apply_error_summary, build_device_containers, encode_section
@@ -46,6 +48,8 @@ from nso_adapter.nso.refusals import DefiniteRefusal, OrdinaryRejection, Protoco
 from nso_adapter.store.execution_evidence import attributed_catalog_records, origin_records, origins_from_records
 from nso_adapter.store.execution_history import bind_historical_origins
 from nso_adapter.store.models import Base, DbInterface, Device, DeviceProjectionStream, GenerationMode
+
+logger = structlog.get_logger(__name__)
 
 
 def _canonical(value: Any) -> str:
@@ -202,6 +206,10 @@ class PreflightResult:
     @property
     def error(self) -> dict | None:
         return json.loads(self._json)["error"]
+
+    @property
+    def delivery_effect(self) -> dict | None:
+        return json.loads(self._json).get("delivery_effect")
 
     @property
     def refusals(self) -> list[dict]:
@@ -451,7 +459,30 @@ def _skips_moved(earlier: dict[str, str], later: dict[str, str]) -> bool:
     return any(later.get(stream) != reason for stream, reason in earlier.items())
 
 
-CandidateIngest = Callable[[AsyncSession], Awaitable[tuple[dict[str, int], dict[str, dict]]]]
+class CandidateIngest(Protocol):
+    async def __call__(self, db: AsyncSession) -> tuple[dict[str, int], dict[str, dict]]: ...
+
+    async def delivery_effect(self, db: AsyncSession) -> dict: ...
+
+
+async def _candidate_delivery_effect(engine, device, ingest: CandidateIngest) -> dict:
+    """Observe normal ingestion in a private snapshot that never commits."""
+    async with engine.connect() as connection:
+        connection = await connection.execution_options(isolation_level="REPEATABLE READ")
+        outer = await connection.begin()
+        token = LAST_ENQUEUED_GENERATION_ID.set(None)
+        try:
+            async with AsyncSession(
+                bind=connection, join_transaction_mode="create_savepoint", expire_on_commit=False
+            ) as db:
+                await lock_projection(db, device.id)
+                current = await db.get(Device, device.id)
+                if current is None or _device_context(current) != _device_context(device):
+                    raise PreflightStale("inputs_changed")
+                return await ingest.delivery_effect(db)
+        finally:
+            LAST_ENQUEUED_GENERATION_ID.reset(token)
+            await outer.rollback()
 
 
 def _preflight_result(
@@ -469,6 +500,7 @@ def _preflight_result(
     cross_stream=(),
     context_disturbed=(),
     error=None,
+    delivery_effect=None,
 ) -> PreflightResult:
     admitted = (
         {stream: revision for stream, revision in current.items() if stream not in skips} if status == "ready" else {}
@@ -495,6 +527,7 @@ def _preflight_result(
                 "context_disturbed": context_disturbed,
                 "error": error or (outcome.error if outcome else None),
                 "refusals": outcome.refusals if outcome else [],
+                "delivery_effect": delivery_effect,
             }
         ),
     )
@@ -515,9 +548,12 @@ async def _run_candidate_preflight(engine, client, device, selected, ingest) -> 
     attempts: list[dict] = []
     current = dict(selected)
     skips: dict[str, str] = {}
+    delivery_effect = None
 
     def finish(status, **kwargs):
-        return _preflight_result(device, live, streams, current, skips, attempts, status, **kwargs)
+        return _preflight_result(
+            device, live, streams, current, skips, attempts, status, delivery_effect=delivery_effect, **kwargs
+        )
 
     if live.section.inconclusive:
         return finish("unavailable")
@@ -536,6 +572,17 @@ async def _run_candidate_preflight(engine, client, device, selected, ingest) -> 
     except _PlanContextConflict as conflict:
         streams.update(conflict.blocks)
         return finish("refused", context_disturbed=conflict.disturbed)
+    try:
+        delivery_effect = await _candidate_delivery_effect(engine, device, ingest)
+    except PreflightStale:
+        return finish("unavailable", error=_INPUTS_MOVED)
+    except (HTTPException, DBAPIError) as exc:
+        logger.warning("preflight.delivery_probe_failed", device_id=device.id, error_type=type(exc).__name__)
+        return finish("unavailable", error={"code": "delivery_probe_failed"})
+    assert planned._candidate_json is not None
+    candidate = json.loads(planned._candidate_json)
+    candidate["identity"] = _digest({"candidate_identity": candidate["identity"], "delivery_effect": delivery_effect})
+    planned = replace(planned, _candidate_json=_canonical(candidate))
     assert planned.candidate_selection is not None
     current = planned.candidate_selection
     skips = planned.skipped

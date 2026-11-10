@@ -1116,6 +1116,15 @@ streams run normal preparation and select the newly prepared slot. The shared Ap
 planner then selects exactly those streams at those revisions. All ingestion, receipt,
 prepared-slot and planning changes roll back. PostgreSQL sequences can advance.
 
+After this pass, candidate mode probes the same bodies through the same handlers in a
+separate rollback-only transaction with a repeatable database snapshot. Receipt streams
+use the next push sequence, the supplied body's digest, and normal mode (`store_only`,
+`delete_origin`, and `backfill_only` all false). Switching streams use normal preparation.
+The probe observes every new generation and job row after each stream's ingestion. It
+does not infer promotion from candidate differences or device settings. Handler commits
+release savepoints only. Workers cannot see the uncommitted rows, and ingestion does not
+dispatch external work. No enqueue is suppressed in this probe. All probe changes roll back.
+
 The route reads one certified live service snapshot. It plans the exact Apply chain in an
 owned rollback-only transaction, then dry-runs every NSO-writing link outside that
 transaction, including detach with its own no-networking policy, in chain order. A link
@@ -1138,6 +1147,14 @@ The response contains:
 - `preflight_identity`: a lowercase sha256 hex string, present only for a `ready` stored selection.
 - `candidate_identity` and `plan_digest`: lowercase sha256 hex strings, present only for a
   `ready` candidate result. Candidate results omit `preflight_identity`.
+- `delivery_effect`: candidate mode only, present when the normal delivery probe completed.
+  It is `{"promotes": false}` when ingestion creates no generation or job. Otherwise it is
+  `{"promotes": true, "effects": [{"stream": "ip", "kind": "auto_apply"}, {"stream": "ip", "kind": "job"}]}`.
+  Each new generation contributes one effect: `auto_apply`, `removal`, or `detach` for the
+  current generation paths. Each new job contributes a `job` effect, including a carrier
+  for a generation already listed. Other generation modes use their mode name. Effects
+  sort by stream and kind. Repeated entries represent distinct created rows. Provisional
+  row ids are not returned. A switching preparation alone does not promote.
 - `diffs`: `native` and `cli` strings from the final admitted plan. Multiple networked links
   are joined in order with newlines. Detach links have no diff-panel output.
 - `attempts`: the ordered passes, each with `selection` and `dropped` stream names.
@@ -1161,10 +1178,13 @@ block, or disturbed authorized context returns `refused` and admits nothing. Ref
 include the candidate row identities and acceptance times. Refusals naming only streams
 outside the candidate map use the same baseline and cross-stream diagnosis as stored
 selection mode. No identity or plan digest is returned for a non-ready result.
+A `ready` candidate result requires a completed normal delivery probe. A failed probe
+returns `unavailable` with `error.code = "delivery_probe_failed"`, no admitted selection,
+no `delivery_effect`, and no candidate identity or plan digest.
 
 `candidate_identity` hashes canonical JSON of the normalized candidate bodies, all streams'
-authorized revisions, NSO instance id, NSO device name, device `ned_id`, and the single
-certified live-input digest. Equivalent timestamp offsets normalize to UTC. `plan_digest`
+authorized revisions, NSO instance id, NSO device name, device `ned_id`, the single
+certified live-input digest, and `delivery_effect`. Equivalent timestamp offsets normalize to UTC. `plan_digest`
 hashes the complete normalized chain, including every link's wire containers, execution
 policy, frozen context and proofs, and removal authority. Database row, generation, cohort
 and sequence identities are normalized out. The two hashes serve different purposes.
@@ -1188,7 +1208,8 @@ fragment is already authorized. Retry reuses it. Abandon releases the ordering b
 does not repair it. An unrelated manual Apply can then report `baseline_refused`.
 Repair requires a fresh push of that stream selected in the next manual Apply, or Release.
 Force-removal and cutover reissues redeploy authorized fragments, promote nothing, and
-carry no pending desired acquisition. Intend will refuse devices with `auto_apply` enabled.
+carry no pending desired acquisition. Intend admission requires a ready candidate result
+with `delivery_effect.promotes` false. The adapter reports the delivery effect.
 Warn-and-skip planner sites still require the refusal conversion tracked separately.
 
 The capability-matrix `POST /api/v1/devices/{id}/apply/preflight` was deleted. It had no

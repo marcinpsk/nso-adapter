@@ -3,12 +3,13 @@
 """Candidate ingestion bound to the same handlers and models as live deliveries."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from inspect import signature
 from typing import Any
 
 from fastapi.routing import iter_route_contexts
 from pydantic import BaseModel, TypeAdapter, ValidationError
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.errors import api_error
@@ -16,6 +17,7 @@ from nso_adapter.api.timestamps import UtcInstant
 from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS, OUT_OF_PROTOCOL_APPLY_POSTS
 from nso_adapter.core.receipt import IntentDelivery, PushIdentity, digest_body, latest_receipt
 from nso_adapter.core.request_flags import BACKFILL_ONLY, DELETE_ORIGIN, MAX_PUSH_SEQ, STORE_ONLY
+from nso_adapter.store.models import DeploymentGeneration, GenerationMode, Job
 
 
 def candidate_ingester(ingest: Callable):
@@ -81,8 +83,44 @@ class CandidateIngestion:
     handlers: dict[str, CandidateHandler]
     bodies: dict[str, Any]
     normalized: dict[str, dict]
+    wire_digests: dict[str, str]
 
     async def __call__(self, db: AsyncSession) -> tuple[dict[str, int], dict[str, dict]]:
+        return await self._ingest(db, store_only=True)
+
+    async def delivery_effect(self, db: AsyncSession) -> dict:
+        """Observe every generation and job created by each normal delivery."""
+        effects = []
+        for stream, body in self.bodies.items():
+            # Watermarks, not id lists: retained history must not grow the query (asyncpg caps bind parameters).
+            generation_floor = await self._max_id(db, DeploymentGeneration)
+            job_floor = await self._max_id(db, Job)
+            candidate = replace(self, bodies={stream: body}, normalized={stream: self.normalized[stream]})
+            await candidate._ingest(db, store_only=False)
+            await db.flush()
+            created = select(DeploymentGeneration.mode, DeploymentGeneration.removal_context).where(
+                DeploymentGeneration.device_id == self.device_id, DeploymentGeneration.id > generation_floor
+            )
+            for generation in (await db.execute(created)).all():
+                if generation.mode == GenerationMode.detach:
+                    kind = "detach"
+                elif generation.removal_context is not None:
+                    kind = "removal"
+                else:
+                    kind = "auto_apply" if generation.mode == GenerationMode.networked else generation.mode.value
+                effects.append({"stream": stream, "kind": kind})
+            new_jobs = select(Job.id).where(Job.device_id == self.device_id, Job.id > job_floor)
+            effects.extend({"stream": stream, "kind": "job"} for _job_id in (await db.scalars(new_jobs)).all())
+        return (
+            {"promotes": True, "effects": sorted(effects, key=lambda effect: (effect["stream"], effect["kind"]))}
+            if effects
+            else {"promotes": False}
+        )
+
+    async def _max_id(self, db: AsyncSession, model) -> int:
+        return await db.scalar(select(func.coalesce(func.max(model.id), 0)).where(model.device_id == self.device_id))
+
+    async def _ingest(self, db: AsyncSession, *, store_only: bool) -> tuple[dict[str, int], dict[str, dict]]:
         selected = {}
         deletion = DELETE_ORIGIN.set(False)
         backfill = BACKFILL_ONLY.set(False)
@@ -96,9 +134,9 @@ class CandidateIngestion:
                     if seq > MAX_PUSH_SEQ:
                         raise api_error(422, "validation_error", "Candidate push sequence is exhausted")
                     kwargs["delivery"] = IntentDelivery(
-                        stream, PushIdentity(seq, digest_body(self.normalized[stream]), True, False, False)
+                        stream, PushIdentity(seq, self.wire_digests[stream], store_only, False, False)
                     )
-                token = STORE_ONLY.set(handler.receipt)
+                token = STORE_ONLY.set(store_only and handler.receipt)
                 try:
                     response = await handler.endpoint(**kwargs)
                 finally:
@@ -135,4 +173,6 @@ def validate_candidates(
         invalid = True
     if invalid:
         raise api_error(422, "validation_error", "Candidate body is invalid or lacks an explicit accepted_at")
-    return CandidateIngestion(device_id, registry, bodies, normalized)
+    return CandidateIngestion(
+        device_id, registry, bodies, normalized, {stream: digest_body(raw) for stream, raw in candidates.items()}
+    )
