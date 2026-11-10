@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 
 import pytest
 from fastapi.routing import iter_route_contexts
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 
 from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS, OUT_OF_PROTOCOL_APPLY_POSTS
 from nso_adapter.core.preflight import _device_context, normalized_plan_digest, plan_action_apply, read_plan_inputs
@@ -132,6 +132,15 @@ async def preview(api, device_id, candidates):
     )
 
 
+async def set_auto_apply(device_id, value):
+    async with session() as db:
+        result = await db.execute(
+            update(DeviceSettings).where(DeviceSettings.device_id == device_id).values(auto_apply=value)
+        )
+        assert result.rowcount == 1
+        await db.commit()
+
+
 async def ready(api, device_id, candidates):
     response = await preview(api, device_id, candidates)
     assert response.status_code == 200, response.text
@@ -164,9 +173,7 @@ async def test_candidate_preflight_persists_nothing(adapter_client, monkeypatch,
     initial["source_revision"] = 41
     initial["interfaces"][0]["tagged_vlans"] = [100]
     assert (await push(adapter_client, device.id, "switchport", initial)).status_code == 200
-    async with session() as db:
-        (await db.get(DeviceSettings, device.id)).auto_apply = auto_apply
-        await db.commit()
+    await set_auto_apply(device.id, auto_apply)
     before = await database_state()
     result = await ready(
         adapter_client,
@@ -183,9 +190,7 @@ async def test_candidate_preflight_persists_nothing(adapter_client, monkeypatch,
 @pytest.mark.parametrize("auto_apply", [False, True])
 async def test_candidate_reports_normal_delivery_auto_apply(adapter_client, monkeypatch, auto_apply):
     device, _, _, _ = await setup(adapter_client, monkeypatch)
-    async with session() as db:
-        (await db.get(DeviceSettings, device.id)).auto_apply = auto_apply
-        await db.commit()
+    await set_auto_apply(device.id, auto_apply)
     result = await ready(adapter_client, device.id, {"ip": BODIES["ip"]})
     expected = {"promotes": False}
     if auto_apply:
@@ -195,8 +200,8 @@ async def test_candidate_reports_normal_delivery_auto_apply(adapter_client, monk
 
 async def test_candidate_probe_reports_only_new_rows_above_a_long_job_history(adapter_client, monkeypatch):
     device, _, _, _ = await setup(adapter_client, monkeypatch)
+    await set_auto_apply(device.id, True)
     async with session() as db:
-        (await db.get(DeviceSettings, device.id)).auto_apply = True
         # More completed jobs than asyncpg accepts bind parameters (32767).
         await db.execute(
             text("""
@@ -224,9 +229,7 @@ async def test_candidate_reports_normal_delivery_removal(adapter_client, monkeyp
         candidate["interfaces"][0].pop("mtu")
     else:
         candidate["interfaces"] = []
-    async with session() as db:
-        (await db.get(DeviceSettings, device.id)).auto_apply = auto_apply
-        await db.commit()
+    await set_auto_apply(device.id, auto_apply)
     before = await database_state()
     result = await ready(adapter_client, device.id, {"interface_mtu": candidate})
     kinds = [kind, "job"]
@@ -242,9 +245,7 @@ async def test_candidate_reports_normal_delivery_removal(adapter_client, monkeyp
 @pytest.mark.parametrize("stream", ["lag", "switchport"])
 async def test_candidate_switching_preparation_does_not_promote(adapter_client, monkeypatch, stream):
     device, _, _, _ = await setup(adapter_client, monkeypatch)
-    async with session() as db:
-        (await db.get(DeviceSettings, device.id)).auto_apply = True
-        await db.commit()
+    await set_auto_apply(device.id, True)
     result = await ready(adapter_client, device.id, {stream: BODIES[stream]})
     assert result.get("delivery_effect") == {"promotes": False}
 
@@ -252,9 +253,7 @@ async def test_candidate_switching_preparation_does_not_promote(adapter_client, 
 async def test_candidate_identity_binds_delivery_effect(adapter_client, monkeypatch):
     device, _, _, _ = await setup(adapter_client, monkeypatch)
     first = await ready(adapter_client, device.id, {"ip": BODIES["ip"]})
-    async with session() as db:
-        (await db.get(DeviceSettings, device.id)).auto_apply = True
-        await db.commit()
+    await set_auto_apply(device.id, True)
     second = await ready(adapter_client, device.id, {"ip": BODIES["ip"]})
     assert first["plan_digest"] == second["plan_digest"]
     assert first["candidate_identity"] != second["candidate_identity"]
