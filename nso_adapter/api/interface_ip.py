@@ -300,17 +300,16 @@ async def put_ip_intent(
         accepted = item.accepted_at if item.accepted_at else now
         if key in existing_rows:
             row = existing_rows[key]
-            row.accepted_at = accepted
         else:
             row = InterfaceIpIntent(
                 interface_id=iface.id,
                 address=item.address,
                 vrf=item.vrf,
-                family=item.family,
-                secondary=item.secondary,
-                accepted_at=accepted,
             )
             db.add(row)
+        row.family = item.family
+        row.secondary = item.secondary
+        row.accepted_at = accepted
         count += 1
 
     await db.flush()
