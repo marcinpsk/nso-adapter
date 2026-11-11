@@ -457,6 +457,31 @@ async def test_candidate_probe_pool_timeout_is_a_failed_probe(adapter_client, mo
     assert_keys_absent(result, ["candidate_identity", "plan_digest", "delivery_effect"])
 
 
+async def test_candidate_interface_proof_conflict_is_a_failed_probe(adapter_client, monkeypatch):
+    device, _, _, _ = await setup(adapter_client, monkeypatch)
+    bound = deepcopy(BODIES["ip"])
+    bound["addresses"][0]["parent_binding"] = "lag-1"
+    assert (await push(adapter_client, device.id, "ip", bound, seq=41)).status_code == 200
+    await authorize(adapter_client, device, {"ip": 41})
+    async with session() as db:
+        interface = await db.scalar(select(DbInterface).where(DbInterface.device_id == device.id))
+        interface.parent_binding = "lag-2"
+        await db.commit()
+    await set_auto_apply(device.id, True)
+    readdressed = deepcopy(BODIES["ip"])
+    readdressed["addresses"].append(readdressed["addresses"][0] | {"address": "198.18.0.9/24"})
+    before = await database_state()
+    # Combined planning freezes lag-2 for both lanes; the attribute delivery alone meets the authorized lag-1 proof.
+    candidates = {"interface_config": BODIES["interface_config"], "ip": readdressed}
+    response = await preview(adapter_client, device.id, candidates)
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["status"] == "unavailable", result
+    assert result["error"] == {"code": "delivery_probe_failed"}
+    assert_keys_absent(result, ["candidate_identity", "plan_digest", "delivery_effect"])
+    assert await database_state() == before
+
+
 @pytest.mark.parametrize("stream", BODIES)
 async def test_candidate_preflight_is_stable_across_repeats(adapter_client, monkeypatch, stream):
     device, _, _, _ = await setup(adapter_client, monkeypatch)

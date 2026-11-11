@@ -585,7 +585,13 @@ async def _run_candidate_preflight(engine, client, device, selected, ingest) -> 
         delivery_effect = await _candidate_delivery_effect(engine, device, ingest, planned.candidate_baseline_revisions)
     except PreflightStale:
         return finish("unavailable", error=_INPUTS_MOVED)
-    except (HTTPException, DBAPIError, PoolTimeoutError, PromotionProvenanceUnexecutable) as exc:
+    except (
+        HTTPException,
+        DBAPIError,
+        PoolTimeoutError,
+        PromotionProvenanceUnexecutable,
+        InterfaceProofConflict,
+    ) as exc:
         logger.warning("preflight.delivery_probe_failed", device_id=device.id, error_type=type(exc).__name__)
         return finish("unavailable", error={"code": "delivery_probe_failed"})
     assert planned._candidate_json is not None
