@@ -2,6 +2,178 @@
 
 <!-- version list -->
 
+## v1.20.0 (2026-11-05)
+
+### Bug Fixes
+
+- **apply**: Refuse replay of an attempt that stored no preflight identity
+  ([`c8bff0f`](https://github.com/marcinpsk/nso-adapter/commit/c8bff0fe4590adc493ba05514231abf634367f4d))
+
+- **intent**: Refresh accepted_at on retained redistribution rows
+  ([`cb8345a`](https://github.com/marcinpsk/nso-adapter/commit/cb8345afd9e11c1f2ca2554bf5b8540bf67e400f))
+
+- **intent**: Stamp an explicit acceptance time on unchanged switching rows
+  ([`a5adc4b`](https://github.com/marcinpsk/nso-adapter/commit/a5adc4beb41aa335c9cf77e0c6d7f0af0b1bd30f))
+
+- **ospf**: Take redistribution acceptance from the instance row
+  ([`1f28cd3`](https://github.com/marcinpsk/nso-adapter/commit/1f28cd30d94c1be7d92780e1654a631f292b69cb))
+
+- **preflight**: Check the device mapping under the projection lock
+  ([`76a338b`](https://github.com/marcinpsk/nso-adapter/commit/76a338b180b92ee5e86ee97bd3244a095092380f))
+
+- **preflight**: Preview a resent networked body once
+  ([`d251f51`](https://github.com/marcinpsk/nso-adapter/commit/d251f518e92b59be57d5abeeda09f6e961c1c0a9))
+
+- **preflight**: Read a 204 dry run as no change
+  ([`59450e8`](https://github.com/marcinpsk/nso-adapter/commit/59450e847ee59d53ccabc7e905f8f38f7951eebc))
+
+- **preflight**: Reject a route-policy candidate without objects
+  ([`9574dd3`](https://github.com/marcinpsk/nso-adapter/commit/9574dd3444d44b35c52c2dc91f0fa9489caa5a94))
+
+- **preflight**: Reject route-policy candidates whose objects is not a list of objects
+  ([`1bc5435`](https://github.com/marcinpsk/nso-adapter/commit/1bc5435a8abc9e381a03b00994aada22942e2301))
+
+### Chores
+
+- **ci**: Bump the actions group with 4 updates
+  ([`16180e1`](https://github.com/marcinpsk/nso-adapter/commit/16180e1a7f14c7a1b03ad99fe2ada222689e28ae))
+
+- **ci**: Let dependabot update pre-commit hook revisions
+  ([`7b9d4d5`](https://github.com/marcinpsk/nso-adapter/commit/7b9d4d543e2595dc92ea4d7fc961c4db2f582e01))
+
+- **deps**: Bump the python-minor-patch group with 5 updates
+  ([`82d7abb`](https://github.com/marcinpsk/nso-adapter/commit/82d7abb0bf737f43ef9b25aa9d1ef968c3203487))
+
+### Documentation
+
+- **api-contract**: Name the stream that a baseline refusal blocks
+  ([`855dc1b`](https://github.com/marcinpsk/nso-adapter/commit/855dc1b11250e33c8db0abcf3aec0295891cb037))
+
+- **contract**: Document the apply_unexecutable refusal of apply-preflight
+  ([`e8ac0e0`](https://github.com/marcinpsk/nso-adapter/commit/e8ac0e08220f35a3f3ffe6ce0d03a481daad80c4))
+
+### Features
+
+- **apply**: Require a preflight identity for manual Apply
+  ([`3dfbf19`](https://github.com/marcinpsk/nso-adapter/commit/3dfbf19ebd842b062ae56ed0116d729ee5c24a28))
+
+- **preflight**: Admit a manual selection by dry-run with recomposition
+  ([`e0e6fb8`](https://github.com/marcinpsk/nso-adapter/commit/e0e6fb8e88e7696036a71fe43c8a0c25b74a21f3))
+
+- **preflight**: Candidate mode for Intend admission
+  ([`c8cf69f`](https://github.com/marcinpsk/nso-adapter/commit/c8cf69f625974d65a8494a9642a246a033ddf294))
+
+- **preflight**: Plan manual Apply in a rollback-only unit of work
+  ([`1ff84c9`](https://github.com/marcinpsk/nso-adapter/commit/1ff84c98d04a50f10e7d14a8fc7eb080afcbc128))
+
+### Performance Improvements
+
+- **preflight**: Build the candidate registry once per app
+  ([`21bf540`](https://github.com/marcinpsk/nso-adapter/commit/21bf5409f18923c6040c006953b85fce3119a292))
+
+### Testing
+
+- **apply**: Bind the rollback test identity to its own selection
+  ([`1cef175`](https://github.com/marcinpsk/nso-adapter/commit/1cef175ba81f3a2b45e3d308f2523f02a3bd3335))
+
+- **apply**: Check state and attempt rejection after an inconclusive live input
+  ([`1568f8f`](https://github.com/marcinpsk/nso-adapter/commit/1568f8f7504308e9676ce70da43178c1b5617964))
+
+- **apply**: Drop doc-string asserts that HTTP tests already prove
+  ([`0f52e4b`](https://github.com/marcinpsk/nso-adapter/commit/0f52e4b44209c83c347732698de21d3048bfe387))
+
+- **apply**: Fail the preflight helper when a stream is blocked
+  ([`fea813e`](https://github.com/marcinpsk/nso-adapter/commit/fea813eeb7fe1a30269e830173775cd1606b461e))
+
+- **apply**: Name the unknown-device Apply test for its 404 result
+  ([`105c3c1`](https://github.com/marcinpsk/nso-adapter/commit/105c3c13bba55ca5cfa5f72c9e4195b7e077cd9b))
+
+- **preflight**: Check the result, not the fixture, for a baseline refusal
+  ([`287fd77`](https://github.com/marcinpsk/nso-adapter/commit/287fd777881bbde16bcc4dd1ee99fa4f4fca231b))
+
+- **preflight**: Compare full database rows around preflight and stale Apply
+  ([`834e91f`](https://github.com/marcinpsk/nso-adapter/commit/834e91f0c22d4058e1346ecc5becbfe3e1b67365))
+
+- **preflight**: Compare plan containers with a deep copy
+  ([`db50ad0`](https://github.com/marcinpsk/nso-adapter/commit/db50ad08e4d19e0ce30d482cc94619a0aa73cf46))
+
+- **preflight**: Compare plan guard inputs with the sender guard
+  ([`fbea05b`](https://github.com/marcinpsk/nso-adapter/commit/fbea05b4422aaa79e8475d3c228ed7e747d96674))
+
+- **preflight**: Drop RESTCONF asserts that a client-less planner cannot fail
+  ([`e54efc1`](https://github.com/marcinpsk/nso-adapter/commit/e54efc1b24a04843fbf0a0ed2458c0e919f38298))
+
+- **preflight**: Pin manual Apply of both interface streams with a backfilled binding
+  ([`3291724`](https://github.com/marcinpsk/nso-adapter/commit/3291724f00ce03cf82feeeb7478f66152cbd2e56))
+
+- **preflight**: Pin modes and skip reasons in the Apply parity tests
+  ([`d33267b`](https://github.com/marcinpsk/nso-adapter/commit/d33267b50326eabb55686fc41f51695daa88e633))
+
+- **preflight**: Pin the disturbed-context verdict and a 204 verify
+  ([`f81c91c`](https://github.com/marcinpsk/nso-adapter/commit/f81c91cb73b6c38245ccf1a0b41704e5bba96a57))
+
+- **preflight**: Prove the plan digest binds each plan field
+  ([`082d743`](https://github.com/marcinpsk/nso-adapter/commit/082d743b55e8826afb5f6876d80a6e505b1c042c))
+
+- **preflight**: Record every non-read request in the loop transport
+  ([`3b2908f`](https://github.com/marcinpsk/nso-adapter/commit/3b2908f315aedb2d6c897019fa02917c6a4e523f))
+
+
+## v1.19.0 (2026-10-31)
+
+### Features
+
+- **refusal**: Add the BGP peer family catalog id
+  ([`14cc848`](https://github.com/marcinpsk/nso-adapter/commit/14cc8489ed2edf9a23598bfe8d4b498e8b7a9864))
+
+
+## v1.18.0 (2026-10-31)
+
+### Bug Fixes
+
+- **opengrep**: Exempt a lambda-deferred default of an offloaded def
+  ([`99fe7a9`](https://github.com/marcinpsk/nso-adapter/commit/99fe7a9e267f3521e4f8369198bf3106ab1373c8))
+
+- **opengrep**: Exempt deferred calls from the default-argument rule
+  ([`52ba69b`](https://github.com/marcinpsk/nso-adapter/commit/52ba69b306b511edaaf5c8f3d3a51889b922c9b8))
+
+- **opengrep**: Exempt worker-thread calls of an offloaded def
+  ([`73fa5f6`](https://github.com/marcinpsk/nso-adapter/commit/73fa5f64cc9f66bc9400344462dd4d36e3daea2a))
+
+- **opengrep**: Limit the off-loop exemptions to deferred builder bodies
+  ([`8e06c72`](https://github.com/marcinpsk/nso-adapter/commit/8e06c726e464c3b7e1be923bc456800eaa2052cd))
+
+- **opengrep**: Reject an envelope builder in a parameter default
+  ([`201cd0d`](https://github.com/marcinpsk/nso-adapter/commit/201cd0df28984521bbdb04715e4017fc18e96572))
+
+- **opengrep**: Report a direct call of a def that run_sync offloads
+  ([`f81490b`](https://github.com/marcinpsk/nso-adapter/commit/f81490b7e74984ac6e4b5bd7f07a8d44a2928960))
+
+- **opengrep**: Report a lambda that a parameter default calls
+  ([`a8b44a5`](https://github.com/marcinpsk/nso-adapter/commit/a8b44a5917ee91ef4c22a9164301948f95e154b4))
+
+- **opengrep**: Report an offloaded def called in a parameter default
+  ([`260257f`](https://github.com/marcinpsk/nso-adapter/commit/260257f0486a5b0b47e182d08437db162c1d45f6))
+
+### Chores
+
+- **deps**: Bump filelock from 3.29.4 to 4.2.1
+  ([`09b93f2`](https://github.com/marcinpsk/nso-adapter/commit/09b93f286be01f1f7a8f97f78d726b278fb36579))
+
+- **deps**: Bump virtualenv from 21.14.9 to 21.14.13
+  ([`710baa6`](https://github.com/marcinpsk/nso-adapter/commit/710baa679ff3b80fd4cb2b81b62db52fc7ca8428))
+
+### Documentation
+
+- **opengrep**: State the nested-lambda limit of the offloaded-def rule
+  ([`277c7a8`](https://github.com/marcinpsk/nso-adapter/commit/277c7a80bd802ac648715fdbfaf86bc76c1aa7cc))
+
+### Features
+
+- **refusal**: Add the LAG bundle range and BGP VRF peer family catalog ids
+  ([`a7732a5`](https://github.com/marcinpsk/nso-adapter/commit/a7732a585c53ab261d3f8e77d5545aab0109f5ea))
+
+
 ## v1.17.1 (2026-10-29)
 
 ### Chores
