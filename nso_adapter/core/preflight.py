@@ -15,6 +15,7 @@ import structlog
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from nso_adapter.core.apply import _apply_error_summary, build_device_containers, encode_section
@@ -39,6 +40,7 @@ from nso_adapter.core.projection import (
     section_registry,
     section_streams,
 )
+from nso_adapter.core.receipt import PromotionProvenanceUnexecutable
 from nso_adapter.core.removal import _leaf_keys, evaluate_collateral_guard, guard_allowed
 from nso_adapter.core.static_route_plan import hydrate_static_route_apply_plan, hydrate_static_route_removal_plan
 from nso_adapter.core.static_route_reader import CertifiedSection, certified_static_route_section
@@ -140,6 +142,10 @@ class PlannedChain:
     @property
     def candidate_identity(self) -> str | None:
         return json.loads(self._candidate_json)["identity"] if self._candidate_json is not None else None
+
+    @property
+    def candidate_baseline_revisions(self) -> dict[str, int] | None:
+        return json.loads(self._candidate_json)["baseline_revisions"] if self._candidate_json is not None else None
 
     @property
     def candidate_selection(self) -> dict[str, int] | None:
@@ -465,7 +471,7 @@ class CandidateIngest(Protocol):
     async def delivery_effect(self, db: AsyncSession) -> dict: ...
 
 
-async def _candidate_delivery_effect(engine, device, ingest: CandidateIngest) -> dict:
+async def _candidate_delivery_effect(engine, device, ingest: CandidateIngest, baseline: dict[str, int]) -> dict:
     """Observe normal ingestion in a private snapshot that never commits."""
     async with engine.connect() as connection:
         connection = await connection.execution_options(isolation_level="REPEATABLE READ")
@@ -478,6 +484,8 @@ async def _candidate_delivery_effect(engine, device, ingest: CandidateIngest) ->
                 await lock_projection(db, device.id)
                 current = await db.get(Device, device.id)
                 if current is None or _device_context(current) != _device_context(device):
+                    raise PreflightStale("inputs_changed")
+                if await _authorized_revisions(db, device.id) != baseline:
                     raise PreflightStale("inputs_changed")
                 return await ingest.delivery_effect(db)
         finally:
@@ -573,10 +581,11 @@ async def _run_candidate_preflight(engine, client, device, selected, ingest) -> 
         streams.update(conflict.blocks)
         return finish("refused", context_disturbed=conflict.disturbed)
     try:
-        delivery_effect = await _candidate_delivery_effect(engine, device, ingest)
+        assert planned.candidate_baseline_revisions is not None
+        delivery_effect = await _candidate_delivery_effect(engine, device, ingest, planned.candidate_baseline_revisions)
     except PreflightStale:
         return finish("unavailable", error=_INPUTS_MOVED)
-    except (HTTPException, DBAPIError) as exc:
+    except (HTTPException, DBAPIError, PoolTimeoutError, PromotionProvenanceUnexecutable) as exc:
         logger.warning("preflight.delivery_probe_failed", device_id=device.id, error_type=type(exc).__name__)
         return finish("unavailable", error={"code": "delivery_probe_failed"})
     assert planned._candidate_json is not None
@@ -801,27 +810,28 @@ async def plan_action_apply(
             await outer.rollback()
 
 
+async def _authorized_revisions(db, device_id: int) -> dict[str, int]:
+    rows = await db.execute(
+        select(DeviceProjectionStream.stream, DeviceProjectionStream.authorized_revision).where(
+            DeviceProjectionStream.device_id == device_id
+        )
+    )
+    revisions = dict(rows.tuples().all())
+    return {stream: revisions.get(stream, 0) for stream in sorted(projection_streams())}
+
+
 async def _ingest_candidate_plan(db, device, ingest, snapshot):
+    # The delivery probe runs in a later transaction and must start from these revisions.
+    baseline = await _authorized_revisions(db, device.id)
     selected, bodies = await ingest(db)
-    revisions = {
-        stream: revision
-        for stream, revision in (
-            await db.execute(
-                select(DeviceProjectionStream.stream, DeviceProjectionStream.authorized_revision).where(
-                    DeviceProjectionStream.device_id == device.id
-                )
-            )
-        ).all()
-    }
     candidate = _canonical(
         {
             "selection": selected,
+            "baseline_revisions": baseline,
             "identity": _digest(
                 {
                     "bodies": bodies,
-                    "authorized_revisions": {
-                        stream: revisions.get(stream, 0) for stream in sorted(projection_streams())
-                    },
+                    "authorized_revisions": await _authorized_revisions(db, device.id),
                     "nso_instance": device.nso_instance,
                     "nso_device_name": device.nso_device_name,
                     "ned_id": device.ned_id,

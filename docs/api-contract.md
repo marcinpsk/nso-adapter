@@ -1180,7 +1180,11 @@ outside the candidate map use the same baseline and cross-stream diagnosis as st
 selection mode. No identity or plan digest is returned for a non-ready result.
 A `ready` candidate result requires a completed normal delivery probe. A failed probe
 returns `unavailable` with `error.code = "delivery_probe_failed"`, no admitted selection,
-no `delivery_effect`, and no candidate identity or plan digest.
+no `delivery_effect`, and no candidate identity or plan digest. A failed probe includes a
+normal-delivery refusal (also `outstanding_deletion_provenance`), a database error, and a
+store connection pool timeout. The probe starts only from the authorized revisions that
+planning read. A different authorized revision returns `unavailable` with
+`error.code = "inputs_changed_during_preflight"`.
 
 `candidate_identity` hashes canonical JSON of the normalized candidate bodies, all streams'
 authorized revisions, NSO instance id, NSO device name, device `ned_id`, the single

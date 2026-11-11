@@ -11,13 +11,13 @@ from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects import postgresql
 
 from nso_adapter.api.errors import api_error
-from nso_adapter.core import apply
+from nso_adapter.core import apply, preflight
 from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS, OUT_OF_PROTOCOL_APPLY_POSTS
 from nso_adapter.core.preflight import _device_context, normalized_plan_digest, plan_action_apply, read_plan_inputs
 from nso_adapter.core.receipt import digest_body
 from nso_adapter.core.request_flags import STORE_ONLY
 from nso_adapter.main import create_app
-from nso_adapter.store.db import get_engine, session
+from nso_adapter.store.db import create_store_engine, get_engine, session
 from nso_adapter.store.models import (
     DbInterface,
     DeploymentGeneration,
@@ -376,6 +376,85 @@ async def test_candidate_delivery_probe_api_error_is_not_ready(adapter_client, m
     assert result["admitted_selection"] == {}
     assert_keys_absent(result, ["candidate_identity", "plan_digest", "delivery_effect"])
     assert await database_state() == before
+
+
+def after_planning(monkeypatch, action):
+    plan = preflight.plan_action_apply
+    pending = [action]
+
+    async def plan_then_act(*args, **kwargs):
+        planned = await plan(*args, **kwargs)
+        # Act once: the action can itself plan (Apply reruns preflight).
+        if pending:
+            await pending.pop()()
+        return planned
+
+    monkeypatch.setattr(preflight, "plan_action_apply", plan_then_act)
+
+
+async def test_candidate_authorization_between_plan_and_probe_needs_new_preflight(adapter_client, monkeypatch):
+    device, selected, _, _ = await setup(adapter_client, monkeypatch)
+    # A concurrent Apply authorizes a new revision after planning and before the probe.
+    after_planning(monkeypatch, lambda: authorize(adapter_client, device, selected))
+    response = await preview(adapter_client, device.id, {"static_route": BODIES["static_route"]})
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["status"] == "unavailable", result
+    assert result["error"] == {"code": "inputs_changed_during_preflight"}
+    assert result["admitted_selection"] == {}
+    assert_keys_absent(result, ["candidate_identity", "plan_digest", "delivery_effect"])
+
+
+def vlans(*vids):
+    return {"vlans": [{"vlan_id": vid, "name": f"vlan-{vid}", "accepted_at": ACCEPTED_AT} for vid in vids]}
+
+
+async def test_candidate_carried_deletion_refusal_is_a_failed_probe(adapter_client, monkeypatch):
+    device, _, _, _ = await setup(adapter_client, monkeypatch)
+    assert (await push(adapter_client, device.id, "vlan", vlans(10, 20), seq=5901)).status_code == 200
+    await authorize(adapter_client, device, {"vlan": 5901})
+    assert (await push(adapter_client, device.id, "vlan", vlans(10), seq=5902)).status_code == 200
+    await set_auto_apply(device.id, True)
+    before = await database_state()
+    # Store-only planning admits the push; the normal push refuses to discard the stored deletion.
+    response = await preview(adapter_client, device.id, {"vlan": vlans(10, 30)})
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["status"] == "unavailable", result
+    assert result["error"] == {"code": "delivery_probe_failed"}
+    assert result["admitted_selection"] == {}
+    assert_keys_absent(result, ["candidate_identity", "plan_digest", "delivery_effect"])
+    assert await database_state() == before
+
+
+async def test_candidate_probe_pool_timeout_is_a_failed_probe(adapter_client, monkeypatch):
+    device, _, _, _ = await setup(adapter_client, monkeypatch)
+    engine = create_store_engine(
+        get_engine().url.render_as_string(hide_password=False),
+        application_name="nso-adapter.test-pool-timeout",
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.1,
+    )
+    held = []
+
+    async def exhaust_pool():
+        held.append(await engine.connect())
+
+    after_planning(monkeypatch, exhaust_pool)
+    monkeypatch.setattr("nso_adapter.store.db.get_engine", lambda: engine)
+    try:
+        response = await preview(adapter_client, device.id, {"ip": BODIES["ip"]})
+    finally:
+        for connection in held:
+            await connection.close()
+        await engine.dispose()
+    assert held
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["status"] == "unavailable", result
+    assert result["error"] == {"code": "delivery_probe_failed"}
+    assert_keys_absent(result, ["candidate_identity", "plan_digest", "delivery_effect"])
 
 
 @pytest.mark.parametrize("stream", BODIES)
