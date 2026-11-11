@@ -296,14 +296,14 @@ async def test_ios_frozen_section_refuses_empty_source_before_send(adapter_clien
 
 
 async def test_source_as_refusal_subclass_envelope_round_trip():
-    from nso_adapter.api.errors import ErrorEnvelope, asn_rule_violation_handler
+    from nso_adapter.api.errors import ErrorEnvelope, domain_conflict_handler
     from nso_adapter.domain.asn import BgpSourceAsRequired, asn_refusal_detail, checked_intent_source_ref
 
     with pytest.raises(BgpSourceAsRequired) as caught:
         checked_intent_source_ref("", "cisco-ios-cli-6.95")
     refusal = caught.value
     assert asn_refusal_detail(refusal) is refusal.error
-    response = await asn_rule_violation_handler(None, refusal)
+    response = await domain_conflict_handler(None, refusal)
     assert response.status_code == 409
     envelope = ErrorEnvelope.model_validate_json(response.body)
     assert envelope.error.code == "bgp_source_as_required"

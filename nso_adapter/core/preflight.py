@@ -18,6 +18,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+from nso_adapter.api.errors import DOMAIN_CONFLICTS
 from nso_adapter.core.apply import _apply_error_summary, build_device_containers, encode_section
 from nso_adapter.core.generation import (
     LAST_ENQUEUED_GENERATION_ID,
@@ -40,7 +41,6 @@ from nso_adapter.core.projection import (
     section_registry,
     section_streams,
 )
-from nso_adapter.core.receipt import PromotionProvenanceUnexecutable
 from nso_adapter.core.removal import _leaf_keys, evaluate_collateral_guard, guard_allowed
 from nso_adapter.core.static_route_plan import hydrate_static_route_apply_plan, hydrate_static_route_removal_plan
 from nso_adapter.core.static_route_reader import CertifiedSection, certified_static_route_section
@@ -457,6 +457,9 @@ async def _judge_dry_run(engine, client, device, live, planned, effective) -> tu
     return {}, await _diagnose_unselected_refusal(engine, client, device, live, outcome)
 
 
+#: What fails the delivery probe: an endpoint error, a mapped domain conflict, or a store failure.
+_PROBE_FAILURES: tuple[type[BaseException], ...] = (HTTPException, DBAPIError, PoolTimeoutError, *DOMAIN_CONFLICTS)
+
 #: A selection changed between two passes of one preflight; the caller retries.
 _INPUTS_MOVED = {"code": "inputs_changed_during_preflight"}
 
@@ -587,13 +590,7 @@ async def _run_candidate_preflight(engine, client, device, selected, ingest) -> 
         delivery_effect = await _candidate_delivery_effect(engine, device, ingest, planned.candidate_baseline_revisions)
     except PreflightStale:
         return finish("unavailable", error=_INPUTS_MOVED)
-    except (
-        HTTPException,
-        DBAPIError,
-        PoolTimeoutError,
-        PromotionProvenanceUnexecutable,
-        InterfaceProofConflict,
-    ) as exc:
+    except _PROBE_FAILURES as exc:
         logger.warning("preflight.delivery_probe_failed", device_id=device.id, error_type=type(exc).__name__)
         return finish("unavailable", error={"code": "delivery_probe_failed"})
     assert planned._candidate_json is not None

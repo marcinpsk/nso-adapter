@@ -574,10 +574,10 @@ async def test_protocol_refresh_refuses_invalid_bgp_source_and_retains_mirror(ad
 
 
 async def test_asn_refusal_handler_matches_error_envelope():
-    from nso_adapter.api.errors import ErrorEnvelope, asn_rule_violation_handler
+    from nso_adapter.api.errors import ErrorEnvelope, domain_conflict_handler
 
     refusal = AsnRuleViolation("device_read.bgp", "router[0]", "asn", "064512")
-    response = await asn_rule_violation_handler(None, refusal)
+    response = await domain_conflict_handler(None, refusal)
     assert_text_free_of(response.body, ["064512"])
     envelope = ErrorEnvelope.model_validate_json(response.body)
     assert response.status_code == 409

@@ -23,14 +23,13 @@ from nso_adapter.api.capability import router as capability_router
 from nso_adapter.api.config import router as config_router
 from nso_adapter.api.devices import router as devices_router
 from nso_adapter.api.errors import (
+    DOMAIN_CONFLICTS,
     ApiError,
     api_error,
     api_error_handler,
-    apply_unexecutable_handler,
-    asn_rule_violation_handler,
+    domain_conflict_handler,
     framework_http_error_handler,
     projection_gone_handler,
-    promotion_provenance_handler,
     unhandled_exception_response,
     validation_error_handler,
 )
@@ -64,10 +63,9 @@ from nso_adapter.api.svi import router as svi_router
 from nso_adapter.api.vlan import SwitchportApplyRequest
 from nso_adapter.api.vlan import router as vlan_router
 from nso_adapter.config import get_config, get_env_settings
-from nso_adapter.core.generation import ApplyUnexecutable, DeviceProjectionGone
+from nso_adapter.core.generation import DeviceProjectionGone
 from nso_adapter.core.importer import register_nso_client, set_netbox_client
 from nso_adapter.core.projection import projection_streams
-from nso_adapter.core.receipt import PromotionProvenanceUnexecutable
 from nso_adapter.core.request_flags import (
     BACKFILL_ONLY,
     DELETE_ORIGIN,
@@ -522,12 +520,11 @@ def create_app(*, lifespan_context: Callable[[FastAPI], AbstractAsyncContextMana
         openapi_url="/openapi.json" if api_docs else None,
     )
     app.add_exception_handler(ApiError, api_error_handler)
-    app.add_exception_handler(AsnRuleViolation, asn_rule_violation_handler)
     app.add_exception_handler(StarletteHTTPException, framework_http_error_handler)
     app.add_exception_handler(RequestValidationError, validation_error_handler)
     app.add_exception_handler(DeviceProjectionGone, projection_gone_handler)
-    app.add_exception_handler(ApplyUnexecutable, apply_unexecutable_handler)
-    app.add_exception_handler(PromotionProvenanceUnexecutable, promotion_provenance_handler)
+    for conflict in DOMAIN_CONFLICTS:
+        app.add_exception_handler(conflict, domain_conflict_handler)
 
     @app.middleware("http")
     async def _request_mode_flags(request, call_next):
