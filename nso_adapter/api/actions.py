@@ -29,6 +29,7 @@ from nso_adapter.api.errors import (
     RESP_422_VALIDATION,
     RESP_500_INTERNAL,
     api_error,
+    domain_conflict,
 )
 from nso_adapter.api.execution import AttributedRefusalOut
 from nso_adapter.core.jobs import enqueue_job
@@ -124,6 +125,16 @@ class PreflightStreamOut(BaseModel):
     context_disturbed: list[str] = Field(default_factory=list, exclude_if=lambda value: not value)
 
 
+class DeliveryPromotionOut(BaseModel):
+    stream: str
+    kind: str
+
+
+class DeliveryEffectOut(BaseModel):
+    promotes: bool
+    effects: list[DeliveryPromotionOut] = Field(default_factory=list, exclude_if=lambda value: not value)
+
+
 class ApplyPreflightOut(BaseModel):
     status: Literal["ready", "refused", "unavailable", "error"]
     streams: dict[str, PreflightStreamOut]
@@ -135,6 +146,7 @@ class ApplyPreflightOut(BaseModel):
     preflight_identity: str | None = Field(default=None, exclude_if=lambda value: value is None)
     candidate_identity: str | None = Field(default=None, exclude_if=lambda value: value is None)
     plan_digest: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    delivery_effect: DeliveryEffectOut | None = Field(default=None, exclude_if=lambda value: value is None)
     diffs: dict[str, str]
     attempts: list[dict]
     refusals: list[AttributedRefusalOut]
@@ -448,6 +460,8 @@ async def action_apply_preflight(
         "refusals": _preflight_evidence(result.refusals),
         "error": result.error,
     }
+    if ingest is not None and result.delivery_effect is not None:
+        payload["delivery_effect"] = result.delivery_effect
     if result.status == "ready":
         if ingest is not None:
             assert result.plan is not None
@@ -614,14 +628,7 @@ async def action_apply(
         await db.commit()
         return _apply_http_response(409, result)
     except ApplyUnexecutable as exc:
-        streams = sorted(exc.reasons)
-        result = {
-            "error": {
-                "code": "apply_unexecutable",
-                "message": f"Selected stream(s) cannot be applied faithfully: {', '.join(streams)}",
-                "detail": {"streams": exc.reasons},
-            }
-        }
+        result = domain_conflict(exc).body
         await complete_apply_attempt(
             db,
             body.apply_attempt_id,

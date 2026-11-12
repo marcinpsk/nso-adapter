@@ -16,6 +16,7 @@ the same envelope by `validation_error_handler` — the framework's default
 from __future__ import annotations
 
 import traceback
+from collections.abc import Callable
 from http import HTTPStatus
 from typing import Any, Literal, get_args
 
@@ -28,7 +29,9 @@ from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from nso_adapter.core.generation import ApplyUnexecutable
+from nso_adapter.core.projection import InterfaceProofConflict
 from nso_adapter.core.receipt import PromotionProvenanceUnexecutable
+from nso_adapter.domain.asn import AsnRuleViolation, asn_refusal_detail
 
 logger = structlog.get_logger(__name__)
 
@@ -50,6 +53,7 @@ ErrorCode = Literal[
     "preflight_stale",
     "asn_rule_violation",
     "bgp_source_as_required",
+    "interface_proof_conflict",
     # per-endpoint
     "ambiguous_device",
     "bad_request",
@@ -127,6 +131,10 @@ class StoredIntentResult(BaseModel):
 
 class ApiError(HTTPException):
     """HTTPException whose detail IS the full response body (no FastAPI wrapping)."""
+
+    def __init__(self, status_code: int, detail: dict) -> None:
+        super().__init__(status_code=status_code, detail=detail)
+        self.body = detail
 
 
 def api_error(
@@ -212,36 +220,50 @@ async def projection_gone_handler(request: Request, exc: Exception) -> JSONRespo
     )
 
 
-async def apply_unexecutable_handler(request: Request, exc: Exception) -> JSONResponse:
-    """Refuse generation creation when its selected projection cannot execute exactly."""
-    assert isinstance(exc, ApplyUnexecutable)
-    reasons = exc.reasons
-    streams = sorted(reasons)
-    return JSONResponse(
-        status_code=409,
-        content={
-            "error": {
-                "code": "apply_unexecutable",
-                "message": f"Selected stream(s) cannot be applied faithfully: {', '.join(streams)}",
-                "detail": {"streams": reasons},
-            }
-        },
+def _apply_unexecutable(exc: ApplyUnexecutable) -> ApiError:
+    streams = sorted(exc.reasons)
+    return api_error(
+        409,
+        "apply_unexecutable",
+        f"Selected stream(s) cannot be applied faithfully: {', '.join(streams)}",
+        {"streams": exc.reasons},
     )
 
 
-async def promotion_provenance_handler(request: Request, exc: Exception) -> JSONResponse:
-    """Refuse a push that cannot execute deletion provenance from an earlier revision."""
-    assert isinstance(exc, PromotionProvenanceUnexecutable)
-    stream = exc.stream
-    return await api_error_handler(
-        request,
-        api_error(
-            409,
-            "apply_unexecutable",
-            str(exc),
-            {"streams": {stream: "outstanding_deletion_provenance"}},
-        ),
-    )
+def _promotion_provenance(exc: PromotionProvenanceUnexecutable) -> ApiError:
+    return api_error(409, "apply_unexecutable", str(exc), {"streams": {exc.stream: "outstanding_deletion_provenance"}})
+
+
+def _interface_proof_conflict(exc: InterfaceProofConflict) -> ApiError:
+    return api_error(409, "interface_proof_conflict", str(exc), {"streams": sorted(exc.streams), "field": exc.field})
+
+
+def _asn_rule_violation(exc: AsnRuleViolation) -> ApiError:
+    # The refusal authors its own code (asn_rule_violation or bgp_source_as_required).
+    return ApiError(status_code=409, detail={"error": asn_refusal_detail(exc)})
+
+
+#: Domain refusals an operator can correct, each mapped to its 409 here and nowhere else (#1915).
+_DOMAIN_CONFLICTS: dict[type[Exception], Callable[[Any], ApiError]] = {
+    ApplyUnexecutable: _apply_unexecutable,
+    AsnRuleViolation: _asn_rule_violation,
+    InterfaceProofConflict: _interface_proof_conflict,
+    PromotionProvenanceUnexecutable: _promotion_provenance,
+}
+DOMAIN_CONFLICTS: tuple[type[Exception], ...] = tuple(_DOMAIN_CONFLICTS)
+
+
+def domain_conflict(exc: Exception) -> ApiError:
+    """Return the 409 for one mapped domain refusal."""
+    for cls in type(exc).__mro__:
+        if cls in _DOMAIN_CONFLICTS:
+            return _DOMAIN_CONFLICTS[cls](exc)
+    raise TypeError(f"{type(exc).__name__} is not a mapped domain conflict")
+
+
+async def domain_conflict_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Answer a domain refusal that escaped an endpoint with its typed 409."""
+    return await api_error_handler(request, domain_conflict(exc))
 
 
 #: How many innermost traceback frames the unhandled-exception log keeps.
@@ -358,7 +380,10 @@ RESP_409_PREPARATION: ResponseSpec = {
 RESP_409_PUSH_SEQ: ResponseSpec = {
     409: {
         **_ENVELOPE_SCHEMA,
-        "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one",
+        "description": (
+            "X-Push-Seq reused with a different body or mode, or older than the admitted one, "
+            "or a delivery conflict refused the push"
+        ),
     }
 }
 # One status, one description: an endpoint that can emit BOTH 409s must say so, or merging
@@ -369,8 +394,9 @@ RESP_409_PUSH_SEQ_OR_DEVICE_BUSY: ResponseSpec = {
     409: {
         **_ENVELOPE_SCHEMA,
         "description": (
-            "The device is busy with another operation, or X-Push-Seq was reused with a "
-            "different body or mode / is older than the admitted one"
+            "The device is busy with another operation, X-Push-Seq was reused with a "
+            "different body or mode / is older than the admitted one, or a delivery conflict "
+            "refused the push"
         ),
     }
 }
@@ -381,11 +407,3 @@ RESP_500_INTERNAL: ResponseSpec = {500: {**_ENVELOPE_SCHEMA, "description": "Int
 RESP_501: ResponseSpec = {501: {**_ENVELOPE_SCHEMA, "description": "Not supported by the configured provider"}}
 RESP_502_NSO: ResponseSpec = {502: {**_ENVELOPE_SCHEMA, "description": "NSO unreachable"}}
 RESP_502: ResponseSpec = {502: {**_ENVELOPE_SCHEMA, "description": "Upstream (NSO/Vault) operation failed"}}
-
-
-async def asn_rule_violation_handler(request: Request, exc: Exception) -> JSONResponse:
-    """Name the invalid row in a fail-closed content refusal."""
-    from nso_adapter.domain.asn import AsnRuleViolation
-
-    assert isinstance(exc, AsnRuleViolation)
-    return JSONResponse(status_code=409, content={"error": exc.error})

@@ -175,6 +175,21 @@ def test_action_apply_requires_an_attempt_id(openapi_schema):
     }
 
 
+def test_candidate_preflight_declares_delivery_effect(openapi_schema):
+    schemas = openapi_schema["components"]["schemas"]
+    response = schemas["ApplyPreflightOut"]
+    assert response["properties"]["delivery_effect"]["anyOf"] == [
+        {"$ref": "#/components/schemas/DeliveryEffectOut"},
+        {"type": "null"},
+    ]
+    assert "delivery_effect" not in response["required"]
+    effect = schemas["DeliveryEffectOut"]
+    assert effect["required"] == ["promotes"]
+    assert effect["properties"]["promotes"]["type"] == "boolean"
+    assert effect["properties"]["effects"]["items"] == {"$ref": "#/components/schemas/DeliveryPromotionOut"}
+    assert schemas["DeliveryPromotionOut"]["required"] == ["stream", "kind"]
+
+
 def test_action_apply_documents_both_selection_identities(openapi_schema):
     """A selection is a push sequence or a prepared revision; the schema must name both."""
     from nso_adapter.core.intent_protocol import OUT_OF_PROTOCOL_STREAMS

@@ -7,13 +7,26 @@ from datetime import UTC, datetime
 
 import pytest
 from fastapi.routing import iter_route_contexts
-from sqlalchemy import select
+from sqlalchemy import func, select, text, update
+from sqlalchemy.dialects import postgresql
 
+from nso_adapter.api.errors import api_error
+from nso_adapter.core import apply, preflight
 from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS, OUT_OF_PROTOCOL_APPLY_POSTS
 from nso_adapter.core.preflight import _device_context, normalized_plan_digest, plan_action_apply, read_plan_inputs
+from nso_adapter.core.receipt import digest_body
+from nso_adapter.core.request_flags import STORE_ONLY
 from nso_adapter.main import create_app
-from nso_adapter.store.db import get_engine, session
-from nso_adapter.store.models import DbInterface, Device, LagBundleIntent, SwitchportIntent
+from nso_adapter.store.db import create_store_engine, get_engine, session
+from nso_adapter.store.models import (
+    DbInterface,
+    DeploymentGeneration,
+    Device,
+    DeviceSettings,
+    Job,
+    LagBundleIntent,
+    SwitchportIntent,
+)
 from tests._secret_discipline import assert_keys_absent, assert_text_free_of
 from tests.conftest import AUTH
 from tests.core.test_preflight_loop import (
@@ -131,12 +144,22 @@ async def preview(api, device_id, candidates):
     )
 
 
+async def set_auto_apply(device_id, value):
+    async with session() as db:
+        result = await db.execute(
+            update(DeviceSettings).where(DeviceSettings.device_id == device_id).values(auto_apply=value)
+        )
+        assert result.rowcount == 1
+        await db.commit()
+
+
 async def ready(api, device_id, candidates):
     response = await preview(api, device_id, candidates)
     assert response.status_code == 200, response.text
     result = response.json()
     assert result["status"] == "ready", result
     assert len(result["candidate_identity"]) == len(result["plan_digest"]) == 64
+    assert isinstance(result["delivery_effect"]["promotes"], bool)
     assert_keys_absent(result, ["preflight_identity"])
     return result
 
@@ -155,22 +178,326 @@ async def test_candidate_preflight_matches_pushed_apply_document(adapter_client,
     assert result["plan_digest"] == normalized_plan_digest(plan)
 
 
-async def test_candidate_preflight_persists_nothing(adapter_client, monkeypatch):
+@pytest.mark.parametrize("auto_apply", [False, True])
+async def test_candidate_preflight_persists_nothing(adapter_client, monkeypatch, auto_apply):
     device, _, _, transport = await setup(adapter_client, monkeypatch)
     initial = deepcopy(BODIES["switchport"])
     initial["source_revision"] = 41
     initial["interfaces"][0]["tagged_vlans"] = [100]
     assert (await push(adapter_client, device.id, "switchport", initial)).status_code == 200
+    await set_auto_apply(device.id, auto_apply)
     before = await database_state()
-    await ready(
+    result = await ready(
         adapter_client,
         device.id,
         {stream: BODIES[stream] for stream in ("ip", "interface_config", "static_route", "lag", "switchport")},
     )
+    assert result.get("delivery_effect", {}).get("promotes") is auto_apply
     assert await database_state() == before
     assert len(transport.fake.reads) == 1
     assert_only_dry_runs(transport, len(transport.dry_requests))
     assert transport.dry_requests and not transport.locks
+
+
+@pytest.mark.parametrize("auto_apply", [False, True])
+async def test_candidate_reports_normal_delivery_auto_apply(adapter_client, monkeypatch, auto_apply):
+    device, _, _, _ = await setup(adapter_client, monkeypatch)
+    await set_auto_apply(device.id, auto_apply)
+    result = await ready(adapter_client, device.id, {"ip": BODIES["ip"]})
+    expected = {"promotes": False}
+    if auto_apply:
+        expected = {"promotes": True, "effects": [{"stream": "ip", "kind": kind} for kind in ("auto_apply", "job")]}
+    assert result.get("delivery_effect") == expected
+
+
+async def test_candidate_probe_reports_only_new_rows_above_a_long_job_history(adapter_client, monkeypatch):
+    device, _, _, _ = await setup(adapter_client, monkeypatch)
+    await set_auto_apply(device.id, True)
+    async with session() as db:
+        # More completed jobs than asyncpg accepts bind parameters (32767).
+        await db.execute(
+            text("""
+            INSERT INTO jobs (device_id, job_type, status, coalescible, created_at, updated_at, run_attempt)
+            SELECT :device_id, 'sync', 'succeeded', false, now(), now(), 0 FROM generate_series(1, 32768)
+        """),
+            {"device_id": device.id},
+        )
+        await db.commit()
+    result = await ready(adapter_client, device.id, {"ip": BODIES["ip"]})
+    assert result["delivery_effect"] == {
+        "promotes": True,
+        "effects": [{"stream": "ip", "kind": kind} for kind in ("auto_apply", "job")],
+    }
+
+
+def _index_conditions(plan: dict) -> list[str]:
+    nested = [condition for child in plan.get("Plans", []) for condition in _index_conditions(child)]
+    return [plan["Index Cond"], *nested] if "Index Cond" in plan else nested
+
+
+@pytest.mark.parametrize("model", [DeploymentGeneration, Job])
+async def test_candidate_probe_watermark_queries_reach_rows_by_device_index(adapter_client, monkeypatch, model):
+    device, _, _, _ = await setup(adapter_client, monkeypatch)
+    queries = [
+        select(func.coalesce(func.max(model.id), 0)).where(model.device_id == device.id),
+        select(model.id).where(model.device_id == device.id, model.id > 0),
+    ]
+    async with session() as db:
+        # The probe runs these under the projection lock: a full scan of retained history would hold it.
+        await db.execute(text("SET LOCAL enable_seqscan = off"))
+        for query in queries:
+            sql = query.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})
+            plan = (await db.execute(text(f"EXPLAIN (FORMAT JSON) {sql}"))).scalar_one()[0]["Plan"]
+            assert any("device_id" in condition for condition in _index_conditions(plan)), plan
+
+
+@pytest.mark.parametrize("kind", ["removal", "detach"])
+@pytest.mark.parametrize("auto_apply", [False, True])
+async def test_candidate_reports_normal_delivery_removal(adapter_client, monkeypatch, kind, auto_apply):
+    device, _, _, _ = await setup(adapter_client, monkeypatch)
+    initial = {"interfaces": [{"interface_name": INTERFACE, "mtu": 9000, "accepted_at": ACCEPTED_AT}]}
+    assert (await push(adapter_client, device.id, "interface_mtu", initial)).status_code == 200
+    candidate = deepcopy(initial)
+    if kind == "removal":
+        candidate["interfaces"][0].pop("mtu")
+    else:
+        candidate["interfaces"] = []
+    await set_auto_apply(device.id, auto_apply)
+    before = await database_state()
+    result = await ready(adapter_client, device.id, {"interface_mtu": candidate})
+    kinds = [kind, "job"]
+    if auto_apply and kind == "removal":
+        kinds.extend(["auto_apply", "job"])
+    assert result.get("delivery_effect") == {
+        "promotes": True,
+        "effects": [{"stream": "interface_mtu", "kind": value} for value in sorted(kinds)],
+    }
+    assert await database_state() == before
+
+
+@pytest.mark.parametrize("stream", ["lag", "switchport"])
+async def test_candidate_switching_preparation_does_not_promote(adapter_client, monkeypatch, stream):
+    device, _, _, _ = await setup(adapter_client, monkeypatch)
+    await set_auto_apply(device.id, True)
+    result = await ready(adapter_client, device.id, {stream: BODIES[stream]})
+    assert result.get("delivery_effect") == {"promotes": False}
+
+
+async def test_candidate_identity_binds_delivery_effect(adapter_client, monkeypatch):
+    device, _, _, _ = await setup(adapter_client, monkeypatch)
+    first = await ready(adapter_client, device.id, {"ip": BODIES["ip"]})
+    await set_auto_apply(device.id, True)
+    second = await ready(adapter_client, device.id, {"ip": BODIES["ip"]})
+    assert first["plan_digest"] == second["plan_digest"]
+    assert first["candidate_identity"] != second["candidate_identity"]
+
+
+async def test_candidate_probe_uses_next_normal_delivery_identity(adapter_client, monkeypatch):
+    device, _, _, _ = await setup(adapter_client, monkeypatch)
+    assert (await push(adapter_client, device.id, "ip", BODIES["ip"])).status_code == 200
+    digest = digest_body(BODIES["ip"])
+    async with session() as db:
+        await db.execute(
+            text(f"""
+            CREATE FUNCTION check_normal_receipt() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF NOT NEW.store_only AND (
+                    NEW.push_seq != 43 OR NEW.request_digest != '{digest}'
+                    OR NEW.delete_origin OR NEW.backfill_only
+                ) THEN
+                    RAISE EXCEPTION 'normal delivery identity differs';
+                END IF;
+                RETURN NEW;
+            END $$
+        """)
+        )
+        await db.execute(
+            text("""
+            CREATE TRIGGER check_normal_receipt BEFORE INSERT OR UPDATE ON intent_push_receipt
+            FOR EACH ROW EXECUTE FUNCTION check_normal_receipt()
+        """)
+        )
+        await db.commit()
+    result = await ready(adapter_client, device.id, {"ip": BODIES["ip"]})
+    assert result["delivery_effect"] == {"promotes": False}
+
+
+async def test_candidate_delivery_probe_failure_is_not_ready(adapter_client, monkeypatch):
+    device, _, _, _ = await setup(adapter_client, monkeypatch)
+    async with session() as db:
+        await db.execute(
+            text("""
+            CREATE FUNCTION refuse_normal_receipt() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF NOT NEW.store_only THEN
+                    RAISE EXCEPTION 'normal delivery cannot complete';
+                END IF;
+                RETURN NEW;
+            END $$
+        """)
+        )
+        await db.execute(
+            text("""
+            CREATE TRIGGER refuse_normal_receipt BEFORE INSERT OR UPDATE ON intent_push_receipt
+            FOR EACH ROW EXECUTE FUNCTION refuse_normal_receipt()
+        """)
+        )
+        await db.commit()
+    before = await database_state()
+    response = await preview(adapter_client, device.id, {"ip": BODIES["ip"]})
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["status"] == "unavailable", result
+    assert result["error"] == {"code": "delivery_probe_failed"}
+    assert result["admitted_selection"] == {}
+    assert_keys_absent(result, ["candidate_identity", "plan_digest", "delivery_effect"])
+    assert await database_state() == before
+
+
+async def test_candidate_delivery_probe_api_error_is_not_ready(adapter_client, monkeypatch):
+    device, _, _, _ = await setup(adapter_client, monkeypatch)
+    await set_auto_apply(device.id, True)
+
+    enqueue_apply = apply.enqueue_apply
+
+    async def refuse_normal_auto_apply(*args, **kwargs):
+        if STORE_ONLY.get():
+            return await enqueue_apply(*args, **kwargs)
+        raise api_error(409, "conflict", "normal delivery cannot complete")
+
+    # The normal-mode probe fails after the delivery has written its rows.
+    monkeypatch.setattr(apply, "enqueue_apply", refuse_normal_auto_apply)
+    before = await database_state()
+    response = await preview(adapter_client, device.id, {"ip": BODIES["ip"]})
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["status"] == "unavailable", result
+    assert result["error"] == {"code": "delivery_probe_failed"}
+    assert result["admitted_selection"] == {}
+    assert_keys_absent(result, ["candidate_identity", "plan_digest", "delivery_effect"])
+    assert await database_state() == before
+
+
+def after_planning(monkeypatch, action):
+    plan = preflight.plan_action_apply
+    pending = [action]
+
+    async def plan_then_act(*args, **kwargs):
+        planned = await plan(*args, **kwargs)
+        # Act once: the action can itself plan (Apply reruns preflight).
+        if pending:
+            await pending.pop()()
+        return planned
+
+    monkeypatch.setattr(preflight, "plan_action_apply", plan_then_act)
+
+
+async def test_candidate_authorization_between_plan_and_probe_needs_new_preflight(adapter_client, monkeypatch):
+    device, selected, _, _ = await setup(adapter_client, monkeypatch)
+    # A concurrent Apply authorizes a new revision after planning and before the probe.
+    after_planning(monkeypatch, lambda: authorize(adapter_client, device, selected))
+    response = await preview(adapter_client, device.id, {"static_route": BODIES["static_route"]})
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["status"] == "unavailable", result
+    assert result["error"] == {"code": "inputs_changed_during_preflight"}
+    assert result["admitted_selection"] == {}
+    assert_keys_absent(result, ["candidate_identity", "plan_digest", "delivery_effect"])
+
+
+async def test_candidate_store_only_write_between_plan_and_probe_needs_new_preflight(adapter_client, monkeypatch):
+    device, _, _, _ = await setup(adapter_client, monkeypatch)
+    stored = {"interfaces": [{"interface_name": INTERFACE, "mtu": 9000, "accepted_at": ACCEPTED_AT}]}
+
+    async def store_only_write():
+        assert (await push(adapter_client, device.id, "interface_mtu", stored, seq=5903)).status_code == 200
+
+    # A store-only write moves the desired revision and leaves the authorized revision unchanged.
+    after_planning(monkeypatch, store_only_write)
+    response = await preview(adapter_client, device.id, {"interface_mtu": {"interfaces": []}})
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["status"] == "unavailable", result
+    assert result["error"] == {"code": "inputs_changed_during_preflight"}
+    assert result["admitted_selection"] == {}
+    assert_keys_absent(result, ["candidate_identity", "plan_digest", "delivery_effect"])
+
+
+def vlans(*vids):
+    return {"vlans": [{"vlan_id": vid, "name": f"vlan-{vid}", "accepted_at": ACCEPTED_AT} for vid in vids]}
+
+
+async def test_candidate_carried_deletion_refusal_is_a_failed_probe(adapter_client, monkeypatch):
+    device, _, _, _ = await setup(adapter_client, monkeypatch)
+    assert (await push(adapter_client, device.id, "vlan", vlans(10, 20), seq=5901)).status_code == 200
+    await authorize(adapter_client, device, {"vlan": 5901})
+    assert (await push(adapter_client, device.id, "vlan", vlans(10), seq=5902)).status_code == 200
+    await set_auto_apply(device.id, True)
+    before = await database_state()
+    # Store-only planning admits the push; the normal push refuses to discard the stored deletion.
+    response = await preview(adapter_client, device.id, {"vlan": vlans(10, 30)})
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["status"] == "unavailable", result
+    assert result["error"] == {"code": "delivery_probe_failed"}
+    assert result["admitted_selection"] == {}
+    assert_keys_absent(result, ["candidate_identity", "plan_digest", "delivery_effect"])
+    assert await database_state() == before
+
+
+async def test_candidate_probe_pool_timeout_is_a_failed_probe(adapter_client, monkeypatch):
+    device, _, _, _ = await setup(adapter_client, monkeypatch)
+    engine = create_store_engine(
+        get_engine().url.render_as_string(hide_password=False),
+        application_name="nso-adapter.test-pool-timeout",
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.1,
+    )
+    held = []
+
+    async def exhaust_pool():
+        held.append(await engine.connect())
+
+    after_planning(monkeypatch, exhaust_pool)
+    monkeypatch.setattr("nso_adapter.store.db.get_engine", lambda: engine)
+    try:
+        response = await preview(adapter_client, device.id, {"ip": BODIES["ip"]})
+    finally:
+        for connection in held:
+            await connection.close()
+        await engine.dispose()
+    assert held
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["status"] == "unavailable", result
+    assert result["error"] == {"code": "delivery_probe_failed"}
+    assert_keys_absent(result, ["candidate_identity", "plan_digest", "delivery_effect"])
+
+
+async def test_candidate_interface_proof_conflict_is_a_failed_probe(adapter_client, monkeypatch):
+    device, _, _, _ = await setup(adapter_client, monkeypatch)
+    bound = deepcopy(BODIES["ip"])
+    bound["addresses"][0]["parent_binding"] = "lag-1"
+    assert (await push(adapter_client, device.id, "ip", bound, seq=41)).status_code == 200
+    await authorize(adapter_client, device, {"ip": 41})
+    async with session() as db:
+        interface = await db.scalar(select(DbInterface).where(DbInterface.device_id == device.id))
+        interface.parent_binding = "lag-2"
+        await db.commit()
+    await set_auto_apply(device.id, True)
+    readdressed = deepcopy(BODIES["ip"])
+    readdressed["addresses"].append(readdressed["addresses"][0] | {"address": "198.18.0.9/24"})
+    before = await database_state()
+    # Combined planning freezes lag-2 for both lanes; the attribute delivery alone meets the authorized lag-1 proof.
+    candidates = {"interface_config": BODIES["interface_config"], "ip": readdressed}
+    response = await preview(adapter_client, device.id, candidates)
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["status"] == "unavailable", result
+    assert result["error"] == {"code": "delivery_probe_failed"}
+    assert_keys_absent(result, ["candidate_identity", "plan_digest", "delivery_effect"])
+    assert await database_state() == before
 
 
 @pytest.mark.parametrize("stream", BODIES)

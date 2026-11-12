@@ -434,6 +434,8 @@ class Job(Base):
             unique=True,
             postgresql_where=text("settle_seq IS NOT NULL"),
         ),
+        # Every job of one device, by id: the candidate probe's watermark reads under the projection lock.
+        Index("ix_job_device_id", "device_id", "id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
