@@ -29,6 +29,7 @@ from nso_adapter.api.errors import (
     RESP_422_VALIDATION,
     RESP_500_INTERNAL,
     api_error,
+    domain_conflict,
 )
 from nso_adapter.api.execution import AttributedRefusalOut
 from nso_adapter.core.jobs import enqueue_job
@@ -627,14 +628,7 @@ async def action_apply(
         await db.commit()
         return _apply_http_response(409, result)
     except ApplyUnexecutable as exc:
-        streams = sorted(exc.reasons)
-        result = {
-            "error": {
-                "code": "apply_unexecutable",
-                "message": f"Selected stream(s) cannot be applied faithfully: {', '.join(streams)}",
-                "detail": {"streams": exc.reasons},
-            }
-        }
+        result = domain_conflict(exc).body
         await complete_apply_attempt(
             db,
             body.apply_attempt_id,

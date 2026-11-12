@@ -3755,6 +3755,7 @@
               "preflight_stale",
               "asn_rule_violation",
               "bgp_source_as_required",
+              "interface_proof_conflict",
               "ambiguous_device",
               "bad_request",
               "community_not_found",
@@ -18472,7 +18473,7 @@
                 }
               }
             },
-            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one, or a delivery conflict refused the push"
           },
           "422": {
             "content": {
@@ -18651,7 +18652,7 @@
                 }
               }
             },
-            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one, or a delivery conflict refused the push"
           },
           "422": {
             "content": {
@@ -19172,7 +19173,7 @@
                 }
               }
             },
-            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one, or a delivery conflict refused the push"
           },
           "422": {
             "content": {
@@ -19486,7 +19487,7 @@
                 }
               }
             },
-            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one, or a delivery conflict refused the push"
           },
           "422": {
             "content": {
@@ -19735,7 +19736,7 @@
                 }
               }
             },
-            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one, or a delivery conflict refused the push"
           },
           "422": {
             "content": {
@@ -19836,7 +19837,7 @@
                 }
               }
             },
-            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one, or a delivery conflict refused the push"
           },
           "422": {
             "content": {
@@ -19937,7 +19938,7 @@
                 }
               }
             },
-            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one, or a delivery conflict refused the push"
           },
           "422": {
             "content": {
@@ -20105,7 +20106,7 @@
                 }
               }
             },
-            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one, or a delivery conflict refused the push"
           },
           "422": {
             "content": {
@@ -20562,7 +20563,7 @@
                 }
               }
             },
-            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one, or a delivery conflict refused the push"
           },
           "422": {
             "content": {
@@ -20730,7 +20731,7 @@
                 }
               }
             },
-            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one, or a delivery conflict refused the push"
           },
           "422": {
             "content": {
@@ -21104,7 +21105,7 @@
                 }
               }
             },
-            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one, or a delivery conflict refused the push"
           },
           "422": {
             "content": {
@@ -21708,7 +21709,7 @@
                 }
               }
             },
-            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one, or a delivery conflict refused the push"
           },
           "422": {
             "content": {
@@ -21942,7 +21943,7 @@
                 }
               }
             },
-            "description": "The device is busy with another operation, or X-Push-Seq was reused with a different body or mode / is older than the admitted one"
+            "description": "The device is busy with another operation, X-Push-Seq was reused with a different body or mode / is older than the admitted one, or a delivery conflict refused the push"
           },
           "422": {
             "content": {
@@ -22178,7 +22179,7 @@
                 }
               }
             },
-            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one, or a delivery conflict refused the push"
           },
           "422": {
             "content": {
@@ -22347,7 +22348,7 @@
                 }
               }
             },
-            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one, or a delivery conflict refused the push"
           },
           "422": {
             "content": {
@@ -22747,7 +22748,7 @@
                 }
               }
             },
-            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one, or a delivery conflict refused the push"
           },
           "422": {
             "content": {

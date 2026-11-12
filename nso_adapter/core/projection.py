@@ -940,6 +940,7 @@ class InterfaceProofConflict(ValueError):
 
     def __init__(self, section: str, key: str, field: str, previous, value):
         self.streams: tuple[str, ...] = (section,)
+        self.field = field
         super().__init__(
             f"document section {section!r} interface {key} has conflicting {field!r} values "
             f"{previous!r} and {value!r} across its fragments"

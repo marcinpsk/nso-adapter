@@ -80,6 +80,11 @@
     `nso_unavailable` (secrets probe), `secrets_write_unsupported`,
     `vault_error`, and route-policy intent validation:
     `invalid_payload`, `invalid_family`, `invalid_name`, `invalid_entries`.
+  - Interface context: `interface_proof_conflict` (409, two authorized fragments of one
+    interface section record different values for the same interface field, for example a
+    parent binding that moved after the ip lane was authorized; `error.detail.streams` names
+    the contributing streams and `error.detail.field` the field). See
+    [Delivery conflicts](#delivery-conflicts).
   - Keyed intent pushes (`X-Push-Seq`, see below): `sequence_reuse` (409 — the
     same sequence was already admitted for this stream with a different body or
     a different request mode) and `stale` (409 — the sequence is older than the
@@ -94,6 +99,28 @@
     it failed on. The adapter log retains only redacted trace context: the exception
     type, request method and path, and safe frame locations. It excludes exception
     arguments, source text, and frame locals.
+
+### Delivery conflicts
+
+An intent PUT can meet a domain refusal that the operator can correct, most often when it
+promotes (auto-apply on, or a removal). Each one answers 409 with a stable code, from one mapping in
+`nso_adapter/api/errors.py::DOMAIN_CONFLICTS`:
+
+- `apply_unexecutable`: a promoted stream cannot be delivered faithfully, including
+  `outstanding_deletion_provenance`.
+- `asn_rule_violation` and `bgp_source_as_required`: stored AS content fails the AS rules.
+- `interface_proof_conflict`: the fragments of one interface section disagree about an
+  interface field.
+
+The refused request rolls back completely: it writes no new intent rows, receipt,
+revision or job. A replay of the same `X-Push-Seq` meets the same refusal until the operator
+changes the state that causes it, so a consumer must not retry it as a transient failure.
+`apply_unexecutable` and `interface_proof_conflict` are raised after receipt admission, so
+they never answer a replay of an admitted sequence: the refused request is proven to have
+had no effect. The AS refusals run before receipt replay (see above), so they can also
+refuse a replay of a sequence the adapter already admitted. That refusal does not undo the
+earlier admission: its receipt and the effects of its delivery stay. Every other failure of
+the promotion chain is an adapter invariant and answers `500 internal`.
 
 ### `X-Push-Seq` — keyed intent pushes
 
@@ -1180,11 +1207,13 @@ outside the candidate map use the same baseline and cross-stream diagnosis as st
 selection mode. No identity or plan digest is returned for a non-ready result.
 A `ready` candidate result requires a completed normal delivery probe. A failed probe
 returns `unavailable` with `error.code = "delivery_probe_failed"`, no admitted selection,
-no `delivery_effect`, and no candidate identity or plan digest. A failed probe includes a
-normal-delivery refusal (also `outstanding_deletion_provenance`), a database error, and a
-store connection pool timeout. The probe starts only from the desired and authorized
-revisions that planning read. A different desired or authorized revision (for example, after
-a store-only write) returns `unavailable` with `error.code = "inputs_changed_during_preflight"`.
+no `delivery_effect`, and no candidate identity or plan digest. A failed probe includes these
+typed errors that the normal delivery answers: an endpoint error, any
+[delivery conflict](#delivery-conflicts) (for example `outstanding_deletion_provenance` or
+`interface_proof_conflict`), a database error, and a store connection pool timeout. The probe
+starts only from the desired and authorized revisions that planning read. A different desired
+or authorized revision (for example, after a store-only write) returns `unavailable` with
+`error.code = "inputs_changed_during_preflight"`.
 
 `candidate_identity` hashes canonical JSON of the normalized candidate bodies, all streams'
 authorized revisions, NSO instance id, NSO device name, device `ned_id`, the single
