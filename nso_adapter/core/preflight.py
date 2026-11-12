@@ -144,7 +144,7 @@ class PlannedChain:
         return json.loads(self._candidate_json)["identity"] if self._candidate_json is not None else None
 
     @property
-    def candidate_baseline_revisions(self) -> dict[str, int] | None:
+    def candidate_baseline_revisions(self) -> dict[str, dict[str, int]] | None:
         return json.loads(self._candidate_json)["baseline_revisions"] if self._candidate_json is not None else None
 
     @property
@@ -471,7 +471,9 @@ class CandidateIngest(Protocol):
     async def delivery_effect(self, db: AsyncSession) -> dict: ...
 
 
-async def _candidate_delivery_effect(engine, device, ingest: CandidateIngest, baseline: dict[str, int]) -> dict:
+async def _candidate_delivery_effect(
+    engine, device, ingest: CandidateIngest, baseline: dict[str, dict[str, int]]
+) -> dict:
     """Observe normal ingestion in a private snapshot that never commits."""
     async with engine.connect() as connection:
         connection = await connection.execution_options(isolation_level="REPEATABLE READ")
@@ -485,7 +487,7 @@ async def _candidate_delivery_effect(engine, device, ingest: CandidateIngest, ba
                 current = await db.get(Device, device.id)
                 if current is None or _device_context(current) != _device_context(device):
                     raise PreflightStale("inputs_changed")
-                if await _authorized_revisions(db, device.id) != baseline:
+                if await _stream_revisions(db, device.id) != baseline:
                     raise PreflightStale("inputs_changed")
                 return await ingest.delivery_effect(db)
         finally:
@@ -816,19 +818,26 @@ async def plan_action_apply(
             await outer.rollback()
 
 
-async def _authorized_revisions(db, device_id: int) -> dict[str, int]:
-    rows = await db.execute(
-        select(DeviceProjectionStream.stream, DeviceProjectionStream.authorized_revision).where(
-            DeviceProjectionStream.device_id == device_id
-        )
-    )
-    revisions = dict(rows.tuples().all())
-    return {stream: revisions.get(stream, 0) for stream in sorted(projection_streams())}
+async def _stream_revisions(db, device_id: int) -> dict[str, dict[str, int]]:
+    # A store-only write moves only the desired revision.
+    query = select(
+        DeviceProjectionStream.stream,
+        DeviceProjectionStream.desired_revision,
+        DeviceProjectionStream.authorized_revision,
+    ).where(DeviceProjectionStream.device_id == device_id)
+    rows = (await db.execute(query)).tuples().all()
+    desired = {stream: revision for stream, revision, _ in rows}
+    authorized = {stream: revision for stream, _, revision in rows}
+    streams = sorted(projection_streams())
+    return {
+        "desired": {stream: desired.get(stream, 0) for stream in streams},
+        "authorized": {stream: authorized.get(stream, 0) for stream in streams},
+    }
 
 
 async def _ingest_candidate_plan(db, device, ingest, snapshot):
     # The delivery probe runs in a later transaction and must start from these revisions.
-    baseline = await _authorized_revisions(db, device.id)
+    baseline = await _stream_revisions(db, device.id)
     selected, bodies = await ingest(db)
     candidate = _canonical(
         {
@@ -837,7 +846,7 @@ async def _ingest_candidate_plan(db, device, ingest, snapshot):
             "identity": _digest(
                 {
                     "bodies": bodies,
-                    "authorized_revisions": await _authorized_revisions(db, device.id),
+                    "authorized_revisions": (await _stream_revisions(db, device.id))["authorized"],
                     "nso_instance": device.nso_instance,
                     "nso_device_name": device.nso_device_name,
                     "ned_id": device.ned_id,

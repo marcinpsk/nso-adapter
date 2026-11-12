@@ -405,6 +405,24 @@ async def test_candidate_authorization_between_plan_and_probe_needs_new_prefligh
     assert_keys_absent(result, ["candidate_identity", "plan_digest", "delivery_effect"])
 
 
+async def test_candidate_store_only_write_between_plan_and_probe_needs_new_preflight(adapter_client, monkeypatch):
+    device, _, _, _ = await setup(adapter_client, monkeypatch)
+    stored = {"interfaces": [{"interface_name": INTERFACE, "mtu": 9000, "accepted_at": ACCEPTED_AT}]}
+
+    async def store_only_write():
+        assert (await push(adapter_client, device.id, "interface_mtu", stored, seq=5903)).status_code == 200
+
+    # A store-only write moves the desired revision and leaves the authorized revision unchanged.
+    after_planning(monkeypatch, store_only_write)
+    response = await preview(adapter_client, device.id, {"interface_mtu": {"interfaces": []}})
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["status"] == "unavailable", result
+    assert result["error"] == {"code": "inputs_changed_during_preflight"}
+    assert result["admitted_selection"] == {}
+    assert_keys_absent(result, ["candidate_identity", "plan_digest", "delivery_effect"])
+
+
 def vlans(*vids):
     return {"vlans": [{"vlan_id": vid, "name": f"vlan-{vid}", "accepted_at": ACCEPTED_AT} for vid in vids]}
 
