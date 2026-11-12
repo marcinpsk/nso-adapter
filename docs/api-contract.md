@@ -1207,8 +1207,8 @@ outside the candidate map use the same baseline and cross-stream diagnosis as st
 selection mode. No identity or plan digest is returned for a non-ready result.
 A `ready` candidate result requires a completed normal delivery probe. A failed probe
 returns `unavailable` with `error.code = "delivery_probe_failed"`, no admitted selection,
-no `delivery_effect`, and no candidate identity or plan digest. A failed probe includes every
-error the normal delivery would answer: an endpoint error, any
+no `delivery_effect`, and no candidate identity or plan digest. A failed probe includes these
+typed errors that the normal delivery answers: an endpoint error, any
 [delivery conflict](#delivery-conflicts) (for example `outstanding_deletion_provenance` or
 `interface_proof_conflict`), a database error, and a store connection pool timeout. The probe
 starts only from the desired and authorized revisions that planning read. A different desired
