@@ -112,14 +112,15 @@ promotes (auto-apply on, or a removal). Each one answers 409 with a stable code,
 - `interface_proof_conflict`: the fragments of one interface section disagree about an
   interface field.
 
-The whole delivery rolls back: no intent rows, no receipt, no revision and no job. A replay
-of the same `X-Push-Seq` meets the same refusal until the operator changes the state that
-causes it, so a consumer must not retry it as a transient failure. `apply_unexecutable` and
-`interface_proof_conflict` are raised after receipt admission, so they never answer a
-replay of an admitted sequence: the refused request is proven to have had no effect. The
-AS refusals run before receipt replay (see above), so they can also refuse a replay of a
-sequence the adapter already admitted. Every other failure of the promotion chain is an
-adapter invariant and answers `500 internal`.
+The refused request rolls back completely: it writes no new intent rows, receipt,
+revision or job. A replay of the same `X-Push-Seq` meets the same refusal until the operator
+changes the state that causes it, so a consumer must not retry it as a transient failure.
+`apply_unexecutable` and `interface_proof_conflict` are raised after receipt admission, so
+they never answer a replay of an admitted sequence: the refused request is proven to have
+had no effect. The AS refusals run before receipt replay (see above), so they can also
+refuse a replay of a sequence the adapter already admitted. That refusal does not undo the
+earlier admission: its receipt and the effects of its delivery stay. Every other failure of
+the promotion chain is an adapter invariant and answers `500 internal`.
 
 ### `X-Push-Seq` — keyed intent pushes
 

@@ -7,13 +7,14 @@ from copy import deepcopy
 import pytest
 from sqlalchemy import select
 
-from nso_adapter.store.models import Device, JobStatus, RedistributionIntent
+from nso_adapter.store.models import Device, IntentPushReceipt, JobStatus, RedistributionIntent
 from tests._secret_discipline import assert_text_free_of
 from tests.api.test_bgp_asn_validation import _redistribution_request
 from tests.conftest import AUTH, push_seq, seed_device, session
 from tests.core.test_action_apply_promotion import _apply
 from tests.core.test_execution_context import _drain, _drain_writes, _next_queued_type, _set_ned
 from tests.core.test_generation_protocol import generations, job_row, recorded_client, run_head, seed_settings
+from tests.core.test_preflight_plan import database_state
 from tests.core.test_static_route_removal import SrFake
 
 _ALLOWED_NEDS = ["juniper-junos-nc", "timos-nc-23.10"]
@@ -148,12 +149,14 @@ async def test_live_ned_change_refuses_empty_source_before_images(adapter_client
         _entries(protocol, body)[0]["source_ref"] = "64512"
     elif operation == "deletion":
         _entries(protocol, body).clear()
+    before = await database_state()
     refused = await adapter_client.put(url, json=body, headers=AUTH | push_seq(1 if operation == "replay" else 2))
     assert_text_free_of(refused.text, ["placeholder-device", "placeholder-process"])
     assert refused.status_code == 409, refused.text
     assert refused.json()["error"]["code"] == "bgp_source_as_required"
-    async with session() as db:
-        assert (await db.scalar(select(RedistributionIntent))).source_ref == ""
+    # The refusal writes no new receipt, revision, row or job; the admitted receipt and rows stay.
+    assert before[IntentPushReceipt.__tablename__] and before[RedistributionIntent.__tablename__]
+    assert await database_state() == before
 
 
 class _WireRecorder(SrFake):
