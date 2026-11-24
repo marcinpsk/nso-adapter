@@ -2,6 +2,54 @@
 
 <!-- version list -->
 
+## v1.21.0 (2026-11-12)
+
+### Bug Fixes
+
+- **errors**: Map operator-correctable delivery refusals to typed 409s in one place
+  ([`ccb7c36`](https://github.com/marcinpsk/nso-adapter/commit/ccb7c36b79b5dfb7f1596169e2275b6324889c9e))
+
+- **preflight**: Compare desired revisions before the candidate delivery probe
+  ([`8843189`](https://github.com/marcinpsk/nso-adapter/commit/884318923ddd2993eaafd76131908a2746f56509))
+
+- **preflight**: Fail the candidate delivery probe on moved revisions and refusals
+  ([`1287af1`](https://github.com/marcinpsk/nso-adapter/commit/1287af16030457716b262e9922d29fd5be993978))
+
+- **preflight**: Report an interface proof conflict as a failed delivery probe
+  ([`fe9e36a`](https://github.com/marcinpsk/nso-adapter/commit/fe9e36aee586738b7188bed46cecd6e6fcfa6b7e))
+
+### Chores
+
+- **ci**: Bump astral-sh/setup-uv
+  ([`96af318`](https://github.com/marcinpsk/nso-adapter/commit/96af3185059715894c81ef49d91e89d3a62a8e72))
+
+- **ci**: Bump https://github.com/astral-sh/ruff-pre-commit
+  ([`d8360b1`](https://github.com/marcinpsk/nso-adapter/commit/d8360b1baee83e74a284b7d437555bd39ba13eeb))
+
+- **ci**: Bump https://github.com/compilerla/conventional-pre-commit
+  ([`26375d8`](https://github.com/marcinpsk/nso-adapter/commit/26375d8971b51857745c2259a067fdc3cb15a03f))
+
+- **deps**: Bump pytest-asyncio from 1.4.1 to 1.4.1.post1
+  ([`2605c1e`](https://github.com/marcinpsk/nso-adapter/commit/2605c1e474e19aef5aeb6cc49fb20fcba7e48e53))
+
+- **deps**: Bump the python-minor-patch group with 3 updates
+  ([`77ef700`](https://github.com/marcinpsk/nso-adapter/commit/77ef7005c3329d9a6bf0c015c25ffd2977d5764b))
+
+- **deps**: Bump the python-minor-patch group with 4 updates
+  ([`703442f`](https://github.com/marcinpsk/nso-adapter/commit/703442fd9bcc95ff2c348365e1599f83263ae8dc))
+
+- **deps**: Bump types-pyyaml from 6.0.12.20260906 to 6.0.12.20261030
+  ([`0a641c7`](https://github.com/marcinpsk/nso-adapter/commit/0a641c7a3a176be1196b68947192b19d40a99e1d))
+
+### Documentation
+
+- **errors**: State that an AS refusal of a replay keeps the earlier receipt
+  ([`e694b8d`](https://github.com/marcinpsk/nso-adapter/commit/e694b8d19e608afbef59b3930add9b174f1d25bc))
+
+- **preflight**: Limit the failed-probe statement to the typed errors
+  ([`ccc0f4e`](https://github.com/marcinpsk/nso-adapter/commit/ccc0f4e6bb19ecb71a0de1f1bbb8cb931b69b132))
+
+
 ## v1.20.0 (2026-11-05)
 
 ### Bug Fixes
